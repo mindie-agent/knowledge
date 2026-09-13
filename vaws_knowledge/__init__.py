@@ -26,4 +26,4 @@ def package_version() -> str:
     try:
         return version("vaws-knowledge")
     except PackageNotFoundError:
-        return "0.7.4"
+        return "0.7.5"
