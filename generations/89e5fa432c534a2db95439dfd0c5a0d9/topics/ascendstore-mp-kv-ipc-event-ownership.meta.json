@@ -1,0 +1,14 @@
+{
+  "conditions": {},
+  "retrieval": {
+    "aliases": [
+      "AscendStore multiprocess Worker Event ownership HCCL hang",
+      "use_multiprocess mooncake register_memory npu device_index",
+      "ascend_store mp npu_ipc ZMQ DEALER pool_worker",
+      "PR 15832 head 22c8c589 rebase pin-latest",
+      "ready-precise AscendStore transfer mp 310p pass a3 fail"
+    ],
+    "source_sha256": "8c7c43daaaa705a4b76d3ae190fcf07f6c00b878c44c86145c48a8a950777ada",
+    "topics": []
+  }
+}

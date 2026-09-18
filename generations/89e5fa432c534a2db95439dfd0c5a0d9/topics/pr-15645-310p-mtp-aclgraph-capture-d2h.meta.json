@@ -1,0 +1,14 @@
+{
+  "conditions": {},
+  "retrieval": {
+    "aliases": [
+      "vllm-ascend PR 15645 310P MTP ACLGraph 107027 D2H",
+      "splitfuse NZ mask query_lens_cpu seq_lens_cpu graph capture",
+      "_bind_splitfuse_mask stable data_ptr capture replay",
+      "test_qwen3_5_mtp_tp1_full_decode_only_graph VLLM_USE_V2_MODEL_RUNNER=0",
+      "310P MRv1 NPUModelRunner310 vs 910 A2 A3 MTP boundary"
+    ],
+    "source_sha256": "77ab6f09e0b2663cfa16e6dbeec11779d2148f855be7303a432c34949ee5ba76",
+    "topics": []
+  }
+}

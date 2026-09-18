@@ -1,0 +1,14 @@
+{
+  "conditions": {},
+  "retrieval": {
+    "aliases": [
+      "Triton build_dspark_swa_indices ACLGraph executor stream",
+      "PR 16542 cf795e72 dspark_swa_indices A2 gate",
+      "AscendC 15626 vs Triton 16542 per_token_lens address stability",
+      "max_num_reqs_for_dspark R_alloc NUM_CB capacity grid",
+      "triton-ascend 3.2.0 DSpark SWA indices pad cleanup"
+    ],
+    "source_sha256": "9659ac711aae8d20df9925a32674978883649886d26989d678f6dbe6ddd42f7c",
+    "topics": []
+  }
+}

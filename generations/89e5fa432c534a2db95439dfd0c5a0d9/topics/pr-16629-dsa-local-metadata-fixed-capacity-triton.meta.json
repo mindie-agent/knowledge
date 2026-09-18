@@ -1,0 +1,14 @@
+{
+  "conditions": {},
+  "retrieval": {
+    "aliases": [
+      "dsa_local_metadata fixed capacity Triton 16629",
+      "eliminate re-JIT num_reqs bucket DSA CP",
+      "do_not_specialize COMPUTE_START_POS Ascend",
+      "PR 16629 vs 16542 Triton capacity patterns",
+      "head 70540b56 blocked dsa_cp wiring"
+    ],
+    "source_sha256": "75c5df20d3abe8a28500e42208844e2455f1dbf2d5d9eb4efe7d4299a0f4574d",
+    "topics": []
+  }
+}

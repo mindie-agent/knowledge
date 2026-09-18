@@ -1,0 +1,14 @@
+{
+  "conditions": {},
+  "retrieval": {
+    "aliases": [
+      "vllm-ascend PR 15816 MRv2 310P MTP Qwen3.5",
+      "_310p/worker/v2 mtp_speculator aclgraph rejection_sampler",
+      "test_spec_decode_mtp_mrv2_310p corruption signatures",
+      "15816 CONFLICTING DIRTY closed 2026-09-14",
+      "15645 overlap host splitfuse mask 107027 MRv2"
+    ],
+    "source_sha256": "e4900881cf125868cebdc63f18d1beb11db6ec305725ca77d3a923190fef3bef",
+    "topics": []
+  }
+}

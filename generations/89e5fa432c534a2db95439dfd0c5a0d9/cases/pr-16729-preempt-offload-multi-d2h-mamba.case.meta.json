@@ -1,0 +1,14 @@
+{
+  "conditions": {},
+  "retrieval": {
+    "aliases": [
+      "preempt offload multi D2H MRV2 handle_preemptions Ascend",
+      "mamba align mode resume index Qwen3.5 KVOffload",
+      "PR 16729 kv_offload preempt_offload manager worker",
+      "P/D KVOffload accuracy preempt Ascend blocked",
+      "vllm-ascend preempt offloading 2026-09-17"
+    ],
+    "source_sha256": "07418875bb785221d317f53d31981ab5794e77cb893cd4408e34df0718cb4b2c",
+    "topics": []
+  }
+}

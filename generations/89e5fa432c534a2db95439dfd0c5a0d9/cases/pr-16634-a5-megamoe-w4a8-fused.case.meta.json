@@ -1,0 +1,14 @@
+{
+  "conditions": {},
+  "retrieval": {
+    "aliases": [
+      "A5 MegaMoE W4A8 FUSED_MC2 fused backend 16634",
+      "mega_moe HCCL symmetric-buffer prepare_finalize",
+      "w4a8_mxfp4 enable_fused_mc2 additional_config",
+      "PR 16634 vs 14449 clean rebuild exclude tests",
+      "DP dummy rank same graph collective path Ascend MoE"
+    ],
+    "source_sha256": "0d1dbdf7e3d5b236976c547605038da8f54c0d99f9a9a3ec332e241b8eac92cf",
+    "topics": []
+  }
+}

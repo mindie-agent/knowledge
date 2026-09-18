@@ -1,0 +1,12 @@
+{
+  "conditions": {},
+  "retrieval": {
+    "aliases": [
+      "GLM5-Next KeyPool PoolKeyIndexer CANN Ascend",
+      "PR 16730 GLM-5.3-Flash vendor ops-transformer",
+      "Triton pooling vs CANN KeyPool scoring contract"
+    ],
+    "source_sha256": "ff93c5cae69a1199b2fc6d31b4cb8a86569064fb805f6b31d1e7e8a2c198c910",
+    "topics": []
+  }
+}

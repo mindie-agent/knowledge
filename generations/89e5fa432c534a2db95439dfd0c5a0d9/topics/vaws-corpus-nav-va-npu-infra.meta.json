@@ -1,0 +1,14 @@
+{
+  "conditions": {},
+  "retrieval": {
+    "aliases": [
+      "vaws-knowledge Ascend910B4 platform_config peaks CANN 9.0.0",
+      "Ascend910B4 single-card dense matmul sustained fraction torch_npu",
+      "vllm-ascend-workspace vaws-knowledge NPU MFU theoretical peak",
+      "vaws-knowledge ACL Graph HCCL dspark",
+      "e16d87287f7db51ca96efc945a9514e4146131d6 corpus/references ascend910b"
+    ],
+    "source_sha256": "532d2ba4d37375881aa734659f3c395dc5e3bc9271374d6a3d6ae0f4450202c4",
+    "topics": []
+  }
+}

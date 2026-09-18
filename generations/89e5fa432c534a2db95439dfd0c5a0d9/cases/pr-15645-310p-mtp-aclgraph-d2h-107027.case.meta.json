@@ -1,0 +1,14 @@
+{
+  "conditions": {},
+  "retrieval": {
+    "aliases": [
+      "310P MTP ACLGraph aclrtMemcpy 107027 D2H query_start_loc seq_lens",
+      "[redacted:credential-high-entropy] host query_lens_cpu splitfuse NZ mask",
+      "AttentionMaskBuilder310 _host_query_lens refuse NPU D2H 107027",
+      "GDN _flatten_state_indices total_tokens vs torch.all device seq_lens",
+      "PR 15645 vllm-ascend CLOSED unmerged 310p_mtp_fix 6730f85"
+    ],
+    "source_sha256": "7a76b8dc9b7c97538ac37dba7cef99c1c402dde0317d4899e674c1695c8b4f7c",
+    "topics": []
+  }
+}

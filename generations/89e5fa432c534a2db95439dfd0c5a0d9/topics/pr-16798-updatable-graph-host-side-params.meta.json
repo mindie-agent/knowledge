@@ -1,0 +1,12 @@
+{
+  "conditions": {},
+  "retrieval": {
+    "aliases": [
+      "UpdatableGraph host-side ACL Graph Ascend MRV1 MRV2",
+      "PR 16798 FIA speculative decoding acl_graph refactor",
+      "issue 13058 UpdatableGraph design vllm-ascend"
+    ],
+    "source_sha256": "bd57998695a4c9e1c3942402b9326cb7ddfc053c7537351acaf12c2ff75d7bf8",
+    "topics": []
+  }
+}

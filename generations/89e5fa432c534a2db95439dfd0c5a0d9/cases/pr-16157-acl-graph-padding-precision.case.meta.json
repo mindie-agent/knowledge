@@ -1,0 +1,14 @@
+{
+  "conditions": {},
+  "retrieval": {
+    "aliases": [
+      "Kimi K3 dspark ACLGraph FULL Query T padding slot_mapping=-1",
+      "fix double N parallel_draft_seq_lens_cpu MLA DSA vllm-ascend",
+      "_is_k3_dspark vs use_cuda_graph _use_aclgraph FULL path",
+      "set_draft_graph_params DSpark FULL capture_descs get_graph_query_num_tokens",
+      "PR 16157 vllm-ascend base fb2820b9 head debfa9bd"
+    ],
+    "source_sha256": "ae2db48bd6e0b079daab3710e5991b4065493f7f2977726c192b83f0ff9df430",
+    "topics": []
+  }
+}

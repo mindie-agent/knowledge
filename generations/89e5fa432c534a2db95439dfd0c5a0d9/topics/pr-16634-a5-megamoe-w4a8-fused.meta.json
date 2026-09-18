@@ -1,0 +1,14 @@
+{
+  "conditions": {},
+  "retrieval": {
+    "aliases": [
+      "MegaMoE W4A8 FUSED_MC2 Ascend A5 16634",
+      "fused_moe mega_moe HCCL symmetric buffer",
+      "w4a8_mxfp4 moe_comm_method prepare_finalize",
+      "enable_fused_mc2 additional_config constraints",
+      "head 3d596b8f CLEAN NPU unverified"
+    ],
+    "source_sha256": "6ad31b10dcb6c23ae0b283859acac0ce554f4996d6e92619bed04b24691922b9",
+    "topics": []
+  }
+}

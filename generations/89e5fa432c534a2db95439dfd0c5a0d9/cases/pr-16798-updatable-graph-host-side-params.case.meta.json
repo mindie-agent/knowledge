@@ -1,0 +1,14 @@
+{
+  "conditions": {},
+  "retrieval": {
+    "aliases": [
+      "UpdatableGraph ACL Graph host-side parameter update Ascend",
+      "PR 16798 MRV1 MRV2 FIA speculative decoding acl_graph",
+      "vllm-ascend compilation updatable_graph issue 13058",
+      "ACL Graph capture replay host params FIA MTP",
+      "A3 A5 manual validation UpdatableGraph blocked"
+    ],
+    "source_sha256": "ac53dcb3ce28f962f86ed2014430404f2f2edb649c4b6d7fca8175bf1e4cc0db",
+    "topics": []
+  }
+}

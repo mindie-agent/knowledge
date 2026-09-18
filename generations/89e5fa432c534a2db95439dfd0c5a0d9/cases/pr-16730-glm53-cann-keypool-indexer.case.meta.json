@@ -1,0 +1,14 @@
+{
+  "conditions": {},
+  "retrieval": {
+    "aliases": [
+      "GLM-5.3-Flash KeyPool PoolKeyIndexer CANN GLM5-Next",
+      "ops-transformer key_pool arch22 arch35 Ascend vendor",
+      "PR 16730 replace Triton pooling sparse index selection",
+      "empty-pool bounds ring-tail causal packing GLM5",
+      "vllm-ascend KeyPoolIndexer integration blocked 2026-09-17"
+    ],
+    "source_sha256": "e00ca8dbacd3249cb4b82409c3a59cb7088b06511e4b2f85d08e14aeb09e45ca",
+    "topics": []
+  }
+}

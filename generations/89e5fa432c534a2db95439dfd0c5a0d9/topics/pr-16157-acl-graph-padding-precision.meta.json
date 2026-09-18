@@ -1,0 +1,14 @@
+{
+  "conditions": {},
+  "retrieval": {
+    "aliases": [
+      "vllm-ascend PR 16157 Kimi K3 DSpark ACL Graph FULL padding Query T",
+      "pad_query_start_loc_for_graph get_graph_query_num_tokens B×N vs B×(1+N)",
+      "_is_k3_dspark use_cuda_graph _use_aclgraph 非K3 FULL 门控",
+      "DSpark MLA parallel_draft_seq_lens_cpu DSA max_seqlen_kv double N",
+      "vllm-ascend releases/v0.26.0rc set_draft_graph_params FULL only dspark"
+    ],
+    "source_sha256": "27a5156d07dc46a228787725bb6034f301440b431ffb39b5d454767f27f57166",
+    "topics": []
+  }
+}
