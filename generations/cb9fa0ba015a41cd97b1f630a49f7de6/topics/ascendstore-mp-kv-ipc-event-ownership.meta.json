@@ -1,0 +1,22 @@
+{
+  "conditions": {
+    "base_ref": "main",
+    "base_sha": "26f1363f7180dfcbeac1230679976cede6010fc8",
+    "head_sha": "b92271485c7991ae8aa36ab24d2cb7c497b5641d",
+    "pr_state": "CLOSED",
+    "pull_request": "https://github.com/vllm-project/vllm-ascend/pull/15832",
+    "source_repository": "vllm-project/vllm-ascend",
+    "validation_scope": "source_control_flow_verified; author_claims_separated; NPU_e2e_unverified; closed_unmerged_reference_only"
+  },
+  "retrieval": {
+    "aliases": [
+      "AscendStore multiprocess Worker Event ownership HCCL hang",
+      "use_multiprocess mooncake register_memory npu device_index",
+      "ascend_store mp npu_ipc ZMQ DEALER pool_worker",
+      "PR 15832 head 22c8c589 rebase pin-latest",
+      "ready-precise AscendStore transfer mp 310p pass a3 fail"
+    ],
+    "source_sha256": "8c7c43daaaa705a4b76d3ae190fcf07f6c00b878c44c86145c48a8a950777ada",
+    "topics": []
+  }
+}

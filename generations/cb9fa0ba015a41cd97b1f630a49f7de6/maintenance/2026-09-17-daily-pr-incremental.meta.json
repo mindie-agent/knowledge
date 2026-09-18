@@ -1,0 +1,14 @@
+{
+  "conditions": {},
+  "retrieval": {
+    "aliases": [
+      "va-knowledge 2026-09-17 daily PR incremental 14409 16542 16468 16555 16629",
+      "new 16731 CANN LI MoE 16730 KeyPool GLM53 16729 preempt D2H",
+      "skip-unchanged 15832 16157 16634 16636 deferred 16236 16417 16628",
+      "pin cede05131 b8df632c 48c8a870 f9f35266 cefa37ab 0a167331 0c7c2dc5 f7d285a7",
+      "maintenance budget ceiling 20 min Asia/Shanghai 2026-09-17"
+    ],
+    "source_sha256": "494a6758e5ac38bd06ba2e1974b2fdfd7f309d6f2873f774c8799c8e89152eb4",
+    "topics": []
+  }
+}

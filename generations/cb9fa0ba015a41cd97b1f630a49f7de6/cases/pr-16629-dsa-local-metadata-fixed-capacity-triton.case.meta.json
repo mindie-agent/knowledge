@@ -1,0 +1,14 @@
+{
+  "conditions": {},
+  "retrieval": {
+    "aliases": [
+      "DSA local_token_metadata fixed-capacity Triton re-JIT 16629",
+      "dsa_local_metadata max_num_seqs do_not_specialize",
+      "build_local_metadata_triton dsa_cp context parallel",
+      "PR 16629 vs 16542 Triton capacity grid Ascend",
+      "int32 fp32 clamp cumsum 910B AiCPU metadata"
+    ],
+    "source_sha256": "63f52a2ab1d4f73e237503383b10334205df4756e683fe740598c4ff138e4f55",
+    "topics": []
+  }
+}

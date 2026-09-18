@@ -1,0 +1,14 @@
+{
+  "conditions": {},
+  "retrieval": {
+    "aliases": [
+      "va-knowledge 2026-09-13 PR 16157 re-verify gh",
+      "fb2820b9 debfa9bd _is_k3_dspark use_cuda_graph",
+      "vaws-knowledge e16d8728 Ascend910B4 corpus nav",
+      "va-knowledge maintenance run-summary DCO CONFLICTING",
+      "ACL Graph padding precision notes revision 2026-09-13"
+    ],
+    "source_sha256": "c5c6e486cfba82036879962eddac8b75d13f02f272968439ba8b65a61089b5a7",
+    "topics": []
+  }
+}

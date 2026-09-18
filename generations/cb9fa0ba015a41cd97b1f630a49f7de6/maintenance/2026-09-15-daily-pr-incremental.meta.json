@@ -1,0 +1,14 @@
+{
+  "conditions": {},
+  "retrieval": {
+    "aliases": [
+      "va-knowledge 2026-09-15 daily PR incremental 15832 14409 16542 16468 16555",
+      "AscendStore mp re-pin 22c8c589 hardware_aware 6b458cff DIRTY",
+      "Triton dspark_swa_indices 16542 A5 Kimi K3 16468 Mooncake EC 16555",
+      "skip-unchanged 16157 deferred 16236 16417",
+      "maintenance budget ceiling 20 min Asia/Shanghai 2026-09-15"
+    ],
+    "source_sha256": "4f230156d1cf9e57a1894d4d923f13d2692a350426aa576f5fde96d2553a6bcd",
+    "topics": []
+  }
+}

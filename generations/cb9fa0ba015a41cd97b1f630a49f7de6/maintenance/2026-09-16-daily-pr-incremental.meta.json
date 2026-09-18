@@ -1,0 +1,14 @@
+{
+  "conditions": {},
+  "retrieval": {
+    "aliases": [
+      "va-knowledge 2026-09-16 daily PR incremental 15832 CLOSED 14409 16468 16555",
+      "new 16634 MegaMoE W4A8 16629 DSA metadata Triton 16636 empty context",
+      "skip-unchanged 16157 16542 deferred 16236 16417 16628",
+      "pin b9227148 6ee85790 4e519623 e634788d 3d596b8f 70540b56 1889ebee",
+      "maintenance budget ceiling 20 min Asia/Shanghai 2026-09-16"
+    ],
+    "source_sha256": "1a0d6a6d1caa12e48bfbceb2c3f4b2b5dc8f722e24300abc4c6e34bbc648882e",
+    "topics": []
+  }
+}

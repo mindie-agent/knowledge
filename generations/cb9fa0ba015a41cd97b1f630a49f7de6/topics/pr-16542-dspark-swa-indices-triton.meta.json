@@ -1,0 +1,21 @@
+{
+  "conditions": {
+    "base_sha": "d9ce0aa6f5c40769920512a69f82d97aecff5d40",
+    "head_sha": "f4bb08f1c7a5b7e91e5183fe894a05fcb88b6fc7",
+    "pr_state": "OPEN",
+    "pull_request": "https://github.com/vllm-project/vllm-ascend/pull/16542",
+    "source_repository": "vllm-project/vllm-ascend",
+    "validation_scope": "source_control_flow_verified; author_claims_separated; NPU_e2e_unverified; OPEN_BLOCKED"
+  },
+  "retrieval": {
+    "aliases": [
+      "Triton build_dspark_swa_indices ACLGraph executor stream",
+      "PR 16542 cf795e72 dspark_swa_indices A2 gate",
+      "AscendC 15626 vs Triton 16542 per_token_lens address stability",
+      "max_num_reqs_for_dspark R_alloc NUM_CB capacity grid",
+      "triton-ascend 3.2.0 DSpark SWA indices pad cleanup"
+    ],
+    "source_sha256": "9659ac711aae8d20df9925a32674978883649886d26989d678f6dbe6ddd42f7c",
+    "topics": []
+  }
+}

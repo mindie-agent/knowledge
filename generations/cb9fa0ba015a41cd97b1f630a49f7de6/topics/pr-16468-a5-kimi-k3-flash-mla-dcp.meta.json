@@ -1,0 +1,21 @@
+{
+  "conditions": {
+    "base_sha": "cb82154ea226c733ba99fe76d7ee3bd3af137ed1",
+    "head_sha": "3c94ce740126984b9683501dd8c3772bf88d4311",
+    "pr_state": "OPEN",
+    "pull_request": "https://github.com/vllm-project/vllm-ascend/pull/16468",
+    "source_repository": "vllm-project/vllm-ascend",
+    "validation_scope": "source_control_flow_verified; author_claims_separated; NPU_e2e_unverified; OPEN_draft_DIRTY_experimental_reference_only"
+  },
+  "retrieval": {
+    "aliases": [
+      "Kimi K3 A5 Flash MLA GQA DSpark ACLGraph draft 16468",
+      "DCP8 small-decode MRv2 policy3 EPLB 4e519623",
+      "DeviceMetadataTask ACLGraph padded requests DCP slots",
+      "PR 16468 vs 16157 rc0.26 padding separate cases",
+      "head 4e519623 rfc16464 DIRTY draft"
+    ],
+    "source_sha256": "33e7910e83ca298079b2910241993d646f64c85394a1f7b8081cf77741ede075",
+    "topics": []
+  }
+}

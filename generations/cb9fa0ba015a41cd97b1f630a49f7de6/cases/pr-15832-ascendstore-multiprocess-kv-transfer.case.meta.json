@@ -1,0 +1,14 @@
+{
+  "conditions": {},
+  "retrieval": {
+    "aliases": [
+      "AscendStore use_multiprocess KV transfer worker subprocess",
+      "npu_ipc export import storage specs ZMQ DEALER ascend_store mp",
+      "NPU Event hang HCCL cross-process synchronize Worker ownership",
+      "mooncake-transfer-engine-npu 0.3.12.post1 register_memory npu:device",
+      "PR 15832 draft feat/ascend-store-transfer-mp head 22c8c589"
+    ],
+    "source_sha256": "91a534baa29f8b6f4ff73e3279218307a546b9548d105cb58db029479bfedd47",
+    "topics": []
+  }
+}

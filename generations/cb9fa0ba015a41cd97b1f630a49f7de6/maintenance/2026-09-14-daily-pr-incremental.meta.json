@@ -1,0 +1,14 @@
+{
+  "conditions": {},
+  "retrieval": {
+    "aliases": [
+      "va-knowledge 2026-09-14 daily PR incremental 15645 15816 15832 14409",
+      "310P MTP ACLGraph 107027 MRv2 skip 16157",
+      "AscendStore use_multiprocess draft Event ownership",
+      "hardware-aware physical_k pin-latest-each-run 2aacea2f",
+      "maintenance budget ceiling 20 min Asia/Shanghai 2026-09-14"
+    ],
+    "source_sha256": "bfa41f9f0b5fa28327176cb70885916f3879ba14ef41e0669e82c185aac2630b",
+    "topics": []
+  }
+}

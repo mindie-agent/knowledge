@@ -1,0 +1,21 @@
+{
+  "conditions": {
+    "base_sha": "10b4fb2a99c4fe8f33efb591b1f2996265430ce3",
+    "head_sha": "f9f352666160e2cd1e467a4cc3a6bd97ca3aec7c",
+    "pr_state": "OPEN",
+    "pull_request": "https://github.com/vllm-project/vllm-ascend/pull/16555",
+    "source_repository": "vllm-project/vllm-ascend",
+    "validation_scope": "source_control_flow_verified; author_claims_separated; NPU_e2e_unverified; OPEN_BLOCKED; V2_out_of_scope"
+  },
+  "retrieval": {
+    "aliases": [
+      "Ascend ECMooncakeConnector ec_transfer mooncake.py",
+      "EPD Mooncake encoder cache NPU Event staging",
+      "PR 16555 ModelRunner V1 EC completion no-forward",
+      "issue 6026 Mooncake cross-node encoder-cache",
+      "head e634788d mypy alias KV connector registration"
+    ],
+    "source_sha256": "209e1b0a51ede043b4e201980428dcfc3f7de15319d19754b72f6a52cf4251f9",
+    "topics": []
+  }
+}

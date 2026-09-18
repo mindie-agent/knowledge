@@ -1,0 +1,19 @@
+{
+  "conditions": {
+    "base_sha": "3db3f931e155da9b496febe8a42d9bd7d9f52849",
+    "head_sha": "3e33c9fdda0578787544fd4360e48ae2fed1dc4b",
+    "pr_state": "OPEN",
+    "pull_request": "https://github.com/vllm-project/vllm-ascend/pull/16798",
+    "source_repository": "vllm-project/vllm-ascend",
+    "validation_scope": "source_control_flow_verified; author_claims_separated; NPU_e2e_unverified; OPEN_BLOCKED"
+  },
+  "retrieval": {
+    "aliases": [
+      "UpdatableGraph host-side ACL Graph Ascend MRV1 MRV2",
+      "PR 16798 FIA speculative decoding acl_graph refactor",
+      "issue 13058 UpdatableGraph design vllm-ascend"
+    ],
+    "source_sha256": "bd57998695a4c9e1c3942402b9326cb7ddfc053c7537351acaf12c2ff75d7bf8",
+    "topics": []
+  }
+}

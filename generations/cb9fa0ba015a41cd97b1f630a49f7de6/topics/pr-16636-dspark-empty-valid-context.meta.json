@@ -1,0 +1,21 @@
+{
+  "conditions": {
+    "base_sha": "c267db731d03e18042047ea1594e033673e46a6f",
+    "head_sha": "1889ebeee16cb3855245b804b95f4b2a43eb8176",
+    "pr_state": "OPEN",
+    "pull_request": "https://github.com/vllm-project/vllm-ascend/pull/16636",
+    "source_repository": "vllm-project/vllm-ascend",
+    "validation_scope": "source_control_flow_verified; author_claims_separated; NPU_e2e_unverified; OPEN_BLOCKED"
+  },
+  "retrieval": {
+    "aliases": [
+      "empty DSpark context discard IndexCheck 16636",
+      "valid_ctx_end equals ctx_start target_positions",
+      "safe anchor first position query positions",
+      "test_copy_and_expand_dflash_dspark regression",
+      "head 1889ebee blocked despite e2e pass"
+    ],
+    "source_sha256": "200c121da6fd08aabeac1a1439b66034d6df3c9ab7d074949753b1fef497425b",
+    "topics": []
+  }
+}

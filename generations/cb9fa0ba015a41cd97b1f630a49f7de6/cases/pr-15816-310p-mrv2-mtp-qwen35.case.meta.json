@@ -1,0 +1,14 @@
+{
+  "conditions": {},
+  "retrieval": {
+    "aliases": [
+      "310P MRv2 MTP Qwen3.5 vllm_ascend _310p worker v2",
+      "test_spec_decode_mtp_mrv2_310p FULL_DECODE_ONLY K=1",
+      "PR 15816 CLOSED CONFLICTING mrv2_310p_mtp_fix",
+      "patch_spec_decode_310 host splitfuse 107027 overlap 15645",
+      "greedy_rejection_sample_cpu NZ KV copy MTP-only config 310P"
+    ],
+    "source_sha256": "87a90cd7289161ed9a43cd381e91257905f1077b008d857ac5c137301c266826",
+    "topics": []
+  }
+}

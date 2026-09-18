@@ -1,0 +1,14 @@
+{
+  "conditions": {},
+  "retrieval": {
+    "aliases": [
+      "build_dspark_swa_indices Triton fuse DSv4 DSpark decode",
+      "dspark_swa_indices capacity grid pad-row ACLGraph stable address",
+      "PR 16542 vs 15626 AscendC Triton-Ascend eligibility A2",
+      "dsa_v1 dspark_proposer HAS_TRITON block_table_width 8192",
+      "triton-ascend tl.gather fp32 roundtrip INDEX_W"
+    ],
+    "source_sha256": "01d3afa1f33153a73ee55a98ab1bfacb24c0636619f2852c25a9ffba0fe251e3",
+    "topics": []
+  }
+}

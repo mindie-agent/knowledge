@@ -1,0 +1,14 @@
+{
+  "conditions": {},
+  "retrieval": {
+    "aliases": [
+      "va-knowledge 2026-09-18 daily PR incremental 16542 16468 16731 16730",
+      "new 16798 UpdatableGraph ACL Graph 16656 A5 SFA DCP LSE",
+      "skip-unchanged 14409 16555 16629 16729 15832 16157 16634 16636",
+      "pin f4bb08f1 d8a34b81 d73c7b3d b5cc342f 3e33c9fd 60c6c32a",
+      "maintenance budget ceiling 20 min Asia/Shanghai 2026-09-18"
+    ],
+    "source_sha256": "811e4cf3a11d000faba9c65794b4295b7c21c5f0479e5fa7d60ec0bf89d92593",
+    "topics": []
+  }
+}
