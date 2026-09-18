@@ -10,7 +10,7 @@ import hashlib
 import json
 import re
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import quote
 
 from vaws_knowledge.markdown import _atomic_write_text, render_markdown
@@ -113,7 +113,7 @@ class Feed:
             if kind is None:
                 skipped.append(name)
                 continue
-            metadata_raw = files[str(Path(name).with_suffix(".meta.json"))]
+            metadata_raw = files[str(PurePosixPath(name).with_suffix(".meta.json"))]
             metadata = json.loads(metadata_raw)
             conditions = metadata["conditions"]
             content = text(raw.decode("utf-8"), "feed content")
