@@ -14,7 +14,7 @@ from typing import Any, Mapping
 FIXTURES = pathlib.Path(__file__).resolve().parent
 REPO = FIXTURES.parent.parent.parent
 
-from vaws_knowledge.server.layers import ServiceConfig, load_config
+from mindie_knowledge.server.layers import ServiceConfig, load_config
 
 def _layer_spec(value: Any, fixture_dir: str) -> dict[str, Any]:
     if value is True:

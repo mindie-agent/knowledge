@@ -24,9 +24,9 @@ from distribution.helpers import (
     metrics_reader_from,
 )
 
-from vaws_knowledge.distribution.errors import SwitchInProgress
-from vaws_knowledge.distribution.manifest import version_id_from_sha
-from vaws_knowledge.distribution.sync import (
+from mindie_knowledge.distribution.errors import SwitchInProgress
+from mindie_knowledge.distribution.manifest import version_id_from_sha
+from mindie_knowledge.distribution.sync import (
     DistributionState,
     SwitchLock,
     check_and_sync,
@@ -344,7 +344,7 @@ def test_real_subprocess_contention_and_crash_reclaim(tmp_path):
     repo_root = Path(__file__).resolve().parent.parent
     helper = (
         "import os, sys\n"
-        "from vaws_knowledge.distribution.sync import SwitchLock\n"
+        "from mindie_knowledge.distribution.sync import SwitchLock\n"
         f"lock = SwitchLock({str(path)!r})\n"
         "lock.acquire()\n"
         "print('acquired', flush=True)\n"
@@ -531,8 +531,8 @@ def test_offline_pointer_recovery_skips_a_corrupted_newest_pack(tmp_path):
 
 
 def test_legacy_activation_can_recover_from_source_download_cache(tmp_path):
-    from vaws_knowledge.distribution.errors import SourceUnavailable
-    from vaws_knowledge.distribution.release import LocalReleaseSource
+    from mindie_knowledge.distribution.errors import SourceUnavailable
+    from mindie_knowledge.distribution.release import LocalReleaseSource
 
     state, client = tmp_path / "state", FakeClient()
     release = make_release_dir(tmp_path / "release")
@@ -650,7 +650,7 @@ def test_failed_model_repair_preserves_active_release_and_never_connects(tmp_pat
 
 
 def test_slow_discovery_cannot_replace_a_concurrently_activated_release(tmp_path):
-    from vaws_knowledge.distribution.release import LocalReleaseSource
+    from mindie_knowledge.distribution.release import LocalReleaseSource
 
     state, client = tmp_path / "state", FakeClient()
     older = make_release_dir(tmp_path / "older")

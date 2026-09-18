@@ -10,10 +10,10 @@ import unittest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "fixtures" / "server"))
 
 import support  # noqa: E402
-from vaws_knowledge.local.backend import MemoryBackend, UnavailableBackend
-from vaws_knowledge.server.capture import capture
-from vaws_knowledge.server.query import explain, query
-from vaws_knowledge.local.reconcile import reconcile_markdown
+from mindie_knowledge.local.backend import MemoryBackend, UnavailableBackend
+from mindie_knowledge.server.capture import capture
+from mindie_knowledge.server.query import explain, query
+from mindie_knowledge.local.reconcile import reconcile_markdown
 
 
 def _config(tmp: str):
@@ -46,7 +46,7 @@ class QueryMarkdown(unittest.TestCase):
             self.assertNotIn("applies", original)
 
     def test_review_status_does_not_hide_related_notes(self) -> None:
-        from vaws_knowledge.markdown import meta_path
+        from mindie_knowledge.markdown import meta_path
         import json
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -102,7 +102,7 @@ class QueryMarkdown(unittest.TestCase):
                 content="Candidate observation about graph replay padding.",
                 config=config,
             )
-            from vaws_knowledge.markdown import save_document, slugify, uri_for
+            from mindie_knowledge.markdown import save_document, slugify, uri_for
 
             saved = save_document(
                 project,
@@ -213,7 +213,7 @@ class QueryMarkdown(unittest.TestCase):
                     raise RuntimeError("embed failed")
 
             config.retrieval = Boom()
-            from vaws_knowledge.maintenance import maintain
+            from mindie_knowledge.maintenance import maintain
             maintain(config)
             payload = query(config, text="keepmequartz", layers=["project"]).to_dict()
             self.assertTrue(path.is_file())
@@ -247,7 +247,7 @@ class QueryMarkdown(unittest.TestCase):
             backend.upsert = tracking  # type: ignore[method-assign]
             config.retrieval = backend
             from unittest.mock import patch
-            with patch("vaws_knowledge.local.reconcile.reconcile_markdown", side_effect=AssertionError("query indexed")):
+            with patch("mindie_knowledge.local.reconcile.reconcile_markdown", side_effect=AssertionError("query indexed")):
                 payload = query(config, text="sharedonyx", layers=["shared"]).to_dict()
             self.assertEqual([], upserts)
             self.assertEqual(1, payload["count"])
@@ -257,7 +257,7 @@ class QueryMarkdown(unittest.TestCase):
 
 class SharedReferenceRoundTrip(unittest.TestCase):
     def _index_shared_pack(self, config):
-        from vaws_knowledge.distribution.sync import CURRENT_SCHEMA, DistributionState
+        from mindie_knowledge.distribution.sync import CURRENT_SCHEMA, DistributionState
 
         version = "v" + "a" * 12
         root_uri = "viking://resources/shared/" + version
@@ -274,12 +274,12 @@ class SharedReferenceRoundTrip(unittest.TestCase):
             "root_uri": root_uri,
             "manifest_path": str(config.state_root / "manifest.json"),
         })
-        from vaws_knowledge.distribution.manifest import atomic_write_json
+        from mindie_knowledge.distribution.manifest import atomic_write_json
         atomic_write_json(config.state_root / "maintenance.json", {"ready": True})
         return ref
 
     def test_active_pack_remains_queryable_when_source_directory_is_missing(self):
-        from vaws_knowledge.server.mcp_server import KnowledgeService
+        from mindie_knowledge.server.mcp_server import KnowledgeService
 
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
@@ -306,8 +306,8 @@ class SharedReferenceRoundTrip(unittest.TestCase):
     def test_active_pack_does_not_reenable_explicitly_disabled_shared_layer(self):
         cases = (
             (False, {}),
-            ("missing", {"VAWS_KNOWLEDGE_SHARED_ROOTS": ""}),
-            ("missing", {"VAWS_KNOWLEDGE_LAYERS": "project,candidate"}),
+            ("missing", {"MINDIE_KNOWLEDGE_SHARED_ROOTS": ""}),
+            ("missing", {"MINDIE_KNOWLEDGE_LAYERS": "project,candidate"}),
         )
         for shared, env in cases:
             with self.subTest(shared=shared, env=env), tempfile.TemporaryDirectory() as tmp:
@@ -344,7 +344,7 @@ class SharedReferenceRoundTrip(unittest.TestCase):
             ref = "viking://resources/shared/current-version/corpus/context.md"
             config.retrieval.upsert(ref, "# Shared observation\n\nOnly observed once; cause unknown.\n", layer="shared")
             active = {"root_uri": "viking://resources/shared/current-version", "source_git_sha": "a" * 40}
-            with patch("vaws_knowledge.server.query.current_shared", return_value=active):
+            with patch("mindie_knowledge.server.query.current_shared", return_value=active):
                 result = explain(config, ref)
                 stale = explain(config, ref.replace("current-version", "old-version"))
             self.assertTrue(result["found"])

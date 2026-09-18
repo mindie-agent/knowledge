@@ -14,10 +14,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from vaws_knowledge.catalog import refresh_catalog
-from vaws_knowledge.evaluation import evaluate
-from vaws_knowledge.markdown import meta_path, normalized_sha256
-from vaws_knowledge.server.layers import load_config
+from mindie_knowledge.catalog import refresh_catalog
+from mindie_knowledge.evaluation import evaluate
+from mindie_knowledge.markdown import meta_path, normalized_sha256
+from mindie_knowledge.server.layers import load_config
 
 
 def run():

@@ -19,13 +19,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from vaws_knowledge.catalog import catalog_path, refresh_catalog, search_catalog
-from vaws_knowledge.corpus import iter_entry_files
-from vaws_knowledge.evaluation import percentile
-from vaws_knowledge.local.backend import MemoryBackend, UnavailableBackend
-from vaws_knowledge.maintenance import maintain
-from vaws_knowledge.server.layers import load_config
-from vaws_knowledge.server.query import query
+from mindie_knowledge.catalog import catalog_path, refresh_catalog, search_catalog
+from mindie_knowledge.corpus import iter_entry_files
+from mindie_knowledge.evaluation import percentile
+from mindie_knowledge.local.backend import MemoryBackend, UnavailableBackend
+from mindie_knowledge.maintenance import maintain
+from mindie_knowledge.server.layers import load_config
+from mindie_knowledge.server.query import query
 
 
 def peak_memory_bytes():

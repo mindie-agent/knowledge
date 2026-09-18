@@ -1,237 +1,40 @@
-# vaws-knowledge
+# MindIE Knowledge
 
-Local Markdown reference notes for vLLM-Ascend development, with CPU retrieval
-through OpenViking and optional public contribution and shared releases.
+Local domain knowledge, experience collection, distribution and independent usefulness feedback for MindIE Agent.
 
-Knowledge helps the Agent reuse experience. Lookup and capture are optional:
-ordinary work needs no knowledge checklist, structured form or extra completion
-step. Results are references, not instructions or applicability decisions. Use
-current evidence and judgment; a review or release does not prove a hardware claim.
-
-## Diagnostics
-
-CLI, MCP calls, optional summaries, maintenance, model preparation and backend
-startup use the zero-dependency `vaws-diagnostics` package. It is pinned to a
-public canonical Git revision in this package's dependencies; standalone installs
-do not require the consumer workspace or another knowledge environment. A release
-wheel is also available from that package for offline dependency bundles.
-
-`VAWS_LOG_LEVEL` selects DEBUG/INFO/WARNING/ERROR; `VAWS_DIAGNOSTICS_ROOT` overrides
-the platform user-state directory. Each process writes separate rotated JSONL
-files (1 MiB per file, three backups). The optional diagnostics worker maintains
-global age/byte retention across old processes. Logging failure reports a bounded
-local warning and preserves the original result. Diagnostic correlation IDs carry
-no task ownership or resource authority.
-
-New embedding/OpenViking processes capture their own stdout and stderr, including
-native file-descriptor writes. The drain lives in that service process, independent
-of the MCP connection. Complete lines are sanitized and bounded; oversized or
-incomplete lines record a gap. Existing legacy process logs remain local and are
-not appended by newly launched services. Embedding counters use DEBUG events and
-the existing health counters, without an unlimited metrics append file.
-
-`vaws-knowledge diagnostics bundle --root PATH --output support.json` exports only
-the shared strict, sanitized event projection. Raw notes, configuration, credentials,
-commands and process text are not automatically included. Export is offline and
-does not start retrieval. The independently enabled reporter handles automatic
-issues; ordinary knowledge operations do not make reporting network calls.
-
-## Read and capture
-
-`knowledge_query(text, limit=8)` finds related notes, `knowledge_explain(ref)`
-reads the original, and `knowledge_capture(title, content)` saves a local note.
-Capturing the same title updates that local note.
-A title and non-empty Markdown body are enough. Keep known conditions, versions,
-evidence and uncertainty in the prose. No frontmatter, fixed headings, runtime
-coordinates, verification label or task association is required.
-
-Install Python 3.11 or newer and the package:
+Use `mindie-knowledge` from the `mindie-knowledge` Python package (Python 3.11+).
+The module namespace is `mindie_knowledge`. There are no VAWS package or command aliases.
 
 ```sh
-python -m pip install -e .
-vaws-knowledge prepare --project /path/to/project
-vaws-knowledge server --config /path/to/project/.vaws-local/knowledge/service.json
+python -m pip install -e . -e tools/knowledge-intake
+mindie-knowledge start --config domain.json
+mindie-knowledge status --config domain.json
+mindie-knowledge mcp --config domain.json
 ```
 
-Explicit `prepare` prepares the CPU model, bundled notes and indexes before
-reporting readiness. Dependency installation alone need not prepare knowledge. After a valid query or
-successful MCP capture, the service maintains them in the background. Connecting,
-listing tools, pinging and closing an unused provider do not start maintenance,
-create a retrieval backend, or contact the network. A standalone installation can use the same command;
-it creates local configuration without enabling public contribution.
+See [the runtime contract](docs/mindie-loop.md) for configuration, import, explicit publication,
+feed synchronization, independent judging and ranking. A Harness provides the model runner;
+the [Codex plugin](https://github.com/mindie-agent/mindie-agent-codex) supplies the first adapter.
+
+## Boundaries
+
+- Each domain owns a separate store and service. Knowledge, experience, use and feedback are distinct records.
+- The local MCP exposes only query, explain and use. Stop collection and background organization/judging are separate.
+- A Stop summarizes the current task. Public distribution includes only explicitly published sanitized material.
+- Feedback measures usefulness in an actual use, not factual truth or confidence.
+- Codex, the knowledge service and judges run locally. Remote NPU execution belongs to remote-dev.
+
+The official vLLM-Ascend feed currently lives in this repository's `knowledge/vllm-ascend` branch.
+Content consolidation into `mindie-agent/knowledge-vllm-ascend` is a separate remaining task.
+
+## Development
 
 ```sh
-vaws-knowledge capture --title "Graph replay observation" \
-  --content "Eager passed; graph replay differed after the input layout changed."
-vaws-knowledge query --text "graph replay input layout"
-vaws-knowledge query --ref "REFERENCE_RETURNED_BY_QUERY"
+python -m pip install -e '.[test]' -e tools/knowledge-intake
+python -m pytest -q tests
+python -m mindie_knowledge.corpus_check --repo .
 ```
 
-Shared, project and candidate notes are searched together by relevance. Their
-location and recorded context remain visible; there is no trust tier or automatic
-condition verdict. A missing or unavailable result means unknown and does not
-block independent development.
-
-Markdown files retain the original content. MCP capture saves locally without
-waiting for retrieval startup or indexing. Background maintenance reconciles
-added, edited and deleted files and periodically checks actual content and vectors.
-Queries use the ready index without waiting for downloads or repairs. Explain
-and native summary capture do not activate maintenance. A reconnect reuses the
-saved check and audit deadlines instead of revalidating all vectors. While a
-knowledge connection is active and the backend is available, the hourly audit
-detects losses that ordinary incremental reconciliation cannot see. Without an
-active connection, overdue work resumes at the next query/capture or explicit
-`prepare`; there is no unattended hourly guarantee. Shared updates preserve project and candidate
-files. Configured summary hooks save locally even when public sharing is off;
-sharing itself follows the publishing configuration. Reuse an existing useful
-summary for capture instead of writing another one.
-
-Bundled and configured Markdown remains searchable alongside the active shared
-release; installing a smaller release does not hide the packaged notes.
-A retrieved shared note can be read through
-`knowledge_explain(ref)` just like a local note. The package handles indexing
-and active shared versions internally.
-
-`VAWS_KNOWLEDGE_CONFIG` selects storage and backend configuration;
-`VAWS_KNOWLEDGE_STATE` selects local runtime state. The local OpenViking instance
-uses CPU embedding on loopback. `VAWS_KNOWLEDGE_EMBEDDING_CACHE` can supply an
-existing model cache; preparation downloads an uncached model. Background
-embedding and OpenViking children use an independent empty stdin, so a Windows
-MCP reader cannot block their interpreter startup. Windows children stay hidden.
-See [the service reference](vaws_knowledge/server/README.md) for setup details.
-
-## Optional maintenance
-
-Project and local notes can be edited as ordinary Markdown. For an explicit
-consolidation task, `vaws-knowledge skill` reads the optional
-`curate-knowledge` guidance. It helps preserve conditions and unresolved
-differences without prescribing a required workflow. Install it for native
-discovery with `vaws-knowledge skill --install-dir <client-skill-directory>`.
-Ordinary lookup, capture and task completion need no skill.
-
-Maintainers can use `catalog`, `evaluate`, `code-map`, `relations`, `curation`
-and `curation-export`; each has `--help`. These are explicit maintenance
-commands, outside the MCP tool list. Full maps, evaluation details and change
-history remain private artifacts; command output stays bounded. Python maps
-use the standard AST. Install `.[code]` only for optional C++ tree-sitter
-extraction. Static links identify definitions and registrations, with unresolved
-dynamic calls labelled; they do not establish runtime behavior or replace a
-client's code index. See [code maps](vaws_knowledge/code_map/README.md).
-
-Independent agents, preferably Grok Bot, can maintain VA/NPU/AI/infra topics,
-PR cases, aliases and cross-task digests from selected sources. Curation accepts
-ordinary Markdown, checks the observed source/target snapshots, and keeps
-reversible history. Public export produces a separate hash-verified generation
-using the existing pattern-based redaction profile; it is intended for selected
-public sources, not unrestricted private material. See
-[independent maintenance](vaws_knowledge/skills/curate-knowledge/references/independent-maintenance.md).
-
-## Public contribution and shared updates
-
-Public sharing follows existing authorization and configuration. The package
-prepares a redacted public copy while preserving the private source, and handles
-configured submission retries. The public corpus uses Markdown/redaction checks
-and **human review and merge**. Local and shared observations remain reference
-material regardless of publication status.
-
-Shared release synchronization is enabled by default, independently of public
-upload permission. For explicitly requested contribution setup,
-`vaws-knowledge publishing configure --config PATH --consent-file COMMUNITY_JSON` creates or reuses a
-contribution fork. `--read-only` disables contribution and keeps release sync
-without a fork or GitHub login. Existing
-private candidates are not bulk uploaded when sharing is enabled. Ordinary
-development does not need a fork, publishing commands or a wait for PR review.
-
-See [publishing setup](docs/publishing.md) and [public contribution](docs/contribution.md).
-These maintenance operations are separate from normal Agent work.
-The [native-client table](docs/publishing.md#native-client-summaries) distinguishes
-automatic final-response capture from MCP support; Kimi Code currently has MCP
-and session support without a native final-text summary hook.
-
-The distribution module builds dense OVPack releases from fixed Git commits and
-verifies imports before switching the active shared version. Failed updates keep
-the prior version. MCP handles configured retries and synchronization internally.
-See [distribution](docs/distribution.md); detailed formats belong to the package,
-not note authors.
-
-## Retrieval evidence and independent maintenance
-
-Queries fuse the existing vector ranking with lexical matches from mounted
-Markdown. Exact code identifiers and Chinese text remain searchable while the
-vector service is pending; the result still reports degraded/unavailable when
-that route fails. Each source URI contributes once per route. Fusion retains
-the stronger reciprocal-rank vote and weights the additional agreement vote
-by this query's relative positive lexical score. Weak common-word overlap
-therefore does not receive the same agreement bonus as strong lexical evidence.
-Vector and lexical score units are never compared. These ranking scores are
-retrieval signals, not truth or applicability confidence.
-
-Lexical queries reuse a rebuildable SQLite catalog and validate only bounded
-selected originals. Maintenance scans file metadata, reparses changed bodies,
-and reuses unchanged vectors. Large-library maintenance lengthens its interval
-according to the last pass's cost. A missing catalog uses a bounded, explicitly
-incomplete fallback; a query never rebuilds it or imports sources.
-Hash-bound aliases and topics can be prepared independently. An edited source
-invalidates its old enrichment. Optional `selection.prefer` topics choose useful
-references; `topic:graph` narrows a query and `all-topics` bypasses that preference.
-Results preserve heading/condition context, tables and fenced source spans
-within one total excerpt budget. The original remains available through explain.
-
-Shared releases transport public Markdown and permitted reference metadata
-alongside the existing vector pack, with hashes and one source revision. They
-switch together; incomplete imports retain the previous release. See the
-[reference asset contract](vaws_knowledge/distribution/REFERENCES.md) and
-[catalog and retrieval measurements](tests/performance/README.md). Offline
-evaluation fixtures check ranking and citation positions; those synthetic
-results are regression evidence, not measured quality on unlabelled user tasks.
-
-Hits include a matching source window, one-based Markdown lines, clipping
-information, and the SHA256 of UTF-8 text with normalized newlines. Shared-pack
-hits identify their indexed snapshot and source revision when available.
-`knowledge_explain` still reads the original. Local source changes can make a
-later read differ; the hash identifies what this query actually observed.
-
-For a separate maintenance task, `python -m vaws_knowledge health --config PATH`
-returns a local worklist (first 50 findings; `--limit` changes only output size).
-No model or external source is called. Mechanical hints cover exact duplicate
-Markdown with matching recorded context, note age, unavailable sources and
-changes to relative links inside mounted roots since observation. Only a
-rebuildable cache is written. Age and lookup failures do not establish that a
-claim is stale or false. External and unrecorded sources remain unchecked.
-
-Active knowledge maintenance refreshes the worklist at its deadline or a change
-wakeup. It reuses unchanged parsed records and reports; its failures never
-change index readiness. An independent maintainer can use the existing
-`curate-knowledge` skill for semantic decisions and authorized note edits.
-Ordinary task agents have no added tool call or completion step. No autonomous
-LLM, scheduler, deletion, merging, promotion or public publication is enabled.
-
-C++ code mapping checks the optional `code` parser versions before loading
-native modules: Tree-sitter 0.25.2 with tree-sitter-cpp 0.23.4. An unsupported
-pair or unavailable package metadata produces a `parser_unavailable` gap and
-partial result while retaining the previous complete map. The C++ cache
-fingerprint includes this compatibility policy so older parses cannot bypass it.
-
-Repeated native final-response events retain the first timestamp and provenance,
-skip duplicate writes/contribution queueing, and preserve maintainer edits.
-
-The design borrows rank fusion and source evidence from
-[WeKnora](https://github.com/Tencent/WeKnora/blob/17f893865d4d8337f7e0bf942c6931a8ce7a08c1/internal/application/service/knowledgebase_search_fusion.go),
-and incremental/source-aware maintenance from
-[TeamAI](https://github.com/Tencent/teamai-cli/blob/6dc1b9919ef1856717c381d6559bb7738089075e/src/wiki-engine/code-knowledge/code-incremental.ts).
-Both remain research references, with no runtime dependency or additional Agent
-obligations.
-
-## Validation
-
-Local tests cover Markdown capture/query, index reconciliation, public redaction,
-submission and prebuilt distribution. Windows coverage includes UTF-8 pipes,
-cross-drive paths, process and file-lock handling. Native OpenViking and dense
-distribution tests are opt-in and need the model cache described in
-`tests/test_openviking_local.py` and `tests/distribution/test_native_chain.py`.
-Set `VAWS_KNOWLEDGE_LIVE_OV=1` to run native OpenViking tests; the distribution
-test has its own documented opt-in. Test fixtures are not hardware evidence.
-
-The installed package version identifies the current interface. Agent tools and
-the packaged reference notes use the same Markdown path. Retired structured
-corpus and automated-review interfaces have been removed.
+Internal Markdown, redaction, retrieval and distribution libraries are reused.
+Older backend design documents record their own scope; the supported product service and CLI are the domain loop.
+Historical corpus provenance is preserved and does not define supported installation paths.

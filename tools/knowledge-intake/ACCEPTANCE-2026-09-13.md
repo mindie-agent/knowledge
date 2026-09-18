@@ -15,7 +15,7 @@ No package/model download or new model service was used.
   deadline, including transport waits, through a disposable process.
 - Both source distribution and wheel built successfully. The wheel installed
   alone into a fresh environment; isolated import confirmed that neither
-  `vaws_knowledge` nor document parsers were present. Installed CLI help and
+  `mindie_knowledge` nor document parsers were present. Installed CLI help and
   an actual Markdown synchronization succeeded with no optional dependencies.
 - Independent CI is authored for Ubuntu Python 3.11/3.13 and Windows/macOS
   Python 3.13. It installs only this tool's `[formats,test]` extras, runs the
@@ -58,7 +58,7 @@ No package/model download or new model service was used.
   This is a small-corpus integration check, not the separate scale benchmark.
 
 Local run artifacts are under the component worktree's untracked
-`.vaws-local/knowledge-intake-acceptance/`: `formats-result.json`,
+`.mindie-local/knowledge-intake-acceptance/`: `formats-result.json`,
 `public-result.json`, `native-result.json`, `retrieval-result.json`, `sources/`,
 `native-requests/` and `state/`. The final ordinary mount is `final/output/`;
 historical `output/` retains earlier run artifacts. Fixture values are

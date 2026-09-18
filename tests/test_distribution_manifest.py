@@ -11,8 +11,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from distribution.helpers import GIT_SHA, make_corpus, make_manifest, make_pack
 
-from vaws_knowledge.distribution.errors import CorruptPack, IncompatiblePack
-from vaws_knowledge.distribution.manifest import (
+from mindie_knowledge.distribution.errors import CorruptPack, IncompatiblePack
+from mindie_knowledge.distribution.manifest import (
     EMBEDDING_MODEL,
     ExpectedContract,
     atomic_write_json,

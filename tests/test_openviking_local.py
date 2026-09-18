@@ -1,4 +1,4 @@
-"""Opt-in live OpenViking loopback path (VAWS_KNOWLEDGE_LIVE_OV=1)."""
+"""Opt-in live OpenViking loopback path (MINDIE_KNOWLEDGE_LIVE_OV=1)."""
 
 from __future__ import annotations
 
@@ -9,26 +9,26 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from vaws_knowledge.server.capture import capture, delete
-from vaws_knowledge.server.layers import load_config
-from vaws_knowledge.server.query import explain, query
-from vaws_knowledge.local.reconcile import reconcile_markdown
-from vaws_knowledge.maintenance import maintain
+from mindie_knowledge.server.capture import capture, delete
+from mindie_knowledge.server.layers import load_config
+from mindie_knowledge.server.query import explain, query
+from mindie_knowledge.local.reconcile import reconcile_markdown
+from mindie_knowledge.maintenance import maintain
 
 
 def _openviking_ready() -> bool:
-    if os.environ.get("VAWS_KNOWLEDGE_LIVE_OV") != "1":
+    if os.environ.get("MINDIE_KNOWLEDGE_LIVE_OV") != "1":
         return False
     try:
         import openviking_sdk  # noqa: F401
     except ImportError:
         return False
-    from vaws_knowledge.local.instance import which
+    from mindie_knowledge.local.instance import which
 
     return which("openviking-server") is not None
 
 
-@unittest.skipUnless(_openviking_ready(), "set VAWS_KNOWLEDGE_LIVE_OV=1 with openviking-server installed")
+@unittest.skipUnless(_openviking_ready(), "set MINDIE_KNOWLEDGE_LIVE_OV=1 with openviking-server installed")
 class LiveOpenViking(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -56,7 +56,7 @@ class LiveOpenViking(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
-        from vaws_knowledge.local.instance import instance_for_config
+        from mindie_knowledge.local.instance import instance_for_config
 
         instance_for_config(self.config).stop()
 
@@ -84,7 +84,7 @@ class LiveOpenViking(unittest.TestCase):
         again = explain(self.config, updated["uri"])
         self.assertIn("slot mapping", again["content"])
 
-        from vaws_knowledge.local.instance import instance_for_config
+        from mindie_knowledge.local.instance import instance_for_config
 
         instance_for_config(self.config).stop()
         self.assertTrue(query(self.config, text="slot mapping").unavailable)

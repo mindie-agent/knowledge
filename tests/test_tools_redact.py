@@ -28,7 +28,7 @@ from test_tools_support import (
     versionlike,
 )
 
-from vaws_knowledge import redact
+from mindie_knowledge import redact
 
 
 def rules_hit(text: str, allow: redact.Allowlist | None = None) -> set[str]:

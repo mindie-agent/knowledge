@@ -13,9 +13,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from distribution.helpers import FakeClient, make_pack
 
-from vaws_knowledge.distribution.build import build_pack, check_markdown_contract
-from vaws_knowledge.distribution.errors import BuildError
-from vaws_knowledge.distribution.manifest import (
+from mindie_knowledge.distribution.build import build_pack, check_markdown_contract
+from mindie_knowledge.distribution.errors import BuildError
+from mindie_knowledge.distribution.manifest import (
     EMBEDDING_MODEL,
     ExpectedContract,
     validate_release_manifest,
@@ -154,7 +154,7 @@ def test_build_pins_model_files(tmp_path):
 
 
 def test_model_pins_ignore_download_metadata_and_historical_snapshots(tmp_path):
-    from vaws_knowledge.distribution.manifest import hash_model_tree
+    from mindie_knowledge.distribution.manifest import hash_model_tree
 
     caches = [tmp_path / "linux", tmp_path / "macos"]
     revision = "a" * 40
@@ -178,7 +178,7 @@ def test_model_pins_ignore_download_metadata_and_historical_snapshots(tmp_path):
 
     # Keeping old files must not let a client serving another revision pass.
     from types import SimpleNamespace
-    from vaws_knowledge.distribution.pack import verify_model_files
+    from mindie_knowledge.distribution.pack import verify_model_files
 
     manifest = SimpleNamespace(embedding={"model_files": hash_model_tree(caches[0])})
     active.write_bytes(b"same-model")

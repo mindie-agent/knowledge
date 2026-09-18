@@ -13,10 +13,10 @@ owner.
 From the package checkout:
 
 ```powershell
-uv run --no-project python tests/performance/benchmark_legacy_lexical.py --output .vaws-local/performance/legacy.json
-uv run --no-project python tests/performance/evaluate_reference_fixture.py --output .vaws-local/performance/retrieval.json
-uv run --no-project python tests/performance/benchmark_reference_catalog.py --sizes 10000 100000 --queries 40 --output .vaws-local/performance/catalog.json
-uv run --no-project python tests/performance/benchmark_capture_growth.py --output .vaws-local/performance/capture-growth.json
+uv run --no-project python tests/performance/benchmark_legacy_lexical.py --output .mindie-local/performance/legacy.json
+uv run --no-project python tests/performance/evaluate_reference_fixture.py --output .mindie-local/performance/retrieval.json
+uv run --no-project python tests/performance/benchmark_reference_catalog.py --sizes 10000 100000 --queries 40 --output .mindie-local/performance/catalog.json
+uv run --no-project python tests/performance/benchmark_capture_growth.py --output .mindie-local/performance/capture-growth.json
 ```
 
 The capacity runner creates real temporary Markdown files from all 65 checked-in
@@ -92,7 +92,7 @@ physical 16 GiB host acceptance is implied.
 Actual final command and retained local evidence:
 
 ```powershell
-python tests/performance/benchmark_reference_catalog.py --sizes 100000 --queries 20 --output .vaws-local/performance/catalog-final-100k.json
+python tests/performance/benchmark_reference_catalog.py --sizes 100000 --queries 20 --output .mindie-local/performance/catalog-final-100k.json
 ```
 
 The same directory holds `catalog-final-100k.log` and

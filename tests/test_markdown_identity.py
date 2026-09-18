@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from vaws_knowledge.markdown import (
+from mindie_knowledge.markdown import (
     document_slug,
     load_document,
     save_document,
@@ -94,7 +94,7 @@ class DocumentIdentity(unittest.TestCase):
 
 
 def test_updating_prose_keeps_recorded_context_without_requiring_metadata(tmp_path):
-    from vaws_knowledge.markdown import save_document, meta_path
+    from mindie_knowledge.markdown import save_document, meta_path
     import json
 
     original = save_document(tmp_path, layer="candidate", title="Reference", content="Observed once.",

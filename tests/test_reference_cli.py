@@ -27,14 +27,14 @@ def reference_inputs(tmp_path):
 
 
 def run_cli(inputs, *args):
-    env = {key: value for key, value in os.environ.items() if not key.startswith("VAWS_KNOWLEDGE_")}
+    env = {key: value for key, value in os.environ.items() if not key.startswith("MINDIE_KNOWLEDGE_")}
     # A deliberately missing config must never fall into the user's own state.
-    env["VAWS_KNOWLEDGE_STATE"] = str(inputs["state"])
-    env["VAWS_KNOWLEDGE_LAYERS"] = "project"
-    env["VAWS_KNOWLEDGE_PROJECT_ROOTS"] = str(inputs["notes"])
-    env["VAWS_DIAGNOSTICS_ROOT"] = str(inputs["root"] / "diagnostics")
+    env["MINDIE_KNOWLEDGE_STATE"] = str(inputs["state"])
+    env["MINDIE_KNOWLEDGE_LAYERS"] = "project"
+    env["MINDIE_KNOWLEDGE_PROJECT_ROOTS"] = str(inputs["notes"])
+    env["MINDIE_DIAGNOSTICS_ROOT"] = str(inputs["root"] / "diagnostics")
     env["PYTHONPATH"] = str(ROOT)
-    return subprocess.run([sys.executable, "-X", "utf8", "-m", "vaws_knowledge", *map(str, args)],
+    return subprocess.run([sys.executable, "-X", "utf8", "-m", "mindie_knowledge", *map(str, args)],
                           cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8", timeout=20)
 
 
@@ -170,7 +170,7 @@ def test_evaluation_deadline_preserves_artifact_without_scoring_unexecuted_queri
 
 
 def test_catalog_cli_reports_real_busy_and_parse_failure_as_not_ready(reference_inputs):
-    from vaws_knowledge.distribution.sync import SwitchLock
+    from mindie_knowledge.distribution.sync import SwitchLock
     inputs = reference_inputs
     lock = SwitchLock(inputs["state"] / "reference-catalog.lock")
     lock.acquire()

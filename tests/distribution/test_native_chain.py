@@ -5,10 +5,10 @@ model over loopback: build a dense OVPack from a fixed Git commit, adapt it
 into a local release, sync it into an isolated instance, switch versions,
 verify modify/delete visibility, private-layer preservation and restart.
 
-Fixtures (never committed paths): set ``VAWS_DIST_TEST_MODEL_CACHE`` to a
+Fixtures (never committed paths): set ``MINDIE_DIST_TEST_MODEL_CACHE`` to a
 pre-existing FastEmbed cache for the pinned MiniLM model. The OpenViking
 server binary defaults to ``.venv/bin/openviking-server`` of this worktree;
-override with ``VAWS_DIST_TEST_OPENVIKING_SERVER``.
+override with ``MINDIE_DIST_TEST_OPENVIKING_SERVER``.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from vaws_knowledge.distribution import (  # noqa: E402
+from mindie_knowledge.distribution import (  # noqa: E402
     LocalReleaseSource,
     build_pack,
     check_and_sync,
@@ -39,12 +39,12 @@ from vaws_knowledge.distribution import (  # noqa: E402
     embedding_info_from_health,
     make_release,
 )
-from vaws_knowledge.distribution.manifest import EMBEDDING_MODEL  # noqa: E402
-from vaws_knowledge.distribution.references import prepared_shared_documents  # noqa: E402
-from vaws_knowledge.markdown import normalized_sha256  # noqa: E402
+from mindie_knowledge.distribution.manifest import EMBEDDING_MODEL  # noqa: E402
+from mindie_knowledge.distribution.references import prepared_shared_documents  # noqa: E402
+from mindie_knowledge.markdown import normalized_sha256  # noqa: E402
 
-MODEL_CACHE = os.environ.get("VAWS_DIST_TEST_MODEL_CACHE", "")
-SERVER_BIN = os.environ.get("VAWS_DIST_TEST_OPENVIKING_SERVER", "")
+MODEL_CACHE = os.environ.get("MINDIE_DIST_TEST_MODEL_CACHE", "")
+SERVER_BIN = os.environ.get("MINDIE_DIST_TEST_OPENVIKING_SERVER", "")
 
 WORKTREE = Path(__file__).resolve().parent.parent.parent
 DEFAULT_SERVER = WORKTREE / ".venv" / "bin" / "openviking-server"
@@ -61,7 +61,7 @@ def _server_binary() -> str | None:
 pytestmark = [
     pytest.mark.skipif(
         not (MODEL_CACHE and Path(MODEL_CACHE).is_dir()),
-        reason="VAWS_DIST_TEST_MODEL_CACHE is not set to a local FastEmbed cache",
+        reason="MINDIE_DIST_TEST_MODEL_CACHE is not set to a local FastEmbed cache",
     ),
     pytest.mark.skipif(_server_binary() is None, reason="openviking-server binary not found"),
 ]
@@ -190,7 +190,7 @@ def _server_config(state_dir: Path, port: int, embed_port: int, root_key: str) -
 def _data_client(port: int, root_key: str):
     """Tenant data key via the production provisioning helper (root key administers only)."""
 
-    from vaws_knowledge.distribution import provision_tenant_key
+    from mindie_knowledge.distribution import provision_tenant_key
 
     user_key = provision_tenant_key(
         f"http://127.0.0.1:{port}", root_key=root_key, user_id="distchain"
@@ -339,8 +339,8 @@ def test_native_build_release_sync_chain(tmp_path):
         graph1 = next(doc for doc in prepared1 if doc.uri.endswith("graph-launch.md"))
         assert graph1.retrieval["aliases"] == ["ACLGraph reservation incident"]
         assert graph1.retrieval["topics"] == ["ascend"]
-        from vaws_knowledge.catalog import refresh_catalog, search_catalog
-        from vaws_knowledge.server.layers import load_config
+        from mindie_knowledge.catalog import refresh_catalog, search_catalog
+        from mindie_knowledge.server.layers import load_config
         bootstrap = tmp_path / "bootstrap"
         bootstrap.mkdir()
         config = load_config({"state_root": str(state_root), "backend": "memory", "layers": {

@@ -14,10 +14,10 @@ from unittest import mock
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "fixtures" / "server"))
 
 import support  # noqa: E402
-from vaws_knowledge.local.backend import MemoryBackend
-from vaws_knowledge.server.capture import capture
-from vaws_knowledge.server.capture_cli import main as capture_main
-from vaws_knowledge.server.query import main
+from mindie_knowledge.local.backend import MemoryBackend
+from mindie_knowledge.server.capture import capture
+from mindie_knowledge.server.capture_cli import main as capture_main
+from mindie_knowledge.server.query import main
 
 
 def _run_cli(*argv: str) -> tuple[int, dict, str]:
@@ -34,8 +34,8 @@ class QueryCli(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             config = support.build_config(candidate=tmp, shared=False, project=False)
             out = io.StringIO()
-            with mock.patch("vaws_knowledge.server.capture_cli.load_config", return_value=config), \
-                    mock.patch("vaws_knowledge.server.capture.backend_for_config") as backend, \
+            with mock.patch("mindie_knowledge.server.capture_cli.load_config", return_value=config), \
+                    mock.patch("mindie_knowledge.server.capture.backend_for_config") as backend, \
                     redirect_stdout(out):
                 code = capture_main(["--title", "Existing finding", "--content", "Useful observation."])
             payload = json.loads(out.getvalue())
@@ -51,7 +51,7 @@ class QueryCli(unittest.TestCase):
             capture(title="cli note", content="hostname missing from etc hosts", config=config)
             cfg = pathlib.Path(tmp) / "cfg.json"
             cfg.write_text("{}", encoding="utf-8")
-            with mock.patch("vaws_knowledge.server.layers.load_config", return_value=config):
+            with mock.patch("mindie_knowledge.server.layers.load_config", return_value=config):
                 code, payload, _err = _run_cli("--config", str(cfg), "--text", "hostname missing")
             self.assertEqual(0, code, payload)
             self.assertGreaterEqual(payload.get("count", 0), 1)
@@ -70,7 +70,7 @@ class QueryCli(unittest.TestCase):
         self.assertNotIn("--cann", out.getvalue())
 
     def test_invalid_limit_does_not_start_the_index(self) -> None:
-        with mock.patch("vaws_knowledge.server.layers.load_config") as load:
+        with mock.patch("mindie_knowledge.server.layers.load_config") as load:
             with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 main(["--text", "context", "--limit", "0"])
             load.assert_not_called()

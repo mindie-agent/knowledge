@@ -4,4 +4,7 @@ __pycache__/
 venv/
 .pytest_cache/
 .ruff_cache/
+.mindie-local/
+
+# Old private state must never enter a commit.
 .vaws-local/

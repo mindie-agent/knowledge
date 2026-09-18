@@ -19,14 +19,14 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from vaws_knowledge.catalog import refresh_catalog
-from vaws_knowledge.server.layers import load_config
-from vaws_knowledge.server.query import query
-from vaws_knowledge.summary_hook import capture_summary
+from mindie_knowledge.catalog import refresh_catalog
+from mindie_knowledge.server.layers import load_config
+from mindie_knowledge.server.query import query
+from mindie_knowledge.summary_hook import capture_summary
 
-INPUTS = ("vaws_knowledge/catalog.py", "vaws_knowledge/server/capture.py",
-          "vaws_knowledge/server/query.py", "vaws_knowledge/summary_hook.py",
-          "vaws_knowledge/markdown.py", "tests/performance/benchmark_capture_growth.py")
+INPUTS = ("mindie_knowledge/catalog.py", "mindie_knowledge/server/capture.py",
+          "mindie_knowledge/server/query.py", "mindie_knowledge/summary_hook.py",
+          "mindie_knowledge/markdown.py", "tests/performance/benchmark_capture_growth.py")
 
 
 def hashes():

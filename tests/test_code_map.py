@@ -9,8 +9,8 @@ import subprocess
 
 import pytest
 
-from vaws_knowledge.code_map import build_code_map, compare_maps, navigate
-from vaws_knowledge.code_map import cpp
+from mindie_knowledge.code_map import build_code_map, compare_maps, navigate
+from mindie_knowledge.code_map import cpp
 
 
 def git(root, *args):
@@ -206,7 +206,7 @@ def test_cpp_version_change_returns_partial_and_preserves_complete_map(tmp_path,
 
 def test_cpp_guard_policy_does_not_reuse_legacy_unverified_cache(tmp_path, monkeypatch):
     import importlib.metadata
-    from vaws_knowledge.code_map import service
+    from mindie_knowledge.code_map import service
 
     root = repo(tmp_path)
     (root / "op.cpp").write_text("int f() { return 1; }\n", encoding="utf-8")
@@ -291,7 +291,7 @@ def test_navigation_does_not_merge_unresolved_receivers(tmp_path):
 
 
 def test_busy_is_quiet_and_does_not_run_another_parser(tmp_path):
-    from vaws_knowledge.distribution.sync import SwitchLock
+    from mindie_knowledge.distribution.sync import SwitchLock
     root = repo(tmp_path)
     (root / "a.py").write_text("def a(): pass\n", encoding="utf-8")
     first = build_code_map(root, tmp_path / "state")
@@ -301,7 +301,7 @@ def test_busy_is_quiet_and_does_not_run_another_parser(tmp_path):
 
 
 def test_parser_failure_is_bounded_and_can_retry(tmp_path, monkeypatch):
-    from vaws_knowledge.code_map import python
+    from mindie_knowledge.code_map import python
     root = repo(tmp_path)
     (root / "a.py").write_text("def a(): pass\n", encoding="utf-8")
     original = python.parse

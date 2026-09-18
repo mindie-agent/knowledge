@@ -293,7 +293,7 @@ class IntakeTests(unittest.TestCase):
         self.assertIsNone(result["revision"])
 
     def test_package_has_no_service_or_heavy_import_at_start(self):
-        script = "import knowledge_intake,sys; assert not any(x in sys.modules for x in ['vaws_knowledge','docx','pptx','openpyxl','PIL','pypdfium2'])"
+        script = "import knowledge_intake,sys; assert not any(x in sys.modules for x in ['mindie_knowledge','docx','pptx','openpyxl','PIL','pypdfium2'])"
         subprocess.check_call([sys.executable, "-c", script])
 
     @unittest.skipUnless(HAS_DOCUMENTS, "requires documents test dependencies")

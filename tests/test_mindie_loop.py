@@ -9,10 +9,10 @@ import time
 
 import pytest
 
-from vaws_knowledge.loop.cli import capture_hook
-from vaws_knowledge.loop.engine import Engine
-from vaws_knowledge.loop.store import Store, canonical, digest, session_key
-from vaws_knowledge.loop.transport import Service, rpc
+from mindie_knowledge.loop.cli import capture_hook
+from mindie_knowledge.loop.engine import Engine
+from mindie_knowledge.loop.store import Store, canonical, digest, session_key
+from mindie_knowledge.loop.transport import Service, rpc
 
 
 @pytest.fixture
@@ -319,7 +319,7 @@ def test_running_mcp_reconnects_after_owned_service_restart(store, tmp_path):
         [
             sys.executable,
             "-m",
-            "vaws_knowledge.loop.cli",
+            "mindie_knowledge.loop.cli",
             "mcp",
             "--config",
             str(config),
@@ -427,7 +427,7 @@ def test_mcp_initialization_and_scoped_tool_contract(services, tmp_path):
         [
             sys.executable,
             "-m",
-            "vaws_knowledge.loop.cli",
+            "mindie_knowledge.loop.cli",
             "mcp",
             "--config",
             str(config),

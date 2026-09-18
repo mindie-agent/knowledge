@@ -10,19 +10,19 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from vaws_knowledge.distribution.sync import SwitchLock
-from vaws_knowledge.local.backend import MemoryBackend, UnavailableBackend
-from vaws_knowledge.maintenance import MaintenanceWorker, main, maintain, project_config
-from vaws_knowledge.server.layers import load_config
-from vaws_knowledge.server.query import query
+from mindie_knowledge.distribution.sync import SwitchLock
+from mindie_knowledge.local.backend import MemoryBackend, UnavailableBackend
+from mindie_knowledge.maintenance import MaintenanceWorker, main, maintain, project_config
+from mindie_knowledge.server.layers import load_config
+from mindie_knowledge.server.query import query
 
 
 class Maintenance(unittest.TestCase):
     def test_legacy_prepared_upgrade_refreshes_catalog_in_the_same_unchanged_pass(self):
         from distribution.helpers import FakeClient, embedding_info, make_release_dir
-        from vaws_knowledge.catalog import get_catalog_document
-        from vaws_knowledge.distribution.sync import DistributionState, check_and_sync, current_shared
-        from vaws_knowledge.maintenance import refresh_references
+        from mindie_knowledge.catalog import get_catalog_document
+        from mindie_knowledge.distribution.sync import DistributionState, check_and_sync, current_shared
+        from mindie_knowledge.maintenance import refresh_references
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -58,9 +58,9 @@ class Maintenance(unittest.TestCase):
                 (root / "notes" / "fact.md").write_text("# Edited during legacy upgrade\n\nCurrent fact.\n", encoding="utf-8")
                 return {"status": "ok", "sync": result.to_dict()}
 
-            with patch("vaws_knowledge.publishing.run_once", side_effect=upgrade), \
+            with patch("mindie_knowledge.publishing.run_once", side_effect=upgrade), \
                     patch.object(client, "import_ovpack", side_effect=AssertionError("valid legacy vectors reimported")), \
-                    patch("vaws_knowledge.maintenance.refresh_references", wraps=refresh_references) as refresh:
+                    patch("mindie_knowledge.maintenance.refresh_references", wraps=refresh_references) as refresh:
                 result = maintain(config, verify=True)
             self.assertTrue(result["ready"], result)
             self.assertEqual(2, refresh.call_count)
@@ -73,10 +73,10 @@ class Maintenance(unittest.TestCase):
             self.assertEqual(92, len(config.retrieval.documents), "imported shared vectors have another owner")
             self.assertTrue(any("Current fact." in document["content"] for document in config.retrieval.documents.values()))
 
-            with patch("vaws_knowledge.publishing.run_once", return_value={"sync": {"status": "unchanged"}}), \
-                    patch("vaws_knowledge.distribution.references.prepared_shared_documents", side_effect=AssertionError("unchanged prepared bodies reread")), \
-                    patch("vaws_knowledge.local.reconcile._scan_documents", side_effect=AssertionError("unchanged vector full scan")), \
-                    patch("vaws_knowledge.maintenance.refresh_references", wraps=refresh_references) as refresh:
+            with patch("mindie_knowledge.publishing.run_once", return_value={"sync": {"status": "unchanged"}}), \
+                    patch("mindie_knowledge.distribution.references.prepared_shared_documents", side_effect=AssertionError("unchanged prepared bodies reread")), \
+                    patch("mindie_knowledge.local.reconcile._scan_documents", side_effect=AssertionError("unchanged vector full scan")), \
+                    patch("mindie_knowledge.maintenance.refresh_references", wraps=refresh_references) as refresh:
                 unchanged = maintain(config, force=True)
             self.assertTrue(unchanged["ready"], unchanged)
             self.assertEqual(1, refresh.call_count)
@@ -85,9 +85,9 @@ class Maintenance(unittest.TestCase):
 
     def test_missing_or_corrupt_shared_pointer_preserves_catalog_and_reports_partial(self):
         from dataclasses import replace
-        from vaws_knowledge.catalog import get_catalog_document, refresh_catalog
-        from vaws_knowledge.maintenance import refresh_references
-        from vaws_knowledge.markdown import load_document
+        from mindie_knowledge.catalog import get_catalog_document, refresh_catalog
+        from mindie_knowledge.maintenance import refresh_references
+        from mindie_knowledge.markdown import load_document
         for damaged in (False, True):
             with self.subTest(damaged=damaged), tempfile.TemporaryDirectory() as tmp:
                 config = self.config(Path(tmp))
@@ -117,7 +117,7 @@ class Maintenance(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             config = self.config(Path(tmp))
             self.assertTrue(maintain(config, verify=True)["ready"])
-            with patch("vaws_knowledge.local.reconcile._scan_documents", side_effect=AssertionError("full scan")):
+            with patch("mindie_knowledge.local.reconcile._scan_documents", side_effect=AssertionError("full scan")):
                 again = maintain(config, force=True)
                 self.assertTrue(again["local"]["reused"])
                 self.assertEqual(0, again["catalog"]["read_bytes"])
@@ -131,7 +131,7 @@ class Maintenance(unittest.TestCase):
                 self.assertFalse(config.retrieval.documents)
 
     def test_explicit_catalog_refresh_and_failed_write_do_not_lose_vector_changes(self):
-        from vaws_knowledge.catalog import refresh_catalog
+        from mindie_knowledge.catalog import refresh_catalog
         with tempfile.TemporaryDirectory() as tmp:
             config = self.config(Path(tmp))
             self.assertTrue(maintain(config, verify=True)["ready"])
@@ -146,7 +146,7 @@ class Maintenance(unittest.TestCase):
             self.assertIn("New independent refresh", next(iter(config.retrieval.documents.values()))["content"])
 
     def test_recreated_catalog_generation_cannot_hide_changes_or_missing_ledger(self):
-        from vaws_knowledge.catalog import catalog_path
+        from mindie_knowledge.catalog import catalog_path
         with tempfile.TemporaryDirectory() as tmp:
             config = self.config(Path(tmp))
             self.assertTrue(maintain(config, verify=True)["ready"])
@@ -166,13 +166,13 @@ class Maintenance(unittest.TestCase):
             def switched(*args, **kwargs):
                 (Path(tmp) / "notes" / "fact.md").write_text("# Changed during download\n\nKeep current local facts\n", encoding="utf-8")
                 return {"sync": {"status": "switched"}}
-            with patch("vaws_knowledge.publishing.run_once", side_effect=switched), \
-                    patch("vaws_knowledge.local.reconcile._scan_documents", side_effect=AssertionError("unexpected full scan")):
+            with patch("mindie_knowledge.publishing.run_once", side_effect=switched), \
+                    patch("mindie_knowledge.local.reconcile._scan_documents", side_effect=AssertionError("unexpected full scan")):
                 changed = maintain(config, force=True)
             self.assertTrue(changed["ready"], changed)
             self.assertEqual(changed["catalog"]["snapshot"], changed["local_snapshot"])
             self.assertIn("Keep current local facts", next(iter(config.retrieval.documents.values()))["content"])
-            with patch("vaws_knowledge.local.reconcile._scan_documents", side_effect=AssertionError("unexpected next full scan")):
+            with patch("mindie_knowledge.local.reconcile._scan_documents", side_effect=AssertionError("unexpected next full scan")):
                 self.assertTrue(maintain(config, force=True)["local"]["reused"])
 
     def config(self, root):
@@ -189,7 +189,7 @@ class Maintenance(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             config = self.config(Path(tmp))
             self.assertEqual(["lexical"], query(config, text="maintenancecanary").results[0]["retrieval"])
-            with patch("vaws_knowledge.publishing.run_once", return_value={"status": "disabled"}) as shared:
+            with patch("mindie_knowledge.publishing.run_once", return_value={"status": "disabled"}) as shared:
                 result = maintain(config, verify=True)
             self.assertTrue(result["ready"], result)
             shared.assert_called_once_with(config, force=False, verify=True)
@@ -200,7 +200,7 @@ class Maintenance(unittest.TestCase):
             root = Path(tmp)
             config = self.config(root)
             original = (root / "notes" / "fact.md").read_bytes()
-            with patch("vaws_knowledge.publishing.run_once", return_value={"status": "disabled"}):
+            with patch("mindie_knowledge.publishing.run_once", return_value={"status": "disabled"}):
                 maintain(config, verify=True)
                 config.retrieval.documents.clear()
                 repaired = maintain(config, verify=True)
@@ -216,7 +216,7 @@ class Maintenance(unittest.TestCase):
             with patch.object(config.retrieval, "available", side_effect=AssertionError("started inline")):
                 self.assertTrue(query(config, text="maintenancecanary").unavailable)
             config.retrieval = MemoryBackend()
-            with patch("vaws_knowledge.publishing.run_once", return_value={"status": "disabled"}):
+            with patch("mindie_knowledge.publishing.run_once", return_value={"status": "disabled"}):
                 self.assertTrue(maintain(config, verify=True)["ready"])
 
     def test_parallel_connection_does_not_run_a_second_repair(self):
@@ -225,7 +225,7 @@ class Maintenance(unittest.TestCase):
             lock = SwitchLock(config.state_root / "maintenance.lock")
             lock.acquire()
             try:
-                with patch("vaws_knowledge.maintenance.reconcile_markdown") as reconcile:
+                with patch("mindie_knowledge.maintenance.reconcile_markdown") as reconcile:
                     self.assertEqual("busy", maintain(config)["status"])
                     reconcile.assert_not_called()
             finally:
@@ -234,7 +234,7 @@ class Maintenance(unittest.TestCase):
     def test_failed_shared_sync_keeps_local_retrieval_and_marks_partial(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = self.config(Path(tmp))
-            with patch("vaws_knowledge.publishing.run_once", return_value={"status": "partial", "sync": {"status": "offline"}}):
+            with patch("mindie_knowledge.publishing.run_once", return_value={"status": "partial", "sync": {"status": "offline"}}):
                 result = maintain(config, verify=True)
             self.assertFalse(result["ready"])
             payload = query(config, text="maintenancecanary")
@@ -250,7 +250,7 @@ class Maintenance(unittest.TestCase):
             def import_new_model(*args, **kwargs):
                 model["revision"] = "after"
                 return {"status": "ok", "sync": {"status": "switched"}}
-            with patch("vaws_knowledge.publishing.run_once", side_effect=import_new_model), \
+            with patch("mindie_knowledge.publishing.run_once", side_effect=import_new_model), \
                     patch.object(config.retrieval, "upsert", wraps=config.retrieval.upsert) as writes:
                 result = maintain(config, verify=True)
             self.assertTrue(result["ready"], result)
@@ -261,7 +261,7 @@ class Maintenance(unittest.TestCase):
     def test_worker_runs_even_when_contributions_are_disabled(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = self.config(Path(tmp))
-            with patch("vaws_knowledge.maintenance.maintain") as tick:
+            with patch("mindie_knowledge.maintenance.maintain") as tick:
                 worker = MaintenanceWorker(config)
                 worker.start()
                 worker.stop()
@@ -274,13 +274,13 @@ class Maintenance(unittest.TestCase):
             self.assertTrue(maintain(config, verify=True)["ready"])
             worker = MaintenanceWorker(config)
             with patch.object(worker.wakeup, "wait", side_effect=lambda _: worker.closed.set()), \
-                    patch("vaws_knowledge.maintenance.reconcile_markdown") as reconcile:
+                    patch("mindie_knowledge.maintenance.reconcile_markdown") as reconcile:
                 worker._run()
                 reconcile.assert_not_called()
             worker.closed.clear()
             worker.request()
             with patch.object(worker.wakeup, "wait", side_effect=lambda _: worker.closed.set()), \
-                    patch("vaws_knowledge.maintenance.maintain", wraps=maintain) as tick:
+                    patch("mindie_knowledge.maintenance.maintain", wraps=maintain) as tick:
                 worker._run()
             tick.assert_called_once_with(config, force=True)
 
@@ -293,7 +293,7 @@ class Maintenance(unittest.TestCase):
         import threading
         with tempfile.TemporaryDirectory() as tmp:
             config = self.config(Path(tmp))
-            with patch("vaws_knowledge.publishing.run_once", return_value={"status": "disabled"}):
+            with patch("mindie_knowledge.publishing.run_once", return_value={"status": "disabled"}):
                 ready = maintain(config, verify=True)
                 self.assertTrue(ready["ready"])
                 config.retrieval.documents.clear()
@@ -304,7 +304,7 @@ class Maintenance(unittest.TestCase):
                     worker.closed.set()
                     completed.set()
                     return result
-                with patch("vaws_knowledge.maintenance.maintain", side_effect=first_pass):
+                with patch("mindie_knowledge.maintenance.maintain", side_effect=first_pass):
                     worker.start()
                     self.assertTrue(completed.wait(3))
                     worker.stop()
@@ -313,36 +313,36 @@ class Maintenance(unittest.TestCase):
                 self.assertEqual({}, config.retrieval.documents)
                 self.assertEqual(["lexical"], query(config, text="maintenancecanary").results[0]["retrieval"])
                 receipt = json.loads((config.state_root / "maintenance.json").read_text())
-                with patch("vaws_knowledge.maintenance.time.time", return_value=receipt["next_verify"] + 1):
+                with patch("mindie_knowledge.maintenance.time.time", return_value=receipt["next_verify"] + 1):
                     self.assertTrue(maintain(config)["ready"])
                 self.assertEqual(1, len(query(config, text="maintenancecanary").results))
 
     def test_new_connection_rechecks_index_loss_when_shared_verification_is_due(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = self.config(Path(tmp))
-            with patch("vaws_knowledge.publishing.run_once", return_value={"status": "disabled"}):
+            with patch("mindie_knowledge.publishing.run_once", return_value={"status": "disabled"}):
                 ready = maintain(config, verify=True)
                 self.assertTrue(ready["ready"])
                 config.retrieval.documents.clear()
                 worker = MaintenanceWorker(config)
                 with patch.object(worker.wakeup, "wait", side_effect=lambda _: worker.closed.set()), \
-                        patch("vaws_knowledge.maintenance.time.time", return_value=ready["next_verify"] + 1):
+                        patch("mindie_knowledge.maintenance.time.time", return_value=ready["next_verify"] + 1):
                     worker._run()
                 self.assertEqual(1, len(query(config, text="maintenancecanary").results))
 
     def test_fresh_deadlines_skip_backend_work_and_expired_audit_overrides_next_check(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = self.config(Path(tmp))
-            with patch("vaws_knowledge.publishing.run_once", return_value={"status": "disabled"}):
+            with patch("mindie_knowledge.publishing.run_once", return_value={"status": "disabled"}):
                 result = maintain(config, verify=True)
-                with patch("vaws_knowledge.maintenance.backend_for_config", side_effect=AssertionError("unneeded backend")):
+                with patch("mindie_knowledge.maintenance.backend_for_config", side_effect=AssertionError("unneeded backend")):
                     self.assertEqual(result, maintain(config))
                 # Even an inconsistent/future next_check cannot postpone an
                 # already due explicit audit of the saved vectors.
                 result["next_check"] = result["next_verify"] + 100
                 (config.state_root / "maintenance.json").write_text(json.dumps(result))
                 config.retrieval.documents.clear()
-                with patch("vaws_knowledge.maintenance.time.time", return_value=result["next_verify"] + 1):
+                with patch("mindie_knowledge.maintenance.time.time", return_value=result["next_verify"] + 1):
                     repaired = maintain(config)
                 self.assertTrue(repaired["ready"])
                 self.assertEqual(1, len(query(config, text="maintenancecanary").results))
@@ -361,14 +361,14 @@ class Maintenance(unittest.TestCase):
             self.assertEqual(payload["publishing"], again.publishing)
 
     def test_prepare_cli_emits_readiness_without_starting_on_help(self):
-        with patch("vaws_knowledge.maintenance.maintain") as work, redirect_stdout(io.StringIO()):
+        with patch("mindie_knowledge.maintenance.maintain") as work, redirect_stdout(io.StringIO()):
             with self.assertRaises(SystemExit):
                 main(["--help"])
             work.assert_not_called()
         with tempfile.TemporaryDirectory() as tmp:
             for ready in (False, True):
                 output = io.StringIO()
-                with patch("vaws_knowledge.maintenance.maintain", return_value={"ready": ready, "status": "ready" if ready else "pending"}), redirect_stdout(output):
+                with patch("mindie_knowledge.maintenance.maintain", return_value={"ready": ready, "status": "ready" if ready else "pending"}), redirect_stdout(output):
                     rc = main(["--project", tmp])
                 self.assertEqual(0 if ready else 1, rc)
                 self.assertEqual(ready, json.loads(output.getvalue())["ready"])

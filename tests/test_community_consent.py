@@ -8,20 +8,20 @@ from unittest.mock import patch
 
 import pytest
 
-from vaws_knowledge.contribution.consent import read_consent
-from vaws_knowledge.contribution.pending import iter_pending
-from vaws_knowledge.contribution.submit import SubmitConfig, submit_pending
-from vaws_knowledge.publishing import configure, current_publishing, publication_allowed, run_once
-from vaws_knowledge.server.capture import capture
-from vaws_knowledge.server.layers import load_config
-from vaws_knowledge.summary_hook import capture_summary
+from mindie_knowledge.contribution.consent import read_consent
+from mindie_knowledge.contribution.pending import iter_pending
+from mindie_knowledge.contribution.submit import SubmitConfig, submit_pending
+from mindie_knowledge.publishing import configure, current_publishing, publication_allowed, run_once
+from mindie_knowledge.server.capture import capture
+from mindie_knowledge.server.layers import load_config
+from mindie_knowledge.summary_hook import capture_summary
 
 from test_publishing import configured
 from contribution.support import FakeContributionGitHub, init_git_repo
 
 
 def decision(path, *, enabled=True, revision="a" * 32, workspace="1" * 32):
-    path.write_text(json.dumps({"schema": "vaws.community.v1", "workspace_id": workspace,
+    path.write_text(json.dumps({"schema": "mindie.community.v1", "workspace_id": workspace,
                                 "decision": "enabled" if enabled else "disabled", "revision": revision}),
                     encoding="utf-8")
 
@@ -36,9 +36,9 @@ def binding(tmp_path):
 
 
 @pytest.mark.parametrize("payload", [None, "not JSON", [], {},
-    {"schema": "vaws.community.v1", "decision": True, "workspace_id": "1" * 32, "revision": "a" * 32},
-    {"schema": "vaws.community.v1", "decision": "enabled", "workspace_id": "1" * 31, "revision": "a" * 32},
-    {"schema": "vaws.community.v1", "decision": "enabled", "workspace_id": "1" * 32, "revision": False},
+    {"schema": "mindie.community.v1", "decision": True, "workspace_id": "1" * 32, "revision": "a" * 32},
+    {"schema": "mindie.community.v1", "decision": "enabled", "workspace_id": "1" * 31, "revision": "a" * 32},
+    {"schema": "mindie.community.v1", "decision": "enabled", "workspace_id": "1" * 32, "revision": False},
     "x" * 16_385])
 def test_invalid_or_missing_decision_fails_closed(tmp_path, payload):
     pointer = tmp_path / "community.json"
@@ -59,7 +59,7 @@ def test_withdrawal_keeps_summary_local_and_never_requeues_history(tmp_path):
                                "A private observation made after sharing was withdrawn."}, config=config, client="codex")
     assert summary["status"] == "saved" and summary["contribution"]["status"] == "local_only"
     assert len(list((tmp_path / "candidate").glob("*.md"))) == 2
-    with patch("vaws_knowledge.github_transport.github_token", side_effect=AssertionError("no upload authentication")):
+    with patch("mindie_knowledge.github_transport.github_token", side_effect=AssertionError("no upload authentication")):
         assert run_once(config, force=True)["status"] == "disabled"
         decision(pointer, revision="c" * 32)
         assert run_once(config, force=True)["status"] == "ok"
@@ -84,7 +84,7 @@ def test_running_service_rereads_config_opt_out_without_restart(tmp_path):
     payload["publishing"]["enabled"] = False
     path.write_text(json.dumps(payload), encoding="utf-8")
     assert running.publishing["enabled"] is True
-    with patch("vaws_knowledge.github_transport.github_token", side_effect=AssertionError("stale worker uploads")):
+    with patch("mindie_knowledge.github_transport.github_token", side_effect=AssertionError("stale worker uploads")):
         assert run_once(running, force=True)["status"] == "disabled"
     path.unlink()
     assert not publication_allowed(current_publishing(running))
@@ -124,7 +124,7 @@ def test_withdrawal_during_submit_stops_next_external_write(tmp_path, boundary):
     record = iter_pending(config.state_root)[0]
     authorize = lambda: publication_allowed(current_publishing(config), record)
     github = FakeContributionGitHub()
-    from vaws_knowledge.contribution import submit
+    from mindie_knowledge.contribution import submit
     original_commit = submit.commit_public_file
 
     def commit(*args, **kwargs):
@@ -161,7 +161,7 @@ def test_enabled_setting_alone_never_authorizes_automatic_publication(tmp_path):
     capture(title="No community decision", content="A publishing flag without an explicit community decision stays private.",
             config=config, index=False)
     assert iter_pending(config.state_root) == []
-    with patch("vaws_knowledge.github_transport.ensure_fork", side_effect=AssertionError("no automatic fork")):
+    with patch("mindie_knowledge.github_transport.ensure_fork", side_effect=AssertionError("no automatic fork")):
         with pytest.raises(ValueError, match="consent-file"):
             configure(tmp_path / "service.json", repository="example/corpus")
 
@@ -170,7 +170,7 @@ def test_configuration_persists_pointer_and_read_only_never_authenticates(tmp_pa
     path = tmp_path / "service.json"
     pointer = tmp_path / "community.json"
     decision(pointer, enabled=False)
-    with patch("vaws_knowledge.github_transport.ensure_fork", side_effect=AssertionError("must not fork")):
+    with patch("mindie_knowledge.github_transport.ensure_fork", side_effect=AssertionError("must not fork")):
         result = configure(path, repository="example/corpus", read_only=True, consent_file=pointer, github_user="maoxx241")
         with pytest.raises(ValueError, match="must be enabled"):
             configure(path, repository="example/corpus", consent_file=pointer, github_user="maoxx241")
@@ -182,17 +182,17 @@ def test_configuration_persists_pointer_and_read_only_never_authenticates(tmp_pa
 
 def test_opt_out_keeps_central_release_downloads_available(tmp_path):
     from types import SimpleNamespace
-    from vaws_knowledge.distribution.sync import SyncResult
+    from mindie_knowledge.distribution.sync import SyncResult
 
     config, pointer = binding(tmp_path)
     decision(pointer, enabled=False)
     config.shared_sync = {"enabled": True}
     instance = SimpleNamespace(state_root=config.state_root, cache_dir=tmp_path / "model")
-    with patch("vaws_knowledge.publishing.instance_for_config", return_value=instance), \
-         patch("vaws_knowledge.github_transport.github_token", side_effect=AssertionError("no contribution auth")), \
-         patch("vaws_knowledge.publishing.iter_pending", side_effect=AssertionError("no private history")), \
-         patch("vaws_knowledge.distribution.release.source_from_location") as source, \
-         patch("vaws_knowledge.publishing.check_and_sync", return_value=SyncResult(status="unchanged")):
+    with patch("mindie_knowledge.publishing.instance_for_config", return_value=instance), \
+         patch("mindie_knowledge.github_transport.github_token", side_effect=AssertionError("no contribution auth")), \
+         patch("mindie_knowledge.publishing.iter_pending", side_effect=AssertionError("no private history")), \
+         patch("mindie_knowledge.distribution.release.source_from_location") as source, \
+         patch("mindie_knowledge.publishing.check_and_sync", return_value=SyncResult(status="unchanged")):
         result = run_once(config, force=True)
     assert source.call_args.args[0] == "github://example/corpus"
     assert result["sync"]["status"] == "unchanged"

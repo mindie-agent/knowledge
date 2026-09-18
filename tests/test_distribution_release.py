@@ -11,8 +11,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from distribution.helpers import make_corpus, make_manifest, make_pack
 
-from vaws_knowledge.distribution.errors import CorruptPack, ReleaseError, SourceUnavailable
-from vaws_knowledge.distribution.release import (
+from mindie_knowledge.distribution.errors import CorruptPack, ReleaseError, SourceUnavailable
+from mindie_knowledge.distribution.release import (
     LocalReleaseSource,
     make_release,
     publish_release,

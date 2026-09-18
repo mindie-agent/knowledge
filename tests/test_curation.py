@@ -6,11 +6,11 @@ from unittest.mock import patch
 
 import pytest
 
-from vaws_knowledge import curation
-from vaws_knowledge.catalog import refresh_catalog
-from vaws_knowledge.markdown import load_document, meta_path
-from vaws_knowledge.server.layers import load_config
-from vaws_knowledge.server.query import query
+from mindie_knowledge import curation
+from mindie_knowledge.catalog import refresh_catalog
+from mindie_knowledge.markdown import load_document, meta_path
+from mindie_knowledge.server.layers import load_config
+from mindie_knowledge.server.query import query
 
 
 def test_cli_missing_or_invalid_explicit_config_cannot_fall_back(tmp_path, capsys):
@@ -98,7 +98,7 @@ def test_cancellation_expiry_and_byte_limit_do_not_apply_results(handoff):
     config, source, target, prepare, result = handoff
     job = prepare(seconds=30, max_bytes=1024)
     result(job)
-    with patch("vaws_knowledge.curation.time.time", return_value=job["deadline"] + 1):
+    with patch("mindie_knowledge.curation.time.time", return_value=job["deadline"] + 1):
         assert curation.status(config, job["job"])["status"] == "expired"
         with pytest.raises(ValueError, match="time budget"):
             curation.apply(config, job["job"])
@@ -122,7 +122,7 @@ def test_interrupted_batch_rolls_back_only_its_own_writes(handoff):
         if path.parent == target and path.suffix == ".json":
             raise OSError("interrupted filesystem write")
         write(path, raw)
-    with patch("vaws_knowledge.curation._write", side_effect=fail_metadata), pytest.raises(OSError):
+    with patch("mindie_knowledge.curation._write", side_effect=fail_metadata), pytest.raises(OSError):
         curation.apply(config, job["job"])
     assert not (target / "topic.md").exists()
     assert curation.status(config, job["job"])["status"] == "interrupted"
@@ -150,7 +150,7 @@ def test_handoff_rejects_mount_root_and_source_change_during_commit(handoff):
         write(path, raw)
         if path.parent == target and path.name == "topic.md":
             source.write_text("# New source\n\nConcurrent evidence\n", encoding="utf-8")
-    with patch("vaws_knowledge.curation._write", side_effect=concurrent_source_edit), pytest.raises(ValueError, match="changed during"):
+    with patch("mindie_knowledge.curation._write", side_effect=concurrent_source_edit), pytest.raises(ValueError, match="changed during"):
         curation.apply(config, job["job"])
     assert not (target / "topic.md").exists()
 

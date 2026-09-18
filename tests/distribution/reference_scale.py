@@ -18,14 +18,14 @@ import tracemalloc
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from distribution.helpers import make_pack, make_manifest, GIT_SHA
-from vaws_knowledge.catalog import refresh_catalog
-from vaws_knowledge.distribution.manifest import ExpectedContract, atomic_write_json, validate_release_manifest
-from vaws_knowledge.distribution.references import prepare_reference, prepare_mount, prepared_shared_documents, write_references
-from vaws_knowledge.distribution.sync import CURRENT_SCHEMA, DistributionState
-from vaws_knowledge.local.backend import MemoryBackend
-from vaws_knowledge.markdown import normalized_sha256
-from vaws_knowledge.server.layers import load_config
-from vaws_knowledge.server.query import query
+from mindie_knowledge.catalog import refresh_catalog
+from mindie_knowledge.distribution.manifest import ExpectedContract, atomic_write_json, validate_release_manifest
+from mindie_knowledge.distribution.references import prepare_reference, prepare_mount, prepared_shared_documents, write_references
+from mindie_knowledge.distribution.sync import CURRENT_SCHEMA, DistributionState
+from mindie_knowledge.local.backend import MemoryBackend
+from mindie_knowledge.markdown import normalized_sha256
+from mindie_knowledge.server.layers import load_config
+from mindie_knowledge.server.query import query
 
 
 def main():

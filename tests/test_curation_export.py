@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from vaws_knowledge import curation_export as export
-from vaws_knowledge.markdown import meta_path, normalized_sha256
+from mindie_knowledge import curation_export as export
+from mindie_knowledge.markdown import meta_path, normalized_sha256
 
 
 @pytest.fixture

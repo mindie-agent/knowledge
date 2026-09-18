@@ -6,8 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from vaws_knowledge.local.openviking import MAINTENANCE_TIMEOUT, READ_TIMEOUT, OpenVikingBackend
-from vaws_knowledge.markdown import SHARED_BOOTSTRAP_URI
+from mindie_knowledge.local.openviking import MAINTENANCE_TIMEOUT, READ_TIMEOUT, OpenVikingBackend
+from mindie_knowledge.markdown import SHARED_BOOTSTRAP_URI
 
 
 class MissingRecord(RuntimeError):
@@ -90,7 +90,7 @@ def native(tmp_path, monkeypatch):
             return {"resources": self.results}
 
     monkeypatch.setitem(sys.modules, "openviking_sdk", SimpleNamespace(SyncHTTPClient=Client))
-    monkeypatch.setattr("vaws_knowledge.local.openviking.instance_for_config", lambda config: instance)
+    monkeypatch.setattr("mindie_knowledge.local.openviking.instance_for_config", lambda config: instance)
     backend = OpenVikingBackend(SimpleNamespace(state_root=tmp_path))
     return backend, instance, records, vectors, clients
 
@@ -186,7 +186,7 @@ def test_searches_only_bootstrap_active_and_requested_local_roots(native, monkey
     backend, instance, records, vectors, clients = native
     instance.live = True
     active = "viking://resources/shared/v0123456789ab"
-    monkeypatch.setattr("vaws_knowledge.local.shared.current_shared", lambda root: {"root_uri": active})
+    monkeypatch.setattr("mindie_knowledge.local.shared.current_shared", lambda root: {"root_uri": active})
     assert backend.ready()[0]
     bootstrap_uri = SHARED_BOOTSTRAP_URI + "/bundled.md"
     active_uri = active + "/corpus/new.md"

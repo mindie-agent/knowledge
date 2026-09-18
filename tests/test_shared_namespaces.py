@@ -4,12 +4,12 @@ import json
 
 import pytest
 
-from vaws_knowledge.corpus import corpus_root
-from vaws_knowledge.local.backend import MemoryBackend
-from vaws_knowledge.local.reconcile import reconcile_markdown
-from vaws_knowledge.local.shared import shared_search_uris
-from vaws_knowledge.markdown import SHARED_BOOTSTRAP_URI, load_document, meta_path, uri_for
-from vaws_knowledge.server.layers import load_config
+from mindie_knowledge.corpus import corpus_root
+from mindie_knowledge.local.backend import MemoryBackend
+from mindie_knowledge.local.reconcile import reconcile_markdown
+from mindie_knowledge.local.shared import shared_search_uris
+from mindie_knowledge.markdown import SHARED_BOOTSTRAP_URI, load_document, meta_path, uri_for
+from mindie_knowledge.server.layers import load_config
 
 
 @pytest.mark.parametrize("active", [
@@ -17,7 +17,7 @@ from vaws_knowledge.server.layers import load_config
     "viking://resources/shared/repairs/0123456789abcdef/v0123456789ab",
 ])
 def test_bootstrap_and_exact_active_root_are_both_searched(active, monkeypatch):
-    monkeypatch.setattr("vaws_knowledge.local.shared.current_shared", lambda root: {"root_uri": active})
+    monkeypatch.setattr("mindie_knowledge.local.shared.current_shared", lambda root: {"root_uri": active})
     assert shared_search_uris(None) == (SHARED_BOOTSTRAP_URI, active)
 
 
@@ -27,7 +27,7 @@ def test_bootstrap_and_exact_active_root_are_both_searched(active, monkeypatch):
     "viking://resources/shared/repairs/0123456789abcdef", "viking://resources/project",
 ])
 def test_broad_parent_pointers_never_expand_the_search_scope(active, monkeypatch):
-    monkeypatch.setattr("vaws_knowledge.local.shared.current_shared", lambda root: {"root_uri": active})
+    monkeypatch.setattr("mindie_knowledge.local.shared.current_shared", lambda root: {"root_uri": active})
     assert shared_search_uris(None) == (SHARED_BOOTSTRAP_URI,)
 
 
@@ -60,7 +60,7 @@ def test_bundled_corpus_and_project_notes_survive_an_active_release(tmp_path, mo
     config.retrieval = backend
     active = "viking://resources/shared/v0123456789ab"
     stale = "viking://resources/shared/vffffffffffff"
-    monkeypatch.setattr("vaws_knowledge.local.shared.current_shared", lambda root: {"root_uri": active})
+    monkeypatch.setattr("mindie_knowledge.local.shared.current_shared", lambda root: {"root_uri": active})
     backend.upsert(active + "/corpus/public.md", "# Public\n\npubliccanary", layer="shared")
     backend.upsert(stale + "/corpus/old.md", "# Stale\n\npubliccanary", layer="shared")
     report = reconcile_markdown(config, verify=True)

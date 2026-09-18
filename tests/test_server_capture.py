@@ -13,11 +13,11 @@ from unittest import mock
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "fixtures" / "server"))
 
 import support  # noqa: E402
-from vaws_knowledge.local.backend import MemoryBackend
-from vaws_knowledge.local.reconcile import reconcile_markdown
-from vaws_knowledge.markdown import meta_path, save_document
-from vaws_knowledge.server.capture import CaptureRefused, CaptureRejected, capture, delete
-from vaws_knowledge.server.query import query
+from mindie_knowledge.local.backend import MemoryBackend
+from mindie_knowledge.local.reconcile import reconcile_markdown
+from mindie_knowledge.markdown import meta_path, save_document
+from mindie_knowledge.server.capture import CaptureRefused, CaptureRejected, capture, delete
+from mindie_knowledge.server.query import query
 
 
 def _config(tmp: str):
@@ -27,8 +27,8 @@ def _config(tmp: str):
 
 
 def test_catalog_locates_legacy_title_and_update_reads_current_original(tmp_path, monkeypatch):
-    from vaws_knowledge.catalog import refresh_catalog
-    from vaws_knowledge.server.layers import load_config
+    from mindie_knowledge.catalog import refresh_catalog
+    from mindie_knowledge.server.layers import load_config
 
     root = tmp_path / "candidate"
     root.mkdir()
@@ -56,7 +56,7 @@ def test_catalog_locates_legacy_title_and_update_reads_current_original(tmp_path
 
 
 def test_cold_capture_keeps_legacy_title_update_without_setup(tmp_path):
-    from vaws_knowledge.server.layers import load_config
+    from mindie_knowledge.server.layers import load_config
 
     legacy = tmp_path / "legacy.md"
     legacy.write_text("# Original title\n\nEarlier evidence.", encoding="utf-8")
@@ -115,7 +115,7 @@ class CaptureMarkdown(unittest.TestCase):
                     capture(title="x", content="y", layer=layer, config=config)
 
     def test_read_only_candidate_is_not_written(self) -> None:
-        from vaws_knowledge.server.layers import load_config
+        from mindie_knowledge.server.layers import load_config
         with tempfile.TemporaryDirectory() as tmp:
             target = pathlib.Path(tmp) / "read-only"
             config = load_config({"layers": {"candidate": {"root": str(target), "read_only": True}}}, env={})
@@ -170,7 +170,7 @@ class CaptureMarkdown(unittest.TestCase):
                         if concurrent_edit:
                             saved_path.write_bytes(replacement)
 
-                    with mock.patch("vaws_knowledge.server.capture.save_document", side_effect=save_with_newlines), \
+                    with mock.patch("mindie_knowledge.server.capture.save_document", side_effect=save_with_newlines), \
                             mock.patch.object(config.retrieval, "upsert", side_effect=edit_during_upsert):
                         captured = capture(title="Concurrent observation", content="Original indexed observation.", config=config)
 
@@ -200,7 +200,7 @@ class CaptureMarkdown(unittest.TestCase):
             before_meta = sidecar.read_bytes()
             indexed_before = dict(config.retrieval.documents)
 
-            with mock.patch("vaws_knowledge.server.capture.backend_for_config") as backend_factory:
+            with mock.patch("mindie_knowledge.server.capture.backend_for_config") as backend_factory:
                 proposed = capture(
                     title="dry run existing",
                     content="replacement must not land",

@@ -3,11 +3,11 @@ from pathlib import Path
 
 import pytest
 
-from vaws_knowledge.catalog import refresh_catalog
-from vaws_knowledge.evaluation import evaluate
-from vaws_knowledge.local.backend import MemoryBackend
-from vaws_knowledge.markdown import meta_path, normalized_sha256
-from vaws_knowledge.server.layers import load_config
+from mindie_knowledge.catalog import refresh_catalog
+from mindie_knowledge.evaluation import evaluate
+from mindie_knowledge.local.backend import MemoryBackend
+from mindie_knowledge.markdown import meta_path, normalized_sha256
+from mindie_knowledge.server.layers import load_config
 
 
 def test_domain_regression_fixture_uses_real_query_path(tmp_path):

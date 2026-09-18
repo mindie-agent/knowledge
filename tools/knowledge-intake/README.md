@@ -189,7 +189,7 @@ Create a standalone `feed.json` outside the generated output directory:
 
 ```json
 {
-  "repository": "https://github.com/YOUR_PERSONAL_USER/vaws-knowledge",
+  "repository": "https://github.com/YOUR_PERSONAL_USER/mindie-knowledge",
   "ref": "codex/va-reference-feed",
   "export_path": "",
   "state_root": "./feed-state",

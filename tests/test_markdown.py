@@ -4,9 +4,9 @@ from unittest.mock import patch
 
 import pytest
 
-from vaws_knowledge import markdown
-from vaws_knowledge.server.capture import capture
-from vaws_knowledge.server.layers import load_config
+from mindie_knowledge import markdown
+from mindie_knowledge.server.capture import capture
+from mindie_knowledge.server.layers import load_config
 
 
 def test_capture_rejects_oversize_orphan_metadata_before_any_write(tmp_path):

@@ -16,9 +16,9 @@ import unittest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "fixtures" / "server"))
 
 import support  # noqa: E402
-from vaws_knowledge.corpus import corpus_root  # noqa: E402
+from mindie_knowledge.corpus import corpus_root  # noqa: E402
 from unittest import mock
-from vaws_knowledge.server.layers import (  # noqa: E402
+from mindie_knowledge.server.layers import (  # noqa: E402
     LAYERS,
     SOURCE_REPO,
     ConfigError,
@@ -95,14 +95,14 @@ class EnvironmentOverrides(unittest.TestCase):
     def test_explicit_state_overrides_discovered_workspace_configuration(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary).resolve()
-            path = root / ".vaws-local" / "knowledge" / "service.json"
+            path = root / ".mindie-local" / "knowledge" / "service.json"
             path.parent.mkdir(parents=True)
             configured_state = root / "configured-instance"
             explicit_state = root / "attached-task" / "instance"
             path.write_text(json.dumps({"state_root": str(configured_state)}), encoding="utf-8")
-            with mock.patch("vaws_knowledge.server.layers.Path.cwd", return_value=root):
+            with mock.patch("mindie_knowledge.server.layers.Path.cwd", return_value=root):
                 configured = load_config(env={})
-                overridden = load_config(env={"VAWS_KNOWLEDGE_STATE": str(explicit_state)})
+                overridden = load_config(env={"MINDIE_KNOWLEDGE_STATE": str(explicit_state)})
             self.assertEqual(path, configured.config_path)
             self.assertEqual(path, overridden.config_path)
             self.assertEqual(configured_state, configured.state_root)
@@ -111,26 +111,26 @@ class EnvironmentOverrides(unittest.TestCase):
     def test_env_roots_override_the_config_file(self):
         config = load_config(
             {"layers": {"project": {"roots": ["no-such-directory"]}}},
-            env={"VAWS_KNOWLEDGE_PROJECT_ROOTS": str(support.FIXTURES / "project")},
+            env={"MINDIE_KNOWLEDGE_PROJECT_ROOTS": str(support.FIXTURES / "project")},
             base_dir=support.FIXTURES,
         )
         self.assertTrue(config.mount("project").present)
 
     def test_empty_env_value_disables_a_layer(self):
-        config = support.build_config(env={"VAWS_KNOWLEDGE_SHARED_ROOTS": ""})
+        config = support.build_config(env={"MINDIE_KNOWLEDGE_SHARED_ROOTS": ""})
         self.assertNotIn("shared", config.available_layers())
-        self.assertIn("disabled by VAWS_KNOWLEDGE_SHARED_ROOTS", config.absent_layers()["shared"])
+        self.assertIn("disabled by MINDIE_KNOWLEDGE_SHARED_ROOTS", config.absent_layers()["shared"])
 
     def test_layer_allowlist_env_narrows_the_mount_set(self):
-        config = support.build_config(env={"VAWS_KNOWLEDGE_LAYERS": "shared"})
+        config = support.build_config(env={"MINDIE_KNOWLEDGE_LAYERS": "shared"})
         self.assertEqual(["shared"], config.available_layers())
-        self.assertIn("VAWS_KNOWLEDGE_LAYERS", config.absent_layers()["project"])
+        self.assertIn("MINDIE_KNOWLEDGE_LAYERS", config.absent_layers()["project"])
 
     def test_identity_comes_from_the_environment(self):
         config = support.build_config(
             env={
-                "VAWS_KNOWLEDGE_CONTRIBUTOR": "example-handle",
-                "VAWS_KNOWLEDGE_ORIGIN_REPO": "example-org/example-repo",
+                "MINDIE_KNOWLEDGE_CONTRIBUTOR": "example-handle",
+                "MINDIE_KNOWLEDGE_ORIGIN_REPO": "example-org/example-repo",
             }
         )
         self.assertEqual("example-handle", config.identity["contributor"])
@@ -143,16 +143,16 @@ class ConfigFiles(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             (root / "notes").mkdir()
-            with mock.patch("vaws_knowledge.server.layers.Path.cwd", return_value=root):
-                config = load_config({}, env={"VAWS_KNOWLEDGE_PROJECT_ROOTS": "notes",
-                                              "VAWS_KNOWLEDGE_CANDIDATE_ROOT": "candidate"})
+            with mock.patch("mindie_knowledge.server.layers.Path.cwd", return_value=root):
+                config = load_config({}, env={"MINDIE_KNOWLEDGE_PROJECT_ROOTS": "notes",
+                                              "MINDIE_KNOWLEDGE_CANDIDATE_ROOT": "candidate"})
         self.assertEqual((root / "notes",), config.mount("project").roots)
         self.assertTrue(config.mount("project").present)
         self.assertEqual((root / "candidate",), config.mount("candidate").roots)
 
     def test_relative_roots_resolve_against_the_config_file(self):
         with tempfile.TemporaryDirectory() as tmp:
-            path = pathlib.Path(tmp) / "vaws-knowledge.json"
+            path = pathlib.Path(tmp) / "mindie-knowledge.json"
             path.write_text(
                 json.dumps(
                     {
@@ -177,7 +177,7 @@ class ConfigFiles(unittest.TestCase):
 
     def test_malformed_config_file_raises_a_clear_error(self):
         with tempfile.TemporaryDirectory() as tmp:
-            path = pathlib.Path(tmp) / "vaws-knowledge.json"
+            path = pathlib.Path(tmp) / "mindie-knowledge.json"
             path.write_text("{not json")
             with self.assertRaises(ConfigError) as ctx:
                 load_config(path=path, env={})
@@ -203,7 +203,7 @@ class PackagedCorpusDefault(unittest.TestCase):
         )
 
     def test_corpus_env_still_resolves_through_resolve_shared_from_corpus(self):
-        roots = default_shared_roots({"VAWS_KNOWLEDGE_CORPUS": str(support.REPO)})
+        roots = default_shared_roots({"MINDIE_KNOWLEDGE_CORPUS": str(support.REPO)})
         self.assertEqual(
             tuple(p.resolve() for p in roots),
             tuple(p.resolve() for p in resolve_shared_from_corpus(support.REPO)),
@@ -220,7 +220,7 @@ class ReferenceConfiguration(unittest.TestCase):
     def test_old_review_policy_does_not_become_a_runtime_filter(self):
         config = load_config({"policy": {"default_statuses": ["verified"], "stale_after_days": 1},
                               "identity": {"redaction_profile": "old-profile"}},
-                             env={"VAWS_KNOWLEDGE_STALE_AFTER_DAYS": "soon", "VAWS_KNOWLEDGE_REDACTION_PROFILE": "old-profile"})
+                             env={"MINDIE_KNOWLEDGE_STALE_AFTER_DAYS": "soon", "MINDIE_KNOWLEDGE_REDACTION_PROFILE": "old-profile"})
         self.assertNotIn("policy", config.describe())
         self.assertNotIn("redaction_profile", config.identity)
         self.assertEqual([], config.warnings)
@@ -236,7 +236,7 @@ class ReferenceConfiguration(unittest.TestCase):
         self.assertEqual(publishing, config.publishing)
 
     def test_json_configuration_does_not_need_yaml(self):
-        with mock.patch("vaws_knowledge.server.layers.yaml", None):
+        with mock.patch("mindie_knowledge.server.layers.yaml", None):
             config = load_config({}, env={})
         self.assertEqual([], config.warnings)
 
@@ -244,7 +244,7 @@ class ReferenceConfiguration(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             path = pathlib.Path(temporary) / "service.yaml"
             path.write_text("backend: memory\n", encoding="utf-8")
-            with mock.patch("vaws_knowledge.server.layers.yaml", None):
+            with mock.patch("mindie_knowledge.server.layers.yaml", None):
                 with self.assertRaisesRegex(ConfigError, "PyYAML is required"):
                     load_config(path=path, env={})
 

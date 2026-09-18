@@ -8,8 +8,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from vaws_knowledge.cli import main
-from vaws_knowledge.skill import install_skill, skill_files
+from mindie_knowledge.cli import main
+from mindie_knowledge.skill import install_skill, skill_files
 
 
 class KnowledgeSkillTests(unittest.TestCase):

@@ -6,10 +6,10 @@ from pathlib import Path
 
 import pytest
 
-from vaws_knowledge.local.backend import MemoryBackend
-from vaws_knowledge.local.reconcile import reconcile_markdown
-from vaws_knowledge.markdown import uri_for
-from vaws_knowledge.server.layers import load_config
+from mindie_knowledge.local.backend import MemoryBackend
+from mindie_knowledge.local.reconcile import reconcile_markdown
+from mindie_knowledge.markdown import uri_for
+from mindie_knowledge.server.layers import load_config
 
 
 class TrackingBackend(MemoryBackend):
@@ -144,7 +144,7 @@ def test_failed_vector_repair_is_not_admitted_as_success(library, monkeypatch):
 def test_transient_scan_error_does_not_delete_previously_indexed_note(library, monkeypatch):
     config, backend, roots, note, uri = library
     assert reconcile_markdown(config).ok
-    from vaws_knowledge.local import reconcile
+    from mindie_knowledge.local import reconcile
     original = reconcile.load_document
 
     def unreadable(path, **kwargs):

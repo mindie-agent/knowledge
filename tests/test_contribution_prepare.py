@@ -14,16 +14,16 @@ if str(REPO / "tests") not in sys.path:
     sys.path.insert(0, str(REPO / "tests"))
 
 from contribution.support import ordinary_md  # noqa: E402
-from vaws_knowledge.contribution.documents import (  # noqa: E402
+from mindie_knowledge.contribution.documents import (  # noqa: E402
     DIGEST_PREFIX,
     MarkdownDocument,
     content_digest,
     require_git_sha,
 )
-from vaws_knowledge.contribution.errors import IdentityError  # noqa: E402
-from vaws_knowledge.contribution.pending import STATUS_AWAITING, STATUS_BLOCKED, load_pending  # noqa: E402
-from vaws_knowledge.contribution.public import prepare_public_copy  # noqa: E402
-from vaws_knowledge.contribution.submit import after_capture, prepare_candidate  # noqa: E402
+from mindie_knowledge.contribution.errors import IdentityError  # noqa: E402
+from mindie_knowledge.contribution.pending import STATUS_AWAITING, STATUS_BLOCKED, load_pending  # noqa: E402
+from mindie_knowledge.contribution.public import prepare_public_copy  # noqa: E402
+from mindie_knowledge.contribution.submit import after_capture, prepare_candidate  # noqa: E402
 
 
 LEAK = "Contact the box at 10.20.30.40 during the outage."

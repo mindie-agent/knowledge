@@ -12,21 +12,21 @@ sys.path.insert(0, str(Path(__file__).parent))
 from contribution.support import FakeContributionGitHub, init_git_repo
 from distribution.helpers import make_corpus, make_manifest, make_pack
 
-from vaws_knowledge.contribution.pending import iter_pending
-from vaws_knowledge.contribution.submit import SubmitConfig, submit_pending
-from vaws_knowledge.distribution.release import GitHubReleaseSource
-from vaws_knowledge.distribution.errors import SourceUnavailable
-from vaws_knowledge.distribution.sync import SwitchLock, SyncResult
-from vaws_knowledge.publishing import configure, queue_capture, run_once
-from vaws_knowledge.server.capture import capture
-from vaws_knowledge.server.layers import load_config
-from vaws_knowledge.summary_hook import capture_summary
-from vaws_knowledge.corpus_check import validate_corpus
+from mindie_knowledge.contribution.pending import iter_pending
+from mindie_knowledge.contribution.submit import SubmitConfig, submit_pending
+from mindie_knowledge.distribution.release import GitHubReleaseSource
+from mindie_knowledge.distribution.errors import SourceUnavailable
+from mindie_knowledge.distribution.sync import SwitchLock, SyncResult
+from mindie_knowledge.publishing import configure, queue_capture, run_once
+from mindie_knowledge.server.capture import capture
+from mindie_knowledge.server.layers import load_config
+from mindie_knowledge.summary_hook import capture_summary
+from mindie_knowledge.corpus_check import validate_corpus
 
 
 def configured(tmp_path):
     pointer = tmp_path / "community.json"
-    pointer.write_text(json.dumps({"schema": "vaws.community.v1", "workspace_id": "1" * 32,
+    pointer.write_text(json.dumps({"schema": "mindie.community.v1", "workspace_id": "1" * 32,
                                   "decision": "enabled", "revision": "a" * 32}), encoding="utf-8")
     return load_config({
         "backend": "memory", "state_root": str(tmp_path / "state"),
@@ -39,8 +39,8 @@ def configured(tmp_path):
 
 def test_capture_queues_without_network_or_index(tmp_path):
     config = configured(tmp_path)
-    with patch("vaws_knowledge.github_transport.gh", side_effect=AssertionError("network in capture")), \
-         patch("vaws_knowledge.server.capture.backend_for_config", side_effect=AssertionError("index in hook")):
+    with patch("mindie_knowledge.github_transport.gh", side_effect=AssertionError("network in capture")), \
+         patch("mindie_knowledge.server.capture.backend_for_config", side_effect=AssertionError("index in hook")):
         saved = capture(title="A local result", content="A candidate can be saved before its public PR exists.",
                         config=config, index=False)
     assert saved["ok"] and saved["contribution"]["status"] == "pending"
@@ -168,8 +168,8 @@ def test_summary_capture_is_local_without_public_publishing(tmp_path):
     config = configured(tmp_path)
     config.publishing = {}
     text = "The graph replay observation remains uncertain; this is a local reference."
-    with patch("vaws_knowledge.github_transport.gh", side_effect=AssertionError("network in hook")), \
-         patch("vaws_knowledge.server.capture.backend_for_config", side_effect=AssertionError("index in hook")):
+    with patch("mindie_knowledge.github_transport.gh", side_effect=AssertionError("network in hook")), \
+         patch("mindie_knowledge.server.capture.backend_for_config", side_effect=AssertionError("index in hook")):
         result = capture_summary({"hook_event_name": "Stop", "last_assistant_message": text},
                                  config=config, client="codex")
     assert result["status"] == "saved"
@@ -212,8 +212,8 @@ def test_unsupported_or_non_response_events_do_not_create_notes(tmp_path, client
 
 
 def test_plain_text_notes_need_no_heading_or_metadata(tmp_path):
-    from vaws_knowledge.markdown import load_document
-    from vaws_knowledge.contribution.documents import MarkdownDocument
+    from mindie_knowledge.markdown import load_document
+    from mindie_knowledge.contribution.documents import MarkdownDocument
 
     note = tmp_path / "ordinary.md"
     text = "One observation whose cause remains unknown."
@@ -231,11 +231,11 @@ def test_shared_sync_defaults_on_without_contribution_authorization(tmp_path):
     config.shared_sync = {}
     instance = SimpleNamespace(state_root=config.state_root, cache_dir=tmp_path / "model",
                                ensure=lambda: {"openviking_url": "http://loopback"}, data_key=lambda: "test")
-    with patch("vaws_knowledge.publishing.instance_for_config", return_value=instance), \
-         patch("vaws_knowledge.publishing.iter_pending", side_effect=AssertionError("private history must not be queued")), \
-         patch("vaws_knowledge.distribution.release.source_from_location") as source, \
-         patch("vaws_knowledge.distribution.client.connect_client"), \
-         patch("vaws_knowledge.publishing.check_and_sync", return_value=SyncResult(status="unchanged")) as sync:
+    with patch("mindie_knowledge.publishing.instance_for_config", return_value=instance), \
+         patch("mindie_knowledge.publishing.iter_pending", side_effect=AssertionError("private history must not be queued")), \
+         patch("mindie_knowledge.distribution.release.source_from_location") as source, \
+         patch("mindie_knowledge.distribution.client.connect_client"), \
+         patch("mindie_knowledge.publishing.check_and_sync", return_value=SyncResult(status="unchanged")) as sync:
         result = run_once(config, verify=True)
     assert result["sync"]["status"] == "unchanged"
     assert source.call_args.args[0] == "github://example/corpus"
@@ -246,20 +246,20 @@ def test_shared_sync_can_be_disabled_without_enabling_private_history(tmp_path):
     config = configured(tmp_path)
     config.publishing["enabled"] = False
     config.shared_sync = {"enabled": False}
-    with patch("vaws_knowledge.publishing.iter_pending", side_effect=AssertionError("pending must stay private")), \
-         patch("vaws_knowledge.publishing.instance_for_config", side_effect=AssertionError("no service needed")):
+    with patch("mindie_knowledge.publishing.iter_pending", side_effect=AssertionError("pending must stay private")), \
+         patch("mindie_knowledge.publishing.instance_for_config", side_effect=AssertionError("no service needed")):
         result = run_once(config, force=True)
     assert result == {"status": "disabled", "sync": {"status": "disabled"}}
 
 
 @pytest.mark.parametrize("disabled,env", [
     ({"enabled": False}, {}),
-    ({}, {"VAWS_KNOWLEDGE_SHARED_ROOTS": ""}),
-    ({}, {"VAWS_KNOWLEDGE_LAYERS": "project,candidate"}),
+    ({}, {"MINDIE_KNOWLEDGE_SHARED_ROOTS": ""}),
+    ({}, {"MINDIE_KNOWLEDGE_LAYERS": "project,candidate"}),
 ])
 def test_explicit_disabled_shared_layer_does_not_start_or_download(tmp_path, disabled, env):
     config = load_config({"state_root": str(tmp_path / "state"), "layers": {"shared": disabled}}, env=env)
-    with patch("vaws_knowledge.publishing.instance_for_config", side_effect=AssertionError("disabled layer must not start runtime")):
+    with patch("mindie_knowledge.publishing.instance_for_config", side_effect=AssertionError("disabled layer must not start runtime")):
         result = run_once(config, force=True, verify=True)
     assert result["sync"]["status"] == "disabled"
 
@@ -275,7 +275,7 @@ def test_release_cache_only_returns_the_requested_activated_git_version(tmp_path
 def test_read_only_configuration_enables_sync_and_disables_upload(tmp_path):
     path = tmp_path / "service.json"
     path.write_text(json.dumps({"publishing": {"enabled": True, "fork": "old/fork"}}))
-    with patch("vaws_knowledge.github_transport.ensure_fork", side_effect=AssertionError("read-only must not create a fork")):
+    with patch("mindie_knowledge.github_transport.ensure_fork", side_effect=AssertionError("read-only must not create a fork")):
         result = configure(path, repository="example/corpus", read_only=True)
     data = json.loads(path.read_text())
     assert data["shared_sync"] == {"enabled": True, "repository": "example/corpus"}
@@ -287,7 +287,7 @@ def test_read_only_configuration_enables_sync_and_disables_upload(tmp_path):
 def test_shared_sync_prepares_latest_manifest_before_connecting(tmp_path):
     from types import SimpleNamespace
     from distribution.helpers import FakeClient, GIT_SHA, make_release_dir
-    from vaws_knowledge.distribution.release import LocalReleaseSource
+    from mindie_knowledge.distribution.release import LocalReleaseSource
 
     config = configured(tmp_path)
     config.publishing["enabled"] = False
@@ -310,9 +310,9 @@ def test_shared_sync_prepares_latest_manifest_before_connecting(tmp_path):
 
     instance = SimpleNamespace(state_root=config.state_root, cache_dir=tmp_path / "model",
                                ensure=ensure, data_key=lambda: "test")
-    with patch("vaws_knowledge.publishing.instance_for_config", return_value=instance), \
-         patch("vaws_knowledge.distribution.release.source_from_location", return_value=LocalReleaseSource(release)), \
-         patch("vaws_knowledge.distribution.client.connect_client", side_effect=connect):
+    with patch("mindie_knowledge.publishing.instance_for_config", return_value=instance), \
+         patch("mindie_knowledge.distribution.release.source_from_location", return_value=LocalReleaseSource(release)), \
+         patch("mindie_knowledge.distribution.client.connect_client", side_effect=connect):
         result = run_once(config, verify=True)
         assert result["sync"]["status"] == "switched", result
         assert events == ["prepare", "connect", "close"]

@@ -7,10 +7,10 @@ from unittest.mock import Mock
 
 import pytest
 
-from vaws_knowledge import maintenance
-from vaws_knowledge.server import mcp_server as mcp
-from vaws_knowledge.server.layers import load_config
-from vaws_knowledge.server.query import QueryResponse
+from mindie_knowledge import maintenance
+from mindie_knowledge.server import mcp_server as mcp
+from mindie_knowledge.server.layers import load_config
+from mindie_knowledge.server.query import QueryResponse
 
 
 @pytest.fixture
@@ -59,7 +59,7 @@ def test_unused_or_invalid_mcp_never_creates_worker_backend_or_network(config, m
     network = Mock(side_effect=AssertionError("network used without knowledge use"))
     monkeypatch.setattr(maintenance, "MaintenanceWorker", factory)
     monkeypatch.setattr(maintenance, "backend_for_config", backend)
-    monkeypatch.setattr("vaws_knowledge.local.backend.backend_for_config", backend)
+    monkeypatch.setattr("mindie_knowledge.local.backend.backend_for_config", backend)
     monkeypatch.setattr("socket.socket.connect", network)
     run_main(monkeypatch, service, messages)
     factory.assert_not_called()
@@ -107,7 +107,7 @@ def test_capture_activates_after_local_save_and_requests_index_work(config, monk
 
 
 def test_summary_capture_does_not_construct_maintenance(config, monkeypatch):
-    from vaws_knowledge.summary_hook import capture_summary
+    from mindie_knowledge.summary_hook import capture_summary
 
     factory = Mock(side_effect=AssertionError("summary activated maintenance"))
     monkeypatch.setattr(maintenance, "MaintenanceWorker", factory)

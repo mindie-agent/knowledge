@@ -9,10 +9,10 @@ from pathlib import Path
 
 import pytest
 
-from vaws_knowledge import health
-from vaws_knowledge.distribution.sync import SwitchLock
-from vaws_knowledge.markdown import meta_path
-from vaws_knowledge.server.layers import load_config
+from mindie_knowledge import health
+from mindie_knowledge.distribution.sync import SwitchLock
+from mindie_knowledge.markdown import meta_path
+from mindie_knowledge.server.layers import load_config
 
 
 NOW = datetime(2026, 9, 13, tzinfo=timezone.utc).timestamp()
@@ -48,7 +48,7 @@ def test_exact_duplicates_keep_conditions_evidence_and_original_files(library, m
     third = note(notes, "c.md", first.read_text(), meta={"conditions": {"mode": "eager"}})
     fourth = note(notes, "d.md", first.read_text(), meta={"conditions": {"mode": "graph"}, "evidence": "Another case"})
     before = {path: path.read_bytes() for path in notes.iterdir()}
-    from vaws_knowledge.local import backend
+    from mindie_knowledge.local import backend
     monkeypatch.setattr(backend, "backend_for_config", lambda *_: pytest.fail("retrieval must not start"))
     import urllib.request
     monkeypatch.setattr(urllib.request, "urlopen", lambda *_args, **_kwargs: pytest.fail("network must not start"))
@@ -111,8 +111,8 @@ def test_corrupt_cache_does_not_hide_authoritative_notes(library, corruption):
     ("snapshot", "another snapshot"),
 ])
 def test_corrupt_report_rebuilds_worklist_and_cli_stays_usable(library, monkeypatch, capsys, key, value):
-    from vaws_knowledge.cli import main
-    from vaws_knowledge.server import layers
+    from mindie_knowledge.cli import main
+    from mindie_knowledge.server import layers
 
     config, notes = library
     path = note(notes, "a.md", "# A\n\nObservation.")

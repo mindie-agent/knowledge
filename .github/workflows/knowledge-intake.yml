@@ -47,7 +47,7 @@ jobs:
           fi
           echo "INTAKE_PY=$intake_python" >> "$GITHUB_ENV"
           uv pip install --python "$intake_python" './tools/knowledge-intake[formats,test]'
-          "$intake_python" -I -c "import importlib.util; assert importlib.util.find_spec('vaws_knowledge') is None"
+          "$intake_python" -I -c "import importlib.util; assert importlib.util.find_spec('mindie_knowledge') is None"
       - name: Real formats, bounded HTTP/Git, and native result handoff
         env:
           OPENBLAS_NUM_THREADS: '1'

@@ -11,9 +11,9 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from vaws_knowledge import summary_hook
-from vaws_knowledge.markdown import load_document, meta_path
-from vaws_knowledge.server.layers import load_config
+from mindie_knowledge import summary_hook
+from mindie_knowledge.markdown import load_document, meta_path
+from mindie_knowledge.server.layers import load_config
 
 
 TEXT = "The prepared launch environment preserves CANN paths; the cause remains uncertain."
@@ -39,13 +39,13 @@ def snapshot(root):
 
 def test_replay_preserves_bytes_mtime_timestamp_and_queue(config):
     queue = Mock(return_value={"status": "local_only"})
-    with patch("vaws_knowledge.publishing.queue_capture", queue), \
-         patch("vaws_knowledge.server.capture.utc_now", return_value="2026-01-01T00:00:00Z"):
+    with patch("mindie_knowledge.publishing.queue_capture", queue), \
+         patch("mindie_knowledge.server.capture.utc_now", return_value="2026-01-01T00:00:00Z"):
         first = summary_hook.capture_summary(payload(), config=config, client="codex")
     root = config.mount("candidate").roots[0]
     before = snapshot(root)
-    with patch("vaws_knowledge.publishing.queue_capture", queue), \
-         patch("vaws_knowledge.server.capture.utc_now", return_value="2026-09-13T00:00:00Z"):
+    with patch("mindie_knowledge.publishing.queue_capture", queue), \
+         patch("mindie_knowledge.server.capture.utc_now", return_value="2026-09-13T00:00:00Z"):
         again = summary_hook.capture_summary(payload(), config=config, client="codex")
     assert again["status"] == "unchanged" and again["ref"] == first["ref"]
     assert snapshot(root) == before
@@ -55,7 +55,7 @@ def test_replay_preserves_bytes_mtime_timestamp_and_queue(config):
 
 def test_changed_summary_creates_new_evidence(config):
     queue = Mock(return_value={"status": "local_only"})
-    with patch("vaws_knowledge.publishing.queue_capture", queue):
+    with patch("mindie_knowledge.publishing.queue_capture", queue):
         first = summary_hook.capture_summary(payload(), config=config, client="codex")
         second = summary_hook.capture_summary(payload(TEXT + " A second run reproduced it."),
                                               config=config, client="codex")
@@ -87,7 +87,7 @@ def test_replay_does_not_undo_maintainer_changes(config, rename):
         meta_path(note).rename(meta_path(renamed))
         note.rename(renamed)
     before = snapshot(root)
-    with patch("vaws_knowledge.summary_hook.capture", side_effect=AssertionError("replay overwrote maintenance")):
+    with patch("mindie_knowledge.summary_hook.capture", side_effect=AssertionError("replay overwrote maintenance")):
         again = summary_hook.capture_summary(payload(), config=config, client="codex")
     assert again["status"] == "preserved" and again["ref"] == first["ref"]
     assert snapshot(root) == before
@@ -103,8 +103,8 @@ def test_parallel_delivery_saves_and_queues_once(config):
         return original(**kwargs)
 
     queue = Mock(return_value={"status": "local_only"})
-    with patch("vaws_knowledge.summary_hook.capture", side_effect=paused_capture) as save, \
-         patch("vaws_knowledge.publishing.queue_capture", queue), \
+    with patch("mindie_knowledge.summary_hook.capture", side_effect=paused_capture) as save, \
+         patch("mindie_knowledge.publishing.queue_capture", queue), \
          ThreadPoolExecutor(max_workers=2) as pool:
         first = pool.submit(summary_hook.capture_summary, payload(), config=config, client="codex")
         try:
@@ -130,7 +130,7 @@ def test_unrelated_summary_does_not_wait_for_other_content(config):
             assert release.wait(10)
         return original(**kwargs)
 
-    with patch("vaws_knowledge.summary_hook.capture", side_effect=paused_capture), \
+    with patch("mindie_knowledge.summary_hook.capture", side_effect=paused_capture), \
          ThreadPoolExecutor(max_workers=2) as pool:
         first = pool.submit(summary_hook.capture_summary, payload(), config=config, client="codex")
         try:
@@ -147,7 +147,7 @@ def test_unrelated_summary_does_not_wait_for_other_content(config):
 def test_hook_output_stays_quiet_and_uses_no_backend_or_transcript(config, monkeypatch, capsys):
     event = payload(transcript_path="this-file-must-not-be-read.jsonl")
     monkeypatch.setattr(summary_hook, "load_config", lambda **_: config)
-    with patch("vaws_knowledge.server.capture.backend_for_config", side_effect=AssertionError("backend started")):
+    with patch("mindie_knowledge.server.capture.backend_for_config", side_effect=AssertionError("backend started")):
         for _ in range(2):
             monkeypatch.setattr(summary_hook.sys, "stdin", io.StringIO(json.dumps(event)))
             assert summary_hook.main(["--client", "codex"]) == 0
@@ -158,7 +158,7 @@ def test_hook_output_stays_quiet_and_uses_no_backend_or_transcript(config, monke
 @pytest.mark.parametrize("count", [64, 512])
 @pytest.mark.parametrize("ready", [False, True])
 def test_new_summary_reads_bounded_old_notes_and_reuses_catalog(config, monkeypatch, count, ready):
-    from vaws_knowledge.catalog import refresh_catalog
+    from mindie_knowledge.catalog import refresh_catalog
 
     root = config.mount("candidate").roots[0]
     root.mkdir()
@@ -184,7 +184,7 @@ def test_new_summary_reads_bounded_old_notes_and_reuses_catalog(config, monkeypa
 
 
 def test_catalog_observed_missing_summary_identity_preserves_manual_rename(config):
-    from vaws_knowledge.catalog import refresh_catalog
+    from mindie_knowledge.catalog import refresh_catalog
 
     first = summary_hook.capture_summary(payload(), config=config, client="codex")
     assert refresh_catalog(config)["status"] == "ready"
@@ -195,7 +195,7 @@ def test_catalog_observed_missing_summary_identity_preserves_manual_rename(confi
     note.rename(renamed)
     renamed.write_text("# Updated human observation\n\nEarlier cause disproved.", encoding="utf-8")
     before = snapshot(root)
-    with patch("vaws_knowledge.summary_hook.capture", side_effect=AssertionError("replayed observed identity")):
+    with patch("mindie_knowledge.summary_hook.capture", side_effect=AssertionError("replayed observed identity")):
         result = summary_hook.capture_summary(payload(), config=config, client="codex")
     assert result["status"] == "preserved" and result["ref"] == first["ref"]
     assert result["title_lookup"]["incomplete"]
@@ -205,14 +205,14 @@ def test_catalog_observed_missing_summary_identity_preserves_manual_rename(confi
 def test_cold_summary_stops_before_scanning_when_deadline_elapsed(config):
     root = config.mount("candidate").roots[0]
     root.mkdir()
-    with patch("vaws_knowledge.server.capture.time.perf_counter", side_effect=[0.0, 0.026]), \
-         patch("vaws_knowledge.server.capture.os.scandir", side_effect=AssertionError("scanned after deadline")):
+    with patch("mindie_knowledge.server.capture.time.perf_counter", side_effect=[0.0, 0.026]), \
+         patch("mindie_knowledge.server.capture.os.scandir", side_effect=AssertionError("scanned after deadline")):
         result = summary_hook.capture_summary(payload(), config=config, client="codex")
     assert result["status"] == "saved" and result["title_lookup"]["incomplete"]
 
 
 def test_cold_summary_oversize_legacy_note_has_one_bounded_read(config):
-    from vaws_knowledge.server import capture as module
+    from mindie_knowledge.server import capture as module
 
     root = config.mount("candidate").roots[0]
     root.mkdir()

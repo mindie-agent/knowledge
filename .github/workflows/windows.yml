@@ -27,7 +27,7 @@ jobs:
           uv pip install -e '.[test]' -e tools/knowledge-intake
       - name: Native capture, query, distribution, CLI and OpenViking lifecycle
         env:
-          VAWS_KNOWLEDGE_LIVE_OV: "1"
+          MINDIE_KNOWLEDGE_LIVE_OV: "1"
           HOME: ${{ runner.temp }}/knowledge-test-home
           USERPROFILE: ${{ runner.temp }}/knowledge-test-home
         run: |

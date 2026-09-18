@@ -8,11 +8,11 @@ from unittest.mock import Mock
 
 import pytest
 
-from vaws_knowledge.local.backend import Hit, MemoryBackend, UnavailableBackend
-from vaws_knowledge.markdown import load_document, meta_path
-from vaws_knowledge.retrieval import fuse, source_excerpt
-from vaws_knowledge.server.layers import load_config
-from vaws_knowledge.server.query import explain, query
+from mindie_knowledge.local.backend import Hit, MemoryBackend, UnavailableBackend
+from mindie_knowledge.markdown import load_document, meta_path
+from mindie_knowledge.retrieval import fuse, source_excerpt
+from mindie_knowledge.server.layers import load_config
+from mindie_knowledge.server.query import explain, query
 
 
 def setup(tmp_path):
@@ -123,8 +123,8 @@ def test_invalid_lexical_scores_do_not_poison_fusion_or_single_route_ranks(bad):
 
 @pytest.mark.parametrize("catalog", [False, True])
 def test_public_hybrid_query_keeps_exact_alias_and_semantic_reference_among_common_hits(tmp_path, catalog):
-    from vaws_knowledge.catalog import refresh_catalog
-    from vaws_knowledge.markdown import normalized_sha256
+    from mindie_knowledge.catalog import refresh_catalog
+    from mindie_knowledge.markdown import normalized_sha256
 
     config, notes = setup(tmp_path)
     raw = "# Diagnostic notebook\n\nObservation has not established its cause.\n"
@@ -195,7 +195,7 @@ def test_newline_hash_scope_matches_normalized_source_text():
 
 def test_partly_missing_mount_is_incomplete_even_if_backend_ready(tmp_path):
     from dataclasses import replace
-    from vaws_knowledge.distribution.manifest import atomic_write_json
+    from mindie_knowledge.distribution.manifest import atomic_write_json
 
     config, notes = setup(tmp_path)
     (notes / "visible.md").write_text("# Seen\n\nunique_marker", encoding="utf-8")

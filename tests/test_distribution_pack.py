@@ -12,9 +12,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from distribution.helpers import GIT_SHA, make_corpus, make_manifest, make_pack
 
-from vaws_knowledge.distribution.errors import CorruptPack, IncompatiblePack
-from vaws_knowledge.distribution.manifest import ExpectedContract, validate_release_manifest
-from vaws_knowledge.distribution.pack import inspect_pack, verify_imported_pack, verify_model_files, verify_pack
+from mindie_knowledge.distribution.errors import CorruptPack, IncompatiblePack
+from mindie_knowledge.distribution.manifest import ExpectedContract, validate_release_manifest
+from mindie_knowledge.distribution.pack import inspect_pack, verify_imported_pack, verify_model_files, verify_pack
 
 
 def _verified_inputs(tmp_path: Path, **pack_kwargs):

@@ -8,9 +8,9 @@ import pytest
 pytest.importorskip("knowledge_intake")
 from knowledge_intake.feed_sync import GitFeed
 
-from vaws_knowledge.curation_export import export_notes
-from vaws_knowledge.loop.feed import Feed
-from vaws_knowledge.loop.store import Store
+from mindie_knowledge.curation_export import export_notes
+from mindie_knowledge.loop.feed import Feed
+from mindie_knowledge.loop.store import Store
 
 
 @pytest.fixture

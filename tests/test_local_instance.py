@@ -12,14 +12,14 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from vaws_knowledge.local.instance import (
+from mindie_knowledge.local.instance import (
     InstanceLock,
     LocalInstance,
     owned_process,
     pid_alive,
     stop_owned_pid,
 )
-from vaws_knowledge.local.shared import current_shared, shared_search_uri
+from mindie_knowledge.local.shared import current_shared, shared_search_uri
 
 
 class ProcessOwnership(unittest.TestCase):
@@ -29,7 +29,7 @@ class ProcessOwnership(unittest.TestCase):
         # DEVNULL the child blocks until the parent's private stdin reaches EOF.
         parent_code = r'''
 import json, subprocess, sys, threading, time
-from vaws_knowledge.local.instance import _popen_kwargs
+from mindie_knowledge.local.instance import _popen_kwargs
 reader = threading.Thread(target=lambda: sys.stdin.buffer.read(1))
 reader.start()
 time.sleep(.1)
@@ -65,7 +65,7 @@ print(json.dumps({'out': out.decode().strip(), 'err': err.decode(), 'exit': chil
 
     @unittest.skipIf(os.name == "nt", "POSIX process command width")
     def test_marker_after_long_arguments_survives_narrow_terminal(self) -> None:
-        marker = "vaws-knowledge-long-command-marker"
+        marker = "mindie-knowledge-long-command-marker"
         proc = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(30)", "x" * 512, marker],
         )
@@ -80,7 +80,7 @@ print(json.dumps({'out': out.decode().strip(), 'err': err.decode(), 'exit': chil
             proc.wait(timeout=5)
 
     def test_owned_process_requires_command_marker(self) -> None:
-        marker = "vaws-knowledge-ownership-marker"
+        marker = "mindie-knowledge-ownership-marker"
         proc = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(30)", marker],
         )
@@ -102,7 +102,7 @@ print(json.dumps({'out': out.decode().strip(), 'err': err.decode(), 'exit': chil
         self.assertFalse(owned_process(proc.pid, "not-this-instance"))
 
     def test_stop_owned_leaves_unrelated_pid_alone(self) -> None:
-        marker = "vaws-knowledge-do-not-kill"
+        marker = "mindie-knowledge-do-not-kill"
         proc = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(30)", marker],
         )

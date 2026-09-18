@@ -1,7 +1,7 @@
 """Shared helpers for distribution tests: synthetic packs, releases, fake clients.
 
 The fake client mirrors only the native OpenViking 0.4.19 surface that
-``vaws_knowledge.distribution`` uses, so logic tests never start a server.
+``mindie_knowledge.distribution`` uses, so logic tests never start a server.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-from vaws_knowledge.distribution.manifest import (
+from mindie_knowledge.distribution.manifest import (
     EMBEDDING_DIMENSION,
     EMBEDDING_MODEL,
     EMBEDDING_PROVIDER,
@@ -153,7 +153,7 @@ def make_manifest(
         "build": {
             "openviking": openviking,
             "openviking_sdk": "0.1.10",
-            "builder": "vaws-knowledge-distribution",
+            "builder": "mindie-knowledge-distribution",
             "builder_version": "0.2.0",
             "platform": "macOS arm64",
             "device": "cpu",

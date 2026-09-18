@@ -1,5 +1,5 @@
 """Quoted Markdown preserves conditions, tables, fences and source positions."""
-from vaws_knowledge.context import document_context, structured_excerpt
+from mindie_knowledge.context import document_context, structured_excerpt
 
 
 def assert_spans(raw, evidence):

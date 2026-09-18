@@ -4,9 +4,9 @@ from __future__ import annotations
 from pathlib import Path
 import subprocess
 
-from vaws_knowledge.code_map import build_code_map, compare_maps
-from vaws_knowledge.markdown import load_document
-from vaws_knowledge.relations import affected_documents, backlinks, build_relations
+from mindie_knowledge.code_map import build_code_map, compare_maps
+from mindie_knowledge.markdown import load_document
+from mindie_knowledge.relations import affected_documents, backlinks, build_relations
 
 
 def note(root, name, text):

@@ -1,1 +1,1 @@
-# Test helpers for vaws_knowledge.contribution
+# Test helpers for mindie_knowledge.contribution

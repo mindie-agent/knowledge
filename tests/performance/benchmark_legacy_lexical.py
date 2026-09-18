@@ -17,9 +17,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from vaws_knowledge.corpus import iter_entry_files
-from vaws_knowledge.markdown import load_document
-from vaws_knowledge.retrieval import lexical_search
+from mindie_knowledge.corpus import iter_entry_files
+from mindie_knowledge.markdown import load_document
+from mindie_knowledge.retrieval import lexical_search
 
 
 def main():

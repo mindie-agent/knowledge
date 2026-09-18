@@ -9,9 +9,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from vaws_knowledge.distribution.__main__ import main as cli_main
-from vaws_knowledge.distribution.client import provision_tenant_key
-from vaws_knowledge.distribution.errors import DistributionError
+from mindie_knowledge.distribution.__main__ import main as cli_main
+from mindie_knowledge.distribution.client import provision_tenant_key
+from mindie_knowledge.distribution.errors import DistributionError
 
 
 class FakeAdmin:
@@ -89,7 +89,7 @@ def test_tenant_key_cli_requires_env(capsys, monkeypatch):
 
 def test_tenant_key_cli_prints_bare_key(capsys, monkeypatch):
     monkeypatch.setenv("OV_ROOT_KEY", "root")
-    import vaws_knowledge.distribution.client as client_module
+    import mindie_knowledge.distribution.client as client_module
 
     admin = FakeAdmin(key="printed-key")
     original = client_module.provision_tenant_key

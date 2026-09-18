@@ -20,10 +20,10 @@ import unittest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "fixtures" / "server"))
 
 import support  # noqa: E402
-from vaws_knowledge import package_version
-from vaws_knowledge.local.reconcile import reconcile_markdown
-from vaws_knowledge.server.layers import load_config  # noqa: E402
-from vaws_knowledge.server.mcp_server import (  # noqa: E402
+from mindie_knowledge import package_version
+from mindie_knowledge.local.reconcile import reconcile_markdown
+from mindie_knowledge.server.layers import load_config  # noqa: E402
+from mindie_knowledge.server.mcp_server import (  # noqa: E402
     METHOD_NOT_FOUND,
     PARSE_ERROR,
     KnowledgeService,
@@ -110,7 +110,7 @@ class Handshake(unittest.TestCase):
         self.assertIn("newline-delimited JSON-RPC", info["framing"])
         self.assertEqual(
             ["title", "content"],
-            result["capabilities"]["experimental"]["vaws-knowledge"]["capture_required"],
+            result["capabilities"]["experimental"]["mindie-knowledge"]["capture_required"],
         )
 
     def test_initialize_reports_absent_layers_with_reasons(self):
@@ -224,7 +224,7 @@ class Tools(unittest.TestCase):
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:
             svc = KnowledgeService(config=support.build_config(candidate=tmp))
-            with patch("vaws_knowledge.server.capture.backend_for_config", side_effect=AssertionError("index started")):
+            with patch("mindie_knowledge.server.capture.backend_for_config", side_effect=AssertionError("index started")):
                 result = call(svc, "knowledge_capture", {"title": "Local observation", "content": "Recorded with uncertain cause."})
             self.assertFalse(result["isError"], result)
             payload = result["structuredContent"]
@@ -255,7 +255,7 @@ class Tools(unittest.TestCase):
 
 class Degradation(unittest.TestCase):
     def test_index_failure_is_not_overwritten_by_healthy_mounts(self):
-        from vaws_knowledge.local.backend import UnavailableBackend
+        from mindie_knowledge.local.backend import UnavailableBackend
         svc = service()
         svc.config.retrieval = UnavailableBackend("not ready")
         result = call(svc, "knowledge_query", {"text": "reference"})["structuredContent"]
@@ -272,7 +272,7 @@ class Degradation(unittest.TestCase):
 
     def test_unreadable_configuration_degrades_instead_of_dying(self):
         with tempfile.TemporaryDirectory() as tmp:
-            path = pathlib.Path(tmp) / "vaws-knowledge.json"
+            path = pathlib.Path(tmp) / "mindie-knowledge.json"
             path.write_text("{not json")
             svc = KnowledgeService(config_path=path, env={}, today=TODAY)
             payload = call(svc, "knowledge_query", {"text": "anything"})["structuredContent"]
@@ -328,16 +328,16 @@ class StdioSubprocessHandshake(unittest.TestCase):
         env = {
             **os.environ,
             "PYTHONPATH": str(repo),
-            "VAWS_KNOWLEDGE_BACKEND": "memory",
-            "VAWS_KNOWLEDGE_CANDIDATE_ROOT": tmp.name,
-            "VAWS_KNOWLEDGE_STATE": str(pathlib.Path(tmp.name) / "instance"),
-            "VAWS_DIAGNOSTICS_ROOT": str(pathlib.Path(tmp.name) / "diagnostics"),
-            "VAWS_KNOWLEDGE_PROJECT_ROOTS": "",
-            "VAWS_KNOWLEDGE_SHARED_ROOTS": "",
+            "MINDIE_KNOWLEDGE_BACKEND": "memory",
+            "MINDIE_KNOWLEDGE_CANDIDATE_ROOT": tmp.name,
+            "MINDIE_KNOWLEDGE_STATE": str(pathlib.Path(tmp.name) / "instance"),
+            "MINDIE_DIAGNOSTICS_ROOT": str(pathlib.Path(tmp.name) / "diagnostics"),
+            "MINDIE_KNOWLEDGE_PROJECT_ROOTS": "",
+            "MINDIE_KNOWLEDGE_SHARED_ROOTS": "",
         }
-        env.pop("VAWS_KNOWLEDGE_CORPUS", None)
+        env.pop("MINDIE_KNOWLEDGE_CORPUS", None)
         proc = subprocess.Popen(
-            [sys.executable, "-m", "vaws_knowledge", "server"],
+            [sys.executable, "-m", "mindie_knowledge", "server"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -360,7 +360,7 @@ class StdioSubprocessHandshake(unittest.TestCase):
             send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
             init = recv()
             self.assertEqual(init["id"], 1)
-            self.assertEqual(init["result"]["serverInfo"]["name"], "vaws-knowledge")
+            self.assertEqual(init["result"]["serverInfo"]["name"], "mindie-knowledge")
             self.assertIn("newline-delimited JSON-RPC", init["result"]["serviceInfo"]["framing"])
             send({"jsonrpc": "2.0", "method": "notifications/initialized"})
             send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})

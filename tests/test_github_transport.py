@@ -11,9 +11,9 @@ from unittest.mock import patch
 
 import pytest
 
-from vaws_knowledge.contribution.consent import ContributionPaused
-from vaws_knowledge.contribution.github import GitHubError, UrllibContributionGitHub, _NoRedirect
-from vaws_knowledge.github_transport import ensure_fork, github_token, git_environment, redact_credentials
+from mindie_knowledge.contribution.consent import ContributionPaused
+from mindie_knowledge.contribution.github import GitHubError, UrllibContributionGitHub, _NoRedirect
+from mindie_knowledge.github_transport import ensure_fork, github_token, git_environment, redact_credentials
 from contribution.support import init_git_repo
 
 
@@ -22,14 +22,14 @@ def test_environment_token_needs_no_github_cli(monkeypatch, name):
     monkeypatch.delenv("GH_TOKEN", raising=False)
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     monkeypatch.setenv(name, "fixture-token-not-a-credential")
-    with patch("vaws_knowledge.github_transport.gh", side_effect=AssertionError("gh must not run")):
+    with patch("mindie_knowledge.github_transport.gh", side_effect=AssertionError("gh must not run")):
         assert github_token() == "fixture-token-not-a-credential"
 
 
 def test_missing_token_and_cli_has_actionable_redacted_error(monkeypatch):
     monkeypatch.delenv("GH_TOKEN", raising=False)
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-    with patch("vaws_knowledge.github_transport.gh", side_effect=FileNotFoundError):
+    with patch("mindie_knowledge.github_transport.gh", side_effect=FileNotFoundError):
         with pytest.raises(RuntimeError, match="GH_TOKEN/GITHUB_TOKEN"):
             github_token()
 
@@ -105,7 +105,7 @@ def test_token_only_fork_setup_with_real_private_clone(tmp_path, monkeypatch, ex
     init_git_repo(source)
     destination = tmp_path / "dedicated-clone"
     api = ForkApi(existing=existing)
-    from vaws_knowledge.contribution import gitops
+    from mindie_knowledge.contribution import gitops
     native_git = gitops.run_git
     clone_calls = []
 
@@ -121,8 +121,8 @@ def test_token_only_fork_setup_with_real_private_clone(tmp_path, monkeypatch, ex
             return result
         return native_git(repo, args, **kwargs)
 
-    with patch("vaws_knowledge.github_transport.gh", side_effect=AssertionError("no CLI")), \
-         patch("vaws_knowledge.contribution.github.UrllibContributionGitHub", return_value=api), \
+    with patch("mindie_knowledge.github_transport.gh", side_effect=AssertionError("no CLI")), \
+         patch("mindie_knowledge.contribution.github.UrllibContributionGitHub", return_value=api), \
          patch.object(gitops, "run_git", side_effect=git):
         result = ensure_fork("example/corpus", destination, github_user="maoxx241")
         again = ensure_fork("example/corpus", destination, github_user="maoxx241")
@@ -139,7 +139,7 @@ def test_fork_setup_rejects_wrong_identity_or_withdrawn_consent_before_write(tmp
     # Withdrawal occurs after read-only identity/fork inspection, before fork creation.
     consent_checks = iter([True, False])
     callback = (lambda: next(consent_checks)) if failure == "consent" else None
-    with patch("vaws_knowledge.contribution.github.UrllibContributionGitHub", return_value=api):
+    with patch("mindie_knowledge.contribution.github.UrllibContributionGitHub", return_value=api):
         with pytest.raises((ValueError, RuntimeError, ContributionPaused)):
             ensure_fork("example/corpus", tmp_path / "fork",
                         github_user="different-user" if failure == "owner" else "maoxx241", authorize=callback)

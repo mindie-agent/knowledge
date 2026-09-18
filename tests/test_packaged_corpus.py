@@ -12,8 +12,8 @@ import unittest
 import zipfile
 from pathlib import Path
 
-from vaws_knowledge import corpus
-from vaws_knowledge.markdown import parse_markdown
+from mindie_knowledge import corpus
+from mindie_knowledge.markdown import parse_markdown
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -43,7 +43,7 @@ def _build_wheel(out_dir: Path) -> Path:
             capture_output=True,
             text=True,
         )
-    wheels = sorted(out_dir.glob("vaws_knowledge-*.whl"))
+    wheels = sorted(out_dir.glob("mindie_knowledge-*.whl"))
     if not wheels:
         raise AssertionError(f"no wheel produced in {out_dir}")
     return wheels[-1]
@@ -81,15 +81,15 @@ class WheelShipsCorpus(unittest.TestCase):
                 names = archive.namelist()
                 for retired in ("bot/", "sync/", "conformance/", "schemas/",
                                 "canonical.py", "export.py", "validate.py"):
-                    self.assertFalse(any(name.startswith("vaws_knowledge/" + retired) for name in names))
+                    self.assertFalse(any(name.startswith("mindie_knowledge/" + retired) for name in names))
             venv = tmp / "venv"
             subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True)
             python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
             subprocess.run([str(python), "-m", "pip", "install", "--quiet", "--no-deps", "--no-index", str(wheel)], check=True)
             script = """
 import hashlib, json, sys
-from vaws_knowledge import corpus
-assert "vaws_diagnostics" not in sys.modules
+from mindie_knowledge import corpus
+assert "mindie_diagnostics" not in sys.modules
 root = corpus.corpus_root()
 print(json.dumps({
     "packaged": "site-packages" in root.as_posix() and "/data/corpus" in root.as_posix(),

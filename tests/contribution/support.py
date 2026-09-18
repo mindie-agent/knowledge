@@ -7,10 +7,10 @@ from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import parse_qs, urlparse
 
-from vaws_knowledge.contribution.documents import MarkdownDocument
-from vaws_knowledge.contribution.github import GitHubError
+from mindie_knowledge.contribution.documents import MarkdownDocument
+from mindie_knowledge.contribution.github import GitHubError
 
-OWNER_REPO = "owner/vaws-knowledge-corpus"
+OWNER_REPO = "owner/mindie-knowledge-corpus"
 DEFAULT_BRANCH = "main"
 
 

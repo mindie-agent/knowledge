@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from vaws_diagnostics import configure
+from mindie_diagnostics import configure
 
 
 def records(root):
@@ -19,14 +19,14 @@ def records(root):
 @pytest.fixture
 def diagnostic_root(tmp_path, monkeypatch):
     root = tmp_path / "diagnostics"
-    monkeypatch.setenv("VAWS_DIAGNOSTICS_ROOT", str(root))
-    rec = configure("vaws-knowledge", root=root, level="DEBUG")
+    monkeypatch.setenv("MINDIE_DIAGNOSTICS_ROOT", str(root))
+    rec = configure("mindie-knowledge", root=root, level="DEBUG")
     yield root
     rec.close()
 
 
 def test_tool_fault_retains_stack_and_server_remains_usable(diagnostic_root, monkeypatch):
-    from vaws_knowledge.server.mcp_server import KnowledgeService
+    from mindie_knowledge.server.mcp_server import KnowledgeService
     service = KnowledgeService(config_mapping={"backend": "memory"}, env={})
     error = RuntimeError("backend unavailable")
     def unavailable(args):
@@ -43,7 +43,7 @@ def test_tool_fault_retains_stack_and_server_remains_usable(diagnostic_root, mon
 
 
 def test_optional_summary_keeps_stdout_and_records_failure(diagnostic_root, monkeypatch, capsys):
-    from vaws_knowledge import summary_hook
+    from mindie_knowledge import summary_hook
     monkeypatch.setattr("sys.stdin", io.StringIO("{bad JSON"))
     assert summary_hook.main(["--client", "codex"]) == 0
     assert capsys.readouterr().out == "{}\n"
@@ -53,8 +53,8 @@ def test_optional_summary_keeps_stdout_and_records_failure(diagnostic_root, monk
 
 
 def test_maintenance_thread_records_real_final_write_failure(diagnostic_root, tmp_path, monkeypatch):
-    from vaws_knowledge import maintenance
-    from vaws_knowledge.server.layers import load_config
+    from mindie_knowledge import maintenance
+    from mindie_knowledge.server.layers import load_config
     config = load_config({"backend": "memory", "state_root": str(tmp_path / "state"),
                           "layers": {"shared": {"enabled": False}, "project": {"enabled": False},
                                      "candidate": {"enabled": False}},
@@ -79,7 +79,7 @@ def test_maintenance_thread_records_real_final_write_failure(diagnostic_root, tm
 
 
 def test_backend_initialization_failure_keeps_original_exception(diagnostic_root, tmp_path, monkeypatch):
-    from vaws_knowledge.local.instance import LocalInstance
+    from mindie_knowledge.local.instance import LocalInstance
     instance = LocalInstance(tmp_path / "state")
     monkeypatch.setattr(instance, "describe", lambda: {"live": False})
     monkeypatch.setattr(instance, "_credentials", lambda: {})
@@ -94,7 +94,7 @@ def test_backend_initialization_failure_keeps_original_exception(diagnostic_root
 
 
 def test_large_child_log_tail_is_bounded(tmp_path):
-    from vaws_knowledge.local.instance import _log_tail
+    from mindie_knowledge.local.instance import _log_tail
     path = tmp_path / "child.log"
     path.write_bytes(b"old line\n" * 200_000 + "last detail".encode())
     assert _log_tail(path, 80).endswith("last detail")
@@ -102,10 +102,10 @@ def test_large_child_log_tail_is_bounded(tmp_path):
 
 
 def test_logging_failure_never_gates_knowledge(tmp_path, capsys):
-    from vaws_knowledge.observability import observed
+    from mindie_knowledge.observability import observed
     blocked = tmp_path / "file"
     blocked.write_text("not a directory")
-    rec = configure("vaws-knowledge", root=blocked)
+    rec = configure("mindie-knowledge", root=blocked)
     @observed("knowledge.local")
     def value():
         return {"answer": "unknown"}
@@ -120,7 +120,7 @@ def test_logging_failure_never_gates_knowledge(tmp_path, capsys):
 def test_daemon_uses_original_entrypoint_arguments(monkeypatch):
     from contextlib import nullcontext
     from types import SimpleNamespace
-    from vaws_knowledge.local import daemon
+    from mindie_knowledge.local import daemon
     called = []
     entry = SimpleNamespace(group="console_scripts", name="openviking-server",
                             load=lambda: lambda: called.append(list(sys.argv)))
@@ -138,7 +138,7 @@ def test_daemon_uses_original_entrypoint_arguments(monkeypatch):
     (["redact", "--check"], 2, "caller"),
 ])
 def test_real_cli_argument_errors_stay_in_inherited_private_root(diagnostic_root, arguments, exit_code, classification):
-    proc = subprocess.run([sys.executable, "-m", "vaws_knowledge", *arguments],
+    proc = subprocess.run([sys.executable, "-m", "mindie_knowledge", *arguments],
                           capture_output=True, text=True, encoding="utf-8", timeout=10)
     assert proc.returncode == exit_code
     ended = [row for row in records(diagnostic_root) if row["event"] == "operation.end"]
@@ -150,7 +150,7 @@ def test_real_cli_argument_errors_stay_in_inherited_private_root(diagnostic_root
 def test_expected_redaction_findings_are_not_tool_failures(diagnostic_root, tmp_path):
     path = tmp_path / "note.md"
     path.write_text("# Fixture\n\n" + ".".join(map(str, (10, 43, 51, 19))), encoding="utf-8")
-    proc = subprocess.run([sys.executable, "-m", "vaws_knowledge", "redact", "--check", str(path)],
+    proc = subprocess.run([sys.executable, "-m", "mindie_knowledge", "redact", "--check", str(path)],
                           capture_output=True, text=True, encoding="utf-8", timeout=10)
     assert proc.returncode == 1
     events = records(diagnostic_root)
@@ -159,7 +159,7 @@ def test_expected_redaction_findings_are_not_tool_failures(diagnostic_root, tmp_
 
 
 def test_unknown_business_exit_two_is_not_inferred_caller(diagnostic_root):
-    from vaws_knowledge.observability import observed
+    from mindie_knowledge.observability import observed
     @observed("knowledge.fixture.business")
     def business():
         return 2
@@ -174,13 +174,13 @@ def test_unknown_business_exit_two_is_not_inferred_caller(diagnostic_root):
 def test_public_bundle_retains_failure_classification_and_numeric_code(
     diagnostic_root, tmp_path, classification, error_code
 ):
-    from vaws_diagnostics import get_recorder
+    from mindie_diagnostics import get_recorder
 
-    with get_recorder("vaws-knowledge").operation("projection.fixture") as operation:
+    with get_recorder("mindie-knowledge").operation("projection.fixture") as operation:
         operation.fail("argument_validation", classification=classification, error_code=error_code)
     output = tmp_path / "public-bundle.json"
     proc = subprocess.run(
-        [sys.executable, "-m", "vaws_knowledge", "diagnostics", "bundle",
+        [sys.executable, "-m", "mindie_knowledge", "diagnostics", "bundle",
          "--root", str(diagnostic_root), "--operation-id", operation.summary()["operation_id"],
          "--output", str(output)],
         capture_output=True, text=True, encoding="utf-8", timeout=15,

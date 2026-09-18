@@ -5,10 +5,10 @@ from unittest.mock import Mock
 
 import pytest
 
-from vaws_knowledge.distribution import client as distribution_client
-from vaws_knowledge.local import instance as module
-from vaws_knowledge.local.embedding import PreparedModel
-from vaws_knowledge.local.instance import LocalInstance
+from mindie_knowledge.distribution import client as distribution_client
+from mindie_knowledge.local import instance as module
+from mindie_knowledge.local.embedding import PreparedModel
+from mindie_knowledge.local.instance import LocalInstance
 
 
 def test_database_rebuild_reprovisions_only_rejected_tenant_key(tmp_path, monkeypatch):

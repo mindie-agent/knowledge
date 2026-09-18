@@ -21,11 +21,11 @@ FIXTURES = REPO_ROOT / "tests" / "fixtures" / "tools"
 EXAMPLE_ENTRY = REPO_ROOT / "examples" / "corpus-contribution" / "ordinary.md"
 
 def run_tool(name: str, *args: str, python: str | None = None) -> subprocess.CompletedProcess:
-    """Run ``python -m vaws_knowledge <name> ARGS`` from the repo root."""
-    cmd = [python or sys.executable, "-m", "vaws_knowledge", name, *args]
+    """Run ``python -m mindie_knowledge <name> ARGS`` from the repo root."""
+    cmd = [python or sys.executable, "-m", "mindie_knowledge", name, *args]
     # This helper also supports direct unittest execution without conftest.
     with tempfile.TemporaryDirectory(prefix="vaws-tool-diagnostics-") as diagnostic_root:
-        env = dict(os.environ, VAWS_DIAGNOSTICS_ROOT=diagnostic_root)
+        env = dict(os.environ, MINDIE_DIAGNOSTICS_ROOT=diagnostic_root)
         return subprocess.run(cmd, cwd=REPO_ROOT, env=env, capture_output=True, text=True, encoding="utf-8")
 
 

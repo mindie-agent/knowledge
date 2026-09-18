@@ -14,19 +14,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from distribution.helpers import FakeClient, make_release_dir
 from test_distribution_build import BuildFakeClient, _repo
 
-from vaws_knowledge.distribution.build import build_pack
-from vaws_knowledge.distribution.errors import CorruptPack, SourceUnavailable
-from vaws_knowledge.distribution.manifest import EMBEDDING_MODEL, ExpectedContract, validate_release_manifest, sha256_file
-from vaws_knowledge.distribution.references import prepared_shared_documents, verify_references
-from vaws_knowledge.distribution.release import LocalReleaseSource, make_release
-from vaws_knowledge.distribution.sync import DistributionState, check_and_sync, current_shared
-from vaws_knowledge.markdown import normalized_sha256
+from mindie_knowledge.distribution.build import build_pack
+from mindie_knowledge.distribution.errors import CorruptPack, SourceUnavailable
+from mindie_knowledge.distribution.manifest import EMBEDDING_MODEL, ExpectedContract, validate_release_manifest, sha256_file
+from mindie_knowledge.distribution.references import prepared_shared_documents, verify_references
+from mindie_knowledge.distribution.release import LocalReleaseSource, make_release
+from mindie_knowledge.distribution.sync import DistributionState, check_and_sync, current_shared
+from mindie_knowledge.markdown import normalized_sha256
 
 EMBEDDING = {"model": EMBEDDING_MODEL, "dimension": 384}
 
 
 def build(tmp_path, monkeypatch, *, alias="Gemma graph padding", topic="vllm-ascend"):
-    from vaws_knowledge.distribution import build as module
+    from mindie_knowledge.distribution import build as module
     monkeypatch.setattr(module, "_installed_version", lambda package: "0.4.19" if package == "openviking" else "0.1.10")
     raw = "# RMSNorm observation\n\n## Conditions\nshape: 32 tokens\n\nGemma replay used the recorded shape. Cause remains unknown.\n"
     metadata = {"source": {"path": "C:/Users/private-person/secret.md", "host": "192.168.19.2"},
@@ -146,8 +146,8 @@ def test_legacy_pack_reuses_body_without_claiming_enrichment(tmp_path):
 
 
 def test_catalog_search_discovers_prepared_alias_and_keeps_topic_selection(tmp_path, monkeypatch):
-    from vaws_knowledge.catalog import refresh_catalog, search_catalog
-    from vaws_knowledge.server.layers import load_config
+    from mindie_knowledge.catalog import refresh_catalog, search_catalog
+    from mindie_knowledge.server.layers import load_config
     result, _, _ = build(tmp_path, monkeypatch, alias="numeric normalization incident", topic="ascend")
     release = make_release(pack_path=result.pack_path, build_manifest=result.manifest, out_dir=tmp_path / "release")
     state = tmp_path / "state"
@@ -166,12 +166,12 @@ def test_catalog_search_discovers_prepared_alias_and_keeps_topic_selection(tmp_p
 def test_prepared_catalog_explain_keeps_release_provenance_separate_from_engine_and_local_sources(tmp_path, monkeypatch):
     from importlib import import_module
     from unittest.mock import patch
-    from vaws_knowledge.catalog import catalog_path, refresh_catalog
-    from vaws_knowledge.local.backend import MemoryBackend
-    from vaws_knowledge.markdown import load_document
-    from vaws_knowledge.server.layers import load_config
+    from mindie_knowledge.catalog import catalog_path, refresh_catalog
+    from mindie_knowledge.local.backend import MemoryBackend
+    from mindie_knowledge.markdown import load_document
+    from mindie_knowledge.server.layers import load_config
 
-    module = import_module("vaws_knowledge.server.query")
+    module = import_module("mindie_knowledge.server.query")
     result, _, _ = build(tmp_path, monkeypatch)
     release = make_release(pack_path=result.pack_path, build_manifest=result.manifest, out_dir=tmp_path / "release")
     state = tmp_path / "state"
@@ -229,8 +229,8 @@ def test_prepared_catalog_explain_keeps_release_provenance_separate_from_engine_
 
 
 def test_context_lines_are_derived_after_public_preparation_and_stale_alias_is_ignored():
-    from vaws_knowledge.distribution.references import prepare_reference
-    from vaws_knowledge.context import document_context
+    from mindie_knowledge.distribution.references import prepare_reference
+    from mindie_knowledge.context import document_context
     raw = "An earlier observation.\n\n# RMSNorm\n\n## Conditions\nhost: 192.168.12.3\n\nMeasured result remains conditional.\n"
     final, row = prepare_reference("rmsnorm.md", raw, {"retrieval": {
         "source_sha256": "f" * 64, "aliases": ["outdated unrelated result"], "topics": ["old"]}})

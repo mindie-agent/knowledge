@@ -10,10 +10,10 @@ from unittest.mock import Mock
 
 import pytest
 
-from vaws_knowledge.distribution.manifest import ReleaseManifest
-from vaws_knowledge.local import embedding
-from vaws_knowledge.local.embedding import PreparedModel, prepare_embedding_cache
-from vaws_knowledge.local.instance import LocalInstance
+from mindie_knowledge.distribution.manifest import ReleaseManifest
+from mindie_knowledge.local import embedding
+from mindie_knowledge.local.embedding import PreparedModel, prepare_embedding_cache
+from mindie_knowledge.local.instance import LocalInstance
 
 
 def model_files(root: Path) -> None:
@@ -39,7 +39,7 @@ def test_external_seed_is_read_only_and_owned_cache_is_warm(tmp_path, monkeypatc
     source = tmp_path / "external"
     model_files(source)
     before = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in source.iterdir()}
-    monkeypatch.setenv("VAWS_KNOWLEDGE_EMBEDDING_CACHE", str(source))
+    monkeypatch.setenv("MINDIE_KNOWLEDGE_EMBEDDING_CACHE", str(source))
     instance = LocalInstance(tmp_path / "instance")
     assert instance.cache_dir == tmp_path / "instance" / "embedding-cache"
     prepared = instance.prepare_model()
@@ -147,7 +147,7 @@ def test_manifest_cannot_resolve_outside_cache(tmp_path, loaders):
 
 
 def test_starting_pid_is_saved_before_each_health_wait(tmp_path, monkeypatch):
-    from vaws_knowledge.local import instance as module
+    from mindie_knowledge.local import instance as module
 
     instance = LocalInstance(tmp_path)
     monkeypatch.setattr(instance, "describe", lambda: {"live": False, "pid": {}})
@@ -180,7 +180,7 @@ def test_starting_pid_is_saved_before_each_health_wait(tmp_path, monkeypatch):
 
 
 def test_successful_start_marks_pid_running(tmp_path, monkeypatch):
-    from vaws_knowledge.local import instance as module
+    from mindie_knowledge.local import instance as module
 
     instance = LocalInstance(tmp_path)
     # Legacy log storage failure cannot gate the new process-owned diagnostic sink.
@@ -201,7 +201,7 @@ def test_successful_start_marks_pid_running(tmp_path, monkeypatch):
         assert launch.kwargs["stdin"] == module.subprocess.DEVNULL
         assert launch.kwargs["stdout"] == module.subprocess.DEVNULL
         assert launch.kwargs["stderr"] == module.subprocess.DEVNULL
-        assert launch.args[0][1:3] == ["-m", "vaws_knowledge.local.daemon"]
+        assert launch.args[0][1:3] == ["-m", "mindie_knowledge.local.daemon"]
         if module.os.name == "nt":
             assert launch.kwargs["creationflags"] & module.subprocess.CREATE_NO_WINDOW
 
@@ -262,8 +262,8 @@ def test_release_pin_rejects_wrong_active_snapshot(tmp_path, monkeypatch):
 
 def test_active_manifest_uses_distribution_pointer(tmp_path):
     from tests.distribution.helpers import GIT_SHA, make_release_dir
-    from vaws_knowledge.distribution.manifest import shared_root_uri, version_id_from_sha
-    from vaws_knowledge.distribution.sync import CURRENT_SCHEMA, DistributionState
+    from mindie_knowledge.distribution.manifest import shared_root_uri, version_id_from_sha
+    from mindie_knowledge.distribution.sync import CURRENT_SCHEMA, DistributionState
 
     instance = LocalInstance(tmp_path)
     state = DistributionState(tmp_path)
@@ -294,7 +294,7 @@ def test_missing_release_metadata_keeps_verified_cache_warm(tmp_path, loaders):
 
 
 def test_model_fingerprint_ignores_metadata_and_detects_weights(tmp_path):
-    from vaws_knowledge.local.openviking import OpenVikingBackend
+    from mindie_knowledge.local.openviking import OpenVikingBackend
 
     instance = LocalInstance(tmp_path)
     instance.cache_dir.mkdir()

@@ -6,11 +6,11 @@ from pathlib import Path
 
 import pytest
 
-from vaws_knowledge.catalog import catalog_path, export_catalog, refresh_catalog, repair_catalog, search_catalog
-from vaws_knowledge.local.backend import MemoryBackend
-from vaws_knowledge.markdown import load_document, meta_path, normalized_sha256, save_document
-from vaws_knowledge.server.layers import load_config
-from vaws_knowledge.server.query import explain, query
+from mindie_knowledge.catalog import catalog_path, export_catalog, refresh_catalog, repair_catalog, search_catalog
+from mindie_knowledge.local.backend import MemoryBackend
+from mindie_knowledge.markdown import load_document, meta_path, normalized_sha256, save_document
+from mindie_knowledge.server.layers import load_config
+from mindie_knowledge.server.query import explain, query
 
 
 @pytest.fixture
@@ -42,7 +42,7 @@ def test_unchanged_refresh_reads_no_bodies_and_query_does_not_scan(library, monk
     second = refresh_catalog(config)
     assert second["parsed"] == second["read_bytes"] == 0 and second["unchanged"] == 40
     assert first["snapshot"] == second["snapshot"]
-    from vaws_knowledge.server import query as module
+    from mindie_knowledge.server import query as module
     monkeypatch.setattr(module, "load_layer_documents", lambda *_a, **_k: pytest.fail("query scanned sources"))
     read = Path.open
     reads = []
@@ -79,7 +79,7 @@ def test_new_vector_reference_reads_exact_original_before_catalog_refresh(librar
     path = note(notes, "fresh.md", "# New graph observation\n\nnewvectorquartz")
     uri = "viking://resources/project/fresh.md"
     config.retrieval.upsert(uri, path.read_text(encoding="utf-8"), layer="project")
-    from vaws_knowledge.server import query as module
+    from mindie_knowledge.server import query as module
     monkeypatch.setattr(module, "load_layer_documents", lambda *_a, **_k: pytest.fail("new hit scanned collection"))
     result = query(config, text="newvectorquartz", limit=1)
     assert result.results[0]["ref"] == uri and result.source_reads == 1
@@ -213,7 +213,7 @@ def _observed_scandir(original, on_entry):
 
 
 def test_cold_fallback_bounds_non_markdown_directory_entries(library, monkeypatch):
-    from vaws_knowledge.server import query as module
+    from mindie_knowledge.server import query as module
 
     config, notes = library
     for number in range(256):
@@ -231,7 +231,7 @@ def test_cold_fallback_bounds_non_markdown_directory_entries(library, monkeypatc
 
 
 def test_cold_fallback_checks_deadline_while_visiting_empty_directories(library, monkeypatch):
-    from vaws_knowledge.server import query as module
+    from mindie_knowledge.server import query as module
 
     config, notes = library
     for number in range(16):
@@ -255,7 +255,7 @@ def test_cold_fallback_checks_deadline_while_visiting_empty_directories(library,
 
 def test_cold_fallback_entry_budget_is_shared_across_mount_roots(library, monkeypatch):
     from dataclasses import replace
-    from vaws_knowledge.server import query as module
+    from mindie_knowledge.server import query as module
 
     config, notes = library
     other = notes.parent / "other"
@@ -275,7 +275,7 @@ def test_growing_oversize_hit_is_unknown_without_unbounded_read(library):
     config, notes = library
     path = note(notes, "large.md", "# Graph\n\nunique_growth_case")
     refresh_catalog(config)
-    from vaws_knowledge.markdown import MAX_REFERENCE_BYTES
+    from mindie_knowledge.markdown import MAX_REFERENCE_BYTES
     path.write_text("# Graph\n\nunique_growth_case " + "x" * MAX_REFERENCE_BYTES, encoding="utf-8")
     found = query(config, text="unique_growth_case")
     assert found.results == [] and found.incomplete
@@ -294,7 +294,7 @@ def test_config_keeps_backend_holder_separate_from_catalog_options(tmp_path):
 
 def test_older_catalog_title_index_is_added_only_by_maintenance(library):
     import sqlite3
-    from vaws_knowledge.catalog import catalog_title_matches
+    from mindie_knowledge.catalog import catalog_title_matches
 
     config, notes = library
     note(notes, "legacy.md", "# Legacy title\n\nACLGraph observation.")
@@ -312,7 +312,7 @@ def test_older_catalog_title_index_is_added_only_by_maintenance(library):
 
 
 def test_catalog_title_lookup_retains_observed_source_gaps(library):
-    from vaws_knowledge.catalog import catalog_title_matches
+    from mindie_knowledge.catalog import catalog_title_matches
 
     config, notes = library
     path = note(notes, "bad.md", "# Unreadable metadata\n\nEarlier evidence.")
@@ -348,7 +348,7 @@ def test_imported_shared_versions_switch_without_mixing_old_aliases(tmp_path, mo
         documents.append(document)
         pointers.append({"root_uri": f"viking://resources/shared/{version}", "prepared_root": str(prepared),
                          "source_git_sha": version})
-    from vaws_knowledge.server import query as module
+    from mindie_knowledge.server import query as module
     monkeypatch.setattr(module, "current_shared", lambda _: pointers[0])
     old = refresh_catalog(config, extra_documents=[documents[0]])
     assert query(config, text="sharedquartz").results[0]["ref"] == documents[0].uri
@@ -373,13 +373,13 @@ def test_failed_shared_iterator_preserves_previous_snapshot(library):
     document.uri = "viking://resources/shared/old/source.md"
     before = refresh_catalog(config, extra_documents=[document])
     from dataclasses import replace
-    from vaws_knowledge.distribution.errors import CorruptPack
+    from mindie_knowledge.distribution.errors import CorruptPack
     def interrupted():
         yield replace(document, uri="viking://resources/shared/new/source.md")
         raise CorruptPack("prepared hash mismatch")
     failed = refresh_catalog(config, extra_documents=interrupted())
     assert failed["status"] == "pending"
-    from vaws_knowledge.catalog import get_catalog_document
+    from mindie_knowledge.catalog import get_catalog_document
     assert get_catalog_document(config, document.uri) is not None
     assert get_catalog_document(config, "viking://resources/shared/new/source.md") is None
     assert refresh_catalog(config)["snapshot"] == before["snapshot"]
@@ -439,7 +439,7 @@ def test_failed_pointer_switch_and_repair_budget_preserve_active_generation(libr
     note(notes, "source.md", "# Graph\n\nrepair_quartz")
     before = refresh_catalog(config)
     original = catalog_path(config)
-    from vaws_knowledge.distribution import manifest
+    from mindie_knowledge.distribution import manifest
     write = manifest.atomic_write_json
     def locked_pointer(*_a, **_k):
         raise PermissionError("Windows reader temporarily owns the pointer")

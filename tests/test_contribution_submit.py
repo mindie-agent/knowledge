@@ -19,8 +19,8 @@ from contribution.support import (  # noqa: E402
     init_git_repo,
     ordinary_md,
 )
-from vaws_knowledge.contribution.pending import STATUS_AWAITING, STATUS_PR_OPEN  # noqa: E402
-from vaws_knowledge.contribution.submit import (  # noqa: E402
+from mindie_knowledge.contribution.pending import STATUS_AWAITING, STATUS_PR_OPEN  # noqa: E402
+from mindie_knowledge.contribution.submit import (  # noqa: E402
     SubmitConfig,
     after_capture,
     prepare_candidate,
