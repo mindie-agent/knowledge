@@ -24,7 +24,7 @@ jobs:
       - name: Install the complete local knowledge backend
         run: |
           uv venv
-          uv pip install -e '.[test]'
+          uv pip install -e '.[test]' -e tools/knowledge-intake
       - name: Native capture, query, distribution, CLI and OpenViking lifecycle
         env:
           VAWS_KNOWLEDGE_LIVE_OV: "1"

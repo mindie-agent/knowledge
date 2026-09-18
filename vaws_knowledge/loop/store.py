@@ -75,6 +75,9 @@ class Store:
             CREATE TABLE IF NOT EXISTS publication(entry_id TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS feed_entries(feed TEXT NOT NULL, path TEXT NOT NULL,
+                entry_id TEXT NOT NULL, fingerprint TEXT NOT NULL, active INTEGER NOT NULL,
+                PRIMARY KEY(feed,entry_id));
         """)
         self.db.commit()
 
@@ -189,7 +192,11 @@ class Store:
                         (session_key(session_id),),
                     )
             rows = self.db.execute(
-                "SELECT document FROM entries LIMIT ?", (MAX_ENTRIES + 1,)
+                "SELECT document FROM entries WHERE NOT EXISTS "
+                "(SELECT 1 FROM feed_entries WHERE entry_id=entries.id AND active=0) "
+                "OR EXISTS (SELECT 1 FROM feed_entries WHERE entry_id=entries.id AND active=1) "
+                "LIMIT ?",
+                (MAX_ENTRIES + 1,),
             ).fetchall()
             if len(rows) > MAX_ENTRIES:
                 raise ValueError(

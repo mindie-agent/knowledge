@@ -293,6 +293,73 @@ def test_failed_judge_does_not_automatically_retry_or_create_a_vote(store):
     assert len(engine.errors) == 1
 
 
+def test_running_mcp_reconnects_after_owned_service_restart(store, tmp_path):
+    experience(store)
+    config = tmp_path / "config.json"
+    config.write_text(
+        canonical(
+            dict(
+                root=str(store.root.parent),
+                domain=store.domain,
+                agent_command=[sys.executable, "-c", "pass"],
+            )
+        )
+    )
+
+    def start():
+        engine = Engine(store, agent_command=[sys.executable, "-c", "pass"])
+        service = Service(engine, connection_path=store.root / "connection.json")
+        thread = threading.Thread(target=service.serve, daemon=True)
+        thread.start()
+        wait_for(lambda: engine.thread.is_alive())
+        return service, thread
+
+    service, thread = start()
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "vaws_knowledge.loop.cli",
+            "mcp",
+            "--config",
+            str(config),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+
+    def query(number):
+        process.stdin.write(
+            canonical(
+                dict(
+                    jsonrpc="2.0",
+                    id=number,
+                    method="tools/call",
+                    params=dict(
+                        name="knowledge_query",
+                        arguments=dict(query="ACL graph", session_id="consumer"),
+                    ),
+                )
+            )
+            + "\n"
+        )
+        process.stdin.flush()
+        return json.loads(process.stdout.readline())["result"]
+
+    try:
+        assert query(1)["structuredContent"]["results"]
+        service.close()
+        thread.join(3)
+        service, thread = start()
+        assert query(2)["structuredContent"]["results"]
+    finally:
+        process.terminate()
+        process.wait(5)
+        service.close()
+        thread.join(3)
+
+
 def test_only_explicitly_published_replica_entries_are_contributed(services):
     authority = services("publisher")
     replica = services("contributor", authority.connection)

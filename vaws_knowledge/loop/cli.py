@@ -44,8 +44,8 @@ def ensure_service(config_path):
     except (OSError, ValueError):
         pass
     # Reuse the existing cross-platform nonblocking lock, not a stale PID file.
-    from vaws_knowledge.distribution.sync import SwitchLock
     from vaws_knowledge.distribution.errors import SwitchInProgress
+    from vaws_knowledge.distribution.sync import SwitchLock
 
     lock = SwitchLock(connection_path(config).with_name("start.lock"))
     try:
@@ -181,7 +181,13 @@ def mcp(config_path):
                 ):
                     raise ValueError("invalid tool arguments")
                 try:
-                    payload = rpc(connection, name.removeprefix("knowledge_"), args)
+                    try:
+                        payload = rpc(connection, name.removeprefix("knowledge_"), args)
+                    except OSError:
+                        # Owned service upgrades rotate its port/token. Reconnect
+                        # once; the three operations are retry-safe by identity.
+                        connection = ensure_service(config_path)
+                        payload = rpc(connection, name.removeprefix("knowledge_"), args)
                     result = dict(
                         content=[dict(type="text", text=canonical(payload))],
                         structuredContent=payload,
@@ -282,6 +288,7 @@ def main(argv=None):
             engine,
             connection_path=connection_path(config),
             upstream=config.get("upstream"),
+            feeds=config.get("feeds", []),
         ).serve()
         return 0
     if args.operation in {"import", "publish"}:
@@ -303,7 +310,9 @@ def main(argv=None):
             connect(config) if args.operation == "stop" else ensure_service(args.config)
         )
         result = rpc(
-            connection, "status" if args.operation == "start" else args.operation
+            connection,
+            "status" if args.operation == "start" else args.operation,
+            timeout=130 if args.operation == "sync" else 10,
         )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0

@@ -12,6 +12,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from vaws_knowledge.markdown import _atomic_write_text
+
 from .store import canonical, digest
 
 MAX_BODY = 16 * 1024 * 1024
@@ -51,8 +52,11 @@ def rpc(connection, method, arguments=None, *, timeout=10):
 
 
 class Service:
-    def __init__(self, engine, *, connection_path=None, upstream=None):
+    def __init__(self, engine, *, connection_path=None, upstream=None, feeds=()):
         self.engine, self.store = engine, engine.store
+        from .feed import Feed
+
+        self.feeds = [Feed(self.store, config) for config in feeds]
         self.upstream = upstream
         self.engine.evaluate_uses = not bool(upstream)
         self.token = secrets.token_urlsafe(32)
@@ -119,7 +123,11 @@ class Service:
         if method == "capture":
             return self.engine.capture(**args)
         if method == "status":
-            return dict(**self.engine.status(), last_sync=self.last_sync)
+            return dict(
+                **self.engine.status(),
+                last_sync=self.last_sync,
+                feeds=[feed.last for feed in self.feeds],
+            )
         if method == "snapshot":
             return self.store.snapshot()
         if method == "receive_use":
@@ -137,18 +145,30 @@ class Service:
                 self.store.publish(entry["id"])
             return installed
         if method == "sync":
-            return self.sync()
+            return self.sync(force=True)
         if method == "stop":
             threading.Thread(target=self.close, daemon=True).start()
             return dict(status="stopping")
         raise ValueError("unsupported operation")
 
-    def sync(self):
-        if not self.upstream:
+    def sync(self, *, force=False):
+        if not self.upstream and not self.feeds:
             return dict(status="no_upstream")
         if not self.sync_lock.acquire(blocking=False):
             return dict(status="busy")
         try:
+            feed_results = [feed.sync(force=force) for feed in self.feeds]
+            if not self.upstream:
+                self.last_sync = dict(
+                    status="synced"
+                    if all(
+                        item["status"] in {"synced", "unchanged"}
+                        for item in feed_results
+                    )
+                    else "unavailable",
+                    feeds=feed_results,
+                )
+                return self.last_sync
             # Only material explicitly authorized for publication is offered.
             offered = self.store.snapshot()
             offered["feedback"] = []
@@ -171,7 +191,7 @@ class Service:
             for usage in rows:
                 if self.store.upstream_entry(usage["entry_id"]):
                     rpc(self.upstream, "receive_use", dict(usage=usage))
-            self.last_sync = dict(status="synced", **installed)
+            self.last_sync = dict(status="synced", **installed, feeds=feed_results)
         except Exception as exc:
             self.last_sync = dict(status="unavailable", error=type(exc).__name__)
         finally:

@@ -59,6 +59,33 @@ on loopback; remote services require HTTPS. Redirects are rejected. Service cred
 belong in private configuration; production multi-user identity/authorization,
 durable publisher deployment and public release channels are outside this first slice.
 
+## Official domain feed
+
+Install the independent, model-free reader with `pip install ./tools/knowledge-intake`.
+An explicit `feeds` configuration reads a trusted publisher's committed exports:
+
+```json
+{"feeds": [{"repository": "vllm-ascend-workspace/vaws-knowledge",
+  "ref": "knowledge/vllm-ascend", "domain": "vllm-ascend",
+  "interval_seconds": 300}]}
+```
+
+The GitHub reader uses existing `gh` authentication when available, with public
+HTTPS reads otherwise. It resolves one immutable commit and verifies the export
+manifest, every body and sidecar before changing search. `topics/` become knowledge
+and must have explicit applicability; `cases/` become advisory experiences;
+maintenance diaries are excluded. Feed content is reference data, never executable
+instructions. Source references retain the publisher commit and original content hash.
+
+Background checks have a bounded 120-second read budget and run at the configured
+interval (minimum 60 seconds). They are polling, not GitHub event subscriptions.
+An unchanged commit downloads no content; unchanged blobs are hash-checked and
+reused. Changed or removed documents disappear from search in one SQLite transaction.
+Old content remains available to existing references and uses. Unchanged experiences
+keep their identities and feedback. A failed import keeps the prior searchable
+generation and reports the failure in `status`. This feed does not send local
+captures or votes to GitHub. Experience feedback distribution uses `upstream`.
+
 ## Initial ranking policy
 
 Existing BM25 lexical retrieval supplies relevance. Experience relevance is

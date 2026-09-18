@@ -262,7 +262,7 @@ def verified_snapshot(source: GitFeed, prefix: str = "", *, reuse=None) -> dict:
         expected.update((name, side))
     if observed != expected:
         raise IntakeError("feed generation has missing or unmanaged files")
-    return {"files": files, "manifest_sha256": pointer["manifest_sha256"], "snapshot": signature,
+    return {"files": files, "generation": pointer["generation"], "manifest_sha256": pointer["manifest_sha256"], "snapshot": signature,
             "revision": source.commit, "changes": manifest["changes"], "documents": len(rows),
             "prepared_bytes": total, "reused_files": reused_files, "reused_bytes": reused_bytes,
             "downloaded_files": source.reads, "downloaded_bytes": source.read_bytes}
