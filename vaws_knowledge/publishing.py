@@ -22,7 +22,7 @@ from vaws_knowledge.distribution.sync import SwitchLock, check_and_sync
 from vaws_knowledge.local.instance import instance_for_config
 from vaws_knowledge.server.layers import ServiceConfig, load_config, _read_structured
 
-DEFAULT_CORPUS = "vllm-ascend-workspace/vaws-knowledge-corpus"
+DEFAULT_CORPUS = "mindie-agent/knowledge-vllm-ascend"
 
 
 def current_publishing(config: ServiceConfig) -> dict[str, Any]:

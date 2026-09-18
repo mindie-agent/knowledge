@@ -44,7 +44,7 @@ Git config files. Existing global Git settings are not changed. API and Git
 redirects cannot forward the token to another host. Token permissions and access
 to the selected repositories still determine which GitHub operations succeed.
 
-The default corpus is `vllm-ascend-workspace/vaws-knowledge-corpus`. The service
+The default corpus is `mindie-agent/knowledge-vllm-ascend`. The service
 config contains `state_root`, the three layer mounts, `shared_sync`, and `publishing` settings.
 Set `VAWS_KNOWLEDGE_CONFIG` to that config for MCP and CLI consumers. The workspace
 provides `.agents/scripts/knowledge_setup.py` to set this up with its own paths.

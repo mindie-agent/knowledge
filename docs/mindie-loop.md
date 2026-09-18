@@ -65,7 +65,7 @@ Install the independent, model-free reader with `pip install ./tools/knowledge-i
 An explicit `feeds` configuration reads a trusted publisher's committed exports:
 
 ```json
-{"feeds": [{"repository": "vllm-ascend-workspace/vaws-knowledge",
+{"feeds": [{"repository": "mindie-agent/knowledge",
   "ref": "knowledge/vllm-ascend", "domain": "vllm-ascend",
   "interval_seconds": 300}]}
 ```

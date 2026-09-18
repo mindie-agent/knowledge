@@ -15,9 +15,9 @@ commits and installed package pins are recorded separately from these measuremen
 A response's source metadata or an older CI artifact cannot supply a missing
 execution identity.
 
-The retrieval/distribution change merged as [PR 30](https://github.com/vllm-ascend-workspace/vaws-knowledge/pull/30),
+The retrieval/distribution change merged as [PR 30](https://github.com/mindie-agent/knowledge/pull/30),
 commit `4bdc37571e0ddb9c7312aabf64eaa22aabea2b9d`; curation, source maps and
-version 0.7.0 merged as [PR 31](https://github.com/vllm-ascend-workspace/vaws-knowledge/pull/31),
+version 0.7.0 merged as [PR 31](https://github.com/mindie-agent/knowledge/pull/31),
 commit `24b652de235bae9ecfd08bbc29048cf7b59b4e90`. Local committed snapshots
 `7105a2c` and `95185f3` passed 439 and 501 tests respectively, each with four
 skips and twelve passed subtests. Final PR-head CI passed Linux, Windows and
@@ -25,7 +25,7 @@ macOS. Those CI runs checked GitHub's merge-test refs, distinct from the final
 squash commits; the consumer validation archive preserves both identities.
 
 Final hardening and fusion merged in
-[PR 33](https://github.com/vllm-ascend-workspace/vaws-knowledge/pull/33),
+[PR 33](https://github.com/mindie-agent/knowledge/pull/33),
 commit `778a7b6b6a6f1b8c541dbdc6a646bc033f5e2c0f`. Its final PR head was
 `3a2e8707eed610f681f7941c0845353f8f46df02`. All three jobs checked GitHub's
 merge-test ref `cea65a73ea1462a3b0c64cb07d195b61ad70694d`; Git API verification
@@ -34,9 +34,9 @@ confirmed the tested and consumed commits have the same parents and tree
 
 | Final package check | Passed | Skipped | Passed subtests | Pytest elapsed |
 |---|---:|---:|---:|---:|
-| [Ubuntu / Python 3.11](https://github.com/vllm-ascend-workspace/vaws-knowledge/actions/runs/34747646848) | 531 | 4 | 12 | 20.50 s |
-| [Windows / Python 3.13](https://github.com/vllm-ascend-workspace/vaws-knowledge/actions/runs/34747646837/job/103698412064) | 533 | 2 | 12 | 220.61 s |
-| [macOS / Python 3.13](https://github.com/vllm-ascend-workspace/vaws-knowledge/actions/runs/34747646837/job/103698412104) | 533 | 2 | 12 | 165.68 s |
+| [Ubuntu / Python 3.11](https://github.com/mindie-agent/knowledge/actions/runs/34747646848) | 531 | 4 | 12 | 20.50 s |
+| [Windows / Python 3.13](https://github.com/mindie-agent/knowledge/actions/runs/34747646837/job/103698412064) | 533 | 2 | 12 | 220.61 s |
+| [macOS / Python 3.13](https://github.com/mindie-agent/knowledge/actions/runs/34747646837/job/103698412104) | 533 | 2 | 12 | 165.68 s |
 
 Both native JUnit hashes were reread and matched; each contains 535 testcase
 elements including two skips, while the suite reports 547 tests including
@@ -101,7 +101,7 @@ fixtures. No OCR/model installation is performed by capability discovery.
 Source and wheel builds passed. An isolated fresh environment installed the
 wheel with no dependencies and performed real Markdown conversion followed by
 zero-conversion repeat; imports confirmed no VAWS or document parser package.
-Independent [CI 34746454502](https://github.com/vllm-ascend-workspace/vaws-knowledge/actions/runs/34746454502)
+Independent [CI 34746454502](https://github.com/mindie-agent/knowledge/actions/runs/34746454502)
 passed Ubuntu Python 3.11/3.13 and Windows/macOS Python 3.13. Its actual checkout
 was `2a135380f4cb77aba83316cff5df85454acf8c07`, GitHub's merge-test ref for
 PR head `b3eb681ef3ca5d20fb66ed56113b6968d3965cdc` and base `24b652de`.
@@ -112,7 +112,7 @@ Each job built and installed the independent wheel, checked both CLI entries,
 and proved that VAWS was absent from the isolated environment. macOS RSS is
 sampled every 10 ms, so a short overshoot is possible; Windows/Linux retain
 their operating-system process limits. The independent tool merged in
-[PR 32](https://github.com/vllm-ascend-workspace/vaws-knowledge/pull/32) at
+[PR 32](https://github.com/mindie-agent/knowledge/pull/32) at
 `52754b5e5a714b9c60b4fa840daba5ecde97cb37` after all seven package/native/intake
 checks passed.
 
@@ -458,18 +458,18 @@ manifest. The complete report is
 `84f23b330b0b3bdbacfb50581a87a8674ab3bec88206ff9e854ff5203d42376e`.
 
 Consumer functional head `52b3bec5d17371447c6902ef1c0c24a011e17836` passed
-[CI 34748066882](https://github.com/vllm-ascend-workspace/vllm-ascend-workspace/actions/runs/34748066882)
+[CI 34748066882](https://github.com/mindie-agent/mindie-agent/actions/runs/34748066882)
 on Ubuntu/Python 3.11, Windows/Python 3.13 and macOS/Python 3.13. Job wall
 times were 82, 613 and 200 seconds respectively. Final consumer deployment,
 affected suites and upgrade provenance are carried by the rolling consumer
 `docs/knowledge-platform-validation-2026-09-13.md` record in
-[PR 169](https://github.com/vllm-ascend-workspace/vllm-ascend-workspace/pull/169).
-The [published 92d61a36 record](https://github.com/vllm-ascend-workspace/vllm-ascend-workspace/blob/92d61a365d5a4dd6884322114520e77a2eaa772e/docs/knowledge-platform-validation-2026-09-13.md)
+[PR 169](https://github.com/mindie-agent/mindie-agent/pull/169).
+The [published 92d61a36 record](https://github.com/mindie-agent/mindie-agent/blob/92d61a365d5a4dd6884322114520e77a2eaa772e/docs/knowledge-platform-validation-2026-09-13.md)
 preserves this earlier installation stage.
-[PR 169](https://github.com/vllm-ascend-workspace/vllm-ascend-workspace/pull/169)
+[PR 169](https://github.com/mindie-agent/mindie-agent/pull/169)
 was open at this cutoff. Its subsequent documentation head
 `92d61a365d5a4dd6884322114520e77a2eaa772e` had
-[CI 34748635798](https://github.com/vllm-ascend-workspace/vllm-ascend-workspace/actions/runs/34748635798)
+[CI 34748635798](https://github.com/mindie-agent/mindie-agent/actions/runs/34748635798)
 still running; the PR records that head's checks and merge state. Neither this
 package record nor the earlier functional CI asserts it has passed or merged.
 

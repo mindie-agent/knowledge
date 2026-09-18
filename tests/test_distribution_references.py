@@ -193,7 +193,7 @@ def test_prepared_catalog_explain_keeps_release_provenance_separate_from_engine_
     refreshed = refresh_catalog(config, extra_documents=prepared_shared_documents(state, current=active))
     assert refreshed["status"] == "ready", refreshed
     engine_sha = "e" * 40
-    monkeypatch.setattr(module, "shared_source", lambda: {"source_ref": engine_sha, "source_repo": "vllm-ascend-workspace/vaws-knowledge"})
+    monkeypatch.setattr(module, "shared_source", lambda: {"source_ref": engine_sha, "source_repo": "mindie-agent/knowledge"})
     found = module.query(config, text=released.title, layers=["shared"]).to_dict()
     target = next(hit for hit in found["results"] if hit["uri"] == released.uri)
     assert target["source_git_sha"] == active["source_git_sha"] != engine_sha

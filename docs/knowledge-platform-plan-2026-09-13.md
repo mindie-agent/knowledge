@@ -125,7 +125,7 @@ independent intake CI, final package CI and actual installed
 `0.7.0 / 778a7b6b6a6f1b8c541dbdc6a646bc033f5e2c0f` acceptance completed.
 Consumer functional head `52b3bec5d17371447c6902ef1c0c24a011e17836` passed
 all three platforms. Its subsequent documentation-head checks and publication
-remain visible in [PR 169](https://github.com/vllm-ascend-workspace/vllm-ascend-workspace/pull/169),
+remain visible in [PR 169](https://github.com/mindie-agent/mindie-agent/pull/169),
 which was open at this cutoff. Fixture checks do not become device or
 production-quality evidence; unmeasured applicability is not an unimplemented
 capability. A later installed C++ parser compatibility probe found a native
@@ -232,7 +232,7 @@ related code-map/CLI/relation group passed 48 tests, preserving the previous
 complete map and reusable Python parses.
 
 The rolling consumer delivery record is `docs/knowledge-platform-validation-2026-09-13.md`
-in [PR 169](https://github.com/vllm-ascend-workspace/vllm-ascend-workspace/pull/169).
-Its [published 92d61a36 stage](https://github.com/vllm-ascend-workspace/vllm-ascend-workspace/blob/92d61a365d5a4dd6884322114520e77a2eaa772e/docs/knowledge-platform-validation-2026-09-13.md)
+in [PR 169](https://github.com/mindie-agent/mindie-agent/pull/169).
+Its [published 92d61a36 stage](https://github.com/mindie-agent/mindie-agent/blob/92d61a365d5a4dd6884322114520e77a2eaa772e/docs/knowledge-platform-validation-2026-09-13.md)
 retains the earlier installation evidence. The PR records later package pins,
 checks and merge state separately from already successful functional-head CI.

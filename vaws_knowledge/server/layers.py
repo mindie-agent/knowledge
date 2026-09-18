@@ -50,7 +50,7 @@ DEFAULT_IDENTITY = {
     "origin_repo": "local/unpublished",
 }
 
-SOURCE_REPO = "vllm-ascend-workspace/vaws-knowledge"
+SOURCE_REPO = "mindie-agent/knowledge"
 
 
 class ConfigError(Exception):
