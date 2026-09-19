@@ -147,10 +147,10 @@ Shutdown cancels in-flight maintenance through a shared stop event
 (`bounded_run` interrupts the agent process tree), discards queued captures as
 never-attempted, and joins the worker with a bounded wait.
 
-Process bounding is portable: POSIX uses process groups, Windows uses
-`CREATE_NEW_PROCESS_GROUP` plus `taskkill /T` tree termination, and pipe draining
-uses reader threads instead of `selectors` (which cannot select Windows pipes).
-The Windows path implements the same contract but awaits real-machine evidence.
+Process bounding is portable: POSIX uses process groups; Windows assigns the
+spawned process to a Job Object so descendants stay owned (`TerminateJobObject`,
+with `taskkill /T` only if job assignment fails); pipe draining uses reader
+threads instead of `selectors` (which cannot select Windows pipes).
 
 `serve` runs in foreground for diagnostics. Configuration and service versions
 must be kept together; restart the owned service after updating runtime configuration.

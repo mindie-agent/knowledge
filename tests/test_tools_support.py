@@ -23,7 +23,14 @@ EXAMPLE_ENTRY = REPO_ROOT / "examples" / "corpus-contribution" / "ordinary.md"
 def run_tool(name: str, *args: str, python: str | None = None) -> subprocess.CompletedProcess:
     """Run ``python -m mindie_knowledge.<name> ARGS`` from the repo root."""
     cmd = [python or sys.executable, "-m", f"mindie_knowledge.{name}", *args]
-    return subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True, encoding="utf-8")
+    return subprocess.run(
+        cmd,
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="strict",
+    )
 
 
 # --------------------------------------------------------------------------- #

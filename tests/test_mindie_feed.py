@@ -15,6 +15,33 @@ from mindie_knowledge.loop.feed import Feed
 from mindie_knowledge.loop.store import Store
 
 
+def write_lf(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8", newline="\n")
+
+
+def init_feed_git(repo):
+    """Local Git that stores the exact bytes the producer hashed.
+
+    Windows Git defaults to ``core.autocrlf=true``, which would convert
+    hashed working-tree CRLF into LF blobs and fail verification.
+    """
+    repo.mkdir(parents=True, exist_ok=True)
+    (repo / ".gitattributes").write_bytes(b"* -text\n")
+
+    def git(*args):
+        return subprocess.check_output(
+            ["git", "-C", str(repo), *args], text=True
+        ).strip()
+
+    git("init", "-q")
+    git("config", "user.name", "test")
+    git("config", "user.email", "test@example.com")
+    git("config", "core.autocrlf", "false")
+    git("config", "core.eol", "lf")
+    return git
+
+
 def export_notes(notes, repo):
     """Minimal test producer for the verified export v1 protocol.
 
@@ -33,7 +60,7 @@ def export_notes(notes, repo):
         raw = path.read_bytes()
         sidecar = path.with_suffix(".meta.json")
         conditions = (
-            json.loads(sidecar.read_text())["conditions"] if sidecar.exists() else {}
+            json.loads(sidecar.read_text(encoding="utf-8"))["conditions"] if sidecar.exists() else {}
         )
         normalized = digest(raw.decode().replace("\r\n", "\n").replace("\r", "\n").encode())
         metadata = {
@@ -92,26 +119,20 @@ def fixture(tmp_path):
     (notes / "topics").mkdir(parents=True)
     (notes / "cases").mkdir()
     (notes / "maintenance").mkdir()
-    (notes / "topics/gate.md").write_text(
-        "# Device gate\n\nC8 requires a declared hardware capability.\n"
+    write_lf(
+        notes / "topics/gate.md",
+        "# Device gate\n\nC8 requires a declared hardware capability.\n",
     )
-    (notes / "topics/gate.meta.json").write_text(
-        json.dumps({"conditions": {"revision": "abc"}})
+    write_lf(
+        notes / "topics/gate.meta.json",
+        json.dumps({"conditions": {"revision": "abc"}}),
     )
-    (notes / "cases/debug.md").write_text(
-        "# Device gate investigation\n\nTrace the hardware capability before diagnosing kernels.\n"
+    write_lf(
+        notes / "cases/debug.md",
+        "# Device gate investigation\n\nTrace the hardware capability before diagnosing kernels.\n",
     )
-    (notes / "maintenance/run.md").write_text("# Operational diary\n\nRun completed.\n")
-    repo.mkdir()
-
-    def git(*args):
-        return subprocess.check_output(
-            ["git", "-C", str(repo), *args], text=True
-        ).strip()
-
-    git("init", "-q")
-    git("config", "user.name", "test")
-    git("config", "user.email", "test@example.com")
+    write_lf(notes / "maintenance/run.md", "# Operational diary\n\nRun completed.\n")
+    git = init_feed_git(repo)
 
     def publish():
         export_notes(notes, repo)
@@ -132,6 +153,44 @@ def fixture(tmp_path):
     store.close()
 
 
+def test_committed_feed_bytes_match_manifest_hashes(fixture):
+    """Working-tree writes, git blobs and manifest hashes are the same bytes."""
+    _, repo, _, _, first, _, _ = fixture
+    pointer_raw = subprocess.check_output(
+        ["git", "-C", str(repo), "cat-file", "blob", f"{first}:current.json"]
+    )
+    pointer = json.loads(pointer_raw)
+    assert (repo / "current.json").read_bytes() == pointer_raw
+    generation = pointer["generation"]
+    manifest_raw = subprocess.check_output(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "cat-file",
+            "blob",
+            f"{first}:generations/{generation}/prepared.json",
+        ]
+    )
+    assert digest(manifest_raw) == pointer["manifest_sha256"]
+    assert (repo / "generations" / generation / "prepared.json").read_bytes() == manifest_raw
+    for row in json.loads(manifest_raw)["files"]:
+        blob = subprocess.check_output(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "cat-file",
+                "blob",
+                f"{first}:generations/{generation}/{row['path']}",
+            ]
+        )
+        assert len(blob) == row["size"]
+        assert digest(blob) == row["sha256"]
+        assert (repo / "generations" / generation / row["path"]).read_bytes() == blob
+        assert b"\r\n" not in blob
+
+
 def test_real_feed_update_reuse_removal_and_retained_explanation(fixture):
     notes, _, _, publish, first, store, feed = fixture
     result = feed.sync(force=True)
@@ -150,9 +209,7 @@ def test_real_feed_update_reuse_removal_and_retained_explanation(fixture):
         use["use_id"], judge_id="independent", verdict="helpful", reason="Found gate"
     )
     assert feed.sync(force=True)["downloaded_files"] == 0
-    (notes / "topics/gate.md").write_text(
-        "# Device gate\n\nUpdated C8 capability gate.\n"
-    )
+    write_lf(notes / "topics/gate.md", "# Device gate\n\nUpdated C8 capability gate.\n")
     publish()
     assert feed.sync(force=True)["reused_files"] > 0
     new = {row["kind"]: row for row in store.query("Device gate")["results"]}
@@ -173,7 +230,7 @@ def test_invalid_applicability_keeps_whole_old_generation(fixture):
     notes, _, _, publish, first, store, feed = fixture
     assert feed.sync(force=True)["status"] == "synced"
     before = store.query("Device gate")["results"]
-    (notes / "topics/gate.meta.json").write_text('{"conditions": {}}')
+    write_lf(notes / "topics/gate.meta.json", '{"conditions": {}}')
     publish()
     assert feed.sync(force=True)["retained_revision"] == first
     assert store.query("Device gate")["results"] == before
@@ -184,7 +241,7 @@ def test_tampered_committed_bytes_reject_even_if_cache_claims_unchanged(fixture)
     assert feed.sync(force=True)["status"] == "synced"
     pointer = json.loads((repo / "current.json").read_text())
     path = repo / "generations" / pointer["generation"] / "topics/gate.md"
-    path.write_text("# Tampered gate\n")
+    write_lf(path, "# Tampered gate\n")
     git("add", "generations")
     git("commit", "-qm", "tamper")
     assert feed.sync(force=True)["retained_revision"] == first
@@ -204,11 +261,7 @@ def test_export_feed_roundtrip_through_the_verified_reader(tmp_path):
     from mindie_knowledge.loop.store import session_key
 
     repo = tmp_path / "feed"
-    repo.mkdir()
-    git = lambda *a: subprocess.check_output(["git", "-C", str(repo), *a], text=True).strip()
-    git("init", "-q")
-    git("config", "user.name", "test")
-    git("config", "user.email", "test@example.com")
+    git = init_feed_git(repo)
 
     origin = Store(tmp_path / "origin", "vllm-ascend")
     reader = Store(tmp_path / "reader", "vllm-ascend")
@@ -292,11 +345,7 @@ def test_export_final_withdrawal_clears_downstream(tmp_path):
     from mindie_knowledge.loop.store import session_key
 
     repo = tmp_path / "feed"
-    repo.mkdir()
-    git = lambda *a: subprocess.check_output(["git", "-C", str(repo), *a], text=True).strip()
-    git("init", "-q")
-    git("config", "user.name", "test")
-    git("config", "user.email", "test@example.com")
+    git = init_feed_git(repo)
     origin = Store(tmp_path / "origin", "vllm-ascend")
     reader = Store(tmp_path / "reader", "vllm-ascend")
     try:

@@ -155,21 +155,26 @@ def retrieval_aliases(document: Document) -> list[str]:
     return result
 
 
-def _atomic_write_text(path: Path, text: str) -> None:
+def _atomic_write_bytes(path: Path, raw: bytes) -> None:
+    """Replace ``path`` with exact ``raw`` bytes; no newline translation."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
     )
     temporary = Path(temporary_name)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
-            stream.write(text)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(raw)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
     finally:
         if temporary.exists():
             temporary.unlink()
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    _atomic_write_bytes(path, text.encode("utf-8"))
 
 
 def _clean_mapping(value: Any) -> dict[str, Any] | None:

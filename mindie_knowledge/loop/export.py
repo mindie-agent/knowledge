@@ -18,7 +18,7 @@ from pathlib import Path, PurePosixPath
 
 import hashlib
 
-from mindie_knowledge.markdown import _atomic_write_text, render_markdown
+from mindie_knowledge.markdown import _atomic_write_bytes, _atomic_write_text, render_markdown
 from mindie_knowledge.redact import REDACTION_PROFILE, scan_text
 
 from .store import canonical
@@ -191,12 +191,13 @@ def export_feed(store, output):
         }
     )
     # Write the complete generation first; the pointer swap is the commit point.
+    # Hashed artifacts are the exact encoded bytes, not a text-mode rewrite.
     target = output / "generations" / generation
     for name, raw in sorted(files.items()):
         (target / name).parent.mkdir(parents=True, exist_ok=True)
-        _atomic_write_text(target / name, raw.decode("utf-8"))
-    _atomic_write_text(target / "mindie-loop.json", extension_raw.decode("utf-8"))
-    _atomic_write_text(target / "prepared.json", manifest_raw.decode("utf-8"))
+        _atomic_write_bytes(target / name, raw)
+    _atomic_write_bytes(target / "mindie-loop.json", extension_raw)
+    _atomic_write_bytes(target / "prepared.json", manifest_raw)
     pointer = {
         "schema": SCHEMA,
         "generation": generation,

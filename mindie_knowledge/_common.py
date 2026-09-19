@@ -100,8 +100,20 @@ def relpath(path: Path) -> str:
         return str(path)
 
 
+def configure_utf8_stdio() -> None:
+    """CLI stdout/stderr are UTF-8, including when Windows pipes them."""
+    for stream in (sys.stdout, sys.stderr):
+        if stream is None:
+            continue
+        stream.flush()
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8")
+
+
 def run_cli(main) -> None:
     """Run ``main(argv) -> int`` and turn ``ToolError`` into a clean message."""
+    configure_utf8_stdio()
     try:
         code = main(sys.argv[1:])
     except ToolError as exc:
