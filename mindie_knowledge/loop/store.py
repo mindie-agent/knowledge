@@ -82,8 +82,8 @@ class Store:
                 PRIMARY KEY(feed,entry_id));
             CREATE TABLE IF NOT EXISTS upstream_entries(entry_id TEXT PRIMARY KEY,
                 active INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS upstream_feedback(use_id TEXT PRIMARY KEY,
-                observation TEXT NOT NULL, source TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS upstream_feedback(use_id TEXT NOT NULL,
+                observation TEXT NOT NULL, source TEXT NOT NULL, PRIMARY KEY(use_id,source));
         """)
         # Existing ledgers keep their rows; the observation column binds
         # verdicts to the exact evidence they evaluated. Legacy rows carry ''
@@ -95,6 +95,20 @@ class Store:
             self.db.execute(
                 "ALTER TABLE feedback ADD COLUMN observation TEXT NOT NULL DEFAULT ''"
             )
+        # A use can be distributed by more than one configured source. Keep
+        # each membership so withdrawing one feed cannot withdraw another.
+        primary = [r[1] for r in self.db.execute("PRAGMA table_info(upstream_feedback)") if r[5]]
+        if primary == ["use_id"]:
+            self.db.executescript("""
+                BEGIN IMMEDIATE;
+                ALTER TABLE upstream_feedback RENAME TO upstream_feedback_single;
+                CREATE TABLE upstream_feedback(use_id TEXT NOT NULL,
+                    observation TEXT NOT NULL, source TEXT NOT NULL,
+                    PRIMARY KEY(use_id,source));
+                INSERT INTO upstream_feedback SELECT * FROM upstream_feedback_single;
+                DROP TABLE upstream_feedback_single;
+                COMMIT;
+            """)
         self.db.commit()
 
     @contextlib.contextmanager
@@ -556,6 +570,7 @@ class Store:
                 # Superseded: the new verdict on the corrected observation
                 # replaces it, keeping a single effective vote.
                 self.db.execute("DELETE FROM feedback WHERE use_id=?", (use_id,))
+            self.db.execute("DELETE FROM upstream_feedback WHERE use_id=?", (use_id,))
             self.db.execute(
                 "INSERT INTO feedback VALUES(?,?,?,?,?,?,?,?)",
                 tuple(record.values()),
@@ -653,13 +668,15 @@ class Store:
                     "SELECT observation FROM feedback WHERE use_id=?",
                     (vote["use_id"],),
                 ).fetchone()
-                if (
-                    existing
-                    and existing["observation"] == current
-                    and vote["observation"] != current
+                distributed = self.db.execute(
+                    "SELECT 1 FROM upstream_feedback WHERE use_id=? AND observation=?",
+                    (vote["use_id"], current),
+                ).fetchone()
+                if existing and existing["observation"] == current and (
+                    vote["observation"] != current or not distributed
                 ):
-                    # Keep the effective local verdict; the stale distributed
-                    # vote must not reappear over it.
+                    # Never replace a locally judged current observation, even
+                    # when a source distributes a conflicting verdict for it.
                     continue
             self.db.execute(
                 "INSERT OR REPLACE INTO feedback VALUES(?,?,?,?,?,?,?,?)",
@@ -685,22 +702,21 @@ class Store:
         for row in withdrawn:
             if row["use_id"] in incoming:
                 continue
-            use = self.db.execute(
-                "SELECT * FROM uses WHERE id=?", (row["use_id"],)
-            ).fetchone()
-            locally_effective = (
-                use is not None
-                and use["origin"] == "local"
-                and self.observation_of(use) == row["observation"]
+            self.db.execute(
+                "DELETE FROM upstream_feedback WHERE use_id=? AND source=?",
+                (row["use_id"], source),
             )
-            if not locally_effective:
+            remaining = self.db.execute(
+                "SELECT 1 FROM upstream_feedback WHERE use_id=? AND observation=?",
+                (row["use_id"], row["observation"]),
+            ).fetchone()
+            if not remaining:
+                # A local use alone does not own the remote judge's vote. Local
+                # judging removes distributed membership when it writes a vote.
                 self.db.execute(
                     "DELETE FROM feedback WHERE use_id=? AND observation=?",
                     (row["use_id"], row["observation"]),
                 )
-            self.db.execute(
-                "DELETE FROM upstream_feedback WHERE use_id=?", (row["use_id"],)
-            )
 
     def install_snapshot(self, snapshot, *, authoritative=True):
         """Install a domain snapshot.
