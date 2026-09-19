@@ -164,7 +164,7 @@ TOOLS = [
     ),
     dict(
         name="knowledge_use",
-        description="Record how an experience was actually used and the observed evidence. An independent judge evaluates after this task's Stop hook.",
+        description="Record what an experience changed or enabled beyond existing checks, with observed evidence and limits. Citation alone is not benefit. An independent judge evaluates after this task's Stop hook.",
         inputSchema=schema(
             dict(ref=STRING, session_id=STRING, application=STRING, evidence=STRING),
             ["ref", "session_id", "application", "evidence"],
