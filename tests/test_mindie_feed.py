@@ -1,16 +1,89 @@
 """Real Git/export boundary: atomic updates, stale revisions and feedback."""
 
+import hashlib
 import json
 import subprocess
+import uuid
 
 import pytest
 
 pytest.importorskip("knowledge_intake")
-from knowledge_intake.feed_sync import GitFeed
+from knowledge_intake.common import digest
+from knowledge_intake.feed_sync import SCHEMA, PROFILE, GitFeed
 
-from mindie_knowledge.curation_export import export_notes
 from mindie_knowledge.loop.feed import Feed
 from mindie_knowledge.loop.store import Store
+
+
+def export_notes(notes, repo):
+    """Minimal test producer for the verified export v1 protocol.
+
+    Writes current.json plus generations/<id>/ with a prepared manifest and
+    every Markdown note paired with retrieval metadata, exactly what the
+    independent intake reader verifies.
+    """
+
+    def encoded(value):
+        return (json.dumps(value, sort_keys=True, ensure_ascii=False, indent=2) + "\n").encode()
+
+    notes = sorted(notes.rglob("*.md"))
+    rows, files = [], {}
+    for path in notes:
+        relative = path.relative_to(path.parents[1]).as_posix()
+        raw = path.read_bytes()
+        sidecar = path.with_suffix(".meta.json")
+        conditions = (
+            json.loads(sidecar.read_text())["conditions"] if sidecar.exists() else {}
+        )
+        normalized = digest(raw.decode().replace("\r\n", "\n").replace("\r", "\n").encode())
+        metadata = {
+            "conditions": conditions,
+            "retrieval": {"source_sha256": normalized, "aliases": [], "topics": []},
+        }
+        metadata_raw = encoded(metadata)
+        files[relative] = raw
+        files[str(path.with_suffix(".meta.json").relative_to(path.parents[1]).as_posix())] = metadata_raw
+        rows.append(
+            {
+                "path": relative,
+                "size": len(raw),
+                "sha256": digest(raw),
+                "source_sha256": normalized,
+                "input_sha256": digest(raw),
+                "metadata_size": len(metadata_raw),
+                "metadata_sha256": digest(metadata_raw),
+            }
+        )
+    includes = sorted({row["path"].split("/", 1)[0] for row in rows})
+    generation = uuid.uuid4().hex
+    snapshot = digest(
+        encoded({"files": rows, "includes": includes, "redaction_profile": PROFILE})
+    )
+    manifest = {
+        "schema": SCHEMA,
+        "redaction_profile": PROFILE,
+        "includes": includes,
+        "snapshot": snapshot,
+        "previous_snapshot": None,
+        "files": rows,
+        "changes": {"added": [], "removed": [], "updated": [], "renamed": []},
+    }
+    manifest_raw = encoded(manifest)
+    target = repo / "generations" / generation
+    for name, raw in files.items():
+        (target / name).parent.mkdir(parents=True, exist_ok=True)
+        (target / name).write_bytes(raw)
+    (target / "prepared.json").write_bytes(manifest_raw)
+    (repo / "current.json").write_bytes(
+        encoded(
+            {
+                "schema": SCHEMA,
+                "generation": generation,
+                "manifest_sha256": digest(manifest_raw),
+                "snapshot": snapshot,
+            }
+        )
+    )
 
 
 @pytest.fixture
