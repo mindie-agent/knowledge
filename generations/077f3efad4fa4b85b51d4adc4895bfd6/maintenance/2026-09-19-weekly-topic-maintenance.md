@@ -63,7 +63,9 @@
 
 ## Publish outcome
 
-（由本轮 export/lock helper 回填 — 见下方 Ops / 父代理报告）
+- **Export**: generation `77952cdd9dba4fa2ab63b6a3ae15f5e3`；manifest `be3eed05812c6d1d8fcf65be183eda997e159dbba2acecf93c82578c18cc42c3`；snapshot `18800ddbb8843848b96ee976605670a5e318d3c6e0ef6884f8a7096c7a577e12`；changes added=4 updated=1；**verified**
+- **Publish**: `org-feed-publish-locked.sh` exit 0；tip generation `b5e8f608…` → `77952cdd…`；org tip commit **`363bee7174774b96b2fd51b95f1c5a048bbf1d5f`** on `mindie-agent/knowledge` / `knowledge/vllm-ascend`（prior `caab5632a87516b19957be40172ceda20fbfd768`）
+- Package pin confirmed `cc1a1d76fdee2c90b129f6ba56c171d500c158af`
 
 ## Retrieval queries
 

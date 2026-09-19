@@ -1,15 +1,10 @@
 {
   "changes": {
-    "added": [
-      "maintenance/2026-09-19-weekly-topic-maintenance.md",
-      "topics/a5-dcp-mla-sfa-cluster.md",
-      "topics/aclgraph-hostside-padding-cluster.md",
-      "topics/dsa-dspark-triton-cp-gather-cluster.md"
-    ],
+    "added": [],
     "removed": [],
     "renamed": [],
     "updated": [
-      "maintenance/2026-09-19-daily-pr-incremental.md"
+      "maintenance/2026-09-19-weekly-topic-maintenance.md"
     ]
   },
   "files": [
@@ -257,13 +252,13 @@
       "source_sha256": "0ae9ec0bed0dddb527de58406c6d52427962f373d5f5b7050c1e388be257dcea"
     },
     {
-      "input_sha256": "1bb0b3e4643b28f718bc812fee72a70bd64de074e9c26ecdbb720646093d1eab",
-      "metadata_sha256": "283e9e7d2ebe2909f0469a2a566bb8148a5f2bba9a435f945127285e5451fb8c",
+      "input_sha256": "dc3ed7bc93e0360bec3124e3b2c537c489130797b0c52699884fd86157e60249",
+      "metadata_sha256": "c5e462c11069467fae325bde126f08c9b04ef49ae683aed91c126338488aff74",
       "metadata_size": 439,
       "path": "maintenance/2026-09-19-weekly-topic-maintenance.md",
-      "sha256": "1bb0b3e4643b28f718bc812fee72a70bd64de074e9c26ecdbb720646093d1eab",
-      "size": 4109,
-      "source_sha256": "1bb0b3e4643b28f718bc812fee72a70bd64de074e9c26ecdbb720646093d1eab"
+      "sha256": "dc3ed7bc93e0360bec3124e3b2c537c489130797b0c52699884fd86157e60249",
+      "size": 4629,
+      "source_sha256": "dc3ed7bc93e0360bec3124e3b2c537c489130797b0c52699884fd86157e60249"
     },
     {
       "input_sha256": "5df6c12eec1b9c11f73d211f9fe9a715267cd0323cf91a9983adfe0d7291353b",
@@ -469,8 +464,8 @@
     "maintenance",
     "topics"
   ],
-  "previous_snapshot": "b8789e2bb085f52f496e8efd5ba2530ec38163fb3a7d76a939ed9a5c30949fb6",
+  "previous_snapshot": "18800ddbb8843848b96ee976605670a5e318d3c6e0ef6884f8a7096c7a577e12",
   "redaction_profile": "r2",
   "schema": "vaws-curation-export/1",
-  "snapshot": "18800ddbb8843848b96ee976605670a5e318d3c6e0ef6884f8a7096c7a577e12"
+  "snapshot": "00bb64fa49523f45eb1fc08552f8e5529687ee94967d6e608072b8a561f835fc"
 }
