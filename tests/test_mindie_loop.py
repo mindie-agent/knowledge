@@ -460,37 +460,73 @@ def test_attach_binds_a_session_without_any_query(store):
     )
 
 
-def test_use_refinement_until_judged_then_frozen(store):
+def test_correction_after_judgement_supersedes_the_old_verdict(store):
     doc = experience(store)
-    first = store.use(
+    use = store.use(
         ref=doc["id"],
         session_id="consumer-b",
-        application="Tried the suggested comparison",
-        evidence="Graph capture failed",
+        application="Applied the cleanup",
+        evidence="Parent was absent from ps",
     )
-    second = store.use(
-        ref=doc["id"],
-        session_id="consumer-b",
-        application="Corrected: compared eager and graph execution",
-        evidence="Eager passed, graph failed at capture",
-    )
-    # One use record per (entry, session): later rounds refine, never re-vote.
-    assert second["use_id"] == first["use_id"] and second["refined"]
-    store.capture("consumer-b", "turn-1", "The comparison isolated graph capture.")
-    use_id = first["use_id"]
+    store.capture("consumer-b", "turn-1", "Initial observation: cleanup succeeded.")
+    use_id = use["use_id"]
     store.judge(
-        use_id, judge_id="judge-c", verdict="helpful", reason="Narrowed investigation"
+        use_id, judge_id="judge-c", verdict="helpful", reason="Supported completion"
     )
-    third = store.use(
+    assert store.weight(doc["id"])["helpful"] == 1
+    # A later correction in the same consumer task is a new observation of the
+    # same single vote: the superseded positive verdict stops counting and the
+    # corrected evidence is eligible for one bounded re-evaluation.
+    corrected = store.use(
         ref=doc["id"],
         session_id="consumer-b",
-        application="Late correction attempt",
-        evidence="Changed after judging",
+        application="Correct the earlier incomplete observation",
+        evidence="New inspection found a surviving child",
     )
-    assert third["use_id"] == use_id and not third["refined"]
-    row = store.db.execute("SELECT application FROM uses WHERE id=?", (use_id,)).fetchone()
-    assert row[0] == "Corrected: compared eager and graph execution"
-    assert store.weight(doc["id"])["helpful"] == 1
+    assert corrected["use_id"] == use_id and corrected["refined"]
+    store.capture("consumer-b", "turn-2", "Correction: a child survived.")
+    assert store.weight(doc["id"])["helpful"] == 0
+    pending = store.pending_uses()
+    assert [row["id"] for row in pending] == [use_id]
+    assert pending[0]["outcome"] == "Correction: a child survived."
+    store.judge(
+        use_id,
+        judge_id="judge-d",
+        verdict="unhelpful",
+        reason="Corrected observation shows incomplete cleanup",
+    )
+    weight = store.weight(doc["id"])
+    assert weight["helpful"] == 0 and weight["unhelpful"] == 1
+    # The same verdict on the same observation stays deduplicated.
+    again = store.judge(
+        use_id, judge_id="judge-e", verdict="helpful", reason="late echo"
+    )
+    assert again["verdict"] == "unhelpful"
+
+
+def test_stale_in_flight_judgement_is_rejected(store):
+    doc = experience(store)
+    use = store.use(
+        ref=doc["id"], session_id="consumer-b", application="Tried it", evidence="v1"
+    )
+    store.capture("consumer-b", "turn-1", "Outcome one.")
+    row = store.db.execute(
+        "SELECT * FROM uses WHERE id=?", (use["use_id"],)
+    ).fetchone()
+    stale = store.observation_of(row)
+    store.use(
+        ref=doc["id"], session_id="consumer-b", application="Tried it", evidence="v2"
+    )
+    store.capture("consumer-b", "turn-2", "Outcome two.")
+    with pytest.raises(ValueError, match="stale judgement"):
+        store.judge(
+            use["use_id"],
+            judge_id="judge-c",
+            verdict="helpful",
+            reason="evaluated the old evidence",
+            observation=stale,
+        )
+    assert store.weight(doc["id"])["helpful"] == 0
 
 
 def test_publish_then_withdraw_excludes_from_snapshot(store):
@@ -553,3 +589,135 @@ def test_mcp_discovery_never_starts_the_service(tmp_path):
     assert len(replies[1]["tools"]) == 4
     # No service spawn, no connection file, not even a store directory.
     assert not (tmp_path / "root").exists()
+
+
+def test_withdrawn_upstream_entry_leaves_history_and_local_content(store, tmp_path):
+    origin = Store(tmp_path / "origin", "vllm-ascend")
+    reader = Store(tmp_path / "reader", "vllm-ascend")
+    try:
+        doc = experience(origin)
+        local = reader.add(
+            kind="experience",
+            title="Local-only note",
+            content="Unrelated local observation about build caching.",
+        )
+        origin.publish(doc["id"])
+        reader.install_snapshot(origin.snapshot())
+        assert any(
+            row["ref"].endswith(doc["id"])
+            for row in reader.query("graph investigation")["results"]
+        )
+        origin.withdraw(doc["id"])
+        reader.install_snapshot(origin.snapshot())
+        assert not any(
+            row["ref"].endswith(doc["id"])
+            for row in reader.query("graph investigation")["results"]
+        )
+        # Historical references stay explainable; unrelated local content stays.
+        assert reader.get(doc["id"])["content"]
+        assert reader.get(local["id"])["content"]
+        assert any(
+            row["ref"].endswith(local["id"])
+            for row in reader.query("build caching")["results"]
+        )
+    finally:
+        origin.close()
+        reader.close()
+
+
+def test_contribute_is_incremental_not_membership_replacement(store, tmp_path):
+    authority = Store(tmp_path / "authority", "vllm-ascend")
+    try:
+        own = experience(authority, title="Authority note", content="Existing content.")
+        other = Store(tmp_path / "replica", "vllm-ascend")
+        try:
+            contributed = experience(
+                other, title="Contributed note", content="Replica observation."
+            )
+            other.publish(contributed["id"])
+            authority.install_snapshot(other.snapshot(), authoritative=False)
+        finally:
+            other.close()
+        # Ingestion added the contribution without deactivating local content.
+        assert authority.get(contributed["id"])["content"]
+        assert any(
+            row["ref"].endswith(own["id"])
+            for row in authority.query("existing content")["results"]
+        )
+    finally:
+        authority.close()
+
+
+def test_rpc_bounds_stalled_bodies_and_concurrency(tmp_path):
+    """Real sockets: stalled partial bodies release workers; the service stays
+    responsive; excess concurrent connections are refused without queueing."""
+    import socket
+    import time
+
+    store = Store(tmp_path / "store", "vllm-ascend")
+    engine = Engine(store, agent_command=["never"])
+    service = Service(engine, max_workers=2, request_timeout=0.5)
+    thread = threading.Thread(target=service.http.serve_forever, daemon=True)
+    thread.start()
+    port = service.http.server_port
+    token = service.token
+
+    def stalled_socket():
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        body = canonical(dict(method="status", arguments={}))
+        head = (
+            f"POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+            f"Authorization: Bearer {token}\r\nContent-Length: {len(body)}\r\n\r\n"
+        )
+        sock.sendall(head.encode() + body[:5].encode())  # partial body, then stall
+        return sock
+
+    stalls = [stalled_socket() for _ in range(2)]
+    try:
+        # Both workers are occupied; a third connection gets no worker.
+        time.sleep(0.1)
+        refused = socket.create_connection(("127.0.0.1", port), timeout=5)
+        refused.settimeout(3)
+        refused.sendall(
+            stalled_socket.__doc__.encode() if False else (
+                f"POST /rpc HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                f"Authorization: Bearer {token}\r\nContent-Length: 2\r\n\r\n{{}}"
+            ).encode()
+        )
+        try:
+            refused.recv(4096)
+        except socket.timeout:
+            pass  # refused or held past the deadline; never silently queued forever
+        # After the read deadline the stalled workers are released and a real
+        # request succeeds.
+        time.sleep(0.8)
+        result = rpc(service.connection, "status", timeout=5)
+        assert result["domain"] == "vllm-ascend"
+    finally:
+        for sock in stalls:
+            sock.close()
+        service.http.shutdown()
+        service.http.server_close()
+        store.db.close()
+
+
+def test_failed_attempt_on_old_observation_never_blocks_a_correction(store):
+    doc = experience(store)
+    use = store.use(
+        ref=doc["id"], session_id="consumer-b", application="Tried", evidence="v1"
+    )
+    store.capture("consumer-b", "turn-1", "Outcome one.")
+    row = store.db.execute(
+        "SELECT * FROM uses WHERE id=?", (use["use_id"],)
+    ).fetchone()
+    old = store.observation_of(row)
+    store.failed_judge(use["use_id"], old, "agent crashed")
+    assert store.pending_uses() == []
+    # The corrected observation is new bounded work, not a retry.
+    store.use(
+        ref=doc["id"], session_id="consumer-b", application="Tried", evidence="v2"
+    )
+    store.capture("consumer-b", "turn-2", "Outcome two.")
+    pending = store.pending_uses()
+    assert [row["id"] for row in pending] == [use["use_id"]]
+    assert pending[0]["outcome"] == "Outcome two."

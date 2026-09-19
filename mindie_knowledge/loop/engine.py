@@ -49,7 +49,13 @@ class Engine:
         try:
             from .process import bounded_run
 
-            output = bounded_run(self.agent_command, raw, timeout=65, max_output=131072)
+            output = bounded_run(
+                self.agent_command,
+                raw,
+                timeout=65,
+                max_output=131072,
+                cancel=self.stop,
+            )
             result = json.loads(output)
             if not isinstance(result, dict):
                 raise ValueError("agent must return one JSON object")
@@ -139,6 +145,7 @@ class Engine:
                 continue
             if usage["session"] in doc["producers"]:
                 continue
+            observation = usage["observation"]
             try:
                 result = self.agent(
                     "judge",
@@ -149,7 +156,9 @@ class Engine:
                         evidence=usage["evidence"],
                         outcome=usage["outcome"],
                     ),
-                    attempt_id="judge:" + usage["id"],
+                    # The attempt identity binds the exact observation: a
+                    # corrected use is new work, never a retry of a failure.
+                    attempt_id=f"judge:{usage['id']}:{observation[:16]}",
                     session=usage["session"],
                 )
                 if set(result) != {"verdict", "reason"}:
@@ -159,10 +168,19 @@ class Engine:
                     judge_id="judge-" + uuid.uuid4().hex,
                     verdict=result["verdict"],
                     reason=result["reason"],
+                    observation=observation,
                 )
+            except ValueError as exc:
+                detail = f"{type(exc).__name__}: {exc}"[:1000]
+                if "stale judgement" in str(exc):
+                    # The evidence changed mid-flight; discard, do not fail-mark.
+                    self.errors = (self.errors + [detail])[-20:]
+                    continue
+                self.store.failed_judge(usage["id"], observation, detail)
+                self.errors = (self.errors + [detail])[-20:]
             except Exception as exc:
                 detail = f"{type(exc).__name__}: {exc}"[:1000]
-                self.store.failed_judge(usage["id"], detail)
+                self.store.failed_judge(usage["id"], observation, detail)
                 self.errors = (self.errors + [detail])[-20:]
 
     def run(self):
@@ -184,6 +202,17 @@ class Engine:
             finally:
                 self.evaluate()
                 self.queue.task_done()
+        # Shutdown: discard remaining queued work explicitly; nothing replays.
+        while True:
+            try:
+                ident, _, _ = self.queue.get_nowait()
+            except queue.Empty:
+                break
+            if ident:
+                self.store.mark_capture(
+                    ident, "discarded", "service stopping before processing"
+                )
+            self.queue.task_done()
 
     def wake(self):
         try:

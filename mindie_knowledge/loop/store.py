@@ -71,14 +71,27 @@ class Store:
                 outcome TEXT NOT NULL, origin TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS feedback(use_id TEXT PRIMARY KEY, entry_id TEXT NOT NULL,
                 consumer TEXT NOT NULL, judge TEXT NOT NULL, verdict TEXT NOT NULL,
-                reason TEXT NOT NULL, evidence_hash TEXT NOT NULL);
+                reason TEXT NOT NULL, evidence_hash TEXT NOT NULL,
+                observation TEXT NOT NULL DEFAULT '');
             CREATE TABLE IF NOT EXISTS publication(entry_id TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS feed_entries(feed TEXT NOT NULL, path TEXT NOT NULL,
                 entry_id TEXT NOT NULL, fingerprint TEXT NOT NULL, active INTEGER NOT NULL,
                 PRIMARY KEY(feed,entry_id));
+            CREATE TABLE IF NOT EXISTS upstream_entries(entry_id TEXT PRIMARY KEY,
+                active INTEGER NOT NULL);
         """)
+        # Existing ledgers keep their rows; the observation column binds
+        # verdicts to the exact evidence they evaluated. Legacy rows carry ''
+        # and stay effective.
+        feedback_columns = {
+            row[1] for row in self.db.execute("PRAGMA table_info(feedback)")
+        }
+        if "observation" not in feedback_columns:
+            self.db.execute(
+                "ALTER TABLE feedback ADD COLUMN observation TEXT NOT NULL DEFAULT ''"
+            )
         self.db.commit()
 
     def close(self):
@@ -161,11 +174,26 @@ class Store:
 
     def weight(self, ident):
         with self.lock:
-            rows = self.db.execute(
-                "SELECT verdict FROM feedback WHERE entry_id=?", (ident,)
-            ).fetchall()
-        positive = sum(row[0] == "helpful" for row in rows)
-        negative = sum(row[0] == "unhelpful" for row in rows)
+            rows = [
+                dict(r)
+                for r in self.db.execute(
+                    "SELECT * FROM feedback WHERE entry_id=?", (ident,)
+                ).fetchall()
+            ]
+            effective = []
+            for row in rows:
+                # A verdict counts only for the exact observation it evaluated.
+                # Legacy rows ('') and upstream votes without a local use record
+                # cannot be rechecked and stay effective.
+                if row["observation"]:
+                    use = self.db.execute(
+                        "SELECT * FROM uses WHERE id=?", (row["use_id"],)
+                    ).fetchone()
+                    if use is not None and self.observation_of(use) != row["observation"]:
+                        continue
+                effective.append(row)
+        positive = sum(row["verdict"] == "helpful" for row in effective)
+        negative = sum(row["verdict"] == "unhelpful" for row in effective)
         # A bounded first-release policy, explicitly not a confidence estimate.
         multiplier = max(
             0.1, min(3.0, math.exp(max(-3.0, min(2.0, 0.35 * (positive - negative)))))
@@ -173,7 +201,7 @@ class Store:
         return dict(
             helpful=positive,
             unhelpful=negative,
-            unknown=sum(r[0] == "unknown" for r in rows),
+            unknown=sum(r["verdict"] == "unknown" for r in effective),
             multiplier=round(multiplier, 6),
             withdrawn=negative >= 3 and negative >= positive + 3,
         )
@@ -192,9 +220,13 @@ class Store:
                         (session_key(session_id),),
                     )
             rows = self.db.execute(
-                "SELECT document FROM entries WHERE NOT EXISTS "
-                "(SELECT 1 FROM feed_entries WHERE entry_id=entries.id AND active=0) "
-                "OR EXISTS (SELECT 1 FROM feed_entries WHERE entry_id=entries.id AND active=1) "
+                # Visible: an active feed membership wins; otherwise no inactive
+                # feed generation and no withdrawn upstream membership may hide
+                # the entry. Local-only entries have neither row and stay.
+                "SELECT document FROM entries WHERE "
+                "EXISTS (SELECT 1 FROM feed_entries WHERE entry_id=entries.id AND active=1) "
+                "OR (NOT EXISTS (SELECT 1 FROM feed_entries WHERE entry_id=entries.id AND active=0) "
+                "AND NOT EXISTS (SELECT 1 FROM upstream_entries WHERE entry_id=entries.id AND active=0)) "
                 "LIMIT ?",
                 (MAX_ENTRIES + 1,),
             ).fetchall()
@@ -320,47 +352,71 @@ class Store:
         ident = digest([doc["id"], session])
         with self.lock, self.db:
             self.db.execute("INSERT OR IGNORE INTO sessions VALUES(?)", (session,))
-            self.db.execute(
-                "INSERT OR IGNORE INTO uses VALUES(?,?,?,?,?,?,?)",
-                (ident, doc["id"], session, application, evidence, "", "local"),
-            )
-            # Multi-round semantics: one use record per (entry, session).
-            # Later rounds of the same session refine the same record instead
-            # of creating new votes, so consumption echoes never add weight.
-            # Refinement is accepted only while the use is unjudged; once an
-            # independent verdict exists it stays bound to the evidence hash it
-            # evaluated, and the record no longer mutates underneath it.
-            judged = self.db.execute(
-                "SELECT 1 FROM feedback WHERE use_id=?", (ident,)
+            row = self.db.execute(
+                "SELECT application,evidence FROM uses WHERE id=?", (ident,)
             ).fetchone()
-            if not judged:
+            if row is None:
                 self.db.execute(
-                    "UPDATE uses SET application=?,evidence=? WHERE id=?",
+                    "INSERT INTO uses VALUES(?,?,?,?,?,?,?)",
+                    (ident, doc["id"], session, application, evidence, "", "local"),
+                )
+                refined = False
+            elif (row["application"], row["evidence"]) != (application, evidence):
+                # A correction is a new observation of the same single
+                # consumer vote: the outcome is pending again and any verdict
+                # bound to the superseded observation stops counting. This is
+                # never a retry of a failed evaluation attempt.
+                self.db.execute(
+                    "UPDATE uses SET application=?,evidence=?,outcome='' WHERE id=?",
                     (application, evidence, ident),
                 )
+                refined = True
+            else:
+                refined = False
         return dict(
             use_id=ident,
             eligible=session not in doc["producers"],
-            refined=not judged,
-            note="Stop capture supplies this session's outcome; the independent judge evaluates asynchronously.",
+            refined=refined,
+            note="Stop capture supplies this observation's outcome; the independent judge evaluates asynchronously.",
         )
+
+    @staticmethod
+    def observation_of(row):
+        """Current observation identity of a use record; None while its outcome
+        is still pending. Verdicts and evaluation attempts bind to this hash."""
+        if not row["outcome"]:
+            return None
+        return digest([row["application"], row["evidence"], row["outcome"]])
 
     def pending_uses(self):
         with self.lock:
-            return [
-                dict(r)
-                for r in self.db.execute(
-                    "SELECT uses.* FROM uses LEFT JOIN feedback ON uses.id=feedback.use_id "
-                    "WHERE feedback.use_id IS NULL AND uses.outcome!='' "
-                    "AND NOT EXISTS (SELECT 1 FROM state WHERE key='judge_failed:' || uses.id)"
-                ).fetchall()
-            ]
+            result = []
+            for row in self.db.execute(
+                "SELECT * FROM uses WHERE outcome!=''"
+            ).fetchall():
+                observation = self.observation_of(row)
+                feedback = self.db.execute(
+                    "SELECT observation FROM feedback WHERE use_id=?", (row["id"],)
+                ).fetchone()
+                # An existing verdict on the current (or a legacy unversioned)
+                # observation is final; superseded observations are pending again.
+                if feedback and feedback[0] in {observation, ""}:
+                    continue
+                if self.db.execute(
+                    "SELECT 1 FROM state WHERE key=?",
+                    (f"judge_failed:{row['id']}:{observation[:16]}",),
+                ).fetchone():
+                    continue
+                result.append(dict(row, observation=observation))
+            return result
 
-    def failed_judge(self, use_id, detail):
+    def failed_judge(self, use_id, observation, detail):
+        """Record one failed attempt against the exact observation; a corrected
+        observation is new work, never a retry of this failed attempt."""
         with self.lock, self.db:
             self.db.execute(
                 "INSERT OR REPLACE INTO state VALUES(?,?)",
-                ("judge_failed:" + use_id, detail[:1000]),
+                (f"judge_failed:{use_id}:{observation[:16]}", detail[:1000]),
             )
 
     def upstream_entry(self, ident):
@@ -411,7 +467,7 @@ class Store:
             )
         return usage["id"]
 
-    def judge(self, use_id, *, judge_id, verdict, reason):
+    def judge(self, use_id, *, judge_id, verdict, reason, observation=None):
         if verdict not in {"helpful", "unhelpful", "unknown"}:
             raise ValueError("invalid verdict")
         judge_id, reason = text(judge_id, "judge_id", 256), text(reason, "reason", 4000)
@@ -419,6 +475,11 @@ class Store:
             row = self.db.execute("SELECT * FROM uses WHERE id=?", (use_id,)).fetchone()
             if row is None or not row["outcome"]:
                 raise ValueError("judge requires a completed observed use")
+            current = self.observation_of(row)
+            if observation is not None and observation != current:
+                # The evidence changed while this evaluation was in flight; the
+                # stale verdict must not overwrite the newer observation.
+                raise ValueError("stale judgement: the observation changed")
             doc = self.get(row["entry_id"])
             if row["session"] in doc["producers"]:
                 raise ValueError("producer's own use is not independent feedback")
@@ -434,14 +495,21 @@ class Store:
                 evidence_hash=digest(
                     [row["application"], row["evidence"], row["outcome"]]
                 ),
+                observation=current,
             )
             existing = self.db.execute(
                 "SELECT * FROM feedback WHERE use_id=?", (use_id,)
             ).fetchone()
             if existing:
-                return dict(existing)
+                if existing["observation"] in {current, ""}:
+                    # One effective vote per consumer/entry and observation.
+                    return dict(existing)
+                # Superseded: the new verdict on the corrected observation
+                # replaces it, keeping a single effective vote.
+                self.db.execute("DELETE FROM feedback WHERE use_id=?", (use_id,))
             self.db.execute(
-                "INSERT INTO feedback VALUES(?,?,?,?,?,?,?)", tuple(record.values())
+                "INSERT INTO feedback VALUES(?,?,?,?,?,?,?,?)",
+                tuple(record.values()),
             )
             return record
 
@@ -495,7 +563,15 @@ class Store:
         )
         return dict(version=digest(payload), **payload)
 
-    def install_snapshot(self, snapshot):
+    def install_snapshot(self, snapshot, *, authoritative=True):
+        """Install a domain snapshot.
+
+        ``authoritative=True`` (the sync pull from the configured upstream)
+        replaces upstream membership: entries the authority no longer offers
+        stop being searchable here, while their content stays explainable and
+        local-only or feed-owned entries are untouched. ``authoritative=False``
+        (inbound contributions) is incremental ingestion only.
+        """
         if not isinstance(snapshot, dict) or set(snapshot) != {
             "version",
             "schema",
@@ -606,10 +682,24 @@ class Store:
                         "INSERT OR REPLACE INTO state VALUES(?,?)",
                         ("upstream_entry:" + doc["id"], snapshot["version"]),
                     )
+                if authoritative:
+                    for doc in entries:
+                        self.db.execute(
+                            "INSERT OR REPLACE INTO upstream_entries VALUES(?,1)",
+                            (doc["id"],),
+                        )
+                    if entries:
+                        self.db.execute(
+                            "UPDATE upstream_entries SET active=0 WHERE entry_id NOT IN "
+                            f"({','.join('?' for _ in entries)})",
+                            tuple(doc["id"] for doc in entries),
+                        )
+                    else:
+                        self.db.execute("UPDATE upstream_entries SET active=0")
                 for vote in feedback:
                     # A configured authority owns the distributed verdict.
                     self.db.execute(
-                        "INSERT OR REPLACE INTO feedback VALUES(?,?,?,?,?,?,?)",
+                        "INSERT OR REPLACE INTO feedback VALUES(?,?,?,?,?,?,?,?)",
                         (
                             vote["use_id"],
                             vote["entry_id"],
@@ -618,6 +708,7 @@ class Store:
                             vote["verdict"],
                             "Published independent-use feedback; raw evidence remains at its origin.",
                             vote["evidence_hash"],
+                            "",
                         ),
                     )
                 self.db.execute(

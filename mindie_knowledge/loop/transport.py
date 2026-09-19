@@ -51,6 +51,41 @@ def rpc(connection, method, arguments=None, *, timeout=10):
     return result["result"]
 
 
+class _BoundedHTTPServer(ThreadingHTTPServer):
+    """Threading server with an explicit admission bound.
+
+    At most ``max_workers`` request threads exist; a connection that cannot
+    get a slot within ``slot_wait`` seconds is closed instead of queueing a
+    thread, so held connections cannot exhaust the service.
+    """
+
+    daemon_threads = True
+
+    def __init__(self, address, handler, *, max_workers, slot_wait):
+        self.slots = threading.BoundedSemaphore(max_workers)
+        self.slot_wait = slot_wait
+        super().__init__(address, handler)
+
+    def process_request(self, request, client_address):
+        try:
+            if not self.slots.acquire(timeout=self.slot_wait):
+                request.close()
+                return
+        except OSError:
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
+
+
 class Service:
     def __init__(
         self,
@@ -60,6 +95,8 @@ class Service:
         upstream=None,
         feeds=(),
         session_activation=None,
+        max_workers=8,
+        request_timeout=10.0,
     ):
         self.engine, self.store = engine, engine.store
         self.admission = None
@@ -82,6 +119,12 @@ class Service:
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *args):
                 pass
+
+            def setup(self):
+                super().setup()
+                # A valid bearer with a stalled partial body cannot hold a
+                # worker past this deadline.
+                self.connection.settimeout(request_timeout)
 
             def do_POST(self):
                 if self.path != "/rpc" or self.headers.get("Origin"):
@@ -107,6 +150,10 @@ class Service:
                     )
                 except (ValueError, KeyError, TypeError) as exc:
                     result = dict(ok=False, error=str(exc)[:500])
+                except (TimeoutError, OSError):
+                    # Stalled or aborted request; release the worker quietly.
+                    self.close_connection = True
+                    return
                 except Exception:
                     result = dict(
                         ok=False,
@@ -119,8 +166,12 @@ class Service:
                 self.end_headers()
                 self.wfile.write(data)
 
-        self.http = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.http.daemon_threads = True
+        self.http = _BoundedHTTPServer(
+            ("127.0.0.1", 0),
+            Handler,
+            max_workers=max_workers,
+            slot_wait=min(5.0, request_timeout),
+        )
         self.connection = dict(
             url=f"http://127.0.0.1:{self.http.server_port}",
             token=self.token,
@@ -168,7 +219,7 @@ class Service:
                 raise ValueError(
                     "contributions contain entries only; the authority judges actual uses"
                 )
-            installed = self.store.install_snapshot(snapshot)
+            installed = self.store.install_snapshot(snapshot, authoritative=False)
             for entry in snapshot["entries"]:
                 self.store.publish(entry["id"])
             return installed
@@ -242,9 +293,12 @@ class Service:
         try:
             self.http.serve_forever(poll_interval=0.2)
         finally:
+            # Cancel in-flight optional model work first; interrupted attempts
+            # are recorded failed/discarded and never replayed.
             self.engine.stop.set()
             self.http.server_close()
-            self.engine.thread.join(timeout=185)
+            self.engine.thread.join(timeout=10)
 
     def close(self):
+        self.engine.stop.set()
         self.http.shutdown()

@@ -17,10 +17,13 @@ does not depend on a particular Harness; the Codex adapter supplies the runner.
   Experience is advisory material. A query can exclude incompatible knowledge;
   it does not gate experiences on versions or assign factual confidence.
 - Captures, uses and feedback are separate records. One use per entry and consumer
-  task; later rounds of the same task refine that record until it is judged, then
-  it stays frozen under the verdict's evidence hash. Producer self-use cannot
-  count. The judge uses a fresh invocation and a distinct identity. This is
-  logical task isolation, not adversarial identity proof.
+  task; a correction in the same task is a new *observation* (application, evidence
+  and the outcome bound by the next Stop capture) of that single vote. A verdict
+  binds the observation hash it evaluated: superseded verdicts stop counting, the
+  corrected observation gets exactly one new bounded evaluation attempt, a stale
+  in-flight verdict is rejected, and a failed attempt never blocks a correction.
+  Producer self-use cannot count. The judge uses a fresh invocation and a distinct
+  identity. This is logical task isolation, not adversarial identity proof.
 
 ## Core protocol
 
@@ -63,15 +66,32 @@ identities/verdicts; they omit raw captures, use evidence and judge prose.
 Their digest covers the entire payload.
 
 `upstream` explicitly connects a replica to a trusted domain authority. Sync pulls
-the snapshot, then submits completed local uses to the authority's independent
-judge. Explicitly published replica entries are offered to the authority first,
+the snapshot as *authoritative membership*: entries the authority withdraws stop
+being searchable on the replica, while their content stays explainable by
+reference and local-only or feed-owned entries are untouched. Inbound
+`contribute` is incremental ingestion and never replaces membership. The replica
+then submits completed local uses to the authority's independent judge.
+Explicitly published replica entries are offered to the authority first,
 rechecked by the existing publication redactor, and then distributed. Unpublished
 replica content remains local. Subsequent syncs bring updated feedback to replicas.
 The authority's distributed verdict supersedes a prior local verdict for the same
 use; the use still counts once. HTTP is permitted only
-on loopback; remote services require HTTPS. Redirects are rejected. Service credentials
+on loopback; remote services require HTTPS. Redirects are rejected. The RPC server
+admits at most 8 concurrent request workers and closes connections that cannot
+get a worker or that stall a request body past a 10-second read deadline. Service
+credentials
 belong in private configuration; production multi-user identity/authorization,
 durable publisher deployment and public release channels are outside this first slice.
+
+`export --output DIR` writes one new inspectable feed generation from the entries
+currently authorized by `publish` (knowledge under `topics/`, experience under
+`cases/`), in the exact format the independent intake reader verifies: bodies,
+sidecar metadata with applicability and source hashes, a prepared manifest with
+added/removed/updated/renamed changes against the previous generation, and a
+`current.json` pointer swapped only after the complete generation is on disk, so
+a failed export retains the previous one. Withdrawn entries disappear from the
+next generation and readers deactivate them. It writes files only — reviewing,
+committing and pushing a feed branch stays a human/operator decision.
 
 ## Official domain feed
 
@@ -119,12 +139,18 @@ mindie-knowledge import --config domain.json --file reviewed-entry.json
 mindie-knowledge publish --config domain.json --ref mindie://vllm-ascend/CONTENT_ID
 mindie-knowledge withdraw --config domain.json --ref mindie://vllm-ascend/CONTENT_ID
 mindie-knowledge sync --config domain.json
+mindie-knowledge export --config domain.json --output feed-dir/
 mindie-knowledge mcp --config domain.json
 ```
 
+Shutdown cancels in-flight maintenance through a shared stop event
+(`bounded_run` interrupts the agent process tree), discards queued captures as
+never-attempted, and joins the worker with a bounded wait.
+
 Process bounding is portable: POSIX uses process groups, Windows uses
-`CREATE_NEW_PROCESS_GROUP` plus `taskkill /T` tree termination. The Windows
-path implements the same contract but awaits real-machine evidence.
+`CREATE_NEW_PROCESS_GROUP` plus `taskkill /T` tree termination, and pipe draining
+uses reader threads instead of `selectors` (which cannot select Windows pipes).
+The Windows path implements the same contract but awaits real-machine evidence.
 
 `serve` runs in foreground for diagnostics. Configuration and service versions
 must be kept together; restart the owned service after updating runtime configuration.

@@ -195,3 +195,83 @@ def test_feed_domain_must_match(fixture):
     *_, store, _ = fixture
     with pytest.raises(ValueError, match="domain"):
         Feed(store, dict(repository="org/knowledge", ref="feed", domain="ascendc"))
+
+
+def test_export_feed_roundtrip_through_the_verified_reader(tmp_path):
+    """The production writer emits a feed the independent reader installs:
+    publication, withdrawal in a later generation, failure retaining current."""
+    from mindie_knowledge.loop.export import export_feed
+    from mindie_knowledge.loop.store import session_key
+
+    repo = tmp_path / "feed"
+    repo.mkdir()
+    git = lambda *a: subprocess.check_output(["git", "-C", str(repo), *a], text=True).strip()
+    git("init", "-q")
+    git("config", "user.name", "test")
+    git("config", "user.email", "test@example.com")
+
+    origin = Store(tmp_path / "origin", "vllm-ascend")
+    reader = Store(tmp_path / "reader", "vllm-ascend")
+    try:
+        knowledge = origin.add(
+            kind="knowledge",
+            title="Device gate reference",
+            content="C8 requires a declared hardware capability.",
+            source={"url": "https://example.com/docs", "revision": "abc"},
+            conditions={"revision": "abc"},
+        )
+        exp = origin.add(
+            kind="experience",
+            title="Device gate investigation",
+            content="Trace the hardware capability before diagnosing kernels.",
+            producers=[session_key("producer")],
+        )
+        # Not authorized -> no export.
+        with pytest.raises(ValueError, match="nothing is authorized"):
+            export_feed(origin, repo)
+        origin.publish(knowledge["id"])
+        origin.publish(exp["id"])
+        result = export_feed(origin, repo)
+        assert result["entries"] == 2 and not result["changes"]["removed"]
+        git("add", ".")
+        git("commit", "-qm", "generation 1")
+
+        feed = Feed(
+            reader,
+            dict(repository="org/knowledge", ref="knowledge/vllm-ascend", domain="vllm-ascend"),
+        )
+        feed.GitFeed = lambda repository, ref, budget: GitFeed(str(repo), "HEAD", budget)
+        assert feed.sync(force=True)["status"] == "synced"
+        found = {row["kind"]: row for row in reader.query("Device gate")["results"]}
+        assert set(found) == {"knowledge", "experience"}
+        reader_exp_ref = found["experience"]["ref"]
+
+        # Withdrawal propagates through the next generation.
+        origin.withdraw(exp["id"])
+        result = export_feed(origin, repo)
+        assert result["changes"]["removed"], result["changes"]
+        git("add", ".")
+        git("commit", "-qm", "generation 2")
+        assert feed.sync(force=True)["status"] == "synced"
+        found = {row["kind"] for row in reader.query("Device gate")["results"]}
+        assert set(found) == {"knowledge"}
+        # Content remains explainable by reference on the reader.
+        assert reader.get(reader_exp_ref)["content"]
+
+        # A failed export (private value appears) retains the current pointer.
+        # publish() itself would reject this entry, so authorize it directly to
+        # simulate a later ruleset tightening or a ledger edit.
+        pointer_before = (repo / "current.json").read_text()
+        bad = origin.add(
+            kind="experience",
+            title="Leaky note",
+            content="Checked host 192.168.13.153 first.",
+        )
+        origin.db.execute("INSERT OR IGNORE INTO publication VALUES(?)", (bad["id"],))
+        origin.db.commit()
+        with pytest.raises(ValueError, match="redaction"):
+            export_feed(origin, repo)
+        assert (repo / "current.json").read_text() == pointer_before
+    finally:
+        origin.close()
+        reader.close()

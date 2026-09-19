@@ -135,3 +135,52 @@ def test_timeout_stops_descendants(tmp_path):
         bounded_run([sys.executable, "-c", parent], "", timeout=0.2, max_output=4096)
     time.sleep(1.1)
     assert not marker.exists()
+
+
+def test_bounded_run_cancellation_kills_the_whole_process_tree(tmp_path):
+    """A real sleeping parent+child are both gone after cancellation."""
+    import os
+    import threading
+    import time
+
+    from mindie_knowledge.loop import process as process_module
+    from mindie_knowledge.loop.process import MaintenanceCancelled
+
+    spawned = []
+    real_spawn = process_module._spawn
+
+    def recording_spawn(command, stdin):
+        proc = real_spawn(command, stdin)
+        spawned.append(proc)
+        return proc
+
+    cancel = threading.Event()
+    original = process_module._spawn
+    process_module._spawn = recording_spawn
+    try:
+        outcome = []
+
+        def work():
+            try:
+                process_module.bounded_run(
+                    ["sh", "-c", "sleep 30 & exec sleep 30"],
+                    "{}",
+                    timeout=60,
+                    max_output=1024,
+                    cancel=cancel,
+                )
+            except MaintenanceCancelled:
+                outcome.append("cancelled")
+
+        thread = threading.Thread(target=work)
+        thread.start()
+        time.sleep(0.7)
+        cancel.set()
+        thread.join(timeout=10)
+        assert not thread.is_alive(), "cancellation did not interrupt bounded_run"
+        assert outcome == ["cancelled"]
+        proc = spawned[0]
+        with pytest.raises(ProcessLookupError):
+            os.killpg(proc.pid, 0)  # the whole group, including the child, is gone
+    finally:
+        process_module._spawn = original

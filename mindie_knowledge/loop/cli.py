@@ -302,6 +302,7 @@ def main(argv=None):
             "import",
             "publish",
             "withdraw",
+            "export",
             "snapshot",
             "maintenance-resume",
         ],
@@ -311,6 +312,7 @@ def main(argv=None):
     parser.add_argument("--ref")
     parser.add_argument("--session-id")
     parser.add_argument("--activation")
+    parser.add_argument("--output")
     args = parser.parse_args(argv)
     if args.operation == "hook":
         try:
@@ -351,13 +353,19 @@ def main(argv=None):
             session_activation=config.get("session_activation"),
         ).serve()
         return 0
-    if args.operation in {"import", "publish", "withdraw"}:
+    if args.operation in {"import", "publish", "withdraw", "export"}:
         store = Store(config["root"], config["domain"])
         try:
             if args.operation == "import":
                 if not args.file:
                     parser.error("import requires --file with an entry JSON")
                 result = store.add(**json.loads(Path(args.file).read_text()))
+            elif args.operation == "export":
+                if not args.output:
+                    parser.error("export requires --output with a feed directory")
+                from .export import export_feed
+
+                result = export_feed(store, args.output)
             elif args.operation == "publish":
                 if not args.ref:
                     parser.error("publish requires --ref")
