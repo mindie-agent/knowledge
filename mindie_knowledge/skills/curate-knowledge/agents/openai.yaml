@@ -1,7 +1,7 @@
 interface:
   display_name: "Curate Knowledge"
   short_description: "Maintain and publish domain knowledge; not used for ordinary query or capture"
-  default_prompt: "Use $curate-knowledge only for explicit maintenance, migration, or authorized publication. Bind with loop attach --session-id; do not query in order to bind. Ordinary lookup is knowledge_query / knowledge_explain / knowledge_use. Publish/withdraw are loop commands. Do not call health, code-map, or contribution entries."
+  default_prompt: "Use $curate-knowledge for the requested maintenance, migration or authorized publication. Use installed domain tools, preserve sources and applicability, and report actual changes and publication status."
 
 policy:
   allow_implicit_invocation: false

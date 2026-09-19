@@ -137,7 +137,7 @@ an executable runbook.
 - Separate a confirmed cause from a plausible explanation.
 - Version mismatch means “not applicable here”, not “the old note was false”.
 - No hit, unused hit, and `unknown` usefulness stay unknown. Do not fill them.
-- A successful task that did not use an experience is not evidence that the experience helped.
+- A successful task, an existing check, or a citation does not show that an experience helped. Record what it changed or enabled and what was actually observed; missing causal evidence stays unknown.
 
 Report the substantive edits, unmapped fields, and publication status when
 relevant. Do not author a second summary for the knowledge store.
