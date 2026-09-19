@@ -10,7 +10,7 @@ isolated fixtures. None of these is synthetic NPU/Windows evidence.
 | migration-conflict-versions | no | Conflicting CANN conditions both kept | isolated `fixtures/notes/gate-v1` vs `gate-v2` |
 | migration-unmappable-and-private | no | Unmappable reported; private unpublished | isolated notes |
 | migration-feed-layout | no | topics/cases/maintenance split | isolated `fixtures/feed/` |
-| no-hit | no | No invented hit | `tests/fixtures/retrieval-evaluation.json` query `nonexistent_operator_zz991` |
+| no-hit | no | No invented hit | Imported public corpus, query `nonexistent_operator_zz991` |
 | version-inapplicable | no | CANN 8 must not apply CANN 9.0.0 knowledge | packaged 910B4 peaks |
 | hit-unused | no | Lexical hit without `knowledge_use` | retrieval fixture vs unused peak table |
 | consumption-echo | no | Consumer is not a new producer/vote | `Store.add` after `use` |

@@ -1,8 +1,13 @@
 from pathlib import Path
-
-from mindie_knowledge.skill import skill_files
+from importlib.resources import files
 
 ROOT = Path(__file__).resolve().parents[2] / "mindie_knowledge" / "skills" / "curate-knowledge"
+RESOURCE_NAMES = ("SKILL.md", "references/independent-maintenance.md", "agents/openai.yaml")
+
+
+def skill_files():
+    root = files("mindie_knowledge").joinpath("skills", "curate-knowledge")
+    return {name: root.joinpath(name).read_bytes() for name in RESOURCE_NAMES}
 
 
 def _text() -> str:

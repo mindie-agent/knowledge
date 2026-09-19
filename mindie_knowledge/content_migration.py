@@ -864,6 +864,15 @@ def _capture_ownership(store, ident: str) -> dict[str, Any] | None:
     }
 
 
+def _intended_ownership(item: dict[str, Any], producer: str) -> dict[str, Any]:
+    """Persist our intended mutation before writing, never adopt later owners."""
+    from mindie_knowledge.loop.store import canonical
+
+    doc = dict(id=item["content_id"], **_entry_kwargs(item, producer))
+    doc["title"], doc["content"] = doc["title"].strip(), doc["content"].strip()
+    return dict(document=canonical(doc), published=False, uses=[], feedback=[], feeds=[])
+
+
 def _ownership_reasons(expected: Mapping[str, Any] | None, actual: Mapping[str, Any] | None) -> list[str]:
     if actual is None:
         return []
@@ -883,13 +892,17 @@ def _ownership_reasons(expected: Mapping[str, Any] | None, actual: Mapping[str, 
     return reasons
 
 
-def _remove_new_entry(store, ident: str, kind: str) -> None:
+def _remove_new_entry(store, ident: str, kind: str, expected) -> list[str]:
     with store.lock, store.db:
+        store.db.execute("BEGIN IMMEDIATE")
+        reasons = _ownership_reasons(expected, _capture_ownership(store, ident))
+        if reasons:
+            return reasons
         store.db.execute("DELETE FROM entries WHERE id=?", (ident,))
-        store.db.execute("DELETE FROM publication WHERE entry_id=?", (ident,))
-    for name in (f"{ident}.md", f"{ident}.meta.json"):
-        path = store.root / "content" / kind / name
-        path.unlink(missing_ok=True)
+        for name in (f"{ident}.md", f"{ident}.meta.json"):
+            path = store.root / "content" / kind / name
+            path.unlink(missing_ok=True)
+    return []
 
 
 def _written_rows(progress: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -897,14 +910,29 @@ def _written_rows(progress: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def apply(state_dir: Path, ident: str, *, commit: bool = False) -> dict[str, Any]:
+    from mindie_knowledge.loop.locks import StartLock, StartInProgress
+
+    if not commit:
+        return _apply(state_dir, ident, commit=False)
+    load_job(state_dir, ident)  # Validate before creating a mutation lock.
+    try:
+        with StartLock(job_dir(state_dir, ident) / "mutation.lock"):
+            return _apply(state_dir, ident, commit=True)
+    except StartInProgress as exc:
+        raise ValueError("migration job mutation is already in progress; no retry") from exc
+
+
+def _apply(state_dir: Path, ident: str, *, commit: bool = False) -> dict[str, Any]:
     record = load_job(state_dir, ident)
     if record["status"] in {"undone", "undo_partial"} and commit:
         raise ValueError("undone job cannot be re-applied; create a new plan")
     items = read_json(Path(record["root"]) / "plan.json")["items"]
     problems = _verify_sources(record, items)
+    progress = _load_progress(record)
+    reservations = {row["id"]: row for row in progress if row.get("status") == "reserved"}
     snapshot = inspect_store_readonly(Path(record["store_root"]), record["domain"])
     if snapshot is not None:
-        annotate_against_ids(items, snapshot["ids"])
+        annotate_against_ids(items, snapshot["ids"] - reservations.keys())
         if (
             record.get("store_baseline")
             and snapshot["baseline"] != record["store_baseline"]
@@ -946,7 +974,6 @@ def apply(state_dir: Path, ident: str, *, commit: bool = False) -> dict[str, Any
             record["status"] = "planned"
             save_job(record)
         return {**status_payload(record), "apply": receipt}
-    progress = _load_progress(record)
     already = {
         row["id"]
         for row in progress
@@ -988,10 +1015,11 @@ def apply(state_dir: Path, ident: str, *, commit: bool = False) -> dict[str, Any
     try:
         for item in writable:
             ident_entry = item["content_id"]
+            expected = reservations.get(ident_entry, {}).get("ownership") or _intended_ownership(item, producer)
             progress = _record_progress(
                 record,
                 progress,
-                {"id": ident_entry, "kind": item["kind"], "path": item["path"], "status": "reserved"},
+                {"id": ident_entry, "kind": item["kind"], "path": item["path"], "status": "reserved", "ownership": expected},
             )
             try:
                 existing_doc = store.get(ident_entry)
@@ -999,6 +1027,7 @@ def apply(state_dir: Path, ident: str, *, commit: bool = False) -> dict[str, Any
                 existing_doc = None
             if existing_doc is not None:
                 ownership = _capture_ownership(store, ident_entry)
+                recovered = ident_entry in reservations and not _ownership_reasons(expected, ownership)
                 progress = _record_progress(
                     record,
                     progress,
@@ -1006,16 +1035,17 @@ def apply(state_dir: Path, ident: str, *, commit: bool = False) -> dict[str, Any
                         "id": ident_entry,
                         "kind": item["kind"],
                         "path": item["path"],
-                        "status": "skipped_existing",
-                        "ownership": ownership,
+                        "status": "written" if recovered else "skipped_existing",
+                        "ownership": expected,
+                        "recovered_after_interrupt": recovered,
                     },
                 )
-                skipped_existing.append(ident_entry)
+                if not recovered:
+                    skipped_existing.append(ident_entry)
                 continue
             doc = store.add(**_entry_kwargs(item, producer))
             if doc["id"] != ident_entry:
                 raise ValueError("Store identity diverged from planned content_id")
-            ownership = _capture_ownership(store, doc["id"])
             progress = _record_progress(
                 record,
                 progress,
@@ -1024,7 +1054,7 @@ def apply(state_dir: Path, ident: str, *, commit: bool = False) -> dict[str, Any
                     "kind": doc["kind"],
                     "path": item["path"],
                     "status": "written",
-                    "ownership": ownership,
+                    "ownership": expected,
                 },
             )
         written = _written_rows(progress)
@@ -1066,11 +1096,22 @@ def apply(state_dir: Path, ident: str, *, commit: bool = False) -> dict[str, Any
 
 
 def undo(state_dir: Path, ident: str) -> dict[str, Any]:
+    from mindie_knowledge.loop.locks import StartLock, StartInProgress
+
+    load_job(state_dir, ident)
+    try:
+        with StartLock(job_dir(state_dir, ident) / "mutation.lock"):
+            return _undo(state_dir, ident)
+    except StartInProgress as exc:
+        raise ValueError("migration job mutation is already in progress; no retry") from exc
+
+
+def _undo(state_dir: Path, ident: str) -> dict[str, Any]:
     record = load_job(state_dir, ident)
     if record["status"] not in {"applied", "apply_partial", "applying"}:
         raise ValueError("only an applied or partially applied job can be undone")
     progress = _load_progress(record)
-    written = _written_rows(progress)
+    written = [row for row in progress if row.get("status") in {"written", "reserved"}]
     if not written:
         written_path = Path(record["root"]) / "written.json"
         if written_path.is_file():
@@ -1096,7 +1137,10 @@ def undo(state_dir: Path, ident: str) -> dict[str, Any]:
             if reasons:
                 refused.append({"id": ident_entry, "reason": "; ".join(reasons) + "; entry retained"})
                 continue
-            _remove_new_entry(store, ident_entry, row.get("kind") or "knowledge")
+            reasons = _remove_new_entry(store, ident_entry, row.get("kind") or "knowledge", row.get("ownership"))
+            if reasons:
+                refused.append({"id": ident_entry, "reason": "; ".join(reasons) + "; entry retained"})
+                continue
             restored.append({"id": ident_entry, "status": "removed"})
     finally:
         store.close()
