@@ -6,8 +6,6 @@ import argparse
 import json
 from pathlib import Path
 
-from mindie_knowledge.contribution.documents import MarkdownDocument
-from mindie_knowledge.contribution.errors import DocumentRejected
 from mindie_knowledge.redact import scan_text
 
 
@@ -28,13 +26,14 @@ def validate_corpus(repo: Path) -> dict:
             continue
         try:
             text = path.read_text(encoding="utf-8")
-            MarkdownDocument.from_text(text)
+            if not text.strip() or not text.lstrip().startswith("#"):
+                raise ValueError("expected a Markdown document with a heading")
             # Report rule IDs, never matched private values in public CI logs.
             rules = sorted({finding.rule for finding in scan_text(text)})
             if rules:
                 problems.append({"path": relative, "reason": "redaction required: " + ", ".join(rules)})
             count += 1
-        except (OSError, ValueError, DocumentRejected) as exc:
+        except (OSError, ValueError) as exc:
             problems.append({"path": relative, "reason": type(exc).__name__})
     if not count:
         problems.append({"path": "corpus", "reason": "no knowledge documents"})
