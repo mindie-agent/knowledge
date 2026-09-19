@@ -25,6 +25,8 @@ from .sync import _lock, _safe
 
 SCHEMA = "vaws-curation-export/1"
 PROFILE = "r2"
+LOOP_EXTENSION = "mindie-loop.json"
+LOOP_SCHEMA = "mindie-loop-export/1"
 MAX_FILES = 1024
 MAX_BODY = 4 * 1024 * 1024
 MAX_META = 256 * 1024
@@ -57,6 +59,75 @@ def _json(raw: bytes):
             result[key] = value
         return result
     return json.loads(raw, object_pairs_hook=unique)
+
+
+def _canonical(value) -> bytes:
+    """The producer's canonical JSON digest encoding, reimplemented here so the
+    reader never imports the producer runtime."""
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _digest_json(value) -> str:
+    return hashlib.sha256(_canonical(value)).hexdigest()
+
+
+def _verified_loop(raw: bytes, rows) -> dict:
+    """Validate the optional authenticated loop extension.
+
+    The extension is covered by the same Git commit authentication as every
+    other blob; here we check internal consistency: each entry's id recomputes
+    from its canonical fields, each entry binds by content hash to a
+    hash-pinned manifest row, and every feedback vote is independent of the
+    entry's producers and consumer. Identities are never silently discarded.
+    """
+    data = _json(raw)
+    if not isinstance(data, dict) or set(data) != {"schema", "entries", "feedback"} or data["schema"] != LOOP_SCHEMA:
+        raise IntakeError("loop extension schema is unsupported")
+    entries, feedback = data["entries"], data["feedback"]
+    if not isinstance(entries, list) or not isinstance(feedback, list) or len(entries) > MAX_FILES:
+        raise IntakeError("loop extension bounds are invalid")
+    rows_by_path = {row["path"]: row for row in rows}
+    by_id = {}
+    for doc in entries:
+        if not isinstance(doc, dict) or set(doc) != {"id", "kind", "title", "content", "source", "conditions", "producers", "path"}:
+            raise IntakeError("loop extension entry has unsupported fields")
+        if doc["kind"] not in {"knowledge", "experience"} or not isinstance(doc["source"], dict) or not isinstance(doc["conditions"], dict):
+            raise IntakeError("loop extension entry metadata is invalid")
+        if not isinstance(doc["title"], str) or not 0 < len(doc["title"]) <= 240 or not isinstance(doc["content"], str) or not 0 < len(doc["content"]) <= 32768:
+            raise IntakeError("loop extension entry text bounds are invalid")
+        if doc["kind"] == "knowledge" and (not doc["source"].get("url") or not doc["source"].get("revision") or not doc["conditions"]):
+            raise IntakeError("loop extension knowledge lacks source applicability")
+        if not isinstance(doc["id"], str) or not _SHA.fullmatch(doc["id"]):
+            raise IntakeError("loop extension entry id is invalid")
+        expected_id = _digest_json([doc["kind"], " ".join(doc["title"].split()), " ".join(doc["content"].split()), doc["source"], doc["conditions"]])
+        if doc["id"] != expected_id or doc["id"] in by_id:
+            raise IntakeError("loop extension content identity mismatch")
+        row = rows_by_path.get(doc["path"])
+        if row is None:
+            raise IntakeError("loop extension entry is not bound to a manifest file")
+        rendered = ("# " + doc["title"].strip() + "\n\n" + doc["content"].strip() + "\n").encode()
+        if digest(rendered) != row["source_sha256"]:
+            raise IntakeError("loop extension entry disagrees with its manifest bytes")
+        if (doc["kind"] == "knowledge") != doc["path"].startswith("topics/"):
+            raise IntakeError("loop extension kind disagrees with its export root")
+        if not isinstance(doc["producers"], list) or any(not isinstance(p, str) or not _SHA.fullmatch(p) for p in doc["producers"]):
+            raise IntakeError("loop extension producer identities are invalid")
+        by_id[doc["id"]] = doc
+    seen = set()
+    for vote in feedback:
+        if not isinstance(vote, dict) or set(vote) != {"use_id", "entry_id", "consumer", "judge", "verdict", "evidence_hash", "observation"}:
+            raise IntakeError("loop extension feedback has unsupported fields")
+        doc = by_id.get(vote["entry_id"])
+        if not doc or doc["kind"] != "experience" or vote["verdict"] not in {"helpful", "unhelpful", "unknown"}:
+            raise IntakeError("loop extension feedback has no matching experience")
+        if any(not isinstance(vote[k], str) or not _SHA.fullmatch(vote[k]) for k in ("use_id", "consumer", "judge", "evidence_hash", "observation")):
+            raise IntakeError("loop extension feedback identities are invalid")
+        if vote["consumer"] in doc["producers"] or vote["judge"] in doc["producers"] + [vote["consumer"]]:
+            raise IntakeError("loop extension feedback is not independent")
+        if vote["use_id"] != _digest_json([doc["id"], vote["consumer"]]) or vote["use_id"] in seen:
+            raise IntakeError("loop extension feedback identity is inconsistent")
+        seen.add(vote["use_id"])
+    return {"entries": entries, "feedback": feedback}
 
 
 class GitFeed:
@@ -260,10 +331,17 @@ def verified_snapshot(source: GitFeed, prefix: str = "", *, reuse=None) -> dict:
             raise IntakeError("feed snapshot exceeds its 32 MiB total bound")
         files.update({name: raw, side: metadata_raw})
         expected.update((name, side))
+    loop = None
+    if LOOP_EXTENSION in observed:
+        # One optional authenticated metadata extension; it carries canonical
+        # entry identities and minimal effective feedback for this product's
+        # own feeds and is validated against the hash-pinned manifest rows.
+        loop = _verified_loop(source.read(generation + "/" + LOOP_EXTENSION, MAX_MANIFEST), rows)
+        expected.add(LOOP_EXTENSION)
     if observed != expected:
         raise IntakeError("feed generation has missing or unmanaged files")
     return {"files": files, "generation": pointer["generation"], "manifest_sha256": pointer["manifest_sha256"], "snapshot": signature,
-            "revision": source.commit, "changes": manifest["changes"], "documents": len(rows),
+            "revision": source.commit, "changes": manifest["changes"], "documents": len(rows), "loop": loop,
             "prepared_bytes": total, "reused_files": reused_files, "reused_bytes": reused_bytes,
             "downloaded_files": source.reads, "downloaded_bytes": source.read_bytes}
 

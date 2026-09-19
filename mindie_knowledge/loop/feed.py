@@ -90,6 +90,10 @@ class Feed:
     def install(self, snapshot):
         """Prepare all selected documents before switching searchable membership."""
         files = snapshot["files"]
+        loop_entries = {
+            entry["path"]: entry
+            for entry in (snapshot.get("loop") or {}).get("entries", [])
+        }
         with self.store.lock:
             previous = {
                 r["path"]: dict(r)
@@ -117,18 +121,27 @@ class Feed:
             metadata = json.loads(metadata_raw)
             conditions = metadata["conditions"]
             content = text(raw.decode("utf-8"), "feed content")
-            title = text(
-                next(
-                    (
-                        line.lstrip("# ")
-                        for line in content.splitlines()
-                        if line.startswith("# ")
+            extension = loop_entries.get(name)
+            if extension is not None:
+                # The reader verified the identity binding: canonical source,
+                # conditions, title, body and producers survive the round-trip.
+                title = extension["title"]
+                content = extension["content"]
+                producers = extension["producers"]
+            else:
+                title = text(
+                    next(
+                        (
+                            line.lstrip("# ")
+                            for line in content.splitlines()
+                            if line.startswith("# ")
+                        ),
+                        Path(name).stem,
                     ),
-                    Path(name).stem,
-                ),
-                "feed title",
-                240,
-            )
+                    "feed title",
+                    240,
+                )
+                producers = [session_key("git-feed:" + self.ident)]
             if kind == "knowledge" and not conditions:
                 raise ValueError("topic knowledge requires explicit applicability")
             fingerprint = digest(
@@ -140,6 +153,16 @@ class Feed:
             old = previous.get(name)
             if old and old["fingerprint"] == fingerprint:
                 doc = self.store.get(old["entry_id"])
+            elif extension is not None:
+                doc = dict(
+                    kind=kind,
+                    title=title,
+                    content=content,
+                    source=extension["source"],
+                    conditions=conditions,
+                    producers=producers,
+                )
+                doc["id"] = extension["id"]
             else:
                 path = "/".join(
                     filter(
@@ -165,7 +188,7 @@ class Feed:
                     content=content,
                     source=origin,
                     conditions=conditions,
-                    producers=[session_key("git-feed:" + self.ident)],
+                    producers=producers,
                 )
                 doc["id"] = content_id(kind, title, content, origin, conditions)
             docs.append((name, fingerprint, doc))
@@ -195,7 +218,7 @@ class Feed:
             downloaded_files=snapshot["downloaded_files"],
             reused_files=snapshot["reused_files"],
         )
-        with self.store.lock, self.store.db:
+        with self.store._write_txn():
             self.store.db.execute(
                 "UPDATE feed_entries SET active=0 WHERE feed=?", (self.ident,)
             )
@@ -207,6 +230,12 @@ class Feed:
                 self.store.db.execute(
                     "INSERT OR REPLACE INTO feed_entries VALUES(?,?,?,?,1)",
                     (self.ident, name, doc["id"], fingerprint),
+                )
+            if snapshot.get("loop"):
+                # Independence and identity were verified by the intake reader;
+                # the same distributed-vote rules as upstream sync apply here.
+                self.store._install_distributed_votes(
+                    snapshot["loop"]["feedback"], source="feed:" + self.ident
                 )
             self.store.db.execute(
                 "INSERT OR REPLACE INTO state VALUES(?,?)",

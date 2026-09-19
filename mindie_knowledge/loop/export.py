@@ -42,8 +42,17 @@ def _filename(title, ident):
 def export_feed(store, output):
     """Export the store's currently authorized entries as one new generation.
 
-    Returns the written pointer. Raises without touching the previous export
-    when no entry is authorized or any entry fails validation.
+    Returns the written pointer. An empty authorized set is valid: it produces
+    an empty generation that switches downstream feeds to no active entries,
+    which is how withdrawing the final entry propagates. Raises without
+    touching the previous export when any entry fails validation.
+
+    Alongside the verified Markdown/manifest protocol, one authenticated
+    ``mindie-loop.json`` extension carries each entry's canonical identity
+    (id, source, conditions, producers) and the minimal effective feedback
+    votes, so a Git round-trip preserves Store identity and producer
+    independence instead of making every publisher an unrelated feed producer.
+    Raw captures, use evidence and judge prose are never exported.
     """
     from knowledge_intake.feed_sync import PROFILE, SCHEMA
 
@@ -53,10 +62,9 @@ def export_feed(store, output):
         )
     output = Path(output)
     snapshot = store.snapshot()
-    if not snapshot["entries"]:
-        raise ValueError("nothing is authorized for publication; export retained")
 
     rows, files = [], {}
+    loop_entries = []
     for doc in sorted(snapshot["entries"], key=lambda d: d["id"]):
         subdir = "topics" if doc["kind"] == "knowledge" else "cases"
         body = render_markdown(doc["title"], doc["content"])
@@ -100,8 +108,35 @@ def export_feed(store, output):
                 "metadata_sha256": _hash(metadata_raw),
             }
         )
+        loop_entries.append(
+            {
+                "id": doc["id"],
+                "kind": doc["kind"],
+                "title": doc["title"],
+                "content": doc["content"],
+                "source": doc["source"],
+                "conditions": doc["conditions"],
+                "producers": doc["producers"],
+                "path": name,
+            }
+        )
 
-    includes = sorted({row["path"].split("/", 1)[0] for row in rows})
+    # The reader protocol requires 1..16 supported roots even when empty.
+    includes = sorted({row["path"].split("/", 1)[0] for row in rows}) or [
+        "cases",
+        "topics",
+    ]
+    extension_raw = _encoded(
+        {
+            "schema": "mindie-loop-export/1",
+            "entries": loop_entries,
+            "feedback": snapshot["feedback"],
+        }
+    )
+    findings = scan_text(extension_raw.decode("utf-8"))
+    if findings:
+        rules = ", ".join(sorted({finding.rule for finding in findings}))
+        raise ValueError(f"feedback identities failed redaction: {rules}")
     previous_snapshot, old_rows = None, []
     pointer_path = output / "current.json"
     if pointer_path.is_file():
@@ -160,6 +195,7 @@ def export_feed(store, output):
     for name, raw in sorted(files.items()):
         (target / name).parent.mkdir(parents=True, exist_ok=True)
         _atomic_write_text(target / name, raw.decode("utf-8"))
+    _atomic_write_text(target / "mindie-loop.json", extension_raw.decode("utf-8"))
     _atomic_write_text(target / "prepared.json", manifest_raw.decode("utf-8"))
     pointer = {
         "schema": SCHEMA,

@@ -226,9 +226,19 @@ def test_export_feed_roundtrip_through_the_verified_reader(tmp_path):
             content="Trace the hardware capability before diagnosing kernels.",
             producers=[session_key("producer")],
         )
-        # Not authorized -> no export.
-        with pytest.raises(ValueError, match="nothing is authorized"):
-            export_feed(origin, repo)
+        # Empty authorized set is a valid export: it clears downstream feeds.
+        result = export_feed(origin, repo)
+        assert result["entries"] == 0
+        git("add", ".")
+        git("commit", "-qm", "generation 0")
+        feed = Feed(
+            reader,
+            dict(repository="org/knowledge", ref="knowledge/vllm-ascend", domain="vllm-ascend"),
+        )
+        feed.GitFeed = lambda repository, ref, budget: GitFeed(str(repo), "HEAD", budget)
+        assert feed.sync(force=True)["status"] == "synced"
+        assert reader.query("Device gate")["results"] == []
+
         origin.publish(knowledge["id"])
         origin.publish(exp["id"])
         result = export_feed(origin, repo)
@@ -236,14 +246,12 @@ def test_export_feed_roundtrip_through_the_verified_reader(tmp_path):
         git("add", ".")
         git("commit", "-qm", "generation 1")
 
-        feed = Feed(
-            reader,
-            dict(repository="org/knowledge", ref="knowledge/vllm-ascend", domain="vllm-ascend"),
-        )
-        feed.GitFeed = lambda repository, ref, budget: GitFeed(str(repo), "HEAD", budget)
         assert feed.sync(force=True)["status"] == "synced"
         found = {row["kind"]: row for row in reader.query("Device gate")["results"]}
         assert set(found) == {"knowledge", "experience"}
+        # Canonical identity survives the Git round-trip unchanged.
+        assert found["experience"]["ref"] == reader.ref(exp["id"])
+        assert found["knowledge"]["ref"] == reader.ref(knowledge["id"])
         reader_exp_ref = found["experience"]["ref"]
 
         # Withdrawal propagates through the next generation.
@@ -272,6 +280,51 @@ def test_export_feed_roundtrip_through_the_verified_reader(tmp_path):
         with pytest.raises(ValueError, match="redaction"):
             export_feed(origin, repo)
         assert (repo / "current.json").read_text() == pointer_before
+    finally:
+        origin.close()
+        reader.close()
+
+
+def test_export_final_withdrawal_clears_downstream(tmp_path):
+    """Withdrawing the last entry produces an empty generation that switches
+    the downstream feed to no active entries."""
+    from mindie_knowledge.loop.export import export_feed
+    from mindie_knowledge.loop.store import session_key
+
+    repo = tmp_path / "feed"
+    repo.mkdir()
+    git = lambda *a: subprocess.check_output(["git", "-C", str(repo), *a], text=True).strip()
+    git("init", "-q")
+    git("config", "user.name", "test")
+    git("config", "user.email", "test@example.com")
+    origin = Store(tmp_path / "origin", "vllm-ascend")
+    reader = Store(tmp_path / "reader", "vllm-ascend")
+    try:
+        exp = origin.add(
+            kind="experience",
+            title="Sole exportable note",
+            content="Only one entry is ever published here.",
+            producers=[session_key("producer")],
+        )
+        origin.publish(exp["id"])
+        export_feed(origin, repo)
+        git("add", ".")
+        git("commit", "-qm", "gen1")
+        feed = Feed(
+            reader,
+            dict(repository="org/knowledge", ref="r", domain="vllm-ascend"),
+        )
+        feed.GitFeed = lambda repository, ref, budget: GitFeed(str(repo), "HEAD", budget)
+        assert feed.sync(force=True)["status"] == "synced"
+        assert reader.query("Sole exportable")["results"]
+        origin.withdraw(exp["id"])
+        result = export_feed(origin, repo)
+        assert result["entries"] == 0 and result["changes"]["removed"]
+        git("add", ".")
+        git("commit", "-qm", "gen2-empty")
+        assert feed.sync(force=True)["status"] == "synced"
+        assert reader.query("Sole exportable")["results"] == []
+        assert reader.get(exp["id"])["content"]  # history stays explainable
     finally:
         origin.close()
         reader.close()

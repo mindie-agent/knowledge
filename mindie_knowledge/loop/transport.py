@@ -210,9 +210,9 @@ class Service:
         if method == "snapshot":
             return self.store.snapshot()
         if method == "receive_use":
-            ident = self.store.receive_use(args["usage"])
+            result = self.store.receive_use(args["usage"])
             self.engine.wake()
-            return dict(use_id=ident)
+            return result
         if method == "contribute":
             snapshot = args["snapshot"]
             if snapshot.get("feedback"):

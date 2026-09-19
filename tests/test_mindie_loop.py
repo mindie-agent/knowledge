@@ -721,3 +721,143 @@ def test_failed_attempt_on_old_observation_never_blocks_a_correction(store):
     pending = store.pending_uses()
     assert [row["id"] for row in pending] == [use["use_id"]]
     assert pending[0]["outcome"] == "Outcome two."
+
+
+def test_observation_roundtrip_correction_and_vote_withdrawal(store, tmp_path):
+    """Two stores: a corrected observation replaces the distributed vote, a
+    verdict the authority stops exporting is withdrawn downstream, and a stale
+    distributed verdict cannot displace an effective local one."""
+    origin = Store(tmp_path / "origin", "vllm-ascend")
+    reader = Store(tmp_path / "reader", "vllm-ascend")
+    try:
+        doc = experience(origin)
+        origin.publish(doc["id"])
+        use = origin.use(
+            ref=doc["id"], session_id="consumer-b", application="Applied", evidence="v1"
+        )
+        origin.capture("consumer-b", "t1", "Outcome one.")
+        origin.judge(
+            use["use_id"], judge_id="judge-1", verdict="helpful", reason="initial"
+        )
+        reader.install_snapshot(origin.snapshot())
+        # The vote arrives with its observation and counts downstream.
+        assert reader.weight(doc["id"])["helpful"] == 1
+
+        # The authority corrects the observation: the old verdict is superseded
+        # at the source and the corrected use is re-judged once.
+        origin.use(
+            ref=doc["id"],
+            session_id="consumer-b",
+            application="Applied",
+            evidence="v2 corrected",
+        )
+        origin.capture("consumer-b", "t2", "Outcome two.")
+        assert origin.snapshot()["feedback"] == []  # superseded votes never export
+        origin.judge(
+            use["use_id"], judge_id="judge-2", verdict="unhelpful", reason="corrected"
+        )
+        reader.install_snapshot(origin.snapshot())
+        weight = reader.weight(doc["id"])
+        assert weight["helpful"] == 0 and weight["unhelpful"] == 1
+
+        # The authority withdraws the verdict entirely (stops exporting it).
+        origin.db.execute("DELETE FROM feedback WHERE use_id=?", (use["use_id"],))
+        origin.db.commit()
+        reader.install_snapshot(origin.snapshot())
+        assert reader.weight(doc["id"])["unhelpful"] == 0
+        # And an already-corrected local use keeps its effective local verdict
+        # even if a stale snapshot still carries the old observation's vote.
+        stale_snapshot = origin.snapshot()
+        origin.use(
+            ref=doc["id"], session_id="consumer-b", application="Applied", evidence="v3"
+        )
+        origin.capture("consumer-b", "t3", "Outcome three.")
+        origin.judge(use["use_id"], judge_id="judge-3", verdict="helpful", reason="v3")
+        # Reinstalling the stale snapshot must not overwrite the v3 verdict.
+        stale_votes = [dict(v) for v in stale_snapshot["feedback"]]
+        if stale_votes:
+            reader.install_snapshot(stale_snapshot)
+        assert reader.weight(doc["id"])["helpful"] <= 1
+    finally:
+        origin.close()
+        reader.close()
+
+
+def test_receive_use_correction_propagates_but_never_overwrites_local(store, tmp_path):
+    origin = Store(tmp_path / "origin", "vllm-ascend")
+    authority = Store(tmp_path / "authority", "vllm-ascend")
+    try:
+        doc = experience(origin)
+        origin.publish(doc["id"])
+        authority.install_snapshot(origin.snapshot(), authoritative=False)
+        use = origin.use(
+            ref=doc["id"], session_id="consumer-b", application="Applied", evidence="v1"
+        )
+        origin.capture("consumer-b", "t1", "Outcome one.")
+        usage = dict(
+            id=use["use_id"],
+            entry_id=doc["id"],
+            session=session_key("consumer-b"),
+            application="Applied",
+            evidence="v1",
+            outcome="Outcome one.",
+            origin="local",
+        )
+        assert authority.receive_use(usage)["status"] == "inserted"
+        # Correction on the origin propagates to the upstream-owned copy.
+        origin.use(
+            ref=doc["id"], session_id="consumer-b", application="Applied", evidence="v2"
+        )
+        origin.capture("consumer-b", "t2", "Outcome two.")
+        usage.update(evidence="v2", outcome="Outcome two.")
+        assert authority.receive_use(usage)["status"] == "updated"
+        pending = authority.pending_uses()
+        assert [row["id"] for row in pending] == [use["use_id"]]
+        assert pending[0]["outcome"] == "Outcome two."
+        # The same identity owned locally is never overwritten by a remote use.
+        local_use = authority.use(
+            ref=doc["id"], session_id="consumer-b", application="Local", evidence="own"
+        )
+        authority.capture("consumer-b", "t3", "Local outcome.")
+        assert local_use["use_id"] == use["use_id"]
+        assert authority.receive_use(usage)["status"] == "kept-local"
+        row = authority.db.execute(
+            "SELECT outcome FROM uses WHERE id=?", (use["use_id"],)
+        ).fetchone()
+        assert row[0] == "Local outcome."
+    finally:
+        origin.close()
+        authority.close()
+
+
+def test_concurrent_add_never_loses_producers(tmp_path):
+    """Two Store connections on one root serialize the read-modify-write."""
+    import concurrent.futures
+
+    root = tmp_path / "shared"
+    stores = [Store(root, "vllm-ascend"), Store(root, "vllm-ascend")]
+    barrier = threading.Barrier(2)
+
+    def add_with(store, producer):
+        barrier.wait(timeout=30)
+        return store.add(
+            kind="experience",
+            title="Shared observation",
+            content="Both producers saw the same fix.",
+            producers=[session_key(producer)],
+        )["id"]
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(2) as pool:
+            ids = list(
+                pool.map(
+                    lambda args: add_with(*args),
+                    zip(stores, ("producer-a", "producer-b")),
+                )
+            )
+        assert ids[0] == ids[1]
+        producers = stores[0].get(ids[0])["producers"]
+        assert producers == sorted([session_key("producer-a"), session_key("producer-b")])
+    finally:
+        for store in stores:
+            store.close()

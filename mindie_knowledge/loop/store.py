@@ -7,6 +7,7 @@ contain sanitized published entries; raw hook inputs and use evidence stay local
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import math
@@ -81,6 +82,8 @@ class Store:
                 PRIMARY KEY(feed,entry_id));
             CREATE TABLE IF NOT EXISTS upstream_entries(entry_id TEXT PRIMARY KEY,
                 active INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS upstream_feedback(use_id TEXT PRIMARY KEY,
+                observation TEXT NOT NULL, source TEXT NOT NULL);
         """)
         # Existing ledgers keep their rows; the observation column binds
         # verdicts to the exact evidence they evaluated. Legacy rows carry ''
@@ -93,6 +96,28 @@ class Store:
                 "ALTER TABLE feedback ADD COLUMN observation TEXT NOT NULL DEFAULT ''"
             )
         self.db.commit()
+
+    @contextlib.contextmanager
+    def _write_txn(self):
+        """Serialize read-modify-write across processes sharing this root.
+
+        SQLite's implicit transaction starts at the first write, so a plain
+        ``with self.db`` block races between its reads and writes. BEGIN
+        IMMEDIATE takes the write lock before any read. Callers that already
+        hold a transaction (snapshot installation, feed switch) compose by
+        reusing it instead of failing on a nested BEGIN.
+        """
+        with self.lock:
+            if self.db.in_transaction:
+                yield
+                return
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                yield
+            except BaseException:
+                self.db.rollback()
+                raise
+            self.db.commit()
 
     def close(self):
         self.db.close()
@@ -113,7 +138,7 @@ class Store:
         if any(not re.fullmatch(r"[0-9a-f]{64}", item) for item in producers):
             raise ValueError("producer identities must be session hashes")
         ident = content_id(kind, title, content, source, conditions)
-        with self.lock:
+        with self._write_txn():
             old = self.db.execute(
                 "SELECT document FROM entries WHERE id=?", (ident,)
             ).fetchone()
@@ -137,6 +162,12 @@ class Store:
                     (set(producers) - consumers) | set(old_doc.get("producers", []))
                 ),
             )
+            self.db.execute(
+                "INSERT OR REPLACE INTO entries VALUES(?,?)",
+                (ident, canonical(doc)),
+            )
+            # Inspectable exports are written inside the same critical section;
+            # a file failure rolls back the ledger row above.
             _atomic_write_text(
                 self.root / "content" / kind / f"{ident}.md",
                 render_markdown(title, content),
@@ -145,11 +176,6 @@ class Store:
                 self.root / "content" / kind / f"{ident}.meta.json",
                 canonical(doc) + "\n",
             )
-            with self.db:
-                self.db.execute(
-                    "INSERT OR REPLACE INTO entries VALUES(?,?)",
-                    (ident, canonical(doc)),
-                )
             return doc
 
     def get(self, ref):
@@ -214,11 +240,11 @@ class Store:
             raise ValueError("conditions must be an object")
         with self.lock:
             if session_id is not None:
-                with self.db:
-                    self.db.execute(
-                        "INSERT OR IGNORE INTO sessions VALUES(?)",
-                        (session_key(session_id),),
-                    )
+                self.db.execute(
+                    "INSERT OR IGNORE INTO sessions VALUES(?)",
+                    (session_key(session_id),),
+                )
+                self.db.commit()
             rows = self.db.execute(
                 # Visible: an active feed membership wins; otherwise no inactive
                 # feed generation and no withdrawn upstream membership may hide
@@ -293,7 +319,7 @@ class Store:
         session = session_key(session_id)
         turn_id, summary = text(turn_id, "turn_id", 256), text(summary, "summary")
         ident = digest([session, turn_id])
-        with self.lock, self.db:
+        with self._write_txn():
             old = self.db.execute(
                 "SELECT * FROM captures WHERE id=?", (ident,)
             ).fetchone()
@@ -320,7 +346,7 @@ class Store:
         choice), but binding never requires a query.
         """
         session = session_key(session_id)
-        with self.lock, self.db:
+        with self._write_txn():
             self.db.execute("INSERT OR IGNORE INTO sessions VALUES(?)", (session,))
         return dict(attached=True, domain=self.domain)
 
@@ -334,7 +360,7 @@ class Store:
             )
 
     def mark_capture(self, ident, status, detail=""):
-        with self.lock, self.db:
+        with self._write_txn():
             self.db.execute(
                 "UPDATE captures SET status=?,detail=? WHERE id=?",
                 (status, detail[:1000], ident),
@@ -350,7 +376,7 @@ class Store:
             text(evidence, "evidence", 8000),
         )
         ident = digest([doc["id"], session])
-        with self.lock, self.db:
+        with self._write_txn():
             self.db.execute("INSERT OR IGNORE INTO sessions VALUES(?)", (session,))
             row = self.db.execute(
                 "SELECT application,evidence FROM uses WHERE id=?", (ident,)
@@ -365,13 +391,18 @@ class Store:
                 # A correction is a new observation of the same single
                 # consumer vote: the outcome is pending again and any verdict
                 # bound to the superseded observation stops counting. This is
-                # never a retry of a failed evaluation attempt.
+                # never a retry of a failed evaluation attempt. Recording the
+                # use locally also claims ownership: later remote records for
+                # the same identity never overwrite it.
                 self.db.execute(
-                    "UPDATE uses SET application=?,evidence=?,outcome='' WHERE id=?",
+                    "UPDATE uses SET application=?,evidence=?,outcome='',origin='local' WHERE id=?",
                     (application, evidence, ident),
                 )
                 refined = True
             else:
+                self.db.execute(
+                    "UPDATE uses SET origin='local' WHERE id=?", (ident,)
+                )
                 refined = False
         return dict(
             use_id=ident,
@@ -413,7 +444,7 @@ class Store:
     def failed_judge(self, use_id, observation, detail):
         """Record one failed attempt against the exact observation; a corrected
         observation is new work, never a retry of this failed attempt."""
-        with self.lock, self.db:
+        with self._write_txn():
             self.db.execute(
                 "INSERT OR REPLACE INTO state VALUES(?,?)",
                 (f"judge_failed:{use_id}:{observation[:16]}", detail[:1000]),
@@ -449,29 +480,47 @@ class Store:
             raise ValueError("use identity mismatch")
         for name in ("application", "evidence", "outcome"):
             text(usage[name], name)
-        with self.lock, self.db:
-            self.db.execute(
-                "INSERT OR IGNORE INTO uses VALUES(?,?,?,?,?,?,?)",
-                tuple(
-                    usage[k]
-                    for k in (
-                        "id",
-                        "entry_id",
-                        "session",
-                        "application",
-                        "evidence",
-                        "outcome",
-                    )
+        values = tuple(
+            usage[k]
+            for k in ("id", "entry_id", "session", "application", "evidence", "outcome")
+        )
+        with self._write_txn():
+            existing = self.db.execute(
+                "SELECT origin,application,evidence,outcome FROM uses WHERE id=?",
+                (usage["id"],),
+            ).fetchone()
+            if existing is None:
+                self.db.execute(
+                    "INSERT INTO uses VALUES(?,?,?,?,?,?,?)", values + ("upstream",)
                 )
-                + ("upstream",),
-            )
-        return usage["id"]
+                return dict(use_id=usage["id"], status="inserted")
+            if existing["origin"] == "local":
+                # A remote correction never overwrites a locally-owned use.
+                return dict(use_id=usage["id"], status="kept-local")
+            if (
+                existing["application"],
+                existing["evidence"],
+                existing["outcome"],
+            ) != (usage["application"], usage["evidence"], usage["outcome"]):
+                # Propagate the correction: the superseded distributed verdict
+                # stops counting and the new observation is evaluated once.
+                self.db.execute(
+                    "UPDATE uses SET application=?,evidence=?,outcome=? WHERE id=?",
+                    (
+                        usage["application"],
+                        usage["evidence"],
+                        usage["outcome"],
+                        usage["id"],
+                    ),
+                )
+                return dict(use_id=usage["id"], status="updated")
+            return dict(use_id=usage["id"], status="unchanged")
 
     def judge(self, use_id, *, judge_id, verdict, reason, observation=None):
         if verdict not in {"helpful", "unhelpful", "unknown"}:
             raise ValueError("invalid verdict")
         judge_id, reason = text(judge_id, "judge_id", 256), text(reason, "reason", 4000)
-        with self.lock, self.db:
+        with self._write_txn():
             row = self.db.execute("SELECT * FROM uses WHERE id=?", (use_id,)).fetchone()
             if row is None or not row["outcome"]:
                 raise ValueError("judge requires a completed observed use")
@@ -527,7 +576,7 @@ class Store:
         if findings:
             rules = ", ".join(sorted({finding.rule for finding in findings}))
             raise ValueError(f"entry requires sanitization before publication: {rules}")
-        with self.lock, self.db:
+        with self._write_txn():
             self.db.execute("INSERT OR IGNORE INTO publication VALUES(?)", (doc["id"],))
 
     def withdraw(self, ident):
@@ -539,7 +588,7 @@ class Store:
         references remain explainable.
         """
         doc = self.get(ident)
-        with self.lock, self.db:
+        with self._write_txn():
             self.db.execute("DELETE FROM publication WHERE entry_id=?", (doc["id"],))
         return dict(withdrawn=True, ref=self.ref(doc["id"]))
 
@@ -551,17 +600,107 @@ class Store:
                     "SELECT document FROM entries JOIN publication ON entries.id=publication.entry_id ORDER BY entries.id"
                 )
             ]
-            # Evidence and judge prose remain private. Export only value signals.
-            feedback = [
-                dict(r)
-                for r in self.db.execute(
-                    "SELECT use_id,feedback.entry_id,consumer,judge,verdict,evidence_hash FROM feedback JOIN publication ON feedback.entry_id=publication.entry_id ORDER BY use_id"
+            # Evidence and judge prose remain private. Export only effective
+            # value signals: a verdict travels with the observation hash it
+            # evaluated, and superseded verdicts never leave the store.
+            feedback = []
+            rows = self.db.execute(
+                "SELECT feedback.* FROM feedback JOIN publication ON feedback.entry_id=publication.entry_id ORDER BY use_id"
+            ).fetchall()
+            for row in rows:
+                use = self.db.execute(
+                    "SELECT * FROM uses WHERE id=?", (row["use_id"],)
+                ).fetchone()
+                if use is None or self.observation_of(use) != row["observation"]:
+                    continue
+                feedback.append(
+                    {
+                        key: row[key]
+                        for key in (
+                            "use_id",
+                            "entry_id",
+                            "consumer",
+                            "judge",
+                            "verdict",
+                            "evidence_hash",
+                            "observation",
+                        )
+                    }
                 )
-            ]
         payload = dict(
             schema=SCHEMA, domain=self.domain, entries=entries, feedback=feedback
         )
         return dict(version=digest(payload), **payload)
+
+    def _install_distributed_votes(self, votes, source):
+        """Install verdicts distributed by a trusted authority/feed.
+
+        Caller must hold a write transaction; votes are structurally validated
+        by the snapshot/feed readers. A distributed verdict never displaces a
+        locally-owned verdict on the current observation, and verdicts the
+        authority no longer distributes are withdrawn unless a locally-owned
+        use still makes them effective.
+        """
+        incoming = set()
+        for vote in votes:
+            incoming.add(vote["use_id"])
+            use = self.db.execute(
+                "SELECT * FROM uses WHERE id=?", (vote["use_id"],)
+            ).fetchone()
+            if use is not None and use["origin"] == "local":
+                current = self.observation_of(use)
+                existing = self.db.execute(
+                    "SELECT observation FROM feedback WHERE use_id=?",
+                    (vote["use_id"],),
+                ).fetchone()
+                if (
+                    existing
+                    and existing["observation"] == current
+                    and vote["observation"] != current
+                ):
+                    # Keep the effective local verdict; the stale distributed
+                    # vote must not reappear over it.
+                    continue
+            self.db.execute(
+                "INSERT OR REPLACE INTO feedback VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    vote["use_id"],
+                    vote["entry_id"],
+                    vote["consumer"],
+                    vote["judge"],
+                    vote["verdict"],
+                    "Published independent-use feedback; raw evidence remains at its origin.",
+                    vote["evidence_hash"],
+                    vote["observation"],
+                ),
+            )
+            self.db.execute(
+                "INSERT OR REPLACE INTO upstream_feedback VALUES(?,?,?)",
+                (vote["use_id"], vote["observation"], source),
+            )
+        withdrawn = self.db.execute(
+            "SELECT use_id,observation FROM upstream_feedback WHERE source=?",
+            (source,),
+        ).fetchall()
+        for row in withdrawn:
+            if row["use_id"] in incoming:
+                continue
+            use = self.db.execute(
+                "SELECT * FROM uses WHERE id=?", (row["use_id"],)
+            ).fetchone()
+            locally_effective = (
+                use is not None
+                and use["origin"] == "local"
+                and self.observation_of(use) == row["observation"]
+            )
+            if not locally_effective:
+                self.db.execute(
+                    "DELETE FROM feedback WHERE use_id=? AND observation=?",
+                    (row["use_id"], row["observation"]),
+                )
+            self.db.execute(
+                "DELETE FROM upstream_feedback WHERE use_id=?", (row["use_id"],)
+            )
 
     def install_snapshot(self, snapshot, *, authoritative=True):
         """Install a domain snapshot.
@@ -647,6 +786,7 @@ class Store:
                 "judge",
                 "verdict",
                 "evidence_hash",
+                "observation",
             }:
                 raise ValueError("invalid published feedback")
             doc = by_id.get(vote["entry_id"])
@@ -659,7 +799,7 @@ class Store:
             if any(
                 not isinstance(vote[k], str)
                 or not re.fullmatch(r"[0-9a-f]{64}", vote[k])
-                for k in ("use_id", "consumer", "judge", "evidence_hash")
+                for k in ("use_id", "consumer", "judge", "evidence_hash", "observation")
             ):
                 raise ValueError("invalid feedback identity")
             if vote["consumer"] in doc["producers"] or vote["judge"] in doc[
@@ -672,32 +812,34 @@ class Store:
             ):
                 raise ValueError("duplicate or inconsistent feedback identity")
             seen.add(vote["use_id"])
-        # Validate everything before making any content visible.
-        with self.lock:
+        # Validate everything before making any content visible; the whole
+        # switch is one immediate transaction across processes.
+        with self._write_txn():
             for doc in entries:
                 self.add(**{k: v for k, v in doc.items() if k != "id"})
-            with self.db:
+            for doc in entries:
+                self.db.execute(
+                    "INSERT OR REPLACE INTO state VALUES(?,?)",
+                    ("upstream_entry:" + doc["id"], snapshot["version"]),
+                )
+            if authoritative:
                 for doc in entries:
                     self.db.execute(
-                        "INSERT OR REPLACE INTO state VALUES(?,?)",
-                        ("upstream_entry:" + doc["id"], snapshot["version"]),
+                        "INSERT OR REPLACE INTO upstream_entries VALUES(?,1)",
+                        (doc["id"],),
                     )
-                if authoritative:
-                    for doc in entries:
-                        self.db.execute(
-                            "INSERT OR REPLACE INTO upstream_entries VALUES(?,1)",
-                            (doc["id"],),
-                        )
-                    if entries:
-                        self.db.execute(
-                            "UPDATE upstream_entries SET active=0 WHERE entry_id NOT IN "
-                            f"({','.join('?' for _ in entries)})",
-                            tuple(doc["id"] for doc in entries),
-                        )
-                    else:
-                        self.db.execute("UPDATE upstream_entries SET active=0")
+                if entries:
+                    self.db.execute(
+                        "UPDATE upstream_entries SET active=0 WHERE entry_id NOT IN "
+                        f"({','.join('?' for _ in entries)})",
+                        tuple(doc["id"] for doc in entries),
+                    )
+                else:
+                    self.db.execute("UPDATE upstream_entries SET active=0")
+                self._install_distributed_votes(feedback, source="upstream")
+            else:
+                # Incremental ingestion: add votes, never withdraw.
                 for vote in feedback:
-                    # A configured authority owns the distributed verdict.
                     self.db.execute(
                         "INSERT OR REPLACE INTO feedback VALUES(?,?,?,?,?,?,?,?)",
                         (
@@ -708,13 +850,13 @@ class Store:
                             vote["verdict"],
                             "Published independent-use feedback; raw evidence remains at its origin.",
                             vote["evidence_hash"],
-                            "",
+                            vote["observation"],
                         ),
                     )
-                self.db.execute(
-                    "INSERT OR REPLACE INTO state VALUES('upstream_version',?)",
-                    (snapshot["version"],),
-                )
+            self.db.execute(
+                "INSERT OR REPLACE INTO state VALUES('upstream_version',?)",
+                (snapshot["version"],),
+            )
         return dict(
             version=snapshot["version"], entries=len(entries), feedback=len(feedback)
         )
