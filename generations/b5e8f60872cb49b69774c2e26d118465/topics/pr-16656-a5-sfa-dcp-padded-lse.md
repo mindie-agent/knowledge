@@ -1,9 +1,9 @@
 # Topic: A5 SFA DCP padded-index LSE / empty shards
 
-- **日期**: 2026-09-18（MindIE acceptance 再修订）
+- **日期**: 2026-09-19（MERGED）；MindIE acceptance 2026-09-18
 - **关联 case**: [`cases/pr-16656-a5-sfa-dcp-padded-lse.case.md`](../cases/pr-16656-a5-sfa-dcp-padded-lse.case.md)
 - **PR**: https://github.com/vllm-project/vllm-ascend/pull/16656
-- **Pins**: base `c7ca0b67…` · head `13816345…` · OPEN BLOCKED
+- **Pins**: base `c7ca0b67…` · head `13816345…` · **MERGED** `aff1b74b…`
 
 ## 要点
 

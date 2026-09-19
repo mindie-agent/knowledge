@@ -1,9 +1,20 @@
 # Case: ACL Graph UpdatableGraph — host-side parameter update refactor (MRV1/MRV2)
 
-- **日期**: 2026-09-18
+- **日期**: 2026-09-19（修订）；初建 2026-09-18
 - **状态**: OPEN not-draft / MERGEABLE / **BLOCKED** / reference-only
 - **来源 PR**: https://github.com/vllm-project/vllm-ascend/pull/16798 （author `zhiyu-wa`；labels: `module:tests`, `module:core`, `ready-all`）
-- **Pinned（本轮 gh 2026-09-18）**: base `3db3f931e155da9b496febe8a42d9bd7d9f52849` · head `3e33c9fdda0578787544fd4360e48ae2fed1dc4b`
+- **Pinned（本轮 gh 2026-09-19）**: base `3db3f931e155da9b496febe8a42d9bd7d9f52849` · head `4c29f963ee07d75c474fad5573f21e0d5c256ee4`
+
+
+## 修订说明 / Revision notes（2026-09-19，Asia/Shanghai）
+
+- **重 pin**：base 不变 `3db3f931e155…`；head `3e33c9fdda05…` → `4c29f963ee07d75c474fad5573f21e0d5c256ee4`。
+- 增量 commits（VERIFIED）：`6c67c9d90466…` fix gemma-mtp；`480a5d611129…`/`3d98156b44fd…` style；`4c29f963ee07…` fix。
+- 规模现约 +650/−878，**18 files**（上轮 +642/−878）；仍 MERGEABLE **BLOCKED**。
+- 手测矩阵仍 **CLAIM**；本轮未跑 NPU。
+- 保留旧对比：https://github.com/vllm-project/vllm-ascend/compare/3db3f931e155da9b496febe8a42d9bd7d9f52849...3e33c9fdda0578787544fd4360e48ae2fed1dc4b
+- 本轮对比：https://github.com/vllm-project/vllm-ascend/compare/3db3f931e155da9b496febe8a42d9bd7d9f52849...4c29f963ee07d75c474fad5573f21e0d5c256ee4
+- head-delta：https://github.com/vllm-project/vllm-ascend/compare/3e33c9fdda0578787544fd4360e48ae2fed1dc4b...4c29f963ee07d75c474fad5573f21e0d5c256ee4
 
 ## 修订说明 / Revision notes（2026-09-18，Asia/Shanghai）
 

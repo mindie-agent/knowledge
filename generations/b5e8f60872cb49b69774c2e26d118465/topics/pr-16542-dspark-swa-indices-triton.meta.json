@@ -1,11 +1,11 @@
 {
   "conditions": {
-    "base_sha": "d9ce0aa6f5c40769920512a69f82d97aecff5d40",
-    "head_sha": "f4bb08f1c7a5b7e91e5183fe894a05fcb88b6fc7",
+    "base_sha": "82b0b10ac5ef35b11704b24eebf9a0f774bd69a0",
+    "head_sha": "7036bb09713696d4f8285596f1ac3a1b9ab04253",
     "pr_state": "OPEN",
     "pull_request": "https://github.com/vllm-project/vllm-ascend/pull/16542",
     "source_repository": "vllm-project/vllm-ascend",
-    "validation_scope": "source_control_flow_verified; author_claims_separated; NPU_e2e_unverified; OPEN_BLOCKED"
+    "validation_scope": "source_control_flow_verified; author_claims_separated; NPU_e2e_unverified; OPEN_DIRTY_CONFLICTING"
   },
   "retrieval": {
     "aliases": [

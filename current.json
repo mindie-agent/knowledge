@@ -1,6 +1,6 @@
 {
   "schema": "vaws-curation-export/1",
-  "generation": "cb9fa0ba015a41cd97b1f630a49f7de6",
-  "manifest_sha256": "39de37b30d42ecfee42b6c8fcb54474192c008ae7df1daaf1b903114ce0e03c9",
-  "snapshot": "16f2ea14a3d3afddaf770e6ffd108ba97353674159b9e5cb87db06ecb02b59de"
+  "generation": "b5e8f60872cb49b69774c2e26d118465",
+  "manifest_sha256": "e763722cb3740134f27084cae7e230d0c49581967164836052a500c50bc8f06e",
+  "snapshot": "b8789e2bb085f52f496e8efd5ba2530ec38163fb3a7d76a939ed9a5c30949fb6"
 }

@@ -1,9 +1,18 @@
 # Case: A5 SFA DCP — padded-index LSE + empty local shards
 
-- **日期**: 2026-09-18（MindIE acceptance 再修订）
-- **状态**: OPEN not-draft / MERGEABLE / **BLOCKED** / reference-only
+- **日期**: 2026-09-19（MERGED 状态修订）；MindIE acceptance 2026-09-18；初建 2026-09-18
+- **状态**: **MERGED** 2026-09-18T06:46:02Z（UTC） / mergeCommit `aff1b74b66467a7805cde69ef0728b7e32c0f990` / reference-only
 - **来源 PR**: https://github.com/vllm-project/vllm-ascend/pull/16656 （author `recky-c`；labels: `module:tests`, `module:core`, `ready-a5`, `ready-precise`）
-- **Pinned（本轮 gh 2026-09-18 MindIE acceptance）**: base `c7ca0b676b9668535f467b78cff1274a4ddb63b2` · head `138163458f134fba039ab49e28ebe75e9116c32e`
+- **Pinned（本轮 gh 2026-09-19）**: base `c7ca0b676b9668535f467b78cff1274a4ddb63b2` · head `138163458f134fba039ab49e28ebe75e9116c32e`（SHA 未变；状态 OPEN→MERGED）
+
+
+## 修订说明 / Revision notes（2026-09-19，Asia/Shanghai）
+
+- **状态变更**：OPEN BLOCKED → **MERGED**（VERIFIED `gh pr view`；`mergedAt` 2026-09-18T06:46:02Z；mergeCommit `aff1b74b66467a7805cde69ef0728b7e32c0f990`）。
+- head/base SHA **未变**（仍 `13816345…` / `c7ca0b67…`）；内容面沿用 2026-09-18 MindIE acceptance 笔记。
+- 合并 ≠ 本轮 NPU 复验；数值 / 全拓扑仍按 CLAIM/UNVERIFIED 保留。
+- Compare（不变）：https://github.com/vllm-project/vllm-ascend/compare/c7ca0b676b9668535f467b78cff1274a4ddb63b2...138163458f134fba039ab49e28ebe75e9116c32e
+- Merge commit: https://github.com/vllm-project/vllm-ascend/commit/aff1b74b66467a7805cde69ef0728b7e32c0f990
 
 ## 修订说明 / Revision notes（2026-09-18 MindIE acceptance，Asia/Shanghai）
 

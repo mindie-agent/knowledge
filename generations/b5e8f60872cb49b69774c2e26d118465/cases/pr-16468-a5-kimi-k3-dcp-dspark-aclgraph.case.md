@@ -1,9 +1,19 @@
 # Case: A5 Kimi K3 — MRv1/MRv2 DCP、DSpark ACLGraph、strided Flash MLA/GQA（draft）
 
-- **日期**: 2026-09-18（MindIE acceptance 再修订）；初建 2026-09-15
-- **状态**: OPEN **draft** / **CONFLICTING·DIRTY** / reference-only；超大 PR（+78628/−1695，415 files）
+- **日期**: 2026-09-19（日更修订）；MindIE acceptance 2026-09-18；初建 2026-09-15
+- **状态**: OPEN **draft** / **CONFLICTING·DIRTY** / reference-only；超大 PR（+87751/−1709，445 files）
 - **来源 PR**: https://github.com/vllm-project/vllm-ascend/pull/16468 （author `maoxx241`；labels: `documentation`, `module:tests`, `module:ops`, `module:core`, `module:quantization`, `merge-conflicts`）
-- **Pinned（本轮 gh 2026-09-18 MindIE acceptance）**: base `cb82154ea226c733ba99fe76d7ee3bd3af137ed1` · head `3c94ce740126984b9683501dd8c3772bf88d4311`
+- **Pinned（本轮 gh 2026-09-19）**: base `bdd53a2ac7dadf6e662f8e3106fa0a2f54aca9e7` · head `0344beea2a231896cc460e266f3cb36495de8dd0`
+
+
+## 修订说明 / Revision notes（2026-09-19，Asia/Shanghai）
+
+- **重 pin**：base `cb82154ea226…` → `bdd53a2ac7dadf6e662f8e3106fa0a2f54aca9e7`；head `3c94ce740126…` → `0344beea2a231896cc460e266f3cb36495de8dd0`。
+- tip commits（VERIFIED GraphQL last）：`d9bf27eb2f1f…` `feat(attention): integrate A5 K3 graphs and operator optimizations`；`0344beea2a23…` `feat(attention): add A5 MLA C8 and direct DCP output`。
+- 规模再膨胀：+87751/−1709，**445 files**（上轮 +78628/−1695，415 files）；仍 **draft + DIRTY/CONFLICTING**。
+- 验收 / 性能仍 **CLAIM**；experimental not-to-merge **CLAIM**；本轮未跑 NPU。
+- 保留旧对比：https://github.com/vllm-project/vllm-ascend/compare/cb82154ea226c733ba99fe76d7ee3bd3af137ed1...3c94ce740126984b9683501dd8c3772bf88d4311
+- 本轮对比：https://github.com/vllm-project/vllm-ascend/compare/bdd53a2ac7dadf6e662f8e3106fa0a2f54aca9e7...0344beea2a231896cc460e266f3cb36495de8dd0
 
 ## 修订说明 / Revision notes（2026-09-18 MindIE acceptance，Asia/Shanghai）
 

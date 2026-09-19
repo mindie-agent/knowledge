@@ -1,9 +1,19 @@
 # Case: DSv4 DSpark `build_dspark_swa_indices` Triton 单核融合
 
-- **日期**: 2026-09-18（修订）；初建 2026-09-15
-- **状态**: OPEN not-draft / MERGEABLE / mergeStateStatus **BLOCKED** / reference-only
+- **日期**: 2026-09-19（修订）；初建 2026-09-15
+- **状态**: OPEN not-draft / **CONFLICTING·DIRTY** / reference-only
 - **来源 PR**: https://github.com/vllm-project/vllm-ascend/pull/16542 （author `zhangxiaoshanha`；labels: `module:tests`, `module:ops`）
-- **Pinned（本轮 gh 2026-09-18）**: base `d9ce0aa6f5c40769920512a69f82d97aecff5d40` · head `f4bb08f1c7a5b7e91e5183fe894a05fcb88b6fc7`
+- **Pinned（本轮 gh 2026-09-19）**: base `82b0b10ac5ef35b11704b24eebf9a0f774bd69a0` · head `7036bb09713696d4f8285596f1ac3a1b9ab04253`
+
+
+## 修订说明 / Revision notes（2026-09-19，Asia/Shanghai）
+
+- **重 pin（rebase）**：base `d9ce0aa6f5c4…` → `82b0b10ac5ef35b11704b24eebf9a0f774bd69a0`；head `f4bb08f1c7a5…` → `7036bb09713696d4f8285596f1ac3a1b9ab04253`。
+- tip 仍为 snake_case rename 主题（VERIFIED message `7036bb09…`）；merge 状态由 MERGEABLE/BLOCKED → **CONFLICTING/DIRTY**（VERIFIED GraphQL）。
+- 规模仍约 +1233/−18，**5 files**（`dsa_v1.py` / `dspark_swa_indices.py` / proposer / UT/e2e）。
+- 性能数字仍 **CLAIM**；部署收益 **UNVERIFIED**；本轮未跑 NPU。
+- 保留旧对比：https://github.com/vllm-project/vllm-ascend/compare/d9ce0aa6f5c40769920512a69f82d97aecff5d40...f4bb08f1c7a5b7e91e5183fe894a05fcb88b6fc7
+- 本轮对比：https://github.com/vllm-project/vllm-ascend/compare/82b0b10ac5ef35b11704b24eebf9a0f774bd69a0...7036bb09713696d4f8285596f1ac3a1b9ab04253
 
 ## 修订说明 / Revision notes（2026-09-18，Asia/Shanghai）
 

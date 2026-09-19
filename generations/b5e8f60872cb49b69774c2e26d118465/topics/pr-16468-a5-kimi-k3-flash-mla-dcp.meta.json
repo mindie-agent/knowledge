@@ -1,7 +1,7 @@
 {
   "conditions": {
-    "base_sha": "cb82154ea226c733ba99fe76d7ee3bd3af137ed1",
-    "head_sha": "3c94ce740126984b9683501dd8c3772bf88d4311",
+    "base_sha": "bdd53a2ac7dadf6e662f8e3106fa0a2f54aca9e7",
+    "head_sha": "0344beea2a231896cc460e266f3cb36495de8dd0",
     "pr_state": "OPEN",
     "pull_request": "https://github.com/vllm-project/vllm-ascend/pull/16468",
     "source_repository": "vllm-project/vllm-ascend",

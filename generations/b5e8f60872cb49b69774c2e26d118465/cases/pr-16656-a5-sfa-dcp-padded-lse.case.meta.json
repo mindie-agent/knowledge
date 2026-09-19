@@ -8,7 +8,7 @@
       "GLM5.2 W4A8 TP8 DCP8 SFA C8 disabled eager",
       "sparse_flash_attention_kernel_mla padded -1 indices"
     ],
-    "source_sha256": "8c643c758a2489244ff03965c9ce3a59192e1be21e8173ebb0540f65a59dd182",
+    "source_sha256": "1625cc10927d23a82bf14a4d1f39d6df3c69d5cae3c1a4b0ae15df924249bbca",
     "topics": []
   }
 }

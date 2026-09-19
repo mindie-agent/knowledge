@@ -1,0 +1,14 @@
+{
+  "conditions": {},
+  "retrieval": {
+    "aliases": [
+      "DSA-CP prefill fused cache gather Ascend",
+      "PR 16915 SFA CP block-copy scatter threshold",
+      "token-sharded O-proj DSA-CP MoE backbone",
+      "indexer main KV raw-bytes gather MTP",
+      "A3 NPU DSA-CP prefill overhead reduction"
+    ],
+    "source_sha256": "eea0ef69c717ba601973ae08f3269f74cf22543d9bca37317f473fcc5d599ab9",
+    "topics": []
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "conditions": {},
+  "retrieval": {
+    "aliases": [
+      "MRV2 PCP DP vLLM 0.28.0 dispatch token count Ascend",
+      "PR 16853 pcp_manager model_runner_v2 DPMetadata",
+      "Ascend PCP2 prefill local batch global sync mismatch",
+      "patch_use_v2_model_runner PCP DP workaround",
+      "DCP=1 only PCP DP MRV2 0.28"
+    ],
+    "source_sha256": "ab4e2c2a805761adf07f1aaeba279b343efe29ee9f4fae215731827010cb3c65",
+    "topics": []
+  }
+}

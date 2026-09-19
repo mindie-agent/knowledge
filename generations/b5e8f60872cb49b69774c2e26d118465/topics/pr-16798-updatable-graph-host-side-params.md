@@ -1,9 +1,9 @@
 # Topic: ACL Graph UpdatableGraph / host-side params（MRV1/MRV2）
 
-- **日期**: 2026-09-18
+- **日期**: 2026-09-19（修订）
 - **关联 case**: [`cases/pr-16798-updatable-graph-host-side-params.case.md`](../cases/pr-16798-updatable-graph-host-side-params.case.md)
 - **PR**: https://github.com/vllm-project/vllm-ascend/pull/16798
-- **Pins**: base `3db3f931…` · head `3e33c9fd…` · OPEN BLOCKED
+- **Pins**: base `3db3f931…` · head `4c29f963…` · OPEN BLOCKED；+650/−878，18 files
 
 ## 要点
 

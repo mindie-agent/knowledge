@@ -1,0 +1,14 @@
+{
+  "conditions": {},
+  "retrieval": {
+    "aliases": [
+      "va-knowledge 2026-09-19 daily PR incremental 16904 16915 16853",
+      "revised 16656 MERGED 16798 16468 16542",
+      "deferred 16545 MegaMoe 16848 default MRV2",
+      "pin 257739fc 383fbad9 fb0554b7 4c29f963 0344beea 7036bb09 aff1b74b",
+      "maintenance budget ceiling 20 min Asia/Shanghai 2026-09-19"
+    ],
+    "source_sha256": "f21df474bc6f2c1483baafaf868fd2bfba6fec213e4a9a1d028d22be2479dc13",
+    "topics": []
+  }
+}
