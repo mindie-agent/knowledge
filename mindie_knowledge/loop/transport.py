@@ -52,8 +52,22 @@ def rpc(connection, method, arguments=None, *, timeout=10):
 
 
 class Service:
-    def __init__(self, engine, *, connection_path=None, upstream=None, feeds=()):
+    def __init__(
+        self,
+        engine,
+        *,
+        connection_path=None,
+        upstream=None,
+        feeds=(),
+        session_activation=None,
+    ):
         self.engine, self.store = engine, engine.store
+        self.admission = None
+        if session_activation:
+            from .activation import SessionAdmission
+
+            self.admission = SessionAdmission(session_activation)
+            self.engine.session_allowed = self.admission.allows
         from .feed import Feed
 
         self.feeds = [Feed(self.store, config) for config in feeds]
@@ -114,6 +128,14 @@ class Service:
         )
 
     def call(self, method, args):
+        if self.admission and method in {"query", "explain", "use", "capture"}:
+            args = dict(args)
+            session = args.pop("_session_id", None)
+            self.admission.require(session, args.pop("_activation", None))
+            if method != "explain" and args.get("session_id") != session:
+                raise ValueError("session does not match activation")
+        if method == "maintenance_resume":
+            return self.engine.budget.resume()
         if method == "query":
             return self.store.query(**args)
         if method == "explain":

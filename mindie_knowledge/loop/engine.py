@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import json
 import queue
-import subprocess
 import threading
 import uuid
 
-from .store import Store, canonical, session_key
+from .store import Store, canonical, session_key, text
+from .budget import MaintenanceBudget
 
 
 class Engine:
@@ -21,8 +21,10 @@ class Engine:
             raise ValueError("agent_command must be a nonempty argv list")
         self.store, self.agent_command = store, agent_command
         self.auto_publish = auto_publish
+        self.budget = MaintenanceBudget(store)
         self.evaluate_uses = True
-        self.queue = queue.Queue(maxsize=32)
+        self.session_allowed = lambda session: True
+        self.queue = queue.Queue(maxsize=8)
         self.stop = threading.Event()
         self.thread = threading.Thread(
             target=self.run, name="mindie-maintenance", daemon=True
@@ -36,28 +38,55 @@ class Engine:
             )
         self.thread.start()
 
-    def agent(self, role, payload):
-        completed = subprocess.run(
-            self.agent_command,
-            input=canonical(dict(role=role, **payload)),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=180,
-            check=False,
-        )
-        if completed.returncode:
-            raise RuntimeError(f"{role} agent exited {completed.returncode}")
-        if len(completed.stdout) > 131072:
-            raise ValueError("agent output exceeds limit")
-        result = json.loads(completed.stdout)
-        if not isinstance(result, dict):
-            raise ValueError("agent must return one JSON object")
-        return result
+    def agent(self, role, payload, *, attempt_id, session):
+        if not self.session_allowed(session):
+            raise ValueError("session is no longer active; maintenance not started")
+        raw = canonical(dict(role=role, **payload))
+        if len(raw.encode()) > 65536:
+            raise ValueError("maintenance input exceeds limit")
+        self.budget.reserve(attempt_id, session, role)
+        succeeded = False
+        try:
+            from .process import bounded_run
+
+            output = bounded_run(self.agent_command, raw, timeout=65, max_output=131072)
+            result = json.loads(output)
+            if not isinstance(result, dict):
+                raise ValueError("agent must return one JSON object")
+            if role == "organize":
+                if (
+                    set(result) != {"entries"}
+                    or not isinstance(result["entries"], list)
+                    or len(result["entries"]) > 3
+                ):
+                    raise ValueError("invalid organizer result")
+                for entry in result["entries"]:
+                    if not isinstance(entry, dict) or set(entry) != {
+                        "title",
+                        "content",
+                    }:
+                        raise ValueError("invalid organized experience")
+                    text(entry["title"], "title", 240)
+                    text(entry["content"], "content", 8192)
+            elif (
+                set(result) != {"verdict", "reason"}
+                or result["verdict"] not in {"helpful", "unhelpful", "unknown"}
+                or not isinstance(result["reason"], str)
+                or not 0 < len(result["reason"].strip()) <= 2000
+            ):
+                raise ValueError("invalid judge result")
+            succeeded = True
+            return result
+        finally:
+            self.budget.finish(attempt_id, succeeded)
 
     def capture(self, session_id, turn_id, summary):
+        if not self.session_allowed(session_key(session_id)):
+            return dict(status="skipped", reason="session is not manually active")
         if not self.store.attached(session_id):
             return dict(status="skipped", reason="session has not selected this domain")
+        if self.budget.status()["paused"]:
+            return dict(status="discarded", reason="maintenance circuit paused")
         if self.queue.full():
             return dict(status="discarded", reason="maintenance queue full")
         captured = self.store.capture(session_id, turn_id, summary)
@@ -77,6 +106,8 @@ class Engine:
         result = self.agent(
             "organize",
             dict(domain=self.store.domain, session_summary=summary, related=candidates),
+            attempt_id="organize:" + ident,
+            session=session_key(session),
         )
         if (
             set(result) != {"entries"}
@@ -101,6 +132,8 @@ class Engine:
 
     def evaluate(self):
         for usage in self.store.pending_uses():
+            if not self.session_allowed(usage["session"]):
+                continue
             doc = self.store.get(usage["entry_id"])
             if not self.evaluate_uses and self.store.upstream_entry(doc["id"]):
                 continue
@@ -116,6 +149,8 @@ class Engine:
                         evidence=usage["evidence"],
                         outcome=usage["outcome"],
                     ),
+                    attempt_id="judge:" + usage["id"],
+                    session=usage["session"],
                 )
                 if set(result) != {"verdict", "reason"}:
                     raise ValueError("judge must return verdict and reason")
@@ -160,5 +195,6 @@ class Engine:
         return dict(
             **self.store.status(),
             maintenance_pending=self.queue.unfinished_tasks,
+            maintenance_budget=self.budget.status(),
             errors=self.errors,
         )

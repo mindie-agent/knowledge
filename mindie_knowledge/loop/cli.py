@@ -35,75 +35,91 @@ def connect(config):
     return connection
 
 
+STARTUP_TIMEOUT = 5.0
+MAX_STARTUP_PROBES = 3
+
+
 def ensure_service(config_path):
+    """One start attempt, at most three readiness probes, absolute startup budget."""
     config = config_at(config_path)
-    try:
+    deadline = time.monotonic() + STARTUP_TIMEOUT
+
+    def probe():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("knowledge startup deadline exceeded")
         connection = connect(config)
-        rpc(connection, "status", timeout=1)
+        rpc(connection, "status", timeout=min(0.5, remaining))
         return connection
+
+    try:
+        return probe()
     except (OSError, ValueError):
         pass
-    # Reuse the existing cross-platform nonblocking lock, not a stale PID file.
     from mindie_knowledge.distribution.errors import SwitchInProgress
     from mindie_knowledge.distribution.sync import SwitchLock
 
     lock = SwitchLock(connection_path(config).with_name("start.lock"))
+    acquired = False
+    process = None
+    ready = False
     try:
-        lock.acquire()
-    except SwitchInProgress:
-        for _ in range(50):
-            time.sleep(0.1)
+        try:
+            lock.acquire()
+            acquired = True
+        except SwitchInProgress:
+            pass
+        if acquired:
+            # A peer may have completed startup between our initial probe and lock.
             try:
-                connection = connect(config)
-                rpc(connection, "status", timeout=1)
+                return probe()
+            except (OSError, ValueError):
+                pass
+            if os.name != "posix":
+                raise RuntimeError(
+                    "bounded service startup requires POSIX process groups"
+                )
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "mindie_knowledge.loop.cli",
+                    "serve",
+                    "--config",
+                    str(Path(config_path).resolve()),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        for attempt in range(MAX_STARTUP_PROBES):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.5, remaining))
+            if process is not None and process.poll() is not None:
+                raise RuntimeError("knowledge service exited during startup; no retry")
+            try:
+                connection = probe()
+                ready = True
                 return connection
             except (OSError, ValueError):
                 pass
-        raise RuntimeError("knowledge service startup is already in progress")
-    try:
-        try:
-            connection = connect(config)
-            rpc(connection, "status", timeout=1)
-            return connection
-        except (OSError, ValueError):
-            pass
-        kwargs = (
-            {"start_new_session": True}
-            if os.name != "nt"
-            else {
-                "creationflags": subprocess.CREATE_NEW_PROCESS_GROUP
-                | subprocess.CREATE_NO_WINDOW
-            }
+        raise RuntimeError(
+            "knowledge service unavailable after bounded readiness probes; no restart"
         )
-        process = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "mindie_knowledge.loop.cli",
-                "serve",
-                "--config",
-                str(Path(config_path).resolve()),
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            **kwargs,
-        )
-        for _ in range(80):
-            if process.poll() is not None:
-                raise RuntimeError(
-                    "knowledge service exited during startup; run 'serve' in foreground for diagnostics"
-                )
-            try:
-                connection = connect(config)
-                rpc(connection, "status", timeout=1)
-                return connection
-            except (OSError, ValueError):
-                time.sleep(0.1)
-        process.terminate()
-        raise RuntimeError("knowledge service did not become ready")
     finally:
-        lock.release()
+        if process is not None and not ready:
+            import signal
+
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=1)
+        if acquired:
+            lock.release()
 
 
 def schema(properties, required):
@@ -147,7 +163,6 @@ TOOLS = [
 
 
 def mcp(config_path):
-    connection = ensure_service(config_path)
     for line in sys.stdin:
         message = {}
         try:
@@ -181,19 +196,16 @@ def mcp(config_path):
                 ):
                     raise ValueError("invalid tool arguments")
                 try:
-                    try:
-                        payload = rpc(connection, name.removeprefix("knowledge_"), args)
-                    except OSError:
-                        # Owned service upgrades rotate its port/token. Reconnect
-                        # once; the three operations are retry-safe by identity.
-                        connection = ensure_service(config_path)
-                        payload = rpc(connection, name.removeprefix("knowledge_"), args)
+                    connection = ensure_service(config_path)
+                    payload = rpc(
+                        connection, name.removeprefix("knowledge_"), args, timeout=5
+                    )
                     result = dict(
                         content=[dict(type="text", text=canonical(payload))],
                         structuredContent=payload,
                         isError=False,
                     )
-                except (ValueError, OSError) as exc:
+                except (ValueError, OSError, RuntimeError) as exc:
                     result = dict(
                         content=[
                             dict(
@@ -224,11 +236,21 @@ def mcp(config_path):
 def capture_hook(config_path, event):
     """Fail open: do not start the service, inspect transcripts, or queue offline."""
     try:
-        if event.get("hook_event_name") != "Stop" or event.get("stop_hook_active"):
+        if (
+            not isinstance(event, dict)
+            or event.get("hook_event_name") != "Stop"
+            or event.get("stop_hook_active", False) is not False
+        ):
             return
-        if not all(
-            event.get(key)
-            for key in ("session_id", "turn_id", "last_assistant_message")
+        if any(
+            not isinstance(event.get(key), str)
+            or not event[key].strip()
+            or len(event[key]) > limit
+            for key, limit in (
+                ("session_id", 256),
+                ("turn_id", 256),
+                ("last_assistant_message", 32768),
+            )
         ):
             return
         rpc(
@@ -238,6 +260,14 @@ def capture_hook(config_path, event):
                 session_id=event["session_id"],
                 turn_id=event["turn_id"],
                 summary=event["last_assistant_message"],
+                **(
+                    {
+                        "_session_id": event["session_id"],
+                        "_activation": event["mindie_activation"],
+                    }
+                    if "mindie_activation" in event
+                    else {}
+                ),
             ),
             timeout=0.8,
         )
@@ -260,6 +290,7 @@ def main(argv=None):
             "import",
             "publish",
             "snapshot",
+            "maintenance-resume",
         ],
     )
     parser.add_argument("--config", required=True)
@@ -268,12 +299,17 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.operation == "hook":
         try:
-            capture_hook(args.config, json.load(sys.stdin))
-        except (ValueError, TypeError, AttributeError):
+            raw = sys.stdin.buffer.read(128 * 1024 + 1)
+            if len(raw) <= 128 * 1024:
+                capture_hook(args.config, json.loads(raw))
+        except (ValueError, TypeError, AttributeError, OSError, RecursionError):
             pass
         print("{}")
         return 0
     config = config_at(args.config)
+    if args.operation == "maintenance-resume":
+        print(canonical(rpc(connect(config), "maintenance_resume")))
+        return 0
     if args.operation == "mcp":
         mcp(args.config)
         return 0
@@ -289,6 +325,7 @@ def main(argv=None):
             connection_path=connection_path(config),
             upstream=config.get("upstream"),
             feeds=config.get("feeds", []),
+            session_activation=config.get("session_activation"),
         ).serve()
         return 0
     if args.operation in {"import", "publish"}:
