@@ -79,3 +79,7 @@
 3. deferred 16545 MegaMoe 16848 default MRV2
 4. pin 257739fc 383fbad9 fb0554b7 4c29f963 0344beea 7036bb09 aff1b74b
 5. maintenance budget ceiling 20 min Asia/Shanghai 2026-09-19
+
+## Ops note
+
+- Fixed `/workspace/va-tools/bin/org-feed-publish-locked.sh` tip-compare status capture (NEEDS_PUBLISH exit 3 was swallowed by bash `if`; first attempt exited 0 without push). Re-ran locked publish → tip `caab5632…`.

@@ -1,25 +1,15 @@
 {
   "changes": {
     "added": [
-      "cases/pr-16853-mrv2-pcp-dp-vllm028-dispatch.case.md",
-      "cases/pr-16904-minimax-m3-cann-ops-sparse-attention.case.md",
-      "cases/pr-16915-dsa-cp-prefill-fused-cache-gather.case.md",
-      "maintenance/2026-09-19-daily-pr-incremental.md",
-      "topics/pr-16853-mrv2-pcp-dp-vllm028-dispatch.md",
-      "topics/pr-16904-minimax-m3-cann-ops-sparse-attention.md",
-      "topics/pr-16915-dsa-cp-prefill-fused-cache-gather.md"
+      "maintenance/2026-09-19-weekly-topic-maintenance.md",
+      "topics/a5-dcp-mla-sfa-cluster.md",
+      "topics/aclgraph-hostside-padding-cluster.md",
+      "topics/dsa-dspark-triton-cp-gather-cluster.md"
     ],
     "removed": [],
     "renamed": [],
     "updated": [
-      "cases/pr-16468-a5-kimi-k3-dcp-dspark-aclgraph.case.md",
-      "cases/pr-16542-dspark-swa-indices-triton-fuse.case.md",
-      "cases/pr-16656-a5-sfa-dcp-padded-lse.case.md",
-      "cases/pr-16798-updatable-graph-host-side-params.case.md",
-      "topics/pr-16468-a5-kimi-k3-flash-mla-dcp.md",
-      "topics/pr-16542-dspark-swa-indices-triton.md",
-      "topics/pr-16656-a5-sfa-dcp-padded-lse.md",
-      "topics/pr-16798-updatable-graph-host-side-params.md"
+      "maintenance/2026-09-19-daily-pr-incremental.md"
     ]
   },
   "files": [
@@ -258,13 +248,40 @@
       "source_sha256": "95c4c55ef19846f7bc83c5cdd28f4e779f8cdc2c67e69dd6fef38c120dfa09c6"
     },
     {
-      "input_sha256": "fd8c20f031ee2157470bf4e44b9f5a8c6a98ea02d533cf96b3581d2c74be47ee",
-      "metadata_sha256": "9d691ef81e1a58f456c9d9e255f02315e9e56357d8031cb75fa2504c09faa2e1",
+      "input_sha256": "f3a87d56ff41024a8e8aee7f70271a6c24320b00bfba9d3029556efabfdaa6f2",
+      "metadata_sha256": "3fc304a9135445392e45acdb02896f42e7fa215ccef7ca8205163a45e70bb861",
       "metadata_size": 489,
       "path": "maintenance/2026-09-19-daily-pr-incremental.md",
-      "sha256": "f21df474bc6f2c1483baafaf868fd2bfba6fec213e4a9a1d028d22be2479dc13",
-      "size": 4472,
-      "source_sha256": "f21df474bc6f2c1483baafaf868fd2bfba6fec213e4a9a1d028d22be2479dc13"
+      "sha256": "0ae9ec0bed0dddb527de58406c6d52427962f373d5f5b7050c1e388be257dcea",
+      "size": 4707,
+      "source_sha256": "0ae9ec0bed0dddb527de58406c6d52427962f373d5f5b7050c1e388be257dcea"
+    },
+    {
+      "input_sha256": "1bb0b3e4643b28f718bc812fee72a70bd64de074e9c26ecdbb720646093d1eab",
+      "metadata_sha256": "283e9e7d2ebe2909f0469a2a566bb8148a5f2bba9a435f945127285e5451fb8c",
+      "metadata_size": 439,
+      "path": "maintenance/2026-09-19-weekly-topic-maintenance.md",
+      "sha256": "1bb0b3e4643b28f718bc812fee72a70bd64de074e9c26ecdbb720646093d1eab",
+      "size": 4109,
+      "source_sha256": "1bb0b3e4643b28f718bc812fee72a70bd64de074e9c26ecdbb720646093d1eab"
+    },
+    {
+      "input_sha256": "5df6c12eec1b9c11f73d211f9fe9a715267cd0323cf91a9983adfe0d7291353b",
+      "metadata_sha256": "d1e48d135227844caea200942b12e48e26a7580e9e803294b3e6765e59a51383",
+      "metadata_size": 1383,
+      "path": "topics/a5-dcp-mla-sfa-cluster.md",
+      "sha256": "5df6c12eec1b9c11f73d211f9fe9a715267cd0323cf91a9983adfe0d7291353b",
+      "size": 3237,
+      "source_sha256": "5df6c12eec1b9c11f73d211f9fe9a715267cd0323cf91a9983adfe0d7291353b"
+    },
+    {
+      "input_sha256": "b9615fe320169a64086aadba03c8d694370987818db48e420a8de2b579c82d19",
+      "metadata_sha256": "642cf63ec4fc985b7f14296365902179e01b6f19f0138ee10f3866af8813069b",
+      "metadata_size": 1753,
+      "path": "topics/aclgraph-hostside-padding-cluster.md",
+      "sha256": "b9615fe320169a64086aadba03c8d694370987818db48e420a8de2b579c82d19",
+      "size": 4585,
+      "source_sha256": "b9615fe320169a64086aadba03c8d694370987818db48e420a8de2b579c82d19"
     },
     {
       "input_sha256": "c96239c84b770843c0ffdb0cccb1351dc71fcf3808307d78570478a96e7c9d15",
@@ -274,6 +291,15 @@
       "sha256": "8c7c43daaaa705a4b76d3ae190fcf07f6c00b878c44c86145c48a8a950777ada",
       "size": 4751,
       "source_sha256": "8c7c43daaaa705a4b76d3ae190fcf07f6c00b878c44c86145c48a8a950777ada"
+    },
+    {
+      "input_sha256": "5b512956f2bda015137acde223e37c205fd0c450e9641fb232dcd8f90ff06d3d",
+      "metadata_sha256": "40986588e47159d249990062d9c85a85d596a9dd562771e73d96209464bfba1f",
+      "metadata_size": 1710,
+      "path": "topics/dsa-dspark-triton-cp-gather-cluster.md",
+      "sha256": "5b512956f2bda015137acde223e37c205fd0c450e9641fb232dcd8f90ff06d3d",
+      "size": 4026,
+      "source_sha256": "5b512956f2bda015137acde223e37c205fd0c450e9641fb232dcd8f90ff06d3d"
     },
     {
       "input_sha256": "178de402e308085ca2eab03d5d97ec747fd457a96d9e7ea73972146a1d806a7d",
@@ -443,8 +469,8 @@
     "maintenance",
     "topics"
   ],
-  "previous_snapshot": "16f2ea14a3d3afddaf770e6ffd108ba97353674159b9e5cb87db06ecb02b59de",
+  "previous_snapshot": "b8789e2bb085f52f496e8efd5ba2530ec38163fb3a7d76a939ed9a5c30949fb6",
   "redaction_profile": "r2",
   "schema": "vaws-curation-export/1",
-  "snapshot": "b8789e2bb085f52f496e8efd5ba2530ec38163fb3a7d76a939ed9a5c30949fb6"
+  "snapshot": "18800ddbb8843848b96ee976605670a5e318d3c6e0ef6884f8a7096c7a577e12"
 }
