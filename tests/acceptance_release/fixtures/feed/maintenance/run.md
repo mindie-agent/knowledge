@@ -1,0 +1,3 @@
+# Operational diary
+
+Run completed.
