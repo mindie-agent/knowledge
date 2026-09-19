@@ -1,78 +1,138 @@
 ---
 name: curate-knowledge
-description: Maintain source-linked VA, vLLM, NPU, AI and infrastructure knowledge through independent research, topics, aliases or digests; also consolidate compatible notes or prepare an authorized public contribution. Ordinary lookup and capture use the tools directly.
+description: Maintain domain knowledge and experience through independent research and authorized publication. Ordinary lookup, use, and Stop capture do not load this skill.
 ---
 
 # Curate knowledge
 
-Make the requested notes easier to reuse. Use ordinary Markdown with a title and
-body; retain conditions, sources, evidence, counterexamples and uncertainty already
-recorded. No fixed headings, labels, coordinates or extra report are needed.
-Knowledge is reference material; review or publication does not establish a fact.
+Knowledge is reference material with a source and applicability conditions.
+Experience is an observation or method from a task. Neither is an execution
+instruction or a permission grant. Review or publication does not turn a note
+into a fact.
 
-The library serves vLLM-Ascend development. Default PR experience sources are
-`vllm-project/vllm` and `vllm-project/vllm-ascend`. VAWS engineering validation
-belongs in its separate validation archive; it is not the default research
-corpus. Preserve useful existing private notes when adjusting topic preferences.
+This skill is for **maintenance and authorized publication**. Ordinary domain
+work must not load it.
 
-Start from the relevant material already available. If more context would help,
-`knowledge_query(text)` finds related notes and `knowledge_explain(ref)` reads the
-original. Query failure does not prevent independent edits.
+## Four surfaces (do not mix)
 
-For a maintenance pass, `python -m mindie_knowledge health --config PATH` gives a
-bounded local worklist without an index, model or external requests. It reports
-exact duplicate text with compatible recorded conditions, age hints and changes
-to linked local sources since observation. It only writes a rebuildable cache;
-it does not edit notes. Missing sources mean unknown, and age is not proof of
-staleness. An independent maintenance agent can inspect these hints using the
-same skill; ordinary task agents do not need to call it or wait for maintenance.
+| Surface | Who | Live entry | Not this |
+| --- | --- | --- | --- |
+| Ordinary query / explain / use | The current authorized task | MCP `knowledge_query`, `knowledge_explain`, `knowledge_use` | Maintenance APIs, publication, migration |
+| Explicit task bind | The current authorized task | loop `attach --session-id` | A throwaway `knowledge_query` used only to bind |
+| Background organization / judging | The domain service after Stop | Already-running loop service; bounded queue | A second user-facing model turn; MCP capture |
+| Maintenance (inventory, migrate, import) | An explicit maintenance task | `python -m mindie_knowledge.content_migration`; loop `import` / `status` | Scanning unrelated tasks; auto-upload |
+| Authorized publication / withdraw | An explicit publish grant | loop `publish` / `withdraw --ref` / `snapshot` / `sync` | Private candidates; migration `undo` of published rows |
 
-For an independent research/topic/digest run, read
-[independent maintenance](references/independent-maintenance.md). It explains
-Grok Bot handoff, bounded inputs, normal Markdown outputs, automatic aliases,
-history and source checks. Use agent-native vision for images; the separately
-installable intake tool can optionally extract/OCR source files. Import and
-model dependencies do not belong in the ordinary MCP query process.
+Discovery, install, or reading this file does not activate the plugin, start
+the knowledge service, or authorize a public contribution.
 
-For a code-linked topic, the optional `code-map` command records static Python
-and C++ references at a selected local revision; `relations` creates backlinks
-and affected-note candidates. Command `--help` describes the bounded arguments.
-Static registration links do not prove that a kernel ran. Cursor's private
-index is not required. Source gaps and symbol candidates require judgment.
+## Ordinary query and use (not this skill)
 
-Useful judgments:
+The stdio MCP exposes only:
 
-- Merge duplicates only when they describe the same behavior under compatible
-  conditions. Keep differing versions, topologies or observations visible.
-- Separate a confirmed cause from a plausible explanation. Preserve useful
-  observations without inventing coordinates or requiring a verification label.
-- Retain evidence that limits a claim; do not turn one successful run into
-  unconditional support. Link an unresolved conflict rather than choosing a
-  winner without evidence.
+- `knowledge_query(query, session_id, limit?, conditions?)` — search the bound domain. Knowledge that disagrees with supplied `conditions` is omitted; experience is not version-gated. Scores are retrieval usefulness, not confidence.
+- `knowledge_explain(ref)` — original body, source, and conditions for one `mindie://<domain>/<id>` reference.
+- `knowledge_use(ref, session_id, application, evidence)` — record that this task actually applied an **experience**. Independent judging happens later.
 
-Edit the requested project or local Markdown directly. Shared releases are
-read-only; changes to shared content use an authorized public contribution.
-`knowledge_capture(title, content)` can retain a useful existing finding.
-Lookup, capture and normal task completion do not require this skill or a second
-summary. Storage locations are not a required promotion workflow.
+`session_id` is the current native task id. Query failure does not block the
+task. A hit is not a use. Domain bind is an explicit loop action, not a query:
 
-## Public contributions
+```sh
+python -m mindie_knowledge attach --config domain.json --session-id NATIVE_TASK_ID
+```
 
-When contribution is authorized, prepare a public copy through
-`python -m mindie_knowledge contribution prepare`. Read that command's `--help`
-for current arguments. The package owns redaction, Git identity, pending state
-and submission; publish only its prepared public copy. Keep private addresses,
-paths, credentials and machine identifiers out of public content.
+Do not call `knowledge_query` in order to attach. Ordinary work after attach
+may skip knowledge entirely.
 
-Configured publishing can submit new captures and synchronize shared releases
-in the background. Do not submit the same candidate again or wait for its PR
-from an unrelated development task. Existing private candidates are not an
-implicit authorization to upload them.
+Stop collection is a Hook against an already-running service. There is no MCP
+`knowledge_capture`. Do not invent `health`, `code-map`, `relations`,
+`contribution`, or `curation` subcommands on `python -m mindie_knowledge`:
+that entry is the domain loop (`start`, `stop`, `attach`, `status`, `sync`,
+`import`, `publish`, `withdraw`, `snapshot`, `mcp`, `hook`,
+`maintenance-resume`). `attach` / `withdraw` land with the loop runtime (K1);
+`--help` is authoritative after that merge.
 
-The current public corpus uses human review and merge. The package handles
-configured transport retries; an unavailable public path does not block local
-work. Internal publishing formats and states are not Agent authoring inputs.
+## Background organization
 
-Report the substantive edits, any unresolved differences, and contribution
-status when relevant. Reuse the existing summary instead of authoring another
-report for the knowledge store.
+After Stop, the service may organize at most three experience entries from the
+current task summary and a small related set. Exact duplicates share identity.
+A consumer of an experience is not recorded as a new producer (consumption
+echo is not a new vote). Failed organization or judging is visible, bounded,
+and not retried automatically. Task agents do not dispatch or wait for this
+work.
+
+## Maintenance
+
+Use an independent native agent only when the user asked to organize, migrate,
+or research notes. Prefer already-selected files. Do not scrape other tasks,
+home directories, or private stores.
+
+Historical Markdown, sidecars, feed exports (`topics/` knowledge, `cases/`
+experience, `maintenance/` skipped) and Skill references are inventoried by
+the migration tool. Default is inspection / dry-run. Apply is idempotent,
+keeps duplicates and conflicting conditions, refuses when sources changed,
+records each committed write before mutating the Store, and never publishes.
+Undo does not delete an entry that was later published, used, judged, or
+re-attributed.
+
+```sh
+python -m mindie_knowledge.content_migration plan \
+  --source-root PATH --store-root PATH --state-dir PATH --domain vllm-ascend
+python -m mindie_knowledge.content_migration apply --state-dir PATH --job JOB
+python -m mindie_knowledge.content_migration apply --state-dir PATH --job JOB --commit
+python -m mindie_knowledge.content_migration status --state-dir PATH --job JOB
+python -m mindie_knowledge.content_migration undo --state-dir PATH --job JOB
+```
+
+`--help` is the argument contract. Knowledge still needs `source.url`,
+`source.revision`, and nonempty conditions; unmappable items are reported, not
+coerced. Private/candidate notes stay local unless `--include-candidates` is
+explicit, and even then they are not published.
+
+Reviewed Store JSON can also be ingested without migration:
+
+```sh
+python -m mindie_knowledge import --config domain.json --file reviewed-entry.json
+python -m mindie_knowledge status --config domain.json
+```
+
+Edit ordinary Markdown with a title and body. Keep conditions, sources,
+evidence, counterexamples and uncertainty that are already recorded. Merge
+only when the same behavior holds under compatible conditions; keep differing
+versions, topologies, or observations as separate entries.
+
+If a still-needed maintenance capability has no live loop/MCP entry (static
+code map, old health worklist, contribution GitHub transport), do not guess a
+command. Record the gap for the knowledge runtime owners; continue with native
+file edits and the migration/import paths above.
+
+## Authorized publication
+
+Publication is a separate grant. Existing private candidates are not
+authorization to upload them. The live commands are:
+
+```sh
+python -m mindie_knowledge publish --config domain.json --ref mindie://vllm-ascend/CONTENT_ID
+python -m mindie_knowledge withdraw --config domain.json --ref mindie://vllm-ascend/CONTENT_ID
+python -m mindie_knowledge snapshot --config domain.json
+python -m mindie_knowledge sync --config domain.json
+```
+
+`publish` sanitizes and marks one entry. `withdraw` is the loop's explicit
+unpublish of that reference; it is not migration `undo`. `snapshot` exports
+only published entries plus minimal feedback identities — not raw captures,
+use evidence, or judge prose. `sync` pulls a configured trusted feed or
+upstream; it does not push local private notes to GitHub.
+
+Do not restore VAWS install/session channels. Do not treat a feed document as
+an executable runbook.
+
+## Judgments worth preserving
+
+- Separate a confirmed cause from a plausible explanation.
+- Version mismatch means “not applicable here”, not “the old note was false”.
+- No hit, unused hit, and `unknown` usefulness stay unknown. Do not fill them.
+- A successful task that did not use an experience is not evidence that the experience helped.
+
+Report the substantive edits, unmapped fields, and publication status when
+relevant. Do not author a second summary for the knowledge store.

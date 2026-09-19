@@ -1,67 +1,83 @@
 # Independent maintenance
 
-Use an independent native agent for open judgments such as topic organization,
-research, compatible experience reuse and cross-task digests. Prefer the user's
-Grok Bot when available. It has its own cloud computer and routines; a task
-agent neither dispatches nor waits for these jobs during ordinary VA work.
+Use this reference only from an explicit maintenance or publication task.
+Ordinary query, explain, use, and Stop capture do not load it.
 
-Select a bounded set of original notes or existing useful summaries. No task
-transcript scraping or second per-task summary is needed. Fix relevant source
-revisions; a merged PR, a model answer or a title match is not execution
-evidence. PR cases retain base/head, scope, changes and remaining uncertainty.
+## Live commands (verify with `--help`)
 
-`python -m mindie_knowledge curation prepare --help` describes the local handoff.
-It takes a brief, source files and a topic subdirectory in the writable candidate
-mount. Project/shared mounts remain read-only through the package; requested
-direct edits to project Markdown use native file tools. The curation tool
-records source hashes, output baselines, a time/file/byte budget and a readable
-`TASK.md`. The agent edits ordinary Markdown copies under `output/`. Optional
-`Retrieval queries` / `检索问法` sections become aliases bound to the exact new
-body; no JSON schema is an authoring requirement.
+Domain loop (`python -m mindie_knowledge` / `mindie-knowledge`):
 
-`curation apply` accepts those Markdown files (or a downloaded result directory)
-only while the source and target snapshots remain valid. It preserves optional
-conditions and prior evidence, records before/after revisions, and refuses to
-overwrite another editor's work. `status`, `cancel` and `undo` operate on the
-returned job reference. Cancel stops accepting the job's result; stop a running
-Grok task through Grok too. Source changes require a new bounded preparation.
-The next catalog refresh makes the result searchable; no generative call occurs
-inside query. Ordinary direct Markdown edits remain supported.
+| Command | Role |
+| --- | --- |
+| `attach --config PATH --session-id ID` | Explicit domain bind for this native task; does not require a query |
+| `status --config PATH` | Ledger, captures, uses, feedback, failed judges |
+| `import --config PATH --file ENTRY.json` | Reviewed Store document (`kind`, `title`, `content`, `source`, `conditions`) |
+| `publish --config PATH --ref mindie://DOMAIN/ID` | Explicit sanitized publication |
+| `withdraw --config PATH --ref mindie://DOMAIN/ID` | Explicit unpublish; not migration undo |
+| `snapshot --config PATH` | Published subset only |
+| `sync --config PATH` | Trusted feed / upstream pull; not a private upload |
+| `start` / `stop` / `serve` / `mcp` / `hook` | Service lifecycle; MCP is query/explain/use only |
+| `maintenance-resume --config PATH` | Resume a paused background budget; does not replay failed work |
 
-For cloud work, transfer only explicitly selected inputs within the user's
-scope. The local handoff is not a public redaction step. Public sources can be
-read directly in Grok; private material requires the authorized prepared-copy
-path before public contribution. Never forward credential files. Use the
-already configured native GitHub login for authorized repository operations.
+Content migration (`python -m mindie_knowledge.content_migration`):
 
-For a public-source cloud feed, `curation-export --source-root ROOT --output-root
-EXPORT` prepares only `topics/`, `cases/` and `maintenance/` by default. It
-returns a generation directory and manifest hash. Verify it with
-`curation-export --verify-root GENERATION --manifest-sha256 HASH` before transport.
-Only the verified generation plus its `current.json` pointer belong in a
-dedicated feed branch. Raw source snapshots, job history, credentials and private
-sidecars stay out. The shared pattern-based redaction profile is a mechanical
-check, not a classifier of every possible private fact; feed inputs stay within
-the selected public-source scope. This does not change canonical corpus human
-review and merge. The receiving independent intake tool verifies the feed before
-placing ordinary Markdown in a configured mount.
+| Command | Role |
+| --- | --- |
+| `plan --source-root --store-root --state-dir --domain` | Inventory and map; does not write the Store |
+| `apply --state-dir --job` | Dry-run (default): re-check source hashes and Store baseline |
+| `apply --state-dir --job --commit` | Write mappable entries; skip duplicates; keep conflicts |
+| `status --state-dir --job` | Plan / apply / undo receipt |
+| `undo --state-dir --job` | Reverse unchanged job writes; retains published/used/feedback/feed/attribution changes |
 
-First run a concrete task and inspect the returned artifacts, then save the
-working brief as a Grok routine. A reasonable bounded configuration is daily
-PR intake and weekly topics/digests, with an explicit timezone, source list and
-time budget. Successful source reads and completed output advance checkpoints;
-failures preserve earlier notes. Keep unchanged runs quiet and report meaningful
-changes, failures or needed user action. Do not recursively spawn maintainers.
+Optional mapping flags (see `--help`): `--origin-repository`, `--source-revision`,
+`--repo-root`, `--include-candidates`, `--experience-fallback`. Candidates and
+private sidecars are not published. `--experience-fallback` is opt-in because
+knowledge missing `source.url` / `source.revision` / conditions is otherwise
+reported unmappable rather than silently stored as experience.
 
-For images and scans, the independent intake tool emits a hash-bound native
-vision request and keeps the original image/page. Read the actual image, retain
-units, axes and missing conditions, and return the description against the
-requested hash and allowed references. OCR is optional and on demand. A diagram
-or synthetic fixture cannot establish measured hardware performance.
+There is no live `python -m mindie_knowledge health`, `code-map`, `relations`,
+`curation`, `curation-export`, or `contribution` path: the package module entry
+is the domain loop. Do not tell a task agent to call them.
 
-Digests link selected existing summaries, identify the covered interval and
-separate recurring observations from proposed generalizations. Related notes
-with incompatible hardware, software revisions or topologies remain distinct.
-Topics and aliases are navigation aids; neither publication nor maintenance
-raises their authority. Include an explicit cross-topic query when broader
-reference material would help.
+## What maps, what does not
+
+Preserved when present: title, body, `source.url`, `source.revision`,
+`source.sha256`, applicability conditions, feed path, content hash, and a new
+stable `mindie://<domain>/<content_id>` reference.
+
+Reported unmapped (not invented as Store fields): retrieval aliases, old
+`viking://` URIs, layer/promotion, sidecar `status` / `captured_at` / free-form
+`evidence` objects, maintenance diaries, operational Skill files, credential-like
+keys, and private/candidate notes (unless `--include-candidates`, still unpublished).
+
+Conflicts (same title, different conditions or bodies) stay as separate identities.
+Exact Store identity matches are retained, not overwritten. Source bytes that
+change after `plan` block `apply`. `plan` and dry-run `apply` open an existing
+ledger read-only (no mkdir, chmod, WAL, or schema upgrade). Each `--commit`
+write is reserved on disk first; an interrupted job is `apply_partial` and can
+resume without deleting concurrent Store writes. Undo compares the apply-time
+ownership fingerprint and refuses publication, use, feedback, feed membership,
+or producer/source changes.
+
+## Independent research handoff
+
+Select a bounded set of original notes the user named. Do not scrape other
+tasks or transcripts. Fix revisions on public sources; a title match is not
+execution evidence. Write ordinary Markdown (title + body) with conditions and
+uncertainty. Then `plan` / dry-run `apply` before `--commit`.
+
+Images: use the agent's native vision against the file the user provided. A
+diagram or synthetic fixture is not measured NPU performance. The separately
+installable intake tool is optional and is not part of MCP query.
+
+Public contribution remains a human-reviewed grant. Configured `auto_publish`
+on the service is an operator choice for organized experiences; it is not a
+reason to upload existing private candidates.
+
+## Background organization versus this skill
+
+Stop may queue at most one organization attempt for the current task. The
+organizer returns zero to three experiences. The judge returns
+`helpful` / `unhelpful` / `unknown` from actual use evidence, not from task
+success or a database score. Unknown is neutral. This skill does not start
+those jobs and does not wait for them.
