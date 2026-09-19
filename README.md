@@ -19,7 +19,7 @@ the [Codex plugin](https://github.com/mindie-agent/mindie-agent-codex) supplies 
 ## Boundaries
 
 - Each domain owns a separate store and service. Knowledge, experience, use and feedback are distinct records.
-- The local MCP exposes only query, explain and use. Stop collection and background organization/judging are separate.
+- The local MCP exposes only attach, query, explain and use. Discovery never starts the service; Stop collection and background organization/judging are separate.
 - A Stop summarizes the current task. Public distribution includes only explicitly published sanitized material.
 - Feedback measures usefulness in an actual use, not factual truth or confidence.
 - Codex, the knowledge service and judges run locally. Remote NPU execution belongs to remote-dev.

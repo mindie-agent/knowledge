@@ -128,14 +128,20 @@ class Service:
         )
 
     def call(self, method, args):
-        if self.admission and method in {"query", "explain", "use", "capture"}:
+        if self.admission and method in {"attach", "query", "explain", "use", "capture"}:
             args = dict(args)
             session = args.pop("_session_id", None)
             self.admission.require(session, args.pop("_activation", None))
             if method != "explain" and args.get("session_id") != session:
                 raise ValueError("session does not match activation")
+            if method in {"attach", "capture"}:
+                # A verified activation is the explicit domain bind; it must
+                # not depend on the task ever issuing a knowledge query.
+                self.store.attach(session)
         if method == "maintenance_resume":
             return self.engine.budget.resume()
+        if method == "attach":
+            return self.store.attach(args["session_id"])
         if method == "query":
             return self.store.query(**args)
         if method == "explain":

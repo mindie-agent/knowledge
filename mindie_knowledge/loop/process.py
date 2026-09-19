@@ -1,4 +1,11 @@
-"""Bound owned process groups and pipe memory without retaining retry work."""
+"""Bound owned process trees and pipe memory without retaining retry work.
+
+Process-tree cleanup is portable: POSIX uses a new session and ``killpg``;
+Windows uses ``CREATE_NEW_PROCESS_GROUP`` plus ``taskkill /T`` on the tree.
+Both paths terminate descendants that outlived the direct child. The Windows
+path is implemented to the same contract but is verified on macOS/Linux CI
+only until a Windows machine runs it.
+"""
 
 import os
 import selectors
@@ -8,20 +15,56 @@ import tempfile
 import time
 
 
+def _spawn(command, stdin):
+    if os.name == "nt":
+        return subprocess.Popen(
+            command,
+            stdin=stdin,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            env={**os.environ, "MINDIE_MAINTENANCE_GROUP": "1"},
+        )
+    return subprocess.Popen(
+        command,
+        stdin=stdin,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+        env={**os.environ, "MINDIE_MAINTENANCE_GROUP": "1"},
+    )
+
+
+def terminate_tree(process):
+    """Terminate the whole owned tree rooted at ``process``; never raises."""
+    if os.name == "nt":
+        # taskkill /T walks the descendant tree; /F forces termination.
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        process.wait(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 def bounded_run(command, payload, *, timeout, max_output):
-    if os.name != "posix":
-        raise RuntimeError("bounded maintenance process groups require POSIX")
     with tempfile.TemporaryFile() as input_file:
         input_file.write(payload.encode())
         input_file.seek(0)
-        process = subprocess.Popen(
-            command,
-            stdin=input_file,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-            env={**os.environ, "MINDIE_MAINTENANCE_GROUP": "1"},
-        )
+        process = _spawn(command, input_file)
         selector = selectors.DefaultSelector()
         selector.register(process.stdout, selectors.EVENT_READ, "out")
         selector.register(process.stderr, selectors.EVENT_READ, "err")
@@ -49,20 +92,12 @@ def bounded_run(command, payload, *, timeout, max_output):
                 raise RuntimeError(f"maintenance agent exited {code}")
             return output.decode()
         finally:
-            # Also terminate descendants that outlived the direct child.
+            terminate_tree(process)
             try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                process.wait(timeout=0.5)
+                process.wait(timeout=1)
             except subprocess.TimeoutExpired:
-                pass
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.wait(timeout=1)
+                process.kill()
+                process.wait(timeout=1)
             selector.close()
             process.stdout.close()
             process.stderr.close()

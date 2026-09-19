@@ -17,22 +17,32 @@ does not depend on a particular Harness; the Codex adapter supplies the runner.
   Experience is advisory material. A query can exclude incompatible knowledge;
   it does not gate experiences on versions or assign factual confidence.
 - Captures, uses and feedback are separate records. One use per entry and consumer
-  task; producer self-use cannot count. The judge uses a fresh invocation and a
-  distinct identity. This is logical task isolation, not adversarial identity proof.
+  task; later rounds of the same task refine that record until it is judged, then
+  it stays frozen under the verdict's evidence hash. Producer self-use cannot
+  count. The judge uses a fresh invocation and a distinct identity. This is
+  logical task isolation, not adversarial identity proof.
 
 ## Core protocol
 
-The stdio MCP exposes only `knowledge_query`, `knowledge_explain`, and
-`knowledge_use`. The query supplies a native task ID and selects the configured
-domain; unrelated tasks are not collected. The Stop bridge calls a bounded private
-RPC against an already-running local service. It does not start a server, parse
-transcripts, access reasoning, or persist failed/offline captures for later retry.
+The stdio MCP exposes `knowledge_attach`, `knowledge_query`, `knowledge_explain`,
+and `knowledge_use`. MCP discovery (`initialize`, `tools/list`) never starts the
+service or any business work; only an actual tool call connects. `knowledge_attach`
+explicitly binds the calling task to the configured domain after the Harness
+adapter's manual activation; binding never requires a knowledge query, so a task
+that only used remote tools is still eligible for bounded capture. A verified
+activation token presented with a Stop event binds the same way. The query
+supplies a native task ID and selects the configured domain; unrelated tasks are
+not collected. The Stop bridge calls a bounded private RPC against an
+already-running local service. It does not start a server, parse transcripts,
+access reasoning, or persist failed/offline captures for later retry.
 
 An accepted capture binds the first following final reply to pending use records
 in that task. A bounded in-memory queue triggers organization and independent
 judging. Previously queued captures are discarded after a service restart.
 Failed evaluations are recorded, contribute no vote, and are not automatically
-retried. Human corrections to completed use records are not implemented yet.
+retried. Maintenance admission is durable: per-task and hourly call limits, one
+call at a time, and a pause after consecutive failures that an explicit
+`maintenance-resume` lifts without replaying failed work.
 
 Organizer output is zero to three experience entries. It receives the current
 summary and a small set of related entries to avoid redundant material. Exact
@@ -42,11 +52,15 @@ plus a reason. These are usefulness signals, not fact checking or reproduction.
 
 ## Distribution
 
-`publish --ref` explicitly marks a reviewed sanitized entry for distribution.
-`auto_publish: true` is an explicit operator option for organized entries. Existing
-public-copy redaction rejects material needing further sanitization. Snapshots
-contain only published entries and minimal feedback identities/verdicts; they omit
-raw captures, use evidence and judge prose. Their digest covers the entire payload.
+`publish --ref` explicitly marks a reviewed sanitized entry for distribution;
+`withdraw --ref` revokes that authorization (local content and history are
+retained, so old references stay explainable and republication is possible).
+`auto_publish: true` is an explicit operator option for organized entries.
+Publication runs the source-side redaction ruleset (`mindie_knowledge.redact`,
+profile r2) over content and metadata and rejects material needing sanitization.
+Snapshots contain only published entries and minimal feedback
+identities/verdicts; they omit raw captures, use evidence and judge prose.
+Their digest covers the entire payload.
 
 `upstream` explicitly connects a replica to a trusted domain authority. Sync pulls
 the snapshot, then submits completed local uses to the authority's independent
@@ -100,11 +114,17 @@ explicit initial heuristic, not an effectiveness claim. Domain size is capped at
 ```sh
 mindie-knowledge start --config domain.json
 mindie-knowledge status --config domain.json
+mindie-knowledge attach --config domain.json --session-id TASK [--activation TOKEN]
 mindie-knowledge import --config domain.json --file reviewed-entry.json
 mindie-knowledge publish --config domain.json --ref mindie://vllm-ascend/CONTENT_ID
+mindie-knowledge withdraw --config domain.json --ref mindie://vllm-ascend/CONTENT_ID
 mindie-knowledge sync --config domain.json
 mindie-knowledge mcp --config domain.json
 ```
+
+Process bounding is portable: POSIX uses process groups, Windows uses
+`CREATE_NEW_PROCESS_GROUP` plus `taskkill /T` tree termination. The Windows
+path implements the same contract but awaits real-machine evidence.
 
 `serve` runs in foreground for diagnostics. Configuration and service versions
 must be kept together; restart the owned service after updating runtime configuration.

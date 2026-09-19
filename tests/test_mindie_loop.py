@@ -441,9 +441,115 @@ def test_mcp_initialization_and_scoped_tool_contract(services, tmp_path):
     replies = [json.loads(line)["result"] for line in completed.stdout.splitlines()]
     assert replies[0]["serverInfo"]["name"] == "mindie-knowledge"
     assert {t["name"] for t in replies[1]["tools"]} == {
+        "knowledge_attach",
         "knowledge_query",
         "knowledge_explain",
         "knowledge_use",
     }
     assert replies[2]["structuredContent"]["domain"] == "vllm-ascend"
     assert service.store.attached("task")
+
+
+def test_attach_binds_a_session_without_any_query(store):
+    assert not store.attached("remote-only-task")
+    store.attach("remote-only-task")
+    assert store.attached("remote-only-task")
+    # Idempotent and domain-scoped.
+    assert store.attach("remote-only-task") == dict(
+        attached=True, domain="vllm-ascend"
+    )
+
+
+def test_use_refinement_until_judged_then_frozen(store):
+    doc = experience(store)
+    first = store.use(
+        ref=doc["id"],
+        session_id="consumer-b",
+        application="Tried the suggested comparison",
+        evidence="Graph capture failed",
+    )
+    second = store.use(
+        ref=doc["id"],
+        session_id="consumer-b",
+        application="Corrected: compared eager and graph execution",
+        evidence="Eager passed, graph failed at capture",
+    )
+    # One use record per (entry, session): later rounds refine, never re-vote.
+    assert second["use_id"] == first["use_id"] and second["refined"]
+    store.capture("consumer-b", "turn-1", "The comparison isolated graph capture.")
+    use_id = first["use_id"]
+    store.judge(
+        use_id, judge_id="judge-c", verdict="helpful", reason="Narrowed investigation"
+    )
+    third = store.use(
+        ref=doc["id"],
+        session_id="consumer-b",
+        application="Late correction attempt",
+        evidence="Changed after judging",
+    )
+    assert third["use_id"] == use_id and not third["refined"]
+    row = store.db.execute("SELECT application FROM uses WHERE id=?", (use_id,)).fetchone()
+    assert row[0] == "Corrected: compared eager and graph execution"
+    assert store.weight(doc["id"])["helpful"] == 1
+
+
+def test_publish_then_withdraw_excludes_from_snapshot(store):
+    doc = experience(store)
+    assert store.snapshot()["entries"] == []
+    store.publish(doc["id"])
+    assert [e["id"] for e in store.snapshot()["entries"]] == [doc["id"]]
+    result = store.withdraw(doc["id"])
+    assert result["withdrawn"] and result["ref"] == store.ref(doc["id"])
+    assert store.snapshot()["entries"] == []
+    # Local content and history survive withdrawal; republication is possible.
+    assert store.get(doc["id"])["content"]
+    store.publish(doc["id"])
+    assert [e["id"] for e in store.snapshot()["entries"]] == [doc["id"]]
+
+
+def test_publication_rejects_private_values(store):
+    doc = experience(
+        store,
+        title="Machine-specific note",
+        content="Verified on host 192.168.13.153 before the release.",
+    )
+    with pytest.raises(ValueError, match="sanitization"):
+        store.publish(doc["id"])
+
+
+def test_mcp_discovery_never_starts_the_service(tmp_path):
+    """initialize/tools/list answer from the static contract; nothing starts."""
+    config = tmp_path / "domain.json"
+    config.write_text(
+        json.dumps(
+            dict(
+                root=str(tmp_path / "root"),
+                domain="vllm-ascend",
+                agent_command=["never"],
+            )
+        )
+    )
+    calls = [
+        dict(jsonrpc="2.0", id=1, method="initialize", params={}),
+        dict(jsonrpc="2.0", id=2, method="tools/list", params={}),
+    ]
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "mindie_knowledge.loop.cli",
+            "mcp",
+            "--config",
+            str(config),
+        ],
+        input="\n".join(canonical(c) for c in calls) + "\n",
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+    assert completed.returncode == 0, completed.stderr
+    replies = [json.loads(line)["result"] for line in completed.stdout.splitlines()]
+    assert replies[0]["serverInfo"]["name"] == "mindie-knowledge"
+    assert len(replies[1]["tools"]) == 4
+    # No service spawn, no connection file, not even a store directory.
+    assert not (tmp_path / "root").exists()

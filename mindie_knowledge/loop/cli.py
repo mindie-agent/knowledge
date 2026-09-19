@@ -56,10 +56,9 @@ def ensure_service(config_path):
         return probe()
     except (OSError, ValueError):
         pass
-    from mindie_knowledge.distribution.errors import SwitchInProgress
-    from mindie_knowledge.distribution.sync import SwitchLock
+    from .locks import StartInProgress, StartLock
 
-    lock = SwitchLock(connection_path(config).with_name("start.lock"))
+    lock = StartLock(connection_path(config).with_name("start.lock"))
     acquired = False
     process = None
     ready = False
@@ -67,7 +66,7 @@ def ensure_service(config_path):
         try:
             lock.acquire()
             acquired = True
-        except SwitchInProgress:
+        except StartInProgress:
             pass
         if acquired:
             # A peer may have completed startup between our initial probe and lock.
@@ -75,10 +74,15 @@ def ensure_service(config_path):
                 return probe()
             except (OSError, ValueError):
                 pass
-            if os.name != "posix":
-                raise RuntimeError(
-                    "bounded service startup requires POSIX process groups"
-                )
+            spawn = dict(
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if os.name == "nt":
+                spawn["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                spawn["start_new_session"] = True
             process = subprocess.Popen(
                 [
                     sys.executable,
@@ -88,10 +92,7 @@ def ensure_service(config_path):
                     "--config",
                     str(Path(config_path).resolve()),
                 ],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
+                **spawn,
             )
         for attempt in range(MAX_STARTUP_PROBES):
             remaining = deadline - time.monotonic()
@@ -111,13 +112,14 @@ def ensure_service(config_path):
         )
     finally:
         if process is not None and not ready:
-            import signal
+            from .process import terminate_tree
 
+            terminate_tree(process)
             try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.wait(timeout=1)
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=1)
         if acquired:
             lock.release()
 
@@ -133,6 +135,15 @@ def schema(properties, required):
 
 STRING = {"type": "string"}
 TOOLS = [
+    dict(
+        name="knowledge_attach",
+        description=(
+            "Explicitly bind this task to the selected domain after manual "
+            "activation. Binding never requires a knowledge query; it only "
+            "makes this task's Stop summary eligible for bounded capture."
+        ),
+        inputSchema=schema(dict(session_id=STRING), ["session_id"]),
+    ),
     dict(
         name="knowledge_query",
         description="Search the selected domain's knowledge and experience. References are advisory.",
@@ -285,10 +296,12 @@ def main(argv=None):
             "serve",
             "mcp",
             "hook",
+            "attach",
             "status",
             "sync",
             "import",
             "publish",
+            "withdraw",
             "snapshot",
             "maintenance-resume",
         ],
@@ -296,6 +309,8 @@ def main(argv=None):
     parser.add_argument("--config", required=True)
     parser.add_argument("--file")
     parser.add_argument("--ref")
+    parser.add_argument("--session-id")
+    parser.add_argument("--activation")
     args = parser.parse_args(argv)
     if args.operation == "hook":
         try:
@@ -309,6 +324,14 @@ def main(argv=None):
     config = config_at(args.config)
     if args.operation == "maintenance-resume":
         print(canonical(rpc(connect(config), "maintenance_resume")))
+        return 0
+    if args.operation == "attach":
+        if not args.session_id:
+            parser.error("attach requires --session-id")
+        payload = dict(session_id=args.session_id)
+        if args.activation:
+            payload.update(_session_id=args.session_id, _activation=args.activation)
+        print(canonical(rpc(connect(config), "attach", payload)))
         return 0
     if args.operation == "mcp":
         mcp(args.config)
@@ -328,18 +351,22 @@ def main(argv=None):
             session_activation=config.get("session_activation"),
         ).serve()
         return 0
-    if args.operation in {"import", "publish"}:
+    if args.operation in {"import", "publish", "withdraw"}:
         store = Store(config["root"], config["domain"])
         try:
             if args.operation == "import":
                 if not args.file:
                     parser.error("import requires --file with an entry JSON")
                 result = store.add(**json.loads(Path(args.file).read_text()))
-            else:
+            elif args.operation == "publish":
                 if not args.ref:
                     parser.error("publish requires --ref")
                 store.publish(args.ref)
                 result = dict(published=True, ref=args.ref)
+            else:
+                if not args.ref:
+                    parser.error("withdraw requires --ref")
+                result = store.withdraw(args.ref)
         finally:
             store.close()
     else:

@@ -277,6 +277,21 @@ class Store:
             )
         return dict(id=ident, status="queued", duplicate=False)
 
+    def attach(self, session_id):
+        """Explicitly bind a session to this domain.
+
+        Domain binding is its own operation: the adapter calls this when the
+        user explicitly activates the plugin for a task, so a task that only
+        uses remote tools and never queries knowledge is still bound and its
+        Stop summary is eligible for bounded capture. Querying or recording a
+        use also binds (a real knowledge interaction is itself an explicit
+        choice), but binding never requires a query.
+        """
+        session = session_key(session_id)
+        with self.lock, self.db:
+            self.db.execute("INSERT OR IGNORE INTO sessions VALUES(?)", (session,))
+        return dict(attached=True, domain=self.domain)
+
     def attached(self, session_id):
         with self.lock:
             return (
@@ -309,9 +324,24 @@ class Store:
                 "INSERT OR IGNORE INTO uses VALUES(?,?,?,?,?,?,?)",
                 (ident, doc["id"], session, application, evidence, "", "local"),
             )
+            # Multi-round semantics: one use record per (entry, session).
+            # Later rounds of the same session refine the same record instead
+            # of creating new votes, so consumption echoes never add weight.
+            # Refinement is accepted only while the use is unjudged; once an
+            # independent verdict exists it stays bound to the evidence hash it
+            # evaluated, and the record no longer mutates underneath it.
+            judged = self.db.execute(
+                "SELECT 1 FROM feedback WHERE use_id=?", (ident,)
+            ).fetchone()
+            if not judged:
+                self.db.execute(
+                    "UPDATE uses SET application=?,evidence=? WHERE id=?",
+                    (application, evidence, ident),
+                )
         return dict(
             use_id=ident,
             eligible=session not in doc["producers"],
+            refined=not judged,
             note="Stop capture supplies this session's outcome; the independent judge evaluates asynchronously.",
         )
 
@@ -416,27 +446,34 @@ class Store:
             return record
 
     def publish(self, ident):
-        # Publication is an explicit operator/config choice, after sanitization.
-        from mindie_knowledge.contribution.public import prepare_public_copy
-
-        doc = self.get(ident)
-        copy = prepare_public_copy(render_markdown(doc["title"], doc["content"]))
-        if (
-            copy.blocked
-            or copy.text.strip()
-            != render_markdown(doc["title"], doc["content"]).strip()
-        ):
-            raise ValueError(
-                "entry needs a separately reviewed sanitized copy before publication"
-            )
+        # Publication is an explicit operator/config choice. The rendered
+        # content and all metadata must pass the source-side redaction
+        # ruleset as-is; an entry that needs rewriting is published only as a
+        # separately reviewed sanitized copy added under its own identity.
         from mindie_knowledge.redact import scan_text
 
-        if scan_text(canonical(doc["source"])) or scan_text(
-            canonical(doc["conditions"])
-        ):
-            raise ValueError("source metadata contains private values")
+        doc = self.get(ident)
+        findings = scan_text(render_markdown(doc["title"], doc["content"]))
+        findings += scan_text(canonical(doc["source"]))
+        findings += scan_text(canonical(doc["conditions"]))
+        if findings:
+            rules = ", ".join(sorted({finding.rule for finding in findings}))
+            raise ValueError(f"entry requires sanitization before publication: {rules}")
         with self.lock, self.db:
             self.db.execute("INSERT OR IGNORE INTO publication VALUES(?)", (doc["id"],))
+
+    def withdraw(self, ident):
+        """Remove an entry from the authorized publication set.
+
+        The local content and its use/feedback history are retained; only the
+        authorization to include the entry in future snapshots is revoked, so
+        downstream installs stop offering it after their next sync while old
+        references remain explainable.
+        """
+        doc = self.get(ident)
+        with self.lock, self.db:
+            self.db.execute("DELETE FROM publication WHERE entry_id=?", (doc["id"],))
+        return dict(withdrawn=True, ref=self.ref(doc["id"]))
 
     def snapshot(self):
         with self.lock:

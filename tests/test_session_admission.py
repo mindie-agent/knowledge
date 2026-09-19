@@ -118,10 +118,53 @@ def test_startup_uses_one_spawn_and_bounded_readiness_probes(tmp_path, monkeypat
     spawn = Mock(return_value=process)
     monkeypatch.setattr(cli.subprocess, "Popen", spawn)
     kill = Mock()
-    monkeypatch.setattr(cli.os, "killpg", kill)
+    monkeypatch.setattr("mindie_knowledge.loop.process.terminate_tree", kill)
     with pytest.raises(RuntimeError, match="bounded readiness"):
         cli.ensure_service(config)
     assert spawn.call_count == 1
     assert rpc.call_count == 2 + cli.MAX_STARTUP_PROBES
     assert kill.call_count == 1
     process.wait.assert_called_once()
+
+
+def test_activated_remote_only_session_is_captured_without_a_query(tmp_path):
+    """Explicit activation binds the domain; no knowledge query is required."""
+    config, _ = activated(tmp_path)
+    store = Store(tmp_path / "store", "test")
+    engine = Engine(store, agent_command=["never"])
+    service = Service(engine, session_activation=str(config))
+    try:
+        # A task that only used remote tools: activated, never queried.
+        result = service.call(
+            "capture",
+            dict(
+                session_id="manual-A",
+                turn_id="turn-1",
+                summary="Remote job finished; the fix was a pinned driver.",
+                _session_id="manual-A",
+                _activation="cap-A",
+            ),
+        )
+        assert result["status"] == "queued"
+        assert store.attached("manual-A")
+        # Cross-session capture is still refused.
+        with pytest.raises(ValueError):
+            service.call(
+                "capture",
+                dict(
+                    session_id="other",
+                    turn_id="turn-1",
+                    summary="x",
+                    _session_id="manual-A",
+                    _activation="cap-A",
+                ),
+            )
+        # An explicit attach is also available without waiting for Stop.
+        attached = service.call(
+            "attach",
+            dict(session_id="manual-A", _session_id="manual-A", _activation="cap-A"),
+        )
+        assert attached == dict(attached=True, domain="test")
+    finally:
+        service.http.server_close()
+        store.db.close()
