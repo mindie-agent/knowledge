@@ -151,9 +151,7 @@ class Feed:
                 ]
             )
             old = previous.get(name)
-            if old and old["fingerprint"] == fingerprint:
-                doc = self.store.get(old["entry_id"])
-            elif extension is not None:
+            if extension is not None:
                 doc = dict(
                     kind=kind,
                     title=title,
@@ -163,6 +161,8 @@ class Feed:
                     producers=producers,
                 )
                 doc["id"] = extension["id"]
+            elif old and old["fingerprint"] == fingerprint:
+                doc = self.store.get(old["entry_id"])
             else:
                 path = "/".join(
                     filter(

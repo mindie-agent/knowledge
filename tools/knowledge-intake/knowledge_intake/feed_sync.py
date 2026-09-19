@@ -71,7 +71,7 @@ def _digest_json(value) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()
 
 
-def _verified_loop(raw: bytes, rows) -> dict:
+def _verified_loop(raw: bytes, rows, files) -> dict:
     """Validate the optional authenticated loop extension.
 
     The extension is covered by the same Git commit authentication as every
@@ -105,6 +105,9 @@ def _verified_loop(raw: bytes, rows) -> dict:
         row = rows_by_path.get(doc["path"])
         if row is None:
             raise IntakeError("loop extension entry is not bound to a manifest file")
+        metadata = _json(files[str(PurePosixPath(doc["path"]).with_suffix(".meta.json"))])
+        if doc["conditions"] != metadata["conditions"]:
+            raise IntakeError("loop extension applicability disagrees with metadata")
         rendered = ("# " + doc["title"].strip() + "\n\n" + doc["content"].strip() + "\n").encode()
         if digest(rendered) != row["source_sha256"]:
             raise IntakeError("loop extension entry disagrees with its manifest bytes")
@@ -336,7 +339,7 @@ def verified_snapshot(source: GitFeed, prefix: str = "", *, reuse=None) -> dict:
         # One optional authenticated metadata extension; it carries canonical
         # entry identities and minimal effective feedback for this product's
         # own feeds and is validated against the hash-pinned manifest rows.
-        loop = _verified_loop(source.read(generation + "/" + LOOP_EXTENSION, MAX_MANIFEST), rows)
+        loop = _verified_loop(source.read(generation + "/" + LOOP_EXTENSION, MAX_MANIFEST), rows, files)
         expected.add(LOOP_EXTENSION)
     if observed != expected:
         raise IntakeError("feed generation has missing or unmanaged files")

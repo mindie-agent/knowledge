@@ -28,9 +28,10 @@ def test_live_mcp_and_cli_are_current_loop():
     assert "python -m mindie_knowledge.content_migration" in text
     assert "python -m mindie_knowledge import" in text
     assert "python -m mindie_knowledge publish" in text
-    assert "python -m mindie_knowledge attach" in text
+    assert "knowledge_attach(session_id)" in text
     assert "python -m mindie_knowledge withdraw" in text
-    assert "Do not call `knowledge_query` in order to attach" in text
+    assert "Binding requires no throwaway lookup" in text
+    assert "python -m mindie_knowledge export" in text
     assert "allow_implicit_invocation: false" in text
 
 

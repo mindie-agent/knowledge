@@ -13,44 +13,41 @@ into a fact.
 This skill is for **maintenance and authorized publication**. Ordinary domain
 work must not load it.
 
-## Four surfaces (do not mix)
+## Entry boundaries
 
 | Surface | Who | Live entry | Not this |
 | --- | --- | --- | --- |
 | Ordinary query / explain / use | The current authorized task | MCP `knowledge_query`, `knowledge_explain`, `knowledge_use` | Maintenance APIs, publication, migration |
-| Explicit task bind | The current authorized task | loop `attach --session-id` | A throwaway `knowledge_query` used only to bind |
+| Explicit task bind | The current authorized task | MCP `knowledge_attach` after plugin activation | A throwaway `knowledge_query` used only to bind |
 | Background organization / judging | The domain service after Stop | Already-running loop service; bounded queue | A second user-facing model turn; MCP capture |
 | Maintenance (inventory, migrate, import) | An explicit maintenance task | `python -m mindie_knowledge.content_migration`; loop `import` / `status` | Scanning unrelated tasks; auto-upload |
-| Authorized publication / withdraw | An explicit publish grant | loop `publish` / `withdraw --ref` / `snapshot` / `sync` | Private candidates; migration `undo` of published rows |
+| Authorized publication / withdraw | An explicit publish grant | loop `publish` / `withdraw --ref` / `export` / `snapshot` / `sync` | Private candidates; migration `undo` of published rows |
 
 Discovery, install, or reading this file does not activate the plugin, start
 the knowledge service, or authorize a public contribution.
 
 ## Ordinary query and use (not this skill)
 
-The stdio MCP exposes only:
+The business MCP exposes:
+
+- `knowledge_attach(session_id)` — bind a manually activated task without a query; the plugin entry normally performs this once.
 
 - `knowledge_query(query, session_id, limit?, conditions?)` — search the bound domain. Knowledge that disagrees with supplied `conditions` is omitted; experience is not version-gated. Scores are retrieval usefulness, not confidence.
 - `knowledge_explain(ref)` — original body, source, and conditions for one `mindie://<domain>/<id>` reference.
 - `knowledge_use(ref, session_id, application, evidence)` — record that this task actually applied an **experience**. Independent judging happens later.
 
-`session_id` is the current native task id. Query failure does not block the
-task. A hit is not a use. Domain bind is an explicit loop action, not a query:
-
-```sh
-python -m mindie_knowledge attach --config domain.json --session-id NATIVE_TASK_ID
-```
-
-Do not call `knowledge_query` in order to attach. Ordinary work after attach
-may skip knowledge entirely.
+`session_id` is the current native task id. Plugin MCP calls also carry the
+`mindie_session_id` and `mindie_activation` returned by explicit activation.
+Binding requires no throwaway lookup; ordinary work may skip knowledge entirely.
+A hit is not a use. Query failure does not block the task and does not authorize
+activation or retry.
 
 Stop collection is a Hook against an already-running service. There is no MCP
 `knowledge_capture`. Do not invent `health`, `code-map`, `relations`,
 `contribution`, or `curation` subcommands on `python -m mindie_knowledge`:
 that entry is the domain loop (`start`, `stop`, `attach`, `status`, `sync`,
-`import`, `publish`, `withdraw`, `snapshot`, `mcp`, `hook`,
-`maintenance-resume`). `attach` / `withdraw` land with the loop runtime (K1);
-`--help` is authoritative after that merge.
+`import`, `publish`, `withdraw`, `export`, `snapshot`, `mcp`, `hook`,
+`maintenance-resume`). `--help` is the current argument contract.
 
 ## Background organization
 
@@ -114,15 +111,23 @@ authorization to upload them. The live commands are:
 ```sh
 python -m mindie_knowledge publish --config domain.json --ref mindie://vllm-ascend/CONTENT_ID
 python -m mindie_knowledge withdraw --config domain.json --ref mindie://vllm-ascend/CONTENT_ID
+python -m mindie_knowledge export --config domain.json --output reviewed-feed
 python -m mindie_knowledge snapshot --config domain.json
 python -m mindie_knowledge sync --config domain.json
 ```
 
-`publish` sanitizes and marks one entry. `withdraw` is the loop's explicit
+`publish` checks redaction and authorizes one entry; unsafe content is refused. `withdraw` is the loop's explicit
 unpublish of that reference; it is not migration `undo`. `snapshot` exports
 only published entries plus minimal feedback identities — not raw captures,
 use evidence, or judge prose. `sync` pulls a configured trusted feed or
 upstream; it does not push local private notes to GitHub.
+
+`export` writes a hash-verified feed generation of authorized entries and minimal
+feedback. It preserves canonical content identity, producer identity and current
+observation versions. An empty generation propagates withdrawal of the last
+entry. It does not commit or upload files; publication to a remote repository
+requires the user's explicit grant. New use evidence invalidates an older vote
+until a fresh independent judgment completes.
 
 Do not restore VAWS install/session channels. Do not treat a feed document as
 an executable runbook.
