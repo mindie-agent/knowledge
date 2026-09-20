@@ -8,6 +8,7 @@ transport — its successes are mechanism evidence, not GitHub acceptance.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -16,9 +17,6 @@ import pytest
 
 
 from mindie_knowledge.loop import documents  # integrated package is required
-
-CORE_DOCUMENTS = True
-requires_core_documents = pytest.mark.skipif(False, reason="integrated core is present")
 
 from mindie_knowledge.community import entrydoc  # noqa: F401  (delegates to core documents)
 from mindie_knowledge.community.batch import batch_revision
@@ -36,8 +34,8 @@ def git(argv, cwd=None):
         capture_output=True,
         text=True,
         env={
-            "PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
-            "HOME": str(cwd) if cwd else "/tmp",
+            **os.environ,
+            "GIT_CONFIG_GLOBAL": os.devnull,
             "GIT_CONFIG_NOSYSTEM": "1",
         },
     )

@@ -619,6 +619,26 @@ class Store:
 
     # ---------------------------------------------------------------- outbox
 
+    def reserve_export(self, fingerprint):
+        """Consume this material revision before final scanning/staging.
+
+        A scan failure or interrupted build must not be repeated every idle
+        tick. New draft content or an explicit new vote gets a new fingerprint.
+        """
+        with self._write_txn():
+            return self.db.execute(
+                "INSERT OR IGNORE INTO state VALUES(?,?)",
+                ("export:" + fingerprint, canonical({"status": "attempted"})),
+            ).rowcount == 1
+
+    def finish_export(self, fingerprint, status, detail=""):
+        with self._write_txn():
+            self.db.execute(
+                "UPDATE state SET value=? WHERE key=?",
+                (canonical({"status": status, "detail": str(detail)[:500]}),
+                 "export:" + fingerprint),
+            )
+
     def create_batch(self, *, batch_id, revision, batch, entry_ids, vote_keys,
                      generation=None):
         """Record one built batch as pending and bind its material.
@@ -873,6 +893,10 @@ class Store:
                 ],
                 coverage_gaps=len(self.coverage_gaps()),
                 votes=self.db.execute("SELECT count(*) FROM votes").fetchone()[0],
+                export_attempts=[json.loads(r[0]) for r in self.db.execute(
+                    "SELECT value FROM state WHERE key LIKE 'export:%' "
+                    "ORDER BY rowid DESC LIMIT 20"
+                )],
                 outbox=[
                     dict(r)
                     for r in self.db.execute(

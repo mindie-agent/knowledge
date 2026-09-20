@@ -9,6 +9,7 @@ caller receives ``disabled`` and no Git mutation or outbound request happens.
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
@@ -73,7 +74,8 @@ def validate_settings(data: Mapping[str, Any]) -> dict[str, Any]:
         generation = str(generation)
     out["generation"] = generation
     enabled_at = data.get("enabled_at")
-    if enabled and not (type(enabled_at) in (int, float) and enabled_at > 0):
+    if enabled and not (type(enabled_at) in (int, float)
+                        and math.isfinite(enabled_at) and enabled_at > 0):
         # An enabled config without a finite positive start authorizes nothing.
         raise CommunityError("enabled community config requires a finite positive 'enabled_at'")
     out["enabled_at"] = enabled_at

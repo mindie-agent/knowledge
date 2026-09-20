@@ -63,8 +63,8 @@ def build_batch(store, *, settings, revision_fn=None):
     """Collect all pending material into one batch, or None when empty.
 
     On success the batch is already recorded pending in the outbox and its
-    files staged; the caller submits it. Scan failures raise ValueError with
-    the rule list and create nothing.
+    files staged; the caller submits it. A durable receipt is reserved before
+    scanning, so a failed unchanged material revision is never rebuilt.
     """
     if revision_fn is None:
         revision_fn = _community_revision()
@@ -72,6 +72,24 @@ def build_batch(store, *, settings, revision_fn=None):
     votes = store.unbatched_votes(generation=settings.generation)
     if not drafts and not votes:
         return None
+    fingerprint = digest([
+        settings.generation,
+        sorted((d["entry_id"], d["revision"]) for d in drafts),
+        sorted((v["root_opaque"], v["entry_id"], v["revision"],
+                v["rating"], v["reason"]) for v in votes),
+    ])
+    if not store.reserve_export(fingerprint):
+        return None
+    try:
+        result = _stage_batch(store, settings, drafts, votes, revision_fn)
+    except Exception as exc:
+        store.finish_export(fingerprint, "failed", str(exc))
+        raise
+    store.finish_export(fingerprint, "staged")
+    return result
+
+
+def _stage_batch(store, settings, drafts, votes, revision_fn):
     lineage = lineage_of(store.domain, settings.generation)
     files = []
     for doc in sorted(drafts, key=lambda d: d["entry_id"]):
