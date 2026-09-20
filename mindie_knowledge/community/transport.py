@@ -43,13 +43,11 @@ def _brief(payload: Any) -> str:
 
 
 class Transport:
-    """Narrow GitHub surface used by the publish and review state machines."""
+    """Narrow GitHub surface used by contributor publication."""
 
     def find_pull_requests(self, repo: str, *, head_branch: str, deadline: Deadline) -> list[dict]:
         raise NotImplementedError
 
-    def list_open_pull_requests(self, repo: str, *, deadline: Deadline) -> list[dict]:
-        raise NotImplementedError
 
     def get_pull_request(self, repo: str, number: int, deadline: Deadline) -> dict:
         raise NotImplementedError
@@ -64,25 +62,11 @@ class Transport:
     ) -> dict:
         raise NotImplementedError
 
-    def pull_request_files(self, repo: str, number: int, deadline: Deadline) -> list[dict]:
-        raise NotImplementedError
 
-    def check_runs(self, repo: str, sha: str, deadline: Deadline) -> list[dict]:
-        raise NotImplementedError
 
-    def merge_pull_request(
-        self, repo: str, number: int, *, sha: str, method: str, deadline: Deadline
-    ) -> dict:
-        raise NotImplementedError
 
-    def create_comment(self, repo: str, number: int, *, body: str, deadline: Deadline) -> dict:
-        raise NotImplementedError
 
-    def get_file(self, repo: str, path: str, ref: str, deadline: Deadline) -> str | None:
-        raise NotImplementedError
 
-    def list_files(self, repo: str, prefix: str, ref: str, deadline: Deadline) -> list[str]:
-        raise NotImplementedError
 
 
 # --------------------------------------------------------------------------- #
@@ -167,13 +151,6 @@ class GhTransport(Transport):
         )
         return list(payload) if isinstance(payload, list) else []
 
-    def list_open_pull_requests(self, repo: str, *, deadline: Deadline) -> list[dict]:
-        check_repository(repo)
-        payload = self._api("GET", self._query(f"/repos/{repo}/pulls", state="open", per_page="100"), deadline)
-        pulls = list(payload) if isinstance(payload, list) else []
-        if len(pulls) >= 100:
-            pulls = pulls[:100]
-        return pulls
 
     def get_pull_request(self, repo: str, number: int, deadline: Deadline) -> dict:
         payload = self._api("GET", f"/repos/{repo}/pulls/{int(number)}", deadline)
@@ -198,68 +175,11 @@ class GhTransport(Transport):
         )
         return dict(payload) if isinstance(payload, Mapping) else {}
 
-    def pull_request_files(self, repo, number, deadline) -> list[dict]:
-        payload = self._api("GET", f"/repos/{repo}/pulls/{int(number)}/files?per_page=100", deadline)
-        files = list(payload) if isinstance(payload, list) else []
-        if len(files) >= 100:
-            raise CommunityError("PR exceeds the 100-file review bound")
-        return files
 
-    def check_runs(self, repo, sha, deadline) -> list[dict]:
-        payload = self._api("GET", f"/repos/{repo}/commits/{sha}/check-runs?per_page=100", deadline)
-        if isinstance(payload, Mapping):
-            return list(payload.get("check_runs") or [])
-        return []
 
-    def merge_pull_request(self, repo, number, *, sha, method, deadline) -> dict:
-        payload = self._api(
-            "PUT",
-            f"/repos/{repo}/pulls/{int(number)}/merge",
-            deadline,
-            {"sha": sha, "merge_method": method},
-        )
-        if not isinstance(payload, Mapping) or not payload.get("merged"):
-            raise CommunityError(f"merge refused: {_brief(payload)}")
-        return dict(payload)
 
-    def create_comment(self, repo, number, *, body, deadline) -> dict:
-        payload = self._api(
-            "POST", f"/repos/{repo}/issues/{int(number)}/comments", deadline, {"body": body}
-        )
-        return dict(payload) if isinstance(payload, Mapping) else {}
 
-    def get_file(self, repo, path, ref, deadline) -> str | None:
-        import base64
 
-        try:
-            payload = self._api(
-                "GET", self._query(f"/repos/{repo}/contents/{path}", ref=ref), deadline
-            )
-        except CommunityError as exc:
-            if "404" in str(exc):
-                return None
-            raise
-        if not isinstance(payload, Mapping) or payload.get("encoding") != "base64":
-            raise CommunityError(f"unexpected contents payload for {path}")
-        raw = base64.b64decode(str(payload.get("content") or ""))
-        if len(raw) > 128 * 1024:
-            raise CommunityError(f"{path} exceeds the readable size limit")
-        return raw.decode("utf-8")
-
-    def list_files(self, repo, prefix, ref, deadline) -> list[str]:
-        payload = self._api(
-            "GET", self._query(f"/repos/{repo}/git/trees/{ref}", recursive="1"), deadline
-        )
-        if not isinstance(payload, Mapping):
-            return []
-        out = [
-            str(item["path"])
-            for item in payload.get("tree") or []
-            if isinstance(item, Mapping)
-            and item.get("type") == "blob"
-            and str(item.get("path", "")).startswith(prefix)
-        ]
-        return sorted(out)[:2000]
 
 
 def _http_status(stderr_text: str) -> int | None:
@@ -415,36 +335,6 @@ class FileTransport(Transport):
             self._write(data)
             return dict(pr)
 
-    def pull_request_files(self, repo, number, deadline) -> list[dict]:
-        """Files changed by the PR, computed from real Git when possible."""
-        pr = self.get_pull_request(repo, number, deadline)
-        url = self.remotes.get(repo)
-        if not url:
-            with self.lock:
-                repo_state = self._repo(self._read(), repo)
-                return list(repo_state.get("pr_files", {}).get(str(int(number)), []))
-        deadline.step("git diff for PR files")
-        result = run_argv(
-            [
-                "git",
-                "-C",
-                str(self._ensure_mirror(repo, url, deadline)),
-                "diff",
-                "--name-status",
-                f"{pr['base']['ref']}...{pr['head']['ref']}",
-            ],
-            timeout=min(30, deadline.remaining()),
-            max_output=128 * 1024,
-        )
-        if result.code != 0:
-            raise CommunityError("cannot compute PR file list from the dev remote")
-        files = []
-        for line in result.out_text.splitlines():
-            parts = line.split("\t")
-            if len(parts) == 2:
-                status = {"A": "added", "M": "modified", "D": "removed"}.get(parts[0], "modified")
-                files.append({"filename": parts[1], "status": status})
-        return files
 
     def _ensure_mirror(self, repo: str, url: str, deadline: Deadline) -> Path:
         mirror = self.path.parent / "mirrors" / repo.replace("/", "_")
@@ -459,14 +349,6 @@ class FileTransport(Transport):
             raise CommunityError(f"cannot sync dev remote mirror: {result.err_text[:200]}")
         return mirror
 
-    def check_runs(self, repo, sha, deadline) -> list[dict]:
-        deadline.step("check runs")
-        with self.lock:
-            repo_state = self._repo(self._read(), repo)
-            checks = repo_state.get("checks", {})
-            if sha in checks:
-                return list(checks[sha])
-            return list(repo_state.get("checks_default", []))
 
     def merge_pull_request(self, repo, number, *, sha, method, deadline) -> dict:
         deadline.step("merge pull request")
@@ -532,45 +414,8 @@ class FileTransport(Transport):
         )
         return result.out_text.strip()
 
-    def create_comment(self, repo, number, *, body, deadline) -> dict:
-        deadline.step("create comment")
-        with self.lock:
-            data = self._read()
-            repo_state = self._repo(data, repo)
-            comment = {"id": len(repo_state["comments"]) + 1, "issue": int(number), "body": body, "at": time.time()}
-            repo_state["comments"].append(comment)
-            self._write(data)
-            return dict(comment)
 
-    def get_file(self, repo, path, ref, deadline) -> str | None:
-        url = self.remotes.get(repo)
-        if not url:
-            return None
-        mirror = self._ensure_mirror(repo, url, deadline)
-        deadline.step("git show file")
-        result = run_argv(
-            ["git", "-C", str(mirror), "show", f"{ref}:{path}"],
-            timeout=min(30, deadline.remaining()),
-            max_output=256 * 1024,
-        )
-        if result.code != 0:
-            return None
-        return result.out_text
 
-    def list_files(self, repo, prefix, ref, deadline) -> list[str]:
-        url = self.remotes.get(repo)
-        if not url:
-            return []
-        mirror = self._ensure_mirror(repo, url, deadline)
-        deadline.step("git list tree")
-        result = run_argv(
-            ["git", "-C", str(mirror), "ls-tree", "-r", "--name-only", ref],
-            timeout=min(30, deadline.remaining()),
-            max_output=256 * 1024,
-        )
-        if result.code != 0:
-            return []
-        return sorted(p for p in result.out_text.splitlines() if p.startswith(prefix))[:2000]
 
 
 def transport_from_settings(settings: Mapping[str, Any], state_dir: Path) -> Transport:

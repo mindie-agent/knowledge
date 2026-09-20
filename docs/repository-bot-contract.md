@@ -1,9 +1,8 @@
 # Repository bot contract — external Grok Bot software
 
 Status: **deployment instructions for the external Grok Bot application**
-(installed separately by the maintainer; inspected/configured by root via
-computer use). This repository ships no bot runtime, no model bridge and no
-scheduler. The maintainer's existing bot routines need separate root
+(installed separately by the maintainer). This repository ships no bot runtime, no model bridge and no
+scheduler. The maintainer's existing bot routines need separate configuration
 alignment; nothing here claims they are configured or completed.
 
 ## Ownership split
@@ -12,7 +11,7 @@ alignment; nothing here claims they are configured or completed.
 | --- | --- |
 | Contributor publication (`submit_batch`/`reconcile_batch`, validation, redaction, Git push, durable receipts) | this package, on contributor machines |
 | PR review, correction/retirement decisions, optional Skill proposals | the external Grok Bot app, maintainer-deployed |
-| Pinned full-tree validation of published content | root-owned `mindie_knowledge.publication_check` (not in this package): `python -I -m mindie_knowledge.publication_check --repo CHECKOUT --revision FULL40SHA`, run with the trusted installed code |
+| Pinned full-tree validation of published content | `mindie_knowledge.publication_check` in this package: `python -I -m mindie_knowledge.publication_check --repo CHECKOUT --revision FULL40SHA`, run with the trusted installed code |
 | Content repository | `mindie-agent/knowledge-vllm-ascend`, branch `main` |
 | Plugin repository (Skill packages) | `mindie-agent/mindie-agent-codex`, branch `main` |
 

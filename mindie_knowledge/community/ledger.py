@@ -1,4 +1,4 @@
-"""Durable publication/review ledgers (SQLite), written before any effect.
+"""Durable publication ledger (SQLite), written before any effect.
 
 The publication ledger is the idempotence backbone: an intent row plus
 append-only step receipts exist before the first Git mutation, so a restart
@@ -186,68 +186,3 @@ class Ledger:
             "head_sha": row.get("head_sha"),
             "detail": row.get("detail") or "",
         }
-
-    # ------------------------------------------------------------------ #
-    # Review attempts: one per (repo, pr, head), durable before the model
-    # ------------------------------------------------------------------ #
-
-    def get_review(self, repo: str, pr: int, head_sha: str) -> dict[str, Any] | None:
-        with self.lock:
-            row = self.db.execute(
-                "SELECT * FROM review_attempt WHERE repo=? AND pr=? AND head_sha=?",
-                (repo, pr, head_sha),
-            ).fetchone()
-        return dict(row) if row else None
-
-    def reserve_review(self, repo: str, pr: int, head_sha: str) -> bool:
-        """Record the attempt BEFORE any model call; False if already attempted."""
-        with self.lock, self.db:
-            self.db.execute("BEGIN IMMEDIATE")
-            if self.get_review(repo, pr, head_sha):
-                return False
-            self.db.execute(
-                "INSERT INTO review_attempt(repo, pr, head_sha, status, verdict, detail, at)"
-                " VALUES(?,?,?,'running','','',?)",
-                (repo, pr, head_sha, time.time()),
-            )
-            return True
-
-    def reviews_for_pr(self, repo: str, pr: int) -> list[dict[str, Any]]:
-        with self.lock:
-            rows = self.db.execute(
-                "SELECT * FROM review_attempt WHERE repo=? AND pr=? ORDER BY at",
-                (repo, pr),
-            ).fetchall()
-        return [dict(r) for r in rows]
-
-    def set_patch_sha(self, repo: str, pr: int, head_sha: str, patch_sha: str) -> None:
-        with self.lock, self.db:
-            self.db.execute(
-                "UPDATE review_attempt SET patch_sha=? WHERE repo=? AND pr=? AND head_sha=?",
-                (patch_sha, repo, pr, head_sha),
-            )
-
-    def finish_review(self, repo: str, pr: int, head_sha: str, *, status: str, verdict: str, detail: str = "") -> None:
-        with self.lock, self.db:
-            self.db.execute(
-                "UPDATE review_attempt SET status=?, verdict=?, detail=? WHERE repo=? AND pr=? AND head_sha=?",
-                (status, verdict, detail[:MAX_DETAIL], repo, pr, head_sha),
-            )
-
-    # ------------------------------------------------------------------ #
-    # Skill material digests: one bounded attempt per material set
-    # ------------------------------------------------------------------ #
-
-    def get_skill_material(self, material_digest: str) -> dict[str, Any] | None:
-        with self.lock:
-            row = self.db.execute(
-                "SELECT * FROM skill_material WHERE digest=?", (material_digest,)
-            ).fetchone()
-        return dict(row) if row else None
-
-    def record_skill_material(self, material_digest: str, *, status: str, detail: str = "") -> None:
-        with self.lock, self.db:
-            self.db.execute(
-                "INSERT OR REPLACE INTO skill_material VALUES(?,?,?,?)",
-                (material_digest, status, detail[:MAX_DETAIL], time.time()),
-            )

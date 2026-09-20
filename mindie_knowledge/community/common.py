@@ -1,7 +1,6 @@
 """Shared helpers for the community package: digests, bounds, subprocesses.
 
-Every external effect in this package is a bounded argv subprocess (git, gh or
-the maintainer-configured review CLI). Contribution text is never interpolated
+Every external effect in this package is a bounded git or gh subprocess. Contribution text is never interpolated
 into a shell command: payloads travel via stdin temp files or ``--input`` body
 files, and every call carries a deadline plus an output cap.
 """
@@ -25,7 +24,6 @@ SCHEMA_BATCH = "mindie-contribution/1"
 SCHEMA_FEEDBACK = "mindie-feedback/1"
 SCHEMA_CONFIG = "mindie-community-config/1"
 SCHEMA_ENTRY = "mindie-entry/1"
-SCHEMA_REVIEW = "mindie-review/1"
 
 MAX_DETAIL = 800
 MAX_BATCH_FILES = 200
