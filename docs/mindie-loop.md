@@ -1,158 +1,135 @@
-# MindIE domain loop, first implementation
+# MindIE domain loop
 
-`mindie-knowledge` is the new single-domain runtime entrypoint. Its configuration
-requires `root`, `domain`, and an external `agent_command` argv list. The command
-receives JSON on stdin and returns schema-constrained JSON on stdout. The runtime
-does not depend on a particular Harness; the Codex adapter supplies the runner.
+`mindie-knowledge` is the single-domain runtime. Configuration requires `root`
+and `domain`; optional keys are `agent_command` (argv for the maintenance
+runner), `community_config` (shared `mindie-community-config/1` settings file),
+`session_activation` (adapter config for lease checks) and `feeds`.
 
-## Boundaries
+## The gate
 
-- Separate directory, SQLite ledger, Markdown content, process and reference
-  namespace for each domain. A snapshot/ref for another domain is rejected.
-- SQLite is the serving catalogue and event ledger. Markdown and metadata are
-  readable exports, not independently editable authoritative inputs. Use `import`
-  to ingest reviewed entries. Content identity derives from normalized content and
-  source/applicability; provenance and feedback do not change it.
-- Knowledge requires a source URL, revision and applicability conditions.
-  Experience is advisory material. A query can exclude incompatible knowledge;
-  it does not gate experiences on versions or assign factual confidence.
-- Captures, uses and feedback are separate records. One use per entry and consumer
-  task; a correction in the same task is a new *observation* (application, evidence
-  and the outcome bound by the next Stop capture) of that single vote. A verdict
-  binds the observation hash it evaluated: superseded verdicts stop counting, the
-  corrected observation gets exactly one new bounded evaluation attempt, a stale
-  in-flight verdict is rejected, and a failed attempt never blocks a correction.
-  Producer self-use cannot count. The judge uses a fresh invocation and a distinct
-  identity. This is logical task isolation, not adversarial identity proof.
+`capture_allowed = active adapter lease AND community enabled AND the lease's
+canonical project_root inside the configured scope`. The shared settings file
+is re-read before transcript reading, before every model spawn and before any
+outbound write. When community contribution is off — the default — there is no
+automatic capture, extraction or sanitization at all: the Hook short-circuits,
+no capture row/cursor/draft/worker/model exists, and only read-only retrieval,
+plugin updates and knowledge sync keep working. Disabling mid-task cancels
+queued and running maintenance, the idle batch timer and unsent batches; it
+never deletes drafts or published data, and re-enabling never backfills the
+disabled period.
 
-## Core protocol
+## Capture and bounded increments
 
-The stdio MCP exposes `knowledge_attach`, `knowledge_query`, `knowledge_explain`,
-and `knowledge_use`. MCP discovery (`initialize`, `tools/list`) never starts the
-service or any business work; only an actual tool call connects. `knowledge_attach`
-explicitly binds the calling task to the configured domain after the Harness
-adapter's manual activation; binding never requires a knowledge query, so a task
-that only used remote tools is still eligible for bounded capture. A verified
-activation token presented with a Stop event binds the same way. The query
-supplies a native task ID and selects the configured domain; unrelated tasks are
-not collected. The Stop bridge calls a bounded private RPC against an
-already-running local service. It does not start a server, parse transcripts,
-access reasoning, or persist failed/offline captures for later retry.
+The Stop Hook (`hook --config`) validates the bounded envelope, re-checks the
+gate read-only and forwards whitelist fields to the already-running loopback
+service; it never opens the transcript, starts a service, or retries. A valid
+event carries `session_id` and `turn_id`; `transcript_path` and
+`last_assistant_message` are both optional — a transcript without a final
+summary is still accepted.
 
-An accepted capture binds the first following final reply to pending use records
-in that task. A bounded in-memory queue triggers organization and independent
-judging. Previously queued captures are discarded after a service restart.
-Failed evaluations are recorded, contribute no vote, and are not automatically
-retried. Maintenance admission is durable: per-task and hourly call limits, one
-call at a time, and a pause after consecutive failures that an explicit
-`maintenance-resume` lifts without replaying failed work.
+The worker reads only the new byte region of the admitted task's own
+transcript (`loop/transcript.py`): structural-signature whitelist of Codex
+JSONL — user messages, assistant `final`-channel messages, bounded tool
+input/output. Hidden reasoning, analysis channels, system/developer content,
+credential fields and other tasks' history are never extracted. File
+replacement, truncation, unknown formats and partial trailing records are
+handled explicitly (summary-only degradation within the same attempt, or a
+visible coverage gap); a nonzero cursor resumes exactly where the last region
+ended. Each region `(file identity, start, end, digest)` is durably reserved
+BEFORE the model call, so failures, crashes and cancellation all consume it;
+the attempted cursor and the last-successful cursor are separate, and failed
+regions stay visible as coverage gaps (`status` shows them).
 
-Organizer output is zero to three experience entries. It receives the current
-summary and a small set of related entries to avoid redundant material. Exact
-content duplicates share identity. The judge receives the experience, application,
-observed evidence and final outcome. It returns `helpful`, `unhelpful`, or `unknown`
-plus a reason. These are usefulness signals, not fact checking or reproduction.
+One organizer model call per accepted increment (input 64 KiB, structured
+result 32 KiB, runner 60s/outer 65s, one concurrent call, 6 per task, 20 per
+domain-hour, pause after three consecutive failures; attempts are persisted
+before spawn and never replayed). A deterministic redaction mask runs before
+the model, and every candidate entry is scanned again before becoming a
+draft. Organizer output is at most three entries: `entry_id: null` creates a
+draft owned by the producing task's opaque identity; a non-null id appends a
+self-contained observation to that draft, deduplicated by the increment
+marker. Bodies are capped at 64 KiB (`draft full` stops expansion — no
+auto-condense or extra model).
 
-## Distribution
+## Entries, drafts, publication
 
-`publish --ref` explicitly marks a reviewed sanitized entry for distribution;
-`withdraw --ref` revokes that authorization (local content and history are
-retained, so old references stay explainable and republication is possible).
-`auto_publish: true` is an explicit operator option for organized entries.
-Publication runs the source-side redaction ruleset (`mindie_knowledge.redact`,
-profile r2) over content and metadata and rejects material needing sanitization.
-Snapshots contain only published entries and minimal feedback
-identities/verdicts; they omit raw captures, use evidence and judge prose.
-Their digest covers the entire payload.
+`loop/documents.py` owns the canonical `mindie-entry/1` format: YAML
+frontmatter with every field but `content`, the detailed body as Markdown,
+and `revision` as the SHA256 of the canonical JSON of all fields except
+`revision`. Text fields are canonical (stripped) at admission — noncanonical
+documents are rejected, never silently rewritten, so render/parse/revision
+always agree.
 
-`upstream` explicitly connects a replica to a trusted domain authority. Sync pulls
-the snapshot as *authoritative membership*: entries the authority withdraws stop
-being searchable on the replica, while their content stays explainable by
-reference and local-only or feed-owned entries are untouched. Inbound
-`contribute` is incremental ingestion and never replaces membership. The replica
-then submits completed local uses to the authority's independent judge.
-Explicitly published replica entries are offered to the authority first,
-rechecked by the existing publication redactor, and then distributed. Unpublished
-replica content remains local. Subsequent syncs bring updated feedback to replicas.
-The authority's distributed verdict supersedes a prior local verdict for the same
-use; the use still counts once. HTTP is permitted only
-on loopback; remote services require HTTPS. Redirects are rejected. The RPC server
-admits at most 8 concurrent request workers and closes connections that cannot
-get a worker or that stall a request body past a 10-second read deadline. Service
-credentials
-belong in private configuration; production multi-user identity/authorization,
-durable publisher deployment and public release channels are outside this first slice.
+Search folds draft and published lineage: the published revision wins,
+retired entries leave ordinary search but stay explainable (with their
+retirement reason), and a draft that advances beyond its published revision
+is labeled `supplemental`, never a second hit. Pinned references
+(`mindie://<domain>/<entry_id>@<revision>`) always read the exact historical
+body.
 
-`export --output DIR` writes one new inspectable feed generation from the entries
-currently authorized by `publish` (knowledge under `topics/`, experience under
-`cases/`), in the exact format the independent intake reader verifies: bodies,
-sidecar metadata with applicability and source hashes, a prepared manifest with
-added/removed/updated/renamed changes against the previous generation, and a
-`current.json` pointer swapped only after the complete generation is on disk, so
-a failed export retains the previous one. Withdrawn entries disappear from the
-next generation and readers deactivate them. It writes files only — reviewing,
-committing and pushing a feed branch stays a human/operator decision.
+## Optional feedback
 
-## Official domain feed
+`knowledge_feedback(ref, rating, reason?)` records one current `up`/`down`
+vote per opaque root and entry (a new vote replaces the old, including its
+revision); the reason is optional, at most 1000 characters. Raw native
+session IDs never leave the store — public exports carry only the random
+opaque root ID. Votes recorded while sharing is off stay local
+(`publishable=0`) and are never backfilled; a vote while off also never wakes
+capture or the outbox.
 
-Install the independent, model-free reader with `pip install ./tools/knowledge-intake`.
-An explicit `feeds` configuration reads a trusted publisher's committed exports:
+## Contribution batches
 
-```json
-{"feeds": [{"repository": "mindie-agent/knowledge",
-  "ref": "knowledge/vllm-ascend", "domain": "vllm-ascend",
-  "interval_seconds": 300}]}
-```
+One coalescing outbox per domain: the idle timer (default 300 s from the
+settings file; task deactivation flushes early) packs every changed draft
+revision and unbatched publishable vote into a single `mindie-contribution/1`
+batch — canonical entry Markdown under `cases/`/`topics/`, one
+`feedback/*.json` — staged as already-scanned bytes in a private staging
+directory. Core calls `mindie_knowledge.community.submit_batch` /
+`reconcile_batch` and records the receipt; when the community package is not
+installed while sharing is enabled, batches fail loudly as `unavailable`
+(a dependency failure, never a fake success). Failed/unknown batch revisions
+are never automatically rewritten; unknown outcomes get bounded read-only
+reconciliation before any new work. The model is never involved in batching,
+commit messages or PR text.
 
-The GitHub reader uses existing `gh` authentication when available, with public
-HTTPS reads otherwise. It resolves one immutable commit and verifies the export
-manifest, every body and sidecar before changing search. `topics/` become knowledge
-and must have explicit applicability; `cases/` become advisory experiences;
-maintenance diaries are excluded. Feed content is reference data, never executable
-instructions. Source references retain the publisher commit and original content hash.
+## Knowledge sync
 
-Background checks have a bounded 120-second read budget and run at the configured
-interval (minimum 60 seconds). They are polling, not GitHub event subscriptions.
-An unchanged commit downloads no content; unchanged blobs are hash-checked and
-reused. Changed or removed documents disappear from search in one SQLite transaction.
-Old content remains available to existing references and uses. Unchanged experiences
-keep their identities and feedback. A failed import keeps the prior searchable
-generation and reports the failure in `status`. This feed does not send local
-captures or votes to GitHub. Experience feedback distribution uses `upstream`.
+`sync --config` is standalone and model-free (30 s per attempt, 3 attempts
+per candidate persisted across restarts): it follows the configured content
+repository branch as an immutable Git commit, validates the complete
+candidate tree (canonical layout under `cases/`+`topics/`, sizes, UTF-8/LF,
+schema, revisions, domain, knowledge sources/applicability) and switches
+atomically. A valid empty or retired-only tree empties ordinary search; an
+unsupported old layout (e.g. `corpus/`) fails loudly instead of looking like
+an empty feed; a bad candidate always keeps the old cache. Sync works with
+community contribution off and never starts the maintenance service.
 
-## Initial ranking policy
+## MCP surface
 
-Existing BM25 lexical retrieval supplies relevance. Experience relevance is
-multiplied by `exp(0.35 * (helpful - unhelpful))`, bounded to `[0.1, 3]`.
-Unknown is neutral. At least three negative uses and a negative surplus of three
-withdraw the experience from search; content remains inspectable. This is an
-explicit initial heuristic, not an effectiveness claim. Domain size is capped at
-10,000 entries until a measured larger index or a useful domain split is selected.
+`knowledge_query(query, limit?, conditions?)`, `knowledge_explain(ref,
+offset?, limit?)` (both truthfully annotated read-only) and
+`knowledge_feedback(ref, rating, reason?)` (a write). Every delivered call is
+bound to the host's per-call metadata (`_meta['x-codex-turn-metadata']` with
+matching `threadId`); missing or contradictory metadata fails closed — there
+is no latest-lease guess. Discovery (`initialize`/`tools/list`) is static and
+starts nothing.
 
 ## Commands
 
 ```sh
-mindie-knowledge start --config domain.json
-mindie-knowledge status --config domain.json
-mindie-knowledge attach --config domain.json --session-id TASK [--activation TOKEN]
-mindie-knowledge import --config domain.json --file reviewed-entry.json
-mindie-knowledge publish --config domain.json --ref mindie://vllm-ascend/CONTENT_ID
-mindie-knowledge withdraw --config domain.json --ref mindie://vllm-ascend/CONTENT_ID
-mindie-knowledge sync --config domain.json
-mindie-knowledge export --config domain.json --output feed-dir/
+mindie-knowledge serve --config domain.json      # foreground service
+mindie-knowledge status --config domain.json     # live or local read-only status
+mindie-knowledge sharing-status --config domain.json
+mindie-knowledge sync --config domain.json       # one bounded knowledge sync
+mindie-knowledge maintenance-resume --config domain.json
+mindie-knowledge stop --config domain.json
+mindie-knowledge hook --config domain.json       # Stop envelope on stdin
 mindie-knowledge mcp --config domain.json
 ```
 
-Shutdown cancels in-flight maintenance through a shared stop event
-(`bounded_run` interrupts the agent process tree), discards queued captures as
-never-attempted, and joins the worker with a bounded wait.
-
-Process bounding is portable: POSIX uses process groups; Windows assigns the
-spawned process to a Job Object so descendants stay owned (`TerminateJobObject`,
-with `taskkill /T` only if job assignment fails); pipe draining uses reader
-threads instead of `selectors` (which cannot select Windows pipes).
-
-`serve` runs in foreground for diagnostics. Configuration and service versions
-must be kept together; restart the owned service after updating runtime configuration.
-The adapter repository includes opt-in live Codex acceptance; deterministic unit
-tests here use a fixture runner and do not establish model judgment quality.
+Shutdown cancels in-flight maintenance through the shared cancel event,
+drains the queue as never-attempted, and joins workers with bounded waits.
+Process bounding is portable on POSIX (process groups); on Windows the Job
+Object assignment races the already-running child, so reliable tree ownership
+there is NOT proven and awaits an atomic create/assign/resume sequence plus
+real Windows acceptance.

@@ -1,40 +1,34 @@
 # MindIE Knowledge
 
-Local domain knowledge, experience collection, distribution and independent usefulness feedback for MindIE Agent.
+Local domain knowledge and experience loop for MindIE Agent: bounded capture from admitted tasks, optional community sharing through Git, and read-only retrieval from the canonical Git publication.
 
-Use `mindie-knowledge` from the `mindie-knowledge` Python package (Python 3.11+).
-The module namespace is `mindie_knowledge`. There are no VAWS package or command aliases.
+Use `mindie-knowledge` from the `mindie-knowledge` Python package (Python 3.11+). The module namespace is `mindie_knowledge`.
 
 ```sh
-python -m pip install -e . -e tools/knowledge-intake
-mindie-knowledge start --config domain.json
+python -m pip install -e .
+mindie-knowledge serve --config domain.json
 mindie-knowledge status --config domain.json
+mindie-knowledge sync --config domain.json
 mindie-knowledge mcp --config domain.json
 ```
 
-See [the runtime contract](docs/mindie-loop.md) for configuration, import, explicit publication,
-feed synchronization, independent judging and ranking. A Harness provides the model runner;
-the [Codex plugin](https://github.com/mindie-agent/mindie-agent-codex) supplies the first adapter.
+See [the runtime contract](docs/mindie-loop.md) for configuration, the capture
+gate, bounded transcript increments, drafts and revisions, optional feedback,
+contribution batches and feed sync. A Harness provides the model runner; the
+[Codex plugin](https://github.com/mindie-agent/mindie-agent-codex) supplies the adapter.
 
 ## Boundaries
 
-- Each domain owns a separate store and service. Knowledge, experience, use and feedback are distinct records.
-- The local MCP exposes only attach, query, explain and use. Discovery never starts the service; Stop collection and background organization/judging are separate.
-- A Stop summarizes the current task. Public distribution includes only explicitly published sanitized material.
-- Feedback measures usefulness in an actual use, not factual truth or confidence.
-- Codex, the knowledge service and judges run locally. Remote NPU execution belongs to remote-dev.
-
-The official vLLM-Ascend feed currently lives in this repository's `knowledge/vllm-ascend` branch.
-Content consolidation into `mindie-agent/knowledge-vllm-ascend` is a separate remaining task.
+- Community contribution is a single explicit switch (`mindie-community-config/1`). Off means no capture, extraction or sanitization at all — not local-only capture. Retrieval, updates and sync keep working.
+- Entries have stable opaque IDs and content revisions; publication state (active/retired) comes only from the content repository. Local drafts update by append-only observations and never hide published content.
+- The MCP surface is `knowledge_query`, `knowledge_explain` and optional `knowledge_feedback`; each call is bound to verified host task metadata. Feedback is fully optional up/down with an optional one-line reason; there is no judge and no voting weight.
+- Raw task records stay with the user's Harness. Only redaction-scanned canonical entry Markdown and vote files ever reach the contribution staging directory.
 
 ## Development
 
 ```sh
-python -m pip install -e '.[test]' -e tools/knowledge-intake
+python -m pip install -e '.[test]'
 python -m pytest -q tests
-python -m mindie_knowledge.corpus_check --repo .
 ```
 
-Internal Markdown, redaction, retrieval and distribution libraries are reused.
-Older backend design documents record their own scope; the supported product service and CLI are the domain loop.
-Historical corpus provenance is preserved and does not define supported installation paths.
+The public knowledge base starts empty in the new `mindie-entry/1` format; there is no legacy migration or compatibility layer. Pre-existing private user files stay inert.
