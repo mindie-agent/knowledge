@@ -176,17 +176,25 @@ class ProcessResult:
         return self.err.decode("utf-8", "replace")
 
 
-def _reader(stream, tag: str, chunks: "queue.Queue") -> None:
+def _reader(stream, tag: str, chunks: "queue.Queue", stop: threading.Event) -> None:
     try:
-        while True:
+        while not stop.is_set():
             chunk = os.read(stream.fileno(), 4096)
             if not chunk:
                 break
-            chunks.put((tag, chunk))
+            while not stop.is_set():
+                try:
+                    chunks.put((tag, chunk), timeout=0.05)
+                    break
+                except queue.Full:
+                    continue
     except OSError:
         pass
     finally:
-        chunks.put((tag, None))
+        try:
+            chunks.put((tag, None), timeout=0.2)
+        except queue.Full:
+            pass
 
 
 def run_argv(
@@ -197,12 +205,16 @@ def run_argv(
     input_bytes: bytes | None = None,
     cwd: Path | None = None,
     env: Mapping[str, str] | None = None,
+    cancel: Any = None,
 ) -> ProcessResult:
     """Run ``argv`` with owned process-tree cleanup and bounded pipes.
 
     Returns the raw result; callers decide which exit codes mean what.
     A timeout kills the whole tree and reports ``timed_out`` so callers can
-    distinguish "refused" from "unknown outcome".
+    distinguish "refused" from "unknown outcome". A cancel observed while the
+    child is in flight also kills the tree and raises ``UnknownOutcome``: a
+    mid-flight outbound operation must be reconciled read-only afterwards,
+    never reported as a clean refusal.
     """
     argv = [str(a) for a in argv]
     if not argv:
@@ -251,8 +263,9 @@ def run_argv(
 
     # Bounded in-flight buffer: producers block instead of outgrowing max_output.
     chunks: "queue.Queue" = queue.Queue(maxsize=max(8, max_output // 4096 + 8))
+    stop = threading.Event()
     readers = [
-        threading.Thread(target=_reader, args=(stream, tag, chunks), daemon=True)
+        threading.Thread(target=_reader, args=(stream, tag, chunks, stop), daemon=True)
         for stream, tag in ((process.stdout, "out"), (process.stderr, "err"))
     ]
     for reader in readers:
@@ -264,6 +277,12 @@ def run_argv(
     timed_out = False
     try:
         while open_streams:
+            if cancel is not None:
+                is_set = getattr(cancel, "is_set", None)
+                if callable(is_set) and is_set():
+                    raise UnknownOutcome(
+                        "cancelled while a subprocess was in flight; reconcile read-only"
+                    )
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 timed_out = True
@@ -286,6 +305,7 @@ def run_argv(
         code = process.wait(timeout=max(0.01, deadline - time.monotonic()))
         return ProcessResult(code, bytes(out), bytes(err), False)
     finally:
+        stop.set()
         terminate_tree(process)
         try:
             process.wait(timeout=1)

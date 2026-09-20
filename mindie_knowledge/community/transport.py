@@ -366,7 +366,12 @@ class FileTransport(Transport):
             pr = repo_state["pulls"].get(str(int(number)))
             if pr is None:
                 raise CommunityError(f"PR {number} not found")
-            return dict(pr)
+            pr = dict(pr)
+        # The head sha always reflects the actual remote branch tip.
+        tip = self._tip(repo, pr.get("head", {}).get("ref", ""), deadline)
+        if tip and pr.get("state") == "open":
+            pr.setdefault("head", {})["sha"] = tip
+        return pr
 
     def create_pull_request(self, repo, *, title, body, head, base, deadline) -> dict:
         deadline.step("create pull request")
@@ -458,7 +463,10 @@ class FileTransport(Transport):
         deadline.step("check runs")
         with self.lock:
             repo_state = self._repo(self._read(), repo)
-            return list(repo_state.get("checks", {}).get(sha, []))
+            checks = repo_state.get("checks", {})
+            if sha in checks:
+                return list(checks[sha])
+            return list(repo_state.get("checks_default", []))
 
     def merge_pull_request(self, repo, number, *, sha, method, deadline) -> dict:
         deadline.step("merge pull request")
@@ -472,8 +480,10 @@ class FileTransport(Transport):
                 raise CommunityError(f"PR {number} not found")
             if pr.get("state") != "open":
                 raise CommunityError(f"PR {number} is not open")
-            if pr["head"].get("sha") != sha:
+            tip = self._tip(repo, pr["head"].get("ref", ""), deadline) or pr["head"].get("sha")
+            if tip != sha:
                 raise CommunityError("head moved since review (HTTP 409)")
+            pr["head"]["sha"] = tip
             pr["state"] = "closed"
             pr["merged"] = True
             merge_sha = self._merge_into_remote(repo, pr, deadline)

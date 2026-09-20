@@ -210,11 +210,12 @@ def _publish(checked, settings, state_dir, ledger, deadline, transport, *,
     ledger.record_step(batch_id, revision, "gate:before-git")
     _settings_gate(settings)
     ledger.record_step(batch_id, revision, "git:clone-fetch")
+    genv = gitops.git_env(settings)
     work_dir = gitops.ensure_clone(
-        remote_url, state_dir / "git" / write_repo.replace("/", "_"), deadline
+        remote_url, state_dir / "git" / write_repo.replace("/", "_"), deadline, env=genv
     )
 
-    base_tip = gitops.remote_tip(remote_url, f"refs/heads/{base_branch}", deadline)
+    base_tip = gitops.remote_tip(remote_url, f"refs/heads/{base_branch}", deadline, env=genv)
     if base_tip is None:
         raise CommunityError(f"base branch {base_branch} not found on the write remote")
     if checked["base_commit"] and checked["base_commit"] != base_tip:
@@ -228,16 +229,16 @@ def _publish(checked, settings, state_dir, ledger, deadline, transport, *,
     _settings_gate(settings)
     resumed = False
     if updating:
-        if not gitops.checkout_existing(work_dir, branch, deadline):
+        if not gitops.checkout_existing(work_dir, branch, deadline, env=genv):
             raise CommunityError("our open PR branch is missing on the remote", status="needs_review")
-    elif checked["explicit_retry"] and gitops.remote_tip(remote_url, f"refs/heads/{branch}", deadline):
+    elif checked["explicit_retry"] and gitops.remote_tip(remote_url, f"refs/heads/{branch}", deadline, env=genv):
         # Explicit retry with the branch already pushed: resume from the remote
         # tip and its recorded steps instead of re-pushing earlier commits.
-        gitops.checkout_existing(work_dir, branch, deadline)
+        gitops.checkout_existing(work_dir, branch, deadline, env=genv)
         resumed = True
         ledger.record_step(batch_id, revision, "git:resumed-branch", branch)
     else:
-        gitops.checkout_new(work_dir, branch, f"origin/{base_branch}", deadline)
+        gitops.checkout_new(work_dir, branch, f"origin/{base_branch}", deadline, env=genv)
 
     files, conflict = _prepare_files(checked, work_dir)
     if conflict:
@@ -247,9 +248,9 @@ def _publish(checked, settings, state_dir, ledger, deadline, transport, *,
         ledger.record_step(batch_id, revision, "git:apply-files", f"{len(files)} file(s)")
         gitops.apply_files(work_dir, files)
     ledger.record_step(batch_id, revision, "git:commit")
-    committed = gitops.stage_and_commit(work_dir, [f["path"] for f in files], commit_message, deadline)
+    committed = gitops.stage_and_commit(work_dir, [f["path"] for f in files], commit_message, deadline, env=genv)
     if committed is None:
-        head_sha = gitops.current_head(work_dir, deadline)
+        head_sha = gitops.current_head(work_dir, deadline, env=genv)
         if updating:
             ledger.record_step(batch_id, revision, "gate:before-metadata")
             _settings_gate(settings)
@@ -270,7 +271,7 @@ def _publish(checked, settings, state_dir, ledger, deadline, transport, *,
         ledger.record_step(batch_id, revision, "gate:before-push")
         _settings_gate(settings)
         ledger.record_step(batch_id, revision, "git:push")
-        gitops.push_branch(work_dir, branch, deadline)
+        gitops.push_branch(work_dir, branch, deadline, env=genv, cancel=deadline.cancel)
         ledger.record_step(batch_id, revision, "git:pushed", head_sha)
 
     ledger.record_step(batch_id, revision, "gate:before-api")

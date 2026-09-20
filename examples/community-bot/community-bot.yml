@@ -35,7 +35,7 @@ jobs:
         # repository URL and commit when deploying.
         run: >
           pip install
-          "mindie-knowledge @ git+https://github.com/mindie-agent/mindie-plugin.git@main"
+          "mindie-knowledge @ git+https://github.com/mindie-agent/mindie-agent-codex.git@main"
       - name: Handle the triggering event
         if: github.event_name == 'pull_request'
         env:

@@ -26,7 +26,7 @@
     "max_files_per_pr": 100,
     "poll_max_prs": 20,
     "merge_method": "squash",
-    "plugin_repository": "mindie-agent/mindie-plugin",
+    "plugin_repository": "mindie-agent/mindie-agent-codex",
     "plugin_branch": "main",
     "plugin_token_env": "MINDIE_PLUGIN_TOKEN",
     "skill_grok_argv": [

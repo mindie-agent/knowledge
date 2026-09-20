@@ -33,6 +33,7 @@ from .common import (
     Deadline,
     digest,
     run_argv,
+    sha256_text,
 )
 from .entrydoc import parse_entry
 from .ledger import Ledger
@@ -151,6 +152,7 @@ def _load_repo_state(repo, ref, transport, deadline) -> tuple[dict[str, dict], d
     """Entries by id and up-votes per (entry_id, revision) from real Git content."""
     entries: dict[str, dict] = {}
     votes: dict[tuple[str, str], list] = {}
+    raw: dict[tuple[str, str], dict] = {}
     for prefix, kind in (("cases/", "experience"), ("topics/", "knowledge")):
         for path in transport.list_files(repo, prefix, ref, deadline)[:400]:
             text = transport.get_file(repo, path, ref, deadline)
@@ -169,8 +171,16 @@ def _load_repo_state(repo, ref, transport, deadline) -> tuple[dict[str, dict], d
             feedback = validate_feedback(text, path)
         except CommunityError:
             continue
-        for vote in feedback["votes"]:
-            votes.setdefault((vote["entry_id"], vote["revision"]), []).append(vote)
+        for index, vote in enumerate(feedback["votes"]):
+            # Deterministic cross-file dedup: the lexically latest file wins a
+            # repeated (root, entry, revision) tuple, so a replacement down
+            # overrides an older up instead of both counting.
+            raw.setdefault((vote["entry_id"], vote["revision"]), {})[
+                (vote["root_id"], vote["entry_id"], vote["revision"])
+            ] = (path, index, vote)
+    for key, per_tuple in raw.items():
+        ordered = sorted(per_tuple.values(), key=lambda t: (t[0], t[1]))
+        votes[key] = [vote for _, _, vote in ordered]
     return entries, votes
 
 
@@ -191,18 +201,24 @@ def select_candidates(entries: Mapping[str, dict], votes: Mapping[tuple[str, str
     return out
 
 
-def material_digest(entry: Mapping[str, Any], revision: str, supporters: list[str], target_skill: str | None) -> str:
+def material_digest(entry: Mapping[str, Any], revision: str, supporters: list[str],
+                    target: tuple[str, str] | None) -> str:
+    """Digest covers source revision, feedback set AND actual target content."""
     return digest({
         "schema": SCHEMA_SKILL,
         "entry_id": entry["entry_id"],
         "revision": revision,
         "supporters": sorted(supporters),
-        "target_skill": target_skill,
+        "target_skill": target[0] if target else None,
+        "target_sha256": sha256_text(target[1]) if target else None,
     })
 
 
-def _find_target_skill(plugin_repo, plugin_ref, entry_id, prefix, transport, deadline) -> str | None:
-    """Prefer updating an existing Skill that already references the entry."""
+def _find_target_skill(plugin_repo, plugin_ref, entry_id, prefix, transport, deadline):
+    """Prefer updating an existing Skill that references the entry.
+
+    Returns (slug, current SKILL.md text) so the material digest binds the
+    actual target content and generation can perform a real update."""
     for path in transport.list_files(plugin_repo, prefix + "/", plugin_ref, deadline)[:400]:
         if not path.endswith("SKILL.md"):
             continue
@@ -216,7 +232,7 @@ def _find_target_skill(plugin_repo, plugin_ref, entry_id, prefix, transport, dea
         except (ValueError, TypeError):
             continue
         if entry_id in meta["source_entries"] or entry_id in text:
-            return meta["name"]
+            return meta["name"], text
     return None
 
 
@@ -248,7 +264,7 @@ def _generate_skill(argv: list[str], candidate: Mapping[str, Any], existing_skil
             "content": entry["content"],
         },
         "supporters": candidate["supporters"],
-        "existing_skill": existing_skill,
+        "existing_skill": {"name": existing_skill[0], "skill_md": existing_skill[1][:32768]} if existing_skill else None,
     }
     raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     limit = bot.get("review_input_bytes", 64 * 1024)
@@ -318,16 +334,21 @@ def publish_skill_pr(settings, state_dir, transport, deadline, package, entry, l
     slug = package["slug"]
     branch = f"mindie-skill/{slug}"
     remote_url = _remote_url(settings, plugin_repo)
-    work = gitops.ensure_clone(remote_url, state_dir / "skill" / plugin_repo.replace("/", "_"), deadline)
+    # Plugin mutations use the separately configured plugin credential for BOTH
+    # git and API calls.
+    plugin_env = gitops.git_env(settings, bot.get("plugin_token_env"))
+    transport = _plugin_transport(settings, state_dir, transport, bot)
+    work = gitops.ensure_clone(remote_url, state_dir / "skill" / plugin_repo.replace("/", "_"),
+                               deadline, env=plugin_env)
     base_ref = f"origin/{bot.get('plugin_branch', 'main')}"
     prior = transport.find_pull_requests(plugin_repo, head_branch=branch, deadline=deadline)
     open_prior = next((p for p in prior if p.get("state") == "open"), None)
     if open_prior:
-        if not gitops.checkout_existing(work, branch, deadline):
+        if not gitops.checkout_existing(work, branch, deadline, env=plugin_env):
             raise CommunityError("pending Skill PR branch missing on the plugin remote",
                                  status="needs_review")
     else:
-        gitops.checkout_new(work, branch, base_ref, deadline)
+        gitops.checkout_new(work, branch, base_ref, deadline, env=plugin_env)
     files = [{"path": f"{prefix}/{slug}/SKILL.md", "content": package["skill_md"]},
              {"path": f"{prefix}/{slug}/agents/openai.yaml", "content": package["openai_yaml"]}]
     for name, content in package["references"].items():
@@ -335,13 +356,13 @@ def publish_skill_pr(settings, state_dir, transport, deadline, package, entry, l
     gitops.apply_files(work, files)
     message = (f"mindie-skill: consolidate {entry['entry_id']} into {slug}\n\n"
                f"source-entry: {entry['entry_id']}@{entry['revision'][:12]}\n")
-    committed = gitops.stage_and_commit(work, [f["path"] for f in files], message, deadline)
+    committed = gitops.stage_and_commit(work, [f["path"] for f in files], message, deadline, env=plugin_env)
     if committed is None and open_prior:
         return {"status": "unchanged", "pr_url": open_prior.get("html_url"),
                 "detail": "pending Skill PR already carries this package"}
     if committed is None:
         return {"status": "unchanged", "detail": "skill package already on the plugin branch"}
-    gitops.push_branch(work, branch, deadline)
+    gitops.push_branch(work, branch, deadline, env=plugin_env, cancel=deadline.cancel)
     if open_prior:
         return {"status": "updated", "pr_url": open_prior.get("html_url"),
                 "head_sha": committed, "detail": "updated the pending Skill PR in place"}
@@ -453,6 +474,16 @@ def retirement_corrections(settings: dict, state_dir: Path, *, transport: Transp
     return {"status": "identified", "corrections": corrections[:20],
             "detail": "dependent Skills located; bounded correction PRs are opened by the "
                       "maintainer-approved plugin path"}
+
+
+def _plugin_transport(settings, state_dir, transport, bot):
+    """Plugin-repo API calls carry the plugin token, not the content one."""
+    plugin_env = bot.get("plugin_token_env")
+    if settings.get("transport") == "gh" and plugin_env:
+        from .transport import GhTransport
+
+        return GhTransport({**settings, "token_env": plugin_env})
+    return transport
 
 
 def _remote_url(settings: Mapping[str, Any], repo: str) -> str:
