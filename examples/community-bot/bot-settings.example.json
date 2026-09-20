@@ -1,0 +1,27 @@
+{
+  "schema": "mindie-community-config/1",
+  "enabled": true,
+  "generation": "maintainer-set-opaque-value",
+  "enabled_at": 1760000000,
+  "repository": "mindie-agent/knowledge-vllm-ascend",
+  "branch": "main",
+  "project_roots": [],
+  "idle_seconds": 300,
+  "transaction_seconds": 120,
+  "operation_limit": 60,
+  "transport": "gh",
+  "token_env": "GH_TOKEN",
+  "bot": {
+    "account": "mindie-community-bot",
+    "grok_argv": ["/opt/mindie/bin/grok-review-wrapper.sh"],
+    "review_timeout_seconds": 300,
+    "review_input_bytes": 65536,
+    "review_output_bytes": 131072,
+    "max_files_per_pr": 100,
+    "poll_max_prs": 20,
+    "merge_method": "squash",
+    "plugin_repository": "mindie-agent/mindie-plugin",
+    "plugin_branch": "main",
+    "plugin_token_env": "MINDIE_PLUGIN_TOKEN"
+  }
+}

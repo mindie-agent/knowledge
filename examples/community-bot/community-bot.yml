@@ -1,0 +1,67 @@
+# Example workflow shape for the maintainer-owned community bot.
+# Requires: a self-hosted runner with the Grok CLI installed and the secrets
+# below. This file is a recipe reviewed by maintainers; installing it is a
+# maintainer action, not something experience PRs may do (workflow paths are
+# rejected by the review gates).
+name: mindie-community-bot
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+  schedule:
+    - cron: "*/7 * * * *"
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "Review a single PR number"
+        required: false
+
+concurrency:
+  group: mindie-community-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+
+jobs:
+  review:
+    runs-on: [self-hosted, mindie]
+    timeout-minutes: 15
+    steps:
+      - name: Install package
+        # Pinned install source; replace with the maintainer's actual plugin
+        # repository URL and commit when deploying.
+        run: >
+          pip install
+          "mindie-knowledge @ git+https://github.com/mindie-agent/mindie-plugin.git@main"
+      - name: Handle the triggering event
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.MINDIE_BOT_TOKEN }}
+          MINDIE_PLUGIN_TOKEN: ${{ secrets.MINDIE_PLUGIN_TOKEN }}
+        run: >
+          python -m mindie_knowledge.community event
+          --settings examples/community-bot/bot-settings.json
+          --state-dir "$RUNNER_TEMP/mindie-bot-state"
+          --file "$GITHUB_EVENT_PATH"
+      - name: Fallback sweep
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ secrets.MINDIE_BOT_TOKEN }}
+          MINDIE_PLUGIN_TOKEN: ${{ secrets.MINDIE_PLUGIN_TOKEN }}
+        run: >
+          python -m mindie_knowledge.community poll-once
+          --settings examples/community-bot/bot-settings.json
+          --state-dir "$RUNNER_TEMP/mindie-bot-state"
+      - name: Single PR review
+        if: github.event_name == 'workflow_dispatch' && inputs.pr != ''
+        env:
+          GH_TOKEN: ${{ secrets.MINDIE_BOT_TOKEN }}
+          MINDIE_PLUGIN_TOKEN: ${{ secrets.MINDIE_PLUGIN_TOKEN }}
+        run: >
+          python -m mindie_knowledge.community review
+          --settings examples/community-bot/bot-settings.json
+          --state-dir "$RUNNER_TEMP/mindie-bot-state"
+          --pr "${{ inputs.pr }}"
