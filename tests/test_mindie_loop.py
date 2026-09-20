@@ -12,12 +12,12 @@ import time
 import pytest
 
 from mindie_knowledge.loop import settings as settings_mod
-from mindie_knowledge.loop import transcript as transcript_mod
 from mindie_knowledge.loop.cli import capture_hook
 from mindie_knowledge.loop.engine import Engine
 from mindie_knowledge.loop.store import Store, canonical, session_key
 from mindie_knowledge.loop.transport import Service
 
+import transcript_double as transcript_mod
 from conftest import admission_token, make_admission, write_settings
 
 PRODUCER = "a" * 64
@@ -309,8 +309,6 @@ def test_cursor_persists_full_anchor_identity_and_tamper_fails_closed(gated, tmp
                            transcript_path=str(rollout), summary="")
     engine._process(first["id"])
     assert store.capture_row(first["id"])["status"] == "organized"
-    from mindie_knowledge.loop import transcript as transcript_mod
-
     cursor = next(iter(store.db.execute("SELECT * FROM cursors")), None)
     assert cursor is not None
     persisted = transcript_mod.FileIdentity.unserialize(

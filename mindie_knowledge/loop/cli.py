@@ -74,7 +74,14 @@ def load_transcript_adapter(config):
         raise ValueError(f"transcript_adapter module is missing: {adapter}")
     spec = importlib.util.spec_from_file_location("mindie_transcript_adapter", path)
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    # Register BEFORE exec: dataclasses and intra-module references resolve
+    # the module through sys.modules during execution.
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(spec.name, None)
+        raise
     for name in ("FileIdentity", "identify", "read_material"):
         if not hasattr(module, name):
             raise ValueError(
@@ -250,11 +257,13 @@ def contribution_recovery(config, operation, batch_id):
 
     ``contribution-inspect`` is read-only (loop outbox row + community ledger
     receipts; starts nothing). ``contribution-reconcile`` runs the bounded
-    read-only remote inspection and updates BOTH the loop outbox and the
-    community ledger — it stays available after the automatic read budget is
-    exhausted and never blindly repeats an uncertain write.
-    ``contribution-retry`` resubmits exactly one confirmed failed/unresolved
-    stored payload with ``explicit_retry`` (never a rebuilt or mutated batch).
+    explicit read-only inspection — verifying the exact saved expected PR
+    head — and updates BOTH the loop outbox and the community ledger; it
+    stays available after the automatic read budget is exhausted, and
+    exhaustion or a lookup failure stays ``unknown``, never magically
+    confirmed-failed. ``contribution-retry`` resubmits exactly one PROVEN
+    failed stored payload with ``explicit_retry`` (never an unknown,
+    rebuilt or mutated batch).
     ``contribution-compact`` removes the sent private payload of a confirmed
     batch. None of these reruns the organizer, resets a capture cursor or
     replays failed model attempts.
@@ -309,15 +318,19 @@ def contribution_recovery(config, operation, batch_id):
                     "batch is not confirmed; unresolved/failed unsent work stays available"
                 )
             return {"batch_id": batch_id, "compacted": removed}
-        from mindie_knowledge.community import reconcile_batch, submit_batch
+        from mindie_knowledge.community import inspect_batch, submit_batch
 
         if operation == "contribution-reconcile":
-            receipt = reconcile_batch(batch_id, settings.as_dict(), state_dir)
+            # Explicit bounded read-only inspection: verifies the exact saved
+            # expected PR head and updates the community ledger; works on
+            # cap-exhausted rows too. Unknown stays unknown.
+            receipt = inspect_batch(batch_id, settings.as_dict(), state_dir)
         else:
-            if row["status"] not in {"failed", "unknown"}:
+            if row["status"] != "failed":
                 raise ValueError(
-                    "only a confirmed failed or unresolved batch is retried "
-                    "explicitly; inspect and reconcile uncertain writes first"
+                    "only a proven failed batch is retried explicitly; an "
+                    "uncertain (unknown/unresolved) write is inspected with "
+                    "contribution-reconcile, never replayed"
                 )
             batch = json.loads(row["batch"])
             batch["explicit_retry"] = True

@@ -81,6 +81,9 @@ class Engine:
         self.errors = []
         self.last_activity = time.monotonic()
         self._generation = None
+        self._activity_lock = threading.Lock()
+        self._activity = 0
+        self._frozen = False
         try:
             from mindie_knowledge.community import reconcile_batch, submit_batch
 
@@ -130,6 +133,9 @@ class Engine:
             activated_at if type(activated_at) in (int, float) else 0,
             self.store.capture_floor,
         )
+        if self._is_frozen():
+            return dict(status="skipped",
+                        reason="service is not admitting new work")
         captured = self.store.add_capture(
             root_session=root_hash, session=session_id, turn=turn_id,
             transcript=transcript_path, summary=summary or "",
@@ -336,24 +342,42 @@ class Engine:
                                 "transcript unreadable and no summary")
         return None
 
+    @staticmethod
+    def _pr_number(pr_url):
+        if not isinstance(pr_url, str):
+            return None
+        tail = pr_url.rstrip("/").rsplit("/", 1)[-1]
+        return int(tail) if tail.isdigit() else None
+
     def _restore_sent_draft(self, entry_id, generation):
-        """Fetch the exact body this lineage last sent (bounded, read-only Git)
-        so a later same-task observation appends to/updates the prior body
-        instead of replacing it with only the new paragraph. Never fabricates
-        a base; any failure simply keeps the update refused."""
+        """Fetch the exact body this entry last sent so a later same-task
+        observation appends to/updates the prior body instead of replacing it
+        with only the new paragraph.
+
+        Addressed by the per-entry last-confirmed receipt (independent of the
+        newest lineage outbox row): exact confirmed head, path, hash and sent
+        revision. The fetched body must match the retained hash AND parse
+        back to the same entry identity and sent revision. Any mismatch or
+        failure simply keeps the update refused — no base is ever fabricated,
+        a withdrawn entry is never resurrected and a maintainer correction is
+        never overwritten (the retained hash stays the honest expected base).
+        """
         if self.community is None or not generation:
             return False
-        from .export import lineage_of
-
-        batch_row = self.store.batch(lineage_of(self.store.domain, generation))
-        if not batch_row or batch_row["status"] not in Store_confirmed:
+        receipt = self.store.sent_receipt(entry_id)
+        if not receipt or receipt.get("generation") not in (generation, None):
+            return False
+        head_sha = receipt.get("head_sha")
+        path = receipt.get("path")
+        expected_hash = receipt.get("sha256")
+        expected_revision = receipt.get("sent_revision")
+        if not head_sha or not path or not expected_revision:
             return False
         settings = self._settings()
         if not settings.allows_capture() or not settings.repository:
             return False
         try:
             from mindie_knowledge.community import gitops
-            from mindie_knowledge.community.batch import contribution_branch
             from mindie_knowledge.community.common import Deadline
             from mindie_knowledge.community.publish import _remote_url
 
@@ -369,20 +393,28 @@ class Engine:
                 self.state_dir / "git" / write_repo.replace("/", "_"),
                 deadline, env=env,
             )
-            branch = contribution_branch(self.store.domain, batch_row["batch_id"])
-            if not gitops.checkout_existing(work_dir, branch, deadline, env=env):
+            if not gitops.fetch_commit(work_dir, head_sha, deadline, env=env):
+                number = self._pr_number(receipt.get("pr_url"))
+                if number is None:
+                    return False
+                fetched = gitops.fetch_pr_head(work_dir, number, "",
+                                               deadline, env=env)
+                if fetched != head_sha:
+                    return False
+            raw = gitops.show_file(work_dir, head_sha, path, deadline, env=env)
+            if raw is None or len(raw.encode("utf-8")) > 128 * 1024:
                 return False
-            for path in (f"cases/{entry_id}.md", f"topics/{entry_id}.md"):
-                raw = gitops.read_tree_file(work_dir, path)
-                if raw is None or len(raw.encode("utf-8")) > 128 * 1024:
-                    continue
-                self.store.restore_draft(
-                    entry_id, parse_entry(raw), generation=generation
-                )
-                return True
+            if expected_hash:
+                normalized = raw.encode("utf-8").replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+                if hashlib.sha256(normalized).hexdigest() != expected_hash:
+                    return False
+            doc = parse_entry(raw)
+            if doc["entry_id"] != entry_id or doc["revision"] != expected_revision:
+                return False
+            self.store.restore_draft(entry_id, doc, generation=generation)
+            return True
         except Exception:
             return False
-        return False
 
     def _apply(self, result, *, opaque, marker, generation):
         """Deterministic metadata update + append; no repair model call."""
@@ -422,7 +454,7 @@ class Engine:
                         conditions=entry.get("conditions") or {}, owner=opaque,
                         generation=generation,
                     )
-                refs.append(self.store.ref(doc["entry_id"]))
+                refs.append(self.store.ref(doc["entry_id"], doc["revision"]))
             except DraftFull:
                 notes.append(f"draft full: {entry.get('entry_id')}")
             except ValueError as exc:
@@ -573,16 +605,27 @@ class Engine:
 
     def run(self):
         while not self.stop.is_set():
+            if self._is_frozen():
+                self.stop.wait(0.2)
+                continue
             try:
                 ident = self.queue.get(timeout=0.5)
             except queue.Empty:
+                if self._is_frozen() or self.stop.is_set():
+                    continue
                 ident = self.store.due_capture()
-                if ident:
-                    self._process(ident)
+                if ident and self.begin_work():
+                    try:
+                        self._process(ident)
+                    finally:
+                        self.end_work()
                 continue
             try:
-                if ident:
-                    self._process(ident)
+                if ident and self.begin_work():
+                    try:
+                        self._process(ident)
+                    finally:
+                        self.end_work()
             except MaintenanceCancelled:
                 pass
             except Exception as exc:  # never let the worker die silently
@@ -704,12 +747,23 @@ class Engine:
                         )
                         self._cancel.clear()
                 self._generation = generation
-                if generation is not None:
+                if generation is not None and not self._is_frozen():
                     for row in self.store.outbox_unresolved()[:2]:
-                        if self.store.reconcile_due(row["batch_id"]):
-                            self._reconcile(row)
+                        if self._is_frozen():
+                            break
+                        if self.store.reconcile_due(row["batch_id"]) and self.begin_work():
+                            try:
+                                self._reconcile(row)
+                            finally:
+                                self.end_work()
                     for row in self.store.outbox_pending()[:2]:
-                        self._submit(row)
+                        if self._is_frozen():
+                            break
+                        if self.begin_work():
+                            try:
+                                self._submit(row)
+                            finally:
+                                self.end_work()
                     material = self.store.drafts_changed(
                         generation=generation
                     ) or self.store.unbatched_votes(generation=generation)
@@ -719,8 +773,15 @@ class Engine:
                             self.admission is not None
                             and not self.admission.leases()
                         )
-                        if idle_for >= settings.idle_seconds or deactivated:
-                            self._flush()
+                        if (
+                            (idle_for >= settings.idle_seconds or deactivated)
+                            and not self._is_frozen()
+                            and self.begin_work()
+                        ):
+                            try:
+                                self._flush()
+                            finally:
+                                self.end_work()
             except Exception as exc:
                 self._error(f"outbox: {type(exc).__name__}: {exc}"[:500])
             self.stop.wait(1.0)
@@ -737,8 +798,58 @@ class Engine:
 
     # ---------------------------------------------------------------- status
 
+    def begin_work(self):
+        """Admit one actual service/worker operation. False when frozen or stopping."""
+        with self._activity_lock:
+            if self._frozen or self.stop.is_set():
+                return False
+            self._activity += 1
+            return True
+
+    def end_work(self):
+        with self._activity_lock:
+            if self._activity > 0:
+                self._activity -= 1
+
+    def _is_frozen(self):
+        with self._activity_lock:
+            return self._frozen or self.stop.is_set()
+
+    def stop_if_idle(self):
+        """Atomically freeze new admission and report whether anything is
+        actually running or queued. Unknown/pending receipts and idle task
+        grants are not activity. Never cancels in-flight work: a busy result
+        unfreezes so the service continues."""
+        with self._activity_lock:
+            if self.stop.is_set():
+                return dict(
+                    idle=True, status="stopping", activity=self._activity,
+                    queued_captures=self.queue.unfinished_tasks,
+                    due_capture=False,
+                )
+            self._frozen = True
+            activity = self._activity
+            queued = self.queue.unfinished_tasks
+        due = self.store.due_capture() is not None
+        busy = activity > 0 or queued > 0 or due
+        if busy:
+            with self._activity_lock:
+                if not self.stop.is_set():
+                    self._frozen = False
+            return dict(
+                idle=False, status="busy", activity=activity,
+                queued_captures=queued, due_capture=due,
+            )
+        return dict(
+            idle=True, status="stopping", activity=0,
+            queued_captures=0, due_capture=False,
+        )
+
     def status(self):
         settings = self._settings()
+        with self._activity_lock:
+            activity = self._activity
+            frozen = self._frozen
         return dict(
             **self.store.status(),
             maintenance_pending=self.queue.unfinished_tasks,
@@ -746,4 +857,6 @@ class Engine:
             sharing=settings.public_status(),
             community_package=self.community is not None,
             errors=self.errors,
+            activity=activity,
+            admission_frozen=frozen,
         )

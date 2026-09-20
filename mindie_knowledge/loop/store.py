@@ -65,6 +65,47 @@ def session_key(value):
     return digest(value.strip())
 
 
+def _exact_revision_ref(ref):
+    """Return ``(entry_id, revision)`` for one nonempty versioned ref.
+
+    Unversioned, slash-less, or otherwise unparseable refs are refused — they
+    never count as coverage of a confirmed sent revision.
+    """
+    if not isinstance(ref, str) or "/" not in ref:
+        return None
+    token = ref.rsplit("/", 1)[-1]
+    entry_id, sep, revision = token.partition("@")
+    if not sep or not entry_id or not revision:
+        return None
+    return entry_id, revision
+
+
+def _capture_revision_refs(detail):
+    """Exact ``(entry, revision)`` pairs named by an organized capture.
+
+    Returns None when coverage is empty, unversioned, mixed with unparseable
+    refs, or otherwise ambiguous — the caller must leave that capture intact.
+    """
+    if not isinstance(detail, str) or not detail:
+        return None
+    try:
+        payload = json.loads(detail)
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    refs = payload.get("refs")
+    if not isinstance(refs, list) or not refs:
+        return None
+    covered = set()
+    for ref in refs:
+        parsed = _exact_revision_ref(ref)
+        if parsed is None:
+            return None
+        covered.add(parsed)
+    return covered if covered else None
+
+
 def new_identity():
     return secrets.token_hex(32)
 
@@ -130,6 +171,17 @@ class Store:
                 PRIMARY KEY(kind, identity, revision));
             CREATE TABLE IF NOT EXISTS owners(entry_id TEXT PRIMARY KEY,
                 owner TEXT NOT NULL, created REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS sent_receipts(
+                entry_id TEXT PRIMARY KEY,
+                generation TEXT,
+                sent_revision TEXT NOT NULL,
+                path TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                head_sha TEXT NOT NULL,
+                repository TEXT,
+                pr_url TEXT,
+                batch_id TEXT,
+                updated REAL NOT NULL);
         """)
         self.db.execute(
             "INSERT OR REPLACE INTO meta VALUES('schema', ?)", (SCHEMA,)
@@ -825,6 +877,16 @@ class Store:
                 (status, str(detail)[:1000], pr_url, head_sha,
                  time.time() if attempted else None, time.time(), batch_id),
             )
+            if status in self.CONFIRMED_BATCH:
+                row = self.db.execute(
+                    "SELECT * FROM outbox WHERE batch_id=?", (batch_id,)
+                ).fetchone()
+                if row is not None:
+                    try:
+                        batch = json.loads(row["batch"])
+                    except ValueError:
+                        batch = {}
+                    self._record_sent_receipts(row, batch)
 
     def batch(self, batch_id):
         with self.lock:
@@ -905,22 +967,23 @@ class Store:
             except ValueError:
                 continue
             for ref in batch.get("entry_refs", []):
-                token = ref.rsplit("/", 1)[-1]
-                entry, _, revision = token.partition("@")
-                if entry and revision:
-                    protected.add((entry, revision))
+                parsed = _exact_revision_ref(ref)
+                if parsed is not None:
+                    protected.add(parsed)
         return protected
 
     def compact_confirmed(self, batch_id):
         """Post-confirmation payload cleanup: the GitHub branch is the durable
         body source for a confirmed (submitted/updated/unchanged) batch.
 
-        Removes the sent draft bodies and history, raw capture summaries of
-        the same generation and the staging payload — but only when no newer
-        unsent/unresolved revision references them. Keeps IDs, hashes, the
-        small retrieval/continuation header (title/summary/conditions), the
-        private entry-owner relation, authorized cursor/dedup state and the
-        PR/head/path receipts. A withdrawn entry is never resurrected here.
+        Removes exactly THIS batch's sent draft history (even when a newer
+        unsent draft exists — that current draft and any protected/published
+        revisions stay). Capture summaries are cleared only for organized
+        captures whose recorded refs are a nonempty subset of this batch's
+        exact entry@revision refs; unversioned or otherwise ambiguous coverage
+        is left intact. The outbox row shrinks to a tiny receipt; a per-entry
+        last-confirmed receipt (path/hash/revision/exact head/PR) is kept
+        independently of later lineage-row replacement.
         """
         import shutil
 
@@ -933,17 +996,48 @@ class Store:
             batch = json.loads(row["batch"])
             protected = self._protected_revisions(batch_id)
             removed = dict(entries=0, revisions=0, captures=0, staging=0)
+            file_receipts = [
+                {key: file[key] for key in ("path", "sha256") if key in file}
+                for file in batch.get("files", [])
+            ]
+            batch_refs = set()
             for ref in batch.get("entry_refs", []):
-                token = ref.rsplit("/", 1)[-1]
-                entry_id, _, sent_revision = token.partition("@")
+                parsed = _exact_revision_ref(ref)
+                if parsed is None:
+                    continue
+                entry_id, sent_revision = parsed
+                batch_refs.add(parsed)
                 entry = self._row(entry_id)
                 if entry is None:
                     continue
-                if entry["draft_revision"] and (
-                    entry["draft_revision"] == sent_revision
-                    and (entry_id, entry["draft_revision"]) not in protected
+                current = entry["draft_revision"]
+                kept = {entry["published_revision"]}
+                kept |= {
+                    revision for (ent, revision) in protected if ent == entry_id
+                }
+                if current and current != sent_revision:
+                    kept.add(current)
+                if (entry_id, sent_revision) in protected:
+                    kept.add(sent_revision)
+                kept.discard(None)
+                if (entry_id, sent_revision) not in protected:
+                    kept.discard(sent_revision)
+                if kept:
+                    cursor = self.db.execute(
+                        "DELETE FROM revisions WHERE entry_id=? AND source='draft' "
+                        f"AND revision NOT IN ({','.join('?' for _ in kept)})",
+                        (entry_id, *sorted(kept)),
+                    )
+                else:
+                    cursor = self.db.execute(
+                        "DELETE FROM revisions WHERE entry_id=? AND source='draft'",
+                        (entry_id,),
+                    )
+                removed["revisions"] += cursor.rowcount
+                if (
+                    current == sent_revision
+                    and (entry_id, sent_revision) not in protected
                 ):
-                    # No newer unsent revision: the sent body leaves the device.
                     if entry["published_revision"]:
                         published = self._revision_doc(
                             entry_id, entry["published_revision"]
@@ -953,36 +1047,112 @@ class Store:
                     header = published or {
                         **json.loads(entry["doc"]), "content": ""
                     }
-                    cursor = self.db.execute(
-                        "DELETE FROM revisions WHERE entry_id=? AND source='draft' "
-                        "AND revision != COALESCE(?, '')",
-                        (entry_id, entry["published_revision"]),
-                    )
                     self.db.execute(
                         "UPDATE entries SET draft_revision=NULL, doc=?, updated=? "
                         "WHERE entry_id=?",
                         (canonical(header), time.time(), entry_id),
                     )
-                    removed["revisions"] += cursor.rowcount
                     removed["entries"] += 1
                     try:
                         (self.root / "drafts" / f"{entry_id}.md").unlink()
                     except OSError:
                         pass
+            self._record_sent_receipts(row, batch)
             generation = row["generation"]
-            if generation:
-                cursor = self.db.execute(
-                    "UPDATE captures SET summary='' WHERE generation=? AND "
-                    "summary != '' AND status IN "
-                    "('organized','no-new-material','no-shareable-material')",
-                    (generation,),
+            if generation and batch_refs:
+                removed["captures"] += self._clear_covered_captures(
+                    generation, batch_refs
                 )
-                removed["captures"] += cursor.rowcount
+            receipt = {
+                "schema": "mindie-contribution-receipt/1",
+                "batch_id": batch.get("batch_id", batch_id),
+                "revision": batch.get("revision", row["revision"]),
+                "domain": batch.get("domain", self.domain),
+                "entry_refs": batch.get("entry_refs", []),
+                "files": file_receipts,
+                "summary": batch.get("summary", ""),
+            }
+            self.db.execute(
+                "UPDATE outbox SET batch=? WHERE batch_id=?",
+                (canonical(receipt), batch_id),
+            )
         staging = self.root / "outbox" / "staging" / batch_id
         if staging.is_dir():
             shutil.rmtree(staging, ignore_errors=True)
             removed["staging"] = 1
         return removed
+
+    def _clear_covered_captures(self, generation, batch_refs):
+        """Clear summaries only when capture detail names a nonempty set of
+        exact entry@revision refs that is a subset of this sent batch.
+        Ambiguous or unversioned coverage is left intact — never invented
+        from timestamps or from sharing an entry id with an older revision."""
+        cleared = 0
+        rows = self.db.execute(
+            "SELECT id, detail FROM captures WHERE generation=? AND "
+            "summary != '' AND status='organized'",
+            (generation,),
+        ).fetchall()
+        for ident, detail in rows:
+            covered = _capture_revision_refs(detail)
+            if covered and covered <= batch_refs:
+                self.db.execute(
+                    "UPDATE captures SET summary='' WHERE id=?", (ident,)
+                )
+                cleared += 1
+        return cleared
+
+    def _record_sent_receipts(self, row, batch):
+        """Tiny per-entry last-confirmed receipt, independent of the newest
+        lineage outbox row. No body/history."""
+        head = row["head_sha"] if isinstance(row, sqlite3.Row) else row.get("head_sha")
+        if not isinstance(head, str) or not head:
+            return
+        generation = row["generation"] if isinstance(row, sqlite3.Row) else row.get("generation")
+        pr_url = row["pr_url"] if isinstance(row, sqlite3.Row) else row.get("pr_url")
+        batch_id = row["batch_id"] if isinstance(row, sqlite3.Row) else row.get("batch_id")
+        files = {
+            f.get("path"): f
+            for f in batch.get("files", [])
+            if isinstance(f, dict) and isinstance(f.get("path"), str)
+        }
+        now = time.time()
+        for ref in batch.get("entry_refs", []):
+            parsed = _exact_revision_ref(ref)
+            if parsed is None:
+                continue
+            entry_id, sent_revision = parsed
+            path = next(
+                (p for p in (f"cases/{entry_id}.md", f"topics/{entry_id}.md") if p in files),
+                None,
+            )
+            if not entry_id or not sent_revision or not path:
+                continue
+            sha = files[path].get("sha256")
+            if not isinstance(sha, str) or not sha:
+                continue
+            self.db.execute(
+                "INSERT OR REPLACE INTO sent_receipts "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    entry_id, generation, sent_revision, path, sha, head,
+                    None, pr_url, batch_id, now,
+                ),
+            )
+
+    def sent_receipt(self, entry_id):
+        """Last confirmed per-entry receipt (path/hash/revision/exact head)."""
+        with self.lock:
+            row = self.db.execute(
+                "SELECT * FROM sent_receipts WHERE entry_id=?", (entry_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def sent_file_hash(self, entry_id):
+        """The exact body hash this domain last sent for one entry, from the
+        per-entry confirmed receipt (survives later lineage-row replacement)."""
+        receipt = self.sent_receipt(entry_id)
+        return receipt["sha256"] if receipt else None
 
     def restore_draft(self, entry_id, doc, *, generation=None):
         """Re-seed a compacted append-base from the exact confirmed remote

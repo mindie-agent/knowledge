@@ -32,12 +32,13 @@ event carries `session_id` and `turn_id`; `transcript_path` and
 summary is still accepted.
 
 The worker reads only the new byte region of the admitted task's own
-transcript (`loop/transcript.py`): structural-signature whitelist of Codex
-JSONL — user messages, public assistant commentary/final/final_answer messages,
-function and custom-tool input/output with call identities. Harness catalogue
-wrappers and duplicate native event wrappers are excluded. A native fork's
-creation time excludes inherited parent material. Hidden reasoning, analysis channels, system/developer content,
-credential fields and other tasks' history are never extracted. File
+transcript through the configured `transcript_adapter` module (an absolute
+local path loaded once at service start; core ships no native record parser —
+the Codex parser is the adapter deliverable, the Kimi parser belongs to the
+Kimi adapter). A missing parser means honest summary-only behavior, never a
+format guess. The adapter parser applies its structural public-material
+allowlist; hidden reasoning, system/developer content, credential fields and
+other tasks' history are never extracted. File
 replacement, truncation, unknown formats and partial trailing records are
 handled explicitly (summary-only degradation within the same attempt, or a
 visible coverage gap); a nonzero cursor resumes exactly where the last region
@@ -175,7 +176,7 @@ The contribution operations are deterministic and model-free: inspect is
 read-only (loop outbox + community ledger); reconcile runs the bounded
 read-only remote inspection and updates both stores (available even after the
 automatic read budget is exhausted); retry resubmits exactly one confirmed
-failed/unresolved stored payload with `explicit_retry`; compact removes the
+failed stored payload with `explicit_retry` (unknown outcomes are refused); compact removes the
 sent private payload (draft bodies/history, raw capture summaries, staging)
 of a confirmed batch while keeping IDs, hashes, the retrieval header and
 PR/head receipts. None of them reruns the organizer, resets a capture cursor
@@ -221,3 +222,26 @@ updates the same file. Pending contributions are rechecked for withdrawal,
 and a remote deletion of an expected base is a conflict, never permission to
 restore the removed body. Existing failed or unknown publication receipts stay
 non-replayable within this format.
+
+
+## Confirmed payload cleanup and idle updates
+
+Confirmation requires a matching remote PR head. Exhausted read-only
+reconciliation leaves an uncertain write `unknown`, preserving inspection
+material and preventing blind replay. Automatic cleanup removes exactly the
+sent draft payload and staging. Capture summaries are cleared only when all
+recorded entry-and-revision references are covered by that confirmed batch;
+newer unsent and ambiguous observations remain available.
+
+Tiny per-entry receipts retain the confirmed head, path, hash, revision,
+PR and contribution generation independently of the latest coalescing batch.
+After A is sent and compacted, a later B-only batch does not erase A's
+receipt. A future A update retrieves the exact prior remote body once before
+appending. This does not retain redundant local body history or authorize
+publishing into a different contribution scope.
+
+The authenticated local `stop_if_idle` RPC freezes admission and initiates
+shutdown only when no actual call, worker or admitted capture work remains.
+Idle authorization grants and pending/unknown durable PR receipts alone do
+not block a version switch. Adapters protect each complete call with their
+operation lock and use this RPC instead of status-then-stop inference.

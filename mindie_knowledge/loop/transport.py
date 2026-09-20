@@ -192,6 +192,39 @@ class Service:
         return args, session, lease
 
     def call(self, method, args):
+        if method == "stop_if_idle":
+            return self._stop_if_idle()
+        if method == "status":
+            return self.engine.status()
+        if method == "sharing_status":
+            return dict(
+                self.engine._settings().public_status(),
+                outbox=self.store.status()["outbox"],
+            )
+        if method == "stop":
+            threading.Thread(target=self.close, daemon=True).start()
+            return dict(status="stopping")
+        work = method in {
+            "query", "explain", "feedback", "capture", "sync", "maintenance_resume",
+        }
+        if work and not self.engine.begin_work():
+            raise ValueError("service is not admitting new work")
+        try:
+            return self._dispatch(method, args)
+        finally:
+            if work:
+                self.engine.end_work()
+
+    def _stop_if_idle(self):
+        result = self.engine.stop_if_idle()
+        if result.get("idle"):
+            threading.Thread(target=self.close, daemon=True).start()
+            return dict(result, status="stopping")
+        return result
+
+    def _dispatch(self, method, args):
+        lease = None
+        session = None
         if method in {"query", "explain", "feedback", "capture"}:
             args, session, lease = self._identify(args, capture=method == "capture")
         if method == "query":
@@ -221,20 +254,10 @@ class Service:
             return vote
         if method == "capture":
             return self.engine.capture(**args)
-        if method == "status":
-            return self.engine.status()
-        if method == "sharing_status":
-            return dict(
-                self.engine._settings().public_status(),
-                outbox=self.store.status()["outbox"],
-            )
         if method == "sync":
             return [feed.sync(force=True) for feed in self.feeds]
         if method == "maintenance_resume":
             return self.engine.budget.resume()
-        if method == "stop":
-            threading.Thread(target=self.close, daemon=True).start()
-            return dict(status="stopping")
         raise ValueError("unsupported operation")
 
     # -------------------------------------------------------------- serving

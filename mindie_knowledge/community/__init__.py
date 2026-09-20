@@ -12,6 +12,6 @@ model bridge and no scheduler. ``skill_validation`` offers deterministic
 data-only checks for Skill package bytes.
 """
 
-from .publish import reconcile_batch, submit_batch
+from .publish import inspect_batch, reconcile_batch, submit_batch
 
-__all__ = ["submit_batch", "reconcile_batch"]
+__all__ = ["submit_batch", "reconcile_batch", "inspect_batch"]

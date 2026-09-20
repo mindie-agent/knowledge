@@ -100,11 +100,16 @@ def _stage_batch(store, settings, drafts, votes, revision_fn):
         # The honest expected base is the last body this lineage actually sent
         # (unmerged own-PR update); a fresh contribution has none. The newest
         # published body is only a base when it IS our last outbound body.
+        # After confirmed-PR compaction the sent body is gone locally, so the
+        # retained receipt hash is the base — maintainer edits still move the
+        # remote away from it and park as needs_review, never overwritten.
         base_sha = None
         if row is not None and row["batched_revision"]:
             sent = store._revision_doc(doc["entry_id"], row["batched_revision"])
             if sent is not None:
                 base_sha = _sha(render_entry(sent))
+            else:
+                base_sha = store.sent_file_hash(doc["entry_id"])
         files.append(dict(path=_filename(doc), content=content,
                           sha256=_sha(content), base_sha256=base_sha))
     vote_keys = []
