@@ -201,7 +201,7 @@ def _bare_remote(tmp_path):
     body = render_entry(doc)
     path = f"cases/{entry_id}.md"
     (work / "cases").mkdir()
-    (work / path).write_text(body)
+    (work / path).write_bytes(body.encode("utf-8"))
     _git(["add", "."], work)
     _git(["commit", "-m", "base"], work)
     _git(["branch", "-M", "main"], work)

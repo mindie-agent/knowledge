@@ -19,32 +19,43 @@ def test_serve_starts_with_actual_configured_parser(tmp_path):
         admission_path=str(tmp_path / "admission.sqlite3"),
         transcript_adapter=str(adapter),
     )))
-    process = subprocess.Popen(
-        [sys.executable, "-m", "mindie_knowledge.loop.cli", "serve",
-         "--config", str(config)],
-        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+    diagnostics = tmp_path / "service.log"
+    bootstrap = (
+        "import faulthandler, runpy; "
+        "faulthandler.dump_traceback_later(8, repeat=False); "
+        "runpy.run_module('mindie_knowledge.loop.cli', run_name='__main__')"
     )
-    try:
-        connection_path = root / "test" / "connection.json"
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline and not connection_path.is_file():
-            if process.poll() is not None:
-                raise AssertionError(
-                    f"service exited during startup: {process.stderr.read()[:400]}"
-                )
-            time.sleep(0.1)
-        assert connection_path.is_file(), "service never became ready"
-        from mindie_knowledge.loop.transport import rpc
+    with diagnostics.open("w") as log:
+        process = subprocess.Popen(
+            [sys.executable, "-c", bootstrap, "serve", "--config", str(config)],
+            stdout=log, stderr=log, text=True,
+        )
+        try:
+            connection_path = root / "test" / "connection.json"
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not connection_path.is_file():
+                if process.poll() is not None:
+                    raise AssertionError("service exited: " + diagnostics.read_text())
+                time.sleep(0.1)
+            assert connection_path.is_file(), "service never became ready: " + diagnostics.read_text()
+            from mindie_knowledge.loop.transport import rpc
 
-        connection = json.loads(connection_path.read_text())
-        status = rpc(connection, "status", timeout=5)
-        assert status["domain"] == "test"
-        result = rpc(connection, "stop_if_idle", timeout=5)
-        assert result["idle"] is True
-        assert result["status"] == "stopping"
-    finally:
-        process.wait(timeout=10)
-    assert process.returncode == 0
+            connection = json.loads(connection_path.read_text())
+            status = rpc(connection, "status", timeout=5)
+            assert status["domain"] == "test"
+            result = rpc(connection, "stop_if_idle", timeout=5)
+            assert result["idle"] is True
+            assert result["status"] == "stopping"
+            process.wait(timeout=5)
+            assert process.returncode == 0
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=2)
 
 
 def test_stop_if_idle_refuses_in_flight_and_queued_work(tmp_path):
