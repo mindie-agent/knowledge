@@ -1,4 +1,11 @@
-"""Authenticated loopback service; one process and storage root per domain."""
+"""Authenticated loopback service; one process and storage root per domain.
+
+Loopback only: the service binds 127.0.0.1, requires a per-process bearer
+token, refuses Origin-headed browser requests, bounds body size, worker
+count and stalled reads. There is no remote upstream, authority, contribute
+or raw-outcome route — distribution happens through the outbox and the
+community package, retrieval through the model-free Git feed sync.
+"""
 
 from __future__ import annotations
 
@@ -6,25 +13,22 @@ import hmac
 import json
 import secrets
 import threading
+import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
 
 from mindie_knowledge.markdown import _atomic_write_text
 
-from .store import canonical, digest
+from .store import canonical, session_key
 
-MAX_BODY = 16 * 1024 * 1024
+MAX_BODY = 2 * 1024 * 1024
 
 
 def rpc(connection, method, arguments=None, *, timeout=10):
     url = connection["url"]
-    parsed = urlparse(url)
-    if parsed.scheme != "https" and not (
-        parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "localhost", "::1"}
-    ):
-        raise ValueError("use HTTPS for a remote knowledge service")
+    if not url.startswith("http://127.0.0.1:"):
+        raise ValueError("the knowledge service is loopback-only")
     request = urllib.request.Request(
         url.rstrip("/") + "/rpc",
         data=canonical(dict(method=method, arguments=arguments or {})).encode(),
@@ -34,7 +38,6 @@ def rpc(connection, method, arguments=None, *, timeout=10):
         },
     )
 
-    # Never forward the service credential through an HTTP redirect.
     class NoRedirect(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, *args, **kwargs):
             return None
@@ -52,12 +55,7 @@ def rpc(connection, method, arguments=None, *, timeout=10):
 
 
 class _BoundedHTTPServer(ThreadingHTTPServer):
-    """Threading server with an explicit admission bound.
-
-    At most ``max_workers`` request threads exist; a connection that cannot
-    get a slot within ``slot_wait`` seconds is closed instead of queueing a
-    thread, so held connections cannot exhaust the service.
-    """
+    """Threading server with an explicit admission bound."""
 
     daemon_threads = True
 
@@ -87,33 +85,13 @@ class _BoundedHTTPServer(ThreadingHTTPServer):
 
 
 class Service:
-    def __init__(
-        self,
-        engine,
-        *,
-        connection_path=None,
-        upstream=None,
-        feeds=(),
-        session_activation=None,
-        max_workers=8,
-        request_timeout=10.0,
-    ):
+    def __init__(self, engine, *, connection_path=None, admission=None, feeds=(),
+                 max_workers=8, request_timeout=10.0):
         self.engine, self.store = engine, engine.store
-        self.admission = None
-        if session_activation:
-            from .activation import SessionAdmission
-
-            self.admission = SessionAdmission(session_activation)
-            self.engine.session_allowed = self.admission.allows
-        from .feed import Feed
-
-        self.feeds = [Feed(self.store, config) for config in feeds]
-        self.upstream = upstream
-        self.engine.evaluate_uses = not bool(upstream)
+        self.admission = admission
+        self.feeds = list(feeds)
         self.token = secrets.token_urlsafe(32)
         self.connection_path = Path(connection_path) if connection_path else None
-        self.sync_lock = threading.Lock()
-        self.last_sync = None
         service = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -122,8 +100,6 @@ class Service:
 
             def setup(self):
                 super().setup()
-                # A valid bearer with a stalled partial body cannot hold a
-                # worker past this deadline.
                 self.connection.settimeout(request_timeout)
 
             def do_POST(self):
@@ -151,7 +127,6 @@ class Service:
                 except (ValueError, KeyError, TypeError) as exc:
                     result = dict(ok=False, error=str(exc)[:500])
                 except (TimeoutError, OSError):
-                    # Stalled or aborted request; release the worker quietly.
                     self.close_connection = True
                     return
                 except Exception:
@@ -178,127 +153,93 @@ class Service:
             domain=self.store.domain,
         )
 
+    # -------------------------------------------------------------- routing
+
+    def _identify(self, args, *, capture=False):
+        """Pop and validate the internal identity fields.
+
+        ``_activation`` proves the call with the adapter-issued token (Hook /
+        CLI path). ``_session_verified`` means the MCP layer already bound the
+        call to verified host metadata; the lease is still re-checked here.
+        Capture always requires the token and the current lease schema.
+        """
+        args = dict(args)
+        session = args.pop("_session_id", None)
+        if not isinstance(session, str) or not session:
+            raise ValueError("call identity is missing")
+        if self.admission is None:
+            raise ValueError("no adapter admission is configured")
+        token = args.pop("_activation", None)
+        if token is not None:
+            if capture:
+                lease = self.admission.capture_lease(session, token)
+            else:
+                lease = self.admission.check(session, token)
+        elif not capture and args.pop("_session_verified", False):
+            lease = self.admission.active_lease(session)
+            if lease is None:
+                raise ValueError("session is not manually activated")
+        else:
+            raise ValueError("call identity cannot be verified")
+        return args, session, lease
+
     def call(self, method, args):
-        if self.admission and method in {"attach", "query", "explain", "use", "capture"}:
-            args = dict(args)
-            session = args.pop("_session_id", None)
-            self.admission.require(session, args.pop("_activation", None))
-            if method != "explain" and args.get("session_id") != session:
-                raise ValueError("session does not match activation")
-            if method in {"attach", "capture"}:
-                # A verified activation is the explicit domain bind; it must
-                # not depend on the task ever issuing a knowledge query.
-                self.store.attach(session)
-        if method == "maintenance_resume":
-            return self.engine.budget.resume()
-        if method == "attach":
-            return self.store.attach(args["session_id"])
+        if method in {"query", "explain", "feedback", "capture"}:
+            args, session, lease = self._identify(args, capture=method == "capture")
         if method == "query":
-            return self.store.query(**args)
+            return self.store.query(
+                args["query"], limit=args.get("limit", 5),
+                conditions=args.get("conditions"),
+            )
         if method == "explain":
-            return self.store.get(**args)
-        if method == "use":
-            return self.store.use(**args)
+            return self.store.explain(
+                args["ref"], offset=args.get("offset", 0), limit=args.get("limit")
+            )
+        if method == "feedback":
+            settings = self.engine._settings()
+            root_session = (lease or {}).get("root_session") or session
+            vote = self.store.record_vote(
+                root_hash=session_key(root_session), ref=args["ref"],
+                rating=args["rating"], reason=args.get("reason", ""),
+                publishable=settings.allows_capture(),
+            )
+            if vote["publishable"]:
+                self.engine.last_activity = time.monotonic()
+            return vote
         if method == "capture":
             return self.engine.capture(**args)
         if method == "status":
+            return self.engine.status()
+        if method == "sharing_status":
             return dict(
-                **self.engine.status(),
-                last_sync=self.last_sync,
-                feeds=[feed.last for feed in self.feeds],
+                self.engine._settings().public_status(),
+                outbox=self.store.status()["outbox"],
             )
-        if method == "snapshot":
-            return self.store.snapshot()
-        if method == "receive_use":
-            result = self.store.receive_use(args["usage"])
-            self.engine.wake()
-            return result
-        if method == "contribute":
-            snapshot = args["snapshot"]
-            if snapshot.get("feedback"):
-                raise ValueError(
-                    "contributions contain entries only; the authority judges actual uses"
-                )
-            installed = self.store.install_snapshot(snapshot, authoritative=False)
-            for entry in snapshot["entries"]:
-                self.store.publish(entry["id"])
-            return installed
         if method == "sync":
-            return self.sync(force=True)
+            return [feed.sync(force=True) for feed in self.feeds]
+        if method == "maintenance_resume":
+            return self.engine.budget.resume()
         if method == "stop":
             threading.Thread(target=self.close, daemon=True).start()
             return dict(status="stopping")
         raise ValueError("unsupported operation")
 
-    def sync(self, *, force=False):
-        if not self.upstream and not self.feeds:
-            return dict(status="no_upstream")
-        if not self.sync_lock.acquire(blocking=False):
-            return dict(status="busy")
-        try:
-            feed_results = [feed.sync(force=force) for feed in self.feeds]
-            if not self.upstream:
-                self.last_sync = dict(
-                    status="synced"
-                    if all(
-                        item["status"] in {"synced", "unchanged"}
-                        for item in feed_results
-                    )
-                    else "unavailable",
-                    feeds=feed_results,
-                )
-                return self.last_sync
-            # Only material explicitly authorized for publication is offered.
-            offered = self.store.snapshot()
-            offered["feedback"] = []
-            offered["version"] = digest(
-                {k: v for k, v in offered.items() if k != "version"}
-            )
-            if offered["entries"]:
-                rpc(self.upstream, "contribute", dict(snapshot=offered))
-            snapshot = rpc(self.upstream, "snapshot")
-            installed = self.store.install_snapshot(snapshot)
-            # Only explicitly configured sharing sends completed use evidence.
-            # Raw hook captures never leave the local service through this path.
-            with self.store.lock:
-                rows = [
-                    dict(r)
-                    for r in self.store.db.execute(
-                        "SELECT * FROM uses WHERE outcome!='' AND origin='local'"
-                    )
-                ]
-            for usage in rows:
-                if self.store.upstream_entry(usage["entry_id"]):
-                    rpc(self.upstream, "receive_use", dict(usage=usage))
-            self.last_sync = dict(status="synced", **installed, feeds=feed_results)
-        except Exception as exc:
-            self.last_sync = dict(status="unavailable", error=type(exc).__name__)
-        finally:
-            self.sync_lock.release()
-        return self.last_sync
+    # -------------------------------------------------------------- serving
 
     def serve(self):
         self.engine.start()
         if self.connection_path:
             _atomic_write_text(self.connection_path, canonical(self.connection) + "\n")
             self.connection_path.chmod(0o600)
-
-        def maintain():
-            while not self.engine.stop.is_set():
-                self.sync()
-                self.engine.stop.wait(30)
-
-        self.sync_thread = threading.Thread(target=maintain, daemon=True)
-        self.sync_thread.start()
         try:
             self.http.serve_forever(poll_interval=0.2)
         finally:
-            # Cancel in-flight optional model work first; interrupted attempts
-            # are recorded failed/discarded and never replayed.
-            self.engine.stop.set()
+            # Cancel in-flight model work first; interrupted attempts are
+            # recorded and never replayed.
+            self.engine.shutdown()
             self.http.server_close()
-            self.engine.thread.join(timeout=10)
 
     def close(self):
         self.engine.stop.set()
+        self.engine._cancel.set()
         self.http.shutdown()

@@ -33,26 +33,26 @@ def test_session_and_hourly_limits_apply_to_successes_too(store):
         budget.reserve(str(i), "s", "organize")
         budget.finish(str(i), True)
     with pytest.raises(BudgetExceeded, match="session"):
-        budget.reserve("extra", "s", "judge")
+        budget.reserve("extra", "s", "organize")
     for i in range(6, 20):
-        budget.reserve(str(i), str(i), "judge")
+        budget.reserve(str(i), str(i), "organize")
         budget.finish(str(i), True)
     with pytest.raises(BudgetExceeded, match="hourly"):
-        budget.reserve("extra", "another", "judge")
+        budget.reserve("extra", "another", "organize")
 
 
 def test_failures_pause_across_restart_and_resume_does_not_replay(store):
     budget = MaintenanceBudget(store)
     for i in range(3):
-        budget.reserve(str(i), "s", "judge")
+        budget.reserve(str(i), "s", "organize")
         budget.finish(str(i), False)
     budget = MaintenanceBudget(store)
     assert budget.status()["paused"]
     with pytest.raises(BudgetExceeded, match="paused"):
-        budget.reserve("new", "s", "judge")
+        budget.reserve("new", "s", "organize")
     assert not budget.resume()["paused"]
     with pytest.raises(BudgetExceeded, match="already been attempted"):
-        budget.reserve("0", "s", "judge")
+        budget.reserve("0", "s", "organize")
 
 
 def test_concurrent_duplicate_reserves_only_one_call(store):
@@ -69,34 +69,16 @@ def test_concurrent_duplicate_reserves_only_one_call(store):
         assert sum(pool.map(claim, range(100))) == 1
 
 
-def test_110_hook_repeats_only_queue_one_model_job(store):
-    engine = Engine(store, agent_command=[sys.executable, "-c", "pass"])
-    store.query("example", session_id="s")
+def test_replayed_stops_dedupe_one_capture(store):
+    first = store.add_capture(
+        root_session="r", session="s", turn="t", transcript=None, summary="same"
+    )
     for _ in range(110):
-        engine.capture("s", "t", "same final summary")
-    assert engine.queue.qsize() == 1
-
-
-def test_replayed_hooks_execute_runner_once_even_after_restart(store, tmp_path):
-    marker = tmp_path / "calls"
-    code = f"from pathlib import Path; p=Path({str(marker)!r}); p.open('a').write('call\\n'); print('{{\"entries\":[]}}')"
-    engine = Engine(store, agent_command=[sys.executable, "-c", code])
-    store.query("example", session_id="s")
-    engine.start()
-    try:
-        for _ in range(110):
-            engine.capture("s", "t", "same summary")
-        deadline = time.monotonic() + 3
-        while engine.queue.unfinished_tasks and time.monotonic() < deadline:
-            time.sleep(0.02)
-        assert engine.queue.unfinished_tasks == 0
-        assert marker.read_text().splitlines() == ["call"]
-    finally:
-        engine.stop.set()
-        engine.thread.join(2)
-    restarted = Engine(store, agent_command=engine.agent_command)
-    assert restarted.capture("s", "t", "changed summary")["duplicate"]
-    assert restarted.queue.qsize() == 0
+        again = store.add_capture(
+            root_session="r", session="s", turn="t", transcript=None, summary="same"
+        )
+        assert again["duplicate"]
+    assert first["id"] == again["id"]
 
 
 def test_denied_budget_does_not_spawn_runner(store, tmp_path):
@@ -107,7 +89,7 @@ def test_denied_budget_does_not_spawn_runner(store, tmp_path):
     )
     engine.budget.reserve("job", "s", "organize")
     with pytest.raises(BudgetExceeded):
-        engine.agent("organize", {}, attempt_id="job", session="s")
+        engine.agent(dict(role="organize"), attempt_id="job", root_hash="s")
     assert not marker.exists()
 
 

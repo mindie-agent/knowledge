@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mindie-knowledge"
-version = "0.7.5"
-description = "Domain knowledge, experience collection, distribution and independent usefulness feedback"
+version = "0.8.0"
+description = "Local knowledge and experience loop: bounded capture, optional community sharing, Git-published retrieval"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
@@ -31,6 +31,3 @@ allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["mindie_knowledge"]
-
-[tool.hatch.build.targets.wheel.force-include]
-"corpus" = "mindie_knowledge/data/corpus"

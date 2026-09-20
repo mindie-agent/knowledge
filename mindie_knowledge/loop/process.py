@@ -1,11 +1,20 @@
 """Bound owned process trees and pipe memory without retaining retry work.
 
-Pipe draining uses daemon reader threads and a queue, which works with
-subprocess pipes on both POSIX and Windows (``selectors`` cannot select
-Windows pipes). Process-tree cleanup: POSIX uses a new session and
-``killpg``; Windows assigns the spawned process to a Job Object so
-descendants stay owned, then ``TerminateJobObject`` (``taskkill /T`` only
-if job assignment fails).
+Pipe draining uses daemon reader threads and a bounded queue, which works
+with subprocess pipes on both POSIX and Windows (``selectors`` cannot select
+Windows pipes). The queue is deliberately bounded so a runaway child cannot
+grow memory past the output cap before the consumer notices; readers block
+briefly and drop nothing while the consumer is alive.
+
+Process-tree cleanup: POSIX uses a new session and ``killpg``. Windows
+assigns the spawned process to a Job Object so descendants stay owned, then
+``TerminateJobObject`` (``taskkill /T`` only if job assignment fails).
+Honest limitation: the child starts runnable BEFORE job assignment, so a
+descendant spawned in that race window can escape ownership, and the
+taskkill fallback can lose orphans whose parent already exited. This module
+does NOT prove reliable Windows tree ownership; that needs an atomic
+create-suspended/assign/resume sequence or an equivalent bounded supervisor
+and real Windows acceptance, which remains open (root note 9).
 """
 
 import os
@@ -161,17 +170,29 @@ def terminate_tree(process):
         pass
 
 
-def _reader(stream, tag, chunks):
+def _reader(stream, tag, chunks, cancel):
     try:
         while True:
             chunk = os.read(stream.fileno(), 4096)
             if not chunk:
                 break
-            chunks.put((tag, chunk))
+            # Bounded hand-off: if the consumer stopped (cancellation), the
+            # child is being killed; blocked readers exit instead of growing
+            # memory without limit.
+            while True:
+                try:
+                    chunks.put((tag, chunk), timeout=0.1)
+                    break
+                except queue.Full:
+                    if cancel is not None and cancel.is_set():
+                        return
     except OSError:
         pass
     finally:
-        chunks.put((tag, None))
+        try:
+            chunks.put((tag, None), timeout=0.5)
+        except queue.Full:
+            pass
 
 
 def bounded_run(command, payload, *, timeout, max_output, cancel=None):
@@ -179,10 +200,11 @@ def bounded_run(command, payload, *, timeout, max_output, cancel=None):
         input_file.write(payload.encode())
         input_file.seek(0)
         process = _spawn(command, input_file)
-        chunks = queue.Queue()
+        # 256 x 4 KiB chunks caps in-flight pipe memory well under max_output.
+        chunks = queue.Queue(maxsize=256)
         readers = [
             threading.Thread(
-                target=_reader, args=(stream, tag, chunks), daemon=True
+                target=_reader, args=(stream, tag, chunks, cancel), daemon=True
             )
             for stream, tag in ((process.stdout, "out"), (process.stderr, "err"))
         ]

@@ -18,7 +18,7 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 FIXTURES = REPO_ROOT / "tests" / "fixtures" / "tools"
-EXAMPLE_ENTRY = REPO_ROOT / "examples" / "corpus-contribution" / "ordinary.md"
+EXAMPLE_ENTRY = REPO_ROOT / "tests" / "fixtures" / "ordinary.md"
 
 def run_tool(name: str, *args: str, python: str | None = None) -> subprocess.CompletedProcess:
     """Run ``python -m mindie_knowledge.<name> ARGS`` from the repo root."""
@@ -121,7 +121,7 @@ class EnvironmentTests(unittest.TestCase):
     def test_no_tracked_fixture_contains_a_redaction_hit(self):
         # Belt and braces: the fixture tree itself must be clean under the
         # built-in ruleset, otherwise a test fixture is the leak.
-        proc = run_tool("redact", "--check", str(FIXTURES), str(REPO_ROOT / "examples"))
+        proc = run_tool("redact", "--check", str(FIXTURES))
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
 

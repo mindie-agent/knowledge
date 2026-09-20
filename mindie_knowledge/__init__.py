@@ -1,18 +1,14 @@
-"""Local Markdown references, optional retrieval and public contribution."""
+"""Local domain knowledge and experience loop with optional community sharing."""
 
 from __future__ import annotations
 
 from importlib.metadata import PackageNotFoundError, version
 from importlib import import_module
 
-from mindie_knowledge import corpus
-
-__all__ = ["corpus", "package_version", "redact"]
+__all__ = ["package_version", "redact"]
 
 
 def __getattr__(name: str):
-    # Reading bundled Markdown remains a stdlib-only operation, even when a
-    # distribution is installed with --no-deps for offline corpus access.
     if name == "redact":
         module = import_module("mindie_knowledge.redact")
         globals()[name] = module
@@ -26,4 +22,4 @@ def package_version() -> str:
     try:
         return version("mindie-knowledge")
     except PackageNotFoundError:
-        return "0.7.5"
+        return "0.8.0"

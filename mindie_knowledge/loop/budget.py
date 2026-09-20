@@ -64,11 +64,17 @@ class MaintenanceBudget:
             )
 
     def finish(self, ident, succeeded):
+        """Record the outcome. ``succeeded=None`` is a cancellation (sharing
+        revoked or shutdown): the attempt is consumed but never counted as a
+        failure toward the pause circuit."""
+        status = "succeeded" if succeeded else "failed"
+        if succeeded is None:
+            status = "cancelled"
         with self.store.lock, self.store.db:
             db = self.store.db
             db.execute(
                 "UPDATE maintenance_attempts SET status=? WHERE id=?",
-                ("succeeded" if succeeded else "failed", ident),
+                (status, ident),
             )
             last = db.execute(
                 "SELECT status FROM maintenance_attempts ORDER BY started DESC, rowid DESC LIMIT ?",
