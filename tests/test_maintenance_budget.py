@@ -226,3 +226,17 @@ def test_bounded_run_cancellation_kills_the_whole_process_tree(tmp_path):
         for proc in spawned:
             process_module.terminate_tree(proc)
         process_module._spawn = real_spawn
+
+
+def test_interrupted_attempts_count_toward_pause_across_restarts(store):
+    for i in range(3):
+        budget = MaintenanceBudget(store)
+        budget.reserve('crash-' + str(i), 'session', 'organize')
+        restarted = MaintenanceBudget(store)
+        restarted.recover_interrupted()
+    assert restarted.status()['paused']
+    with pytest.raises(BudgetExceeded, match='paused'):
+        restarted.reserve('new', 'session', 'organize')
+    restarted.resume()
+    with pytest.raises(BudgetExceeded, match='already been attempted'):
+        restarted.reserve('crash-0', 'session', 'organize')

@@ -98,6 +98,15 @@ class MaintenanceBudget:
                     "INSERT OR REPLACE INTO state VALUES('maintenance_paused', 'consecutive failures')"
                 )
 
+    def recover_interrupted(self):
+        """On service start, consume crashes as failures before new admission."""
+        with self.store.lock:
+            interrupted = self.store.db.execute(
+                "SELECT id FROM maintenance_attempts WHERE status='running' ORDER BY started"
+            ).fetchall()
+            for row in interrupted:
+                self.finish(row[0], False)
+
     def resume(self):
         # Keep attempts and quotas: explicit resume does not replay failed work.
         with self.store.lock, self.store.db:

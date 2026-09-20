@@ -282,9 +282,11 @@ class Engine:
                 self.store.mark_capture(row["id"], "no-new-material")
             return None
         if status == "unknown-format":
-            region["region_id"] = reserve(inc["start"], inc["end"], inc["digest"])
             if row["summary"].strip():
+                # Summary model admission, like normal material, must happen
+                # before consuming the region when a quota defers this work.
                 return ("", True, ["unknown transcript format; summary-only"])
+            region["region_id"] = reserve(inc["start"], inc["end"], inc["digest"])
             self.store.finish_region(region["region_id"], "failed",
                                      "unknown transcript format and no summary")
             self.store.mark_capture(row["id"], "failed",
@@ -320,7 +322,7 @@ class Engine:
             findings = scan_text(candidate)
             if findings:
                 rules = ", ".join(sorted({f.rule for f in findings}))
-                notes.append(f"entry kept local; outbound scan: {rules}")
+                notes.append(f"entry rejected before storage/publication; outbound scan: {rules}")
                 continue
             try:
                 ident = entry.get("entry_id")
@@ -471,7 +473,7 @@ class Engine:
                 "WHERE status='processing'"
             )
             self.store.db.execute("UPDATE regions SET status='failed', detail='interrupted attempt; no replay' WHERE status='attempted'")
-            self.store.db.execute("UPDATE maintenance_attempts SET status='failed' WHERE status='running'")
+        self.budget.recover_interrupted()
         self.revoke_stale()
         self.thread.start()
         self.outbox_thread.start()
