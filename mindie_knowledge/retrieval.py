@@ -11,7 +11,7 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Sequence
 
-from mindie_knowledge.markdown import Document, retrieval_aliases
+from mindie_knowledge.markdown import Document
 
 
 @dataclass
@@ -60,9 +60,6 @@ def lexical_search(text: str, documents: Sequence[Document], *, limit: int) -> l
     counts = []
     for document in documents:
         count = Counter(tokens(document.title + "\n" + document.content))
-        for alias_text in retrieval_aliases(document):
-            for term in tokens(alias_text):
-                count[term] += .5
         counts.append(count)
     lengths = [sum(count.values()) for count in counts]
     average = sum(lengths) / max(len(lengths), 1) or 1

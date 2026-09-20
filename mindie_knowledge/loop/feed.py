@@ -12,6 +12,14 @@ valid and empties ordinary search — withdrawal is deletion from the tree —
 while every historical revision body stays readable by pinned reference with
 an explicit withdrawn flag.
 
+Remote discovery never latches permanently: each sync makes one bounded
+discovery pass, and after three consecutive transport failures it defers
+ordinary calls for one hour (the updater's established post-failure
+cadence). Once that time is due, an ordinary call discovers again; a
+successful discovery clears the transient failure state. An explicit
+``sync --resume`` skips the deferral and grants a transiently exhausted
+candidate one fresh bounded round, but never revalidates an invalid one.
+
 Unsupported old layouts (e.g. ``corpus/``) fail loudly instead of looking
 like a valid empty new feed. Sync runs standalone (``sync --config``) with
 community contribution off; it never starts the maintenance service or a
@@ -34,6 +42,9 @@ MAX_FILES = 1024
 MAX_TOTAL_BYTES = 32 * 1024 * 1024
 ATTEMPT_LIMIT = 3
 ATTEMPT_SECONDS = 30
+# Repeated discovery failure defers ordinary calls for one hour, the
+# updater's established post-failure cadence; it is not a new quota.
+DISCOVERY_BACKOFF_SECONDS = 3600
 _ENTRY_RE = re.compile(r"^(cases|topics)/[^/]+\.md$")
 _FEEDBACK_RE = re.compile(r"^feedback/[^/]+\.json$")
 _METADATA_FILES = {"README.md", "README", "AGENTS.md", "LICENSE", "LICENSE.md",
@@ -193,14 +204,26 @@ class Feed:
             deadline = time.monotonic() + ATTEMPT_SECONDS
             discovery_key = f"feed-discovery:{self.ident}"
             discovery = self.store.feed_get(discovery_key) or {}
-            if force:
-                discovery = {}  # explicit operator action, never the updater path
-            if discovery.get("failures", 0) >= ATTEMPT_LIMIT:
-                return dict(status="exhausted", repository=self.repository,
-                            retained_commit=receipt.get("commit"),
-                            detail="remote discovery failed three times; explicit sync --resume required")
-            discovery["failures"] = discovery.get("failures", 0) + 1
-            self.store.feed_set(discovery_key, discovery)  # consume a crash before discovery
+            failures = discovery.get("failures", 0)
+            next_check = discovery.get("next_check", 0)
+            # Deferral, never a permanent latch: state exhausted before this
+            # change carries no next_check and is due immediately.
+            if (
+                not force  # explicit operator action, never the updater path
+                and failures >= ATTEMPT_LIMIT
+                and next_check > time.time()
+            ):
+                return dict(
+                    status="deferred", repository=self.repository,
+                    retained_commit=receipt.get("commit"), next_check=next_check,
+                    detail="remote discovery backs off after repeated failures; "
+                           "explicit sync --resume checks now",
+                )
+            failures += 1
+            record = {"failures": failures}
+            if failures >= ATTEMPT_LIMIT:
+                record["next_check"] = time.time() + DISCOVERY_BACKOFF_SECONDS
+            self.store.feed_set(discovery_key, record)  # consume a crash before discovery
             try:
                 if not self.repo.is_dir():
                     self._clone(deadline)
@@ -229,8 +252,12 @@ class Feed:
                             commit=commit, detail=candidate.get("detail", ""),
                             retained_commit=receipt.get("commit"))
             if candidate.get("attempts", 0) >= ATTEMPT_LIMIT:
-                return dict(status="exhausted", repository=self.repository,
-                            commit=commit, retained_commit=receipt.get("commit"))
+                if not force:
+                    return dict(status="exhausted", repository=self.repository,
+                                commit=commit, retained_commit=receipt.get("commit"))
+                # Explicit resume grants a transiently exhausted candidate one
+                # fresh bounded round; an invalid candidate stays quarantined.
+                candidate = {"commit": commit, "attempts": 0, "status": "resumed"}
             candidate["attempts"] = candidate.get("attempts", 0) + 1
             self._save_candidate(candidate)  # persisted before any work
             try:

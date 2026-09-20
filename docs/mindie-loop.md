@@ -173,14 +173,21 @@ Object assignment races the already-running child, so reliable tree ownership
 there is NOT proven and awaits an atomic create/assign/resume sequence plus
 real Windows acceptance.
 
-### Exhausted discovery and trusted publication validation
+### Deferred discovery and trusted publication validation
 
 Each feed refresh has a 30-second execution budget. Git output and process
-ownership are bounded. Three consecutive failures before resolving the remote
-commit stop automatic discovery for that feed; an operator may run
-`mindie-knowledge sync --config CONFIG --resume` to admit a new discovery
-attempt. This does not replay failed model work or clear invalid candidate
-history. Successful discovery resets this consecutive transport-failure count.
+ownership are bounded. Discovery makes one bounded pass per sync — no
+internal retry loop. Three consecutive transport failures before resolving
+the remote commit defer ordinary discovery for one hour (the updater's
+established post-failure cadence), so frequent callers do not hammer the
+network; this is a deferral, never a permanent latch. Once the backoff is
+due, an ordinary sync discovers again, and a successful discovery clears
+the transient failure count. State persisted before this deferral existed
+carries no due time and is retried immediately. An operator may run
+`mindie-knowledge sync --config CONFIG --resume` to skip the deferral and
+to grant a transiently exhausted candidate one fresh bounded round. This
+does not replay failed model work or revalidate an invalid candidate:
+incompatible content stays quarantined against its immutable commit.
 
 Content CI invokes the pinned installed package with
 `python -I -m mindie_knowledge.publication_check --repo CHECKOUT --revision SHA`.
