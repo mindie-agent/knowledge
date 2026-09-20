@@ -224,7 +224,7 @@ class Engine:
         key = str(Path(row["transcript"]).resolve(strict=False))
         cursor = self.store.cursor(key)
         identity = transcript_mod.identify(row["transcript"])
-        idtext = f"{identity.dev}:{identity.ino}" if identity else ""
+        idtext = identity.serialize() if identity else ""
 
         def reserve(start, finish, rdigest, status="attempted", detail=""):
             return self.store.reserve_region(
@@ -239,12 +239,17 @@ class Engine:
         start = cursor["finish"] if cursor else 0
         expected = None
         if cursor and cursor.get("identity"):
-            dev, _, ino = cursor["identity"].partition(":")
-            try:
-                expected = transcript_mod.FileIdentity(key, int(dev or 0),
-                                                       int(ino or 0), 0, 0)
-            except ValueError:
-                expected = None
+            expected = transcript_mod.FileIdentity.unserialize(
+                cursor["identity"], key
+            )
+            if expected is None:
+                # A missing/malformed persisted identity fails closed: the
+                # segment is never reset to start=0 or read unsafely.
+                self.store.mark_capture(
+                    row["id"], "failed",
+                    "persisted transcript identity is unusable; not rereading",
+                )
+                return None
         inc = transcript_mod.read_increment(
             row["transcript"], start, session_id=row["session"],
             not_before=boundary, expected=expected,

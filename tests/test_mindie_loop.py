@@ -175,6 +175,43 @@ def test_two_turn_increment_keeps_failure_detail(gated, tmp_path):
     assert len(cursor_rows) == 1 and cursor_rows[0]["finish"] > 0
 
 
+def test_cursor_persists_full_anchor_identity_and_tamper_fails_closed(gated, tmp_path):
+    store, engine, _, _ = gated
+    rollout = tmp_path / "rollout.jsonl"
+    from datetime import datetime, timezone
+
+    stamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    with open(rollout, "w", encoding="utf-8", newline="\n") as f:
+        f.write(json.dumps({"timestamp": stamp, "type": "response_item",
+                            "payload": {"type": "message", "role": "user",
+                                        "content": [{"type": "input_text",
+                                                     "text": "investigate"}]}}) + "\n")
+    first = engine.capture(session_id="manual-A", turn_id="t1",
+                           transcript_path=str(rollout), summary="")
+    engine._process(first["id"])
+    assert store.capture_row(first["id"])["status"] == "organized"
+    from mindie_knowledge.loop import transcript as transcript_mod
+
+    cursor = next(iter(store.db.execute("SELECT * FROM cursors")), None)
+    assert cursor is not None
+    persisted = transcript_mod.FileIdentity.unserialize(
+        cursor["identity"], cursor["file_identity"]
+    )
+    assert persisted is not None and persisted.anchor_len > 0
+    assert len(persisted.anchor_digest) == 64  # no inode-only lossy form
+    # A tampered/malformed persisted identity fails closed; it never resets
+    # the cursor to start=0 or rereads consumed history.
+    with store._write_txn():
+        store.db.execute("UPDATE cursors SET identity='corrupt'")
+    finish_before = store.cursor(cursor["file_identity"])["finish"]
+    second = engine.capture(session_id="manual-A", turn_id="t2",
+                            transcript_path=str(rollout), summary="")
+    engine._process(second["id"])
+    assert store.capture_row(second["id"])["status"] == "failed"
+    assert "unusable" in store.capture_row(second["id"])["detail"]
+    assert store.cursor(cursor["file_identity"])["finish"] == finish_before
+
+
 def test_failed_region_is_consumed_and_never_replayed(gated, tmp_path):
     store, engine, settings_path, _ = gated
     engine.agent_command = [sys.executable, "-c", "import sys; sys.exit(1)"]

@@ -118,6 +118,49 @@ def test_replacement_and_truncation_stop_the_segment(tmp_path):
     assert inc["status"] == "replaced"
 
 
+def test_append_preserves_anchored_identity(tmp_path):
+    path = tmp_path / "rollout.jsonl"
+    write_jsonl(path, [meta(), message("user", "first turn")])
+    identity = transcript.identify(str(path))
+    assert identity.anchor_len > 0 and len(identity.anchor_digest) == 64
+    with open(path, "a", encoding="utf-8", newline="\n") as stream:
+        stream.write(json.dumps(message("assistant", "appended turn")) + "\n")
+    inc = transcript.read_increment(
+        str(path), identity.size, session_id="task-1", expected=identity
+    )
+    assert inc["status"] == "ok" and "appended turn" in inc["text"]
+    restored = transcript.FileIdentity.unserialize(identity.serialize(), identity.path)
+    assert restored is not None and transcript.same_file(
+        restored, transcript.identify(str(path))
+    )
+
+
+def test_inplace_prefix_rewrite_same_inode_stops(tmp_path):
+    """Same inode, equal/larger size, rewritten prefix: the anchor decides."""
+    path = tmp_path / "rollout.jsonl"
+    write_jsonl(path, [meta(), message("user", "original body that is long enough" * 4)])
+    identity = transcript.identify(str(path))
+    stat_before = os.stat(path)
+    with open(path, "r+", encoding="utf-8", newline="\n") as stream:
+        stream.write(json.dumps(message("user", "REWRITTEN prefix content")) + "\n")
+    assert os.stat(path).st_ino == stat_before.st_ino
+    assert path.stat().st_size >= 0
+    inc = transcript.read_increment(str(path), 0, expected=identity)
+    assert inc["status"] == "replaced"
+
+
+def test_malformed_persisted_identity_fails_closed(tmp_path):
+    path = tmp_path / "rollout.jsonl"
+    write_jsonl(path, [meta(), message("user", "body")])
+    assert transcript.FileIdentity.unserialize("not json", str(path)) is None
+    assert transcript.FileIdentity.unserialize(
+        '{"dev":1,"ino":2,"anchor_len":0,"anchor_digest":"x" * 64}', str(path)
+    ) is None
+    identity = transcript.identify(str(path))
+    assert not transcript.same_file(None, identity)
+    assert not transcript.same_file(identity, None)
+
+
 def test_foreign_task_transcript_is_not_read(tmp_path):
     path = tmp_path / "rollout.jsonl"
     write_jsonl(path, [meta("other-task"), message("user", "foreign private text")])

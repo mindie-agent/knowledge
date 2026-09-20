@@ -39,36 +39,102 @@ _MESSAGE_ROLES = {"user": "user", "assistant": "assistant"}
 _TEXT_CONTENT = {"input_text", "output_text"}
 
 
+ANCHOR_BYTES = 512
+
+
 @dataclass(frozen=True)
 class FileIdentity:
+    """Replacement/truncation detection that does not trust inode reuse.
+
+    The anchor is the digest of the file's first bytes (at most
+    ``ANCHOR_BYTES``), captured together with the stat on the SAME opened
+    handle. A later open re-reads exactly that recorded span: an unlinked and
+    recreated file that reuses the inode (Linux), or an in-place rewrite that
+    changes the prefix, fails the anchor comparison; an ordinary append keeps
+    it. mtime is never compared (append changes it) and birthtime is never
+    guessed.
+    """
+
     path: str
     dev: int
     ino: int
     size: int
     mtime_ns: int
+    anchor_len: int = 0
+    anchor_digest: str = ""
 
     @property
     def key(self) -> str:
         return f"{self.path}|{self.dev}:{self.ino}"
 
+    def anchor_for(self, count):
+        """SHA256 of the first ``count`` bytes read on one fresh handle."""
+        try:
+            fd = os.open(self.path, os.O_RDONLY)
+        except (OSError, ValueError):
+            return None
+        try:
+            return hashlib.sha256(os.read(fd, count)).hexdigest()
+        except OSError:
+            return None
+        finally:
+            os.close(fd)
+
+    def serialize(self) -> str:
+        return json.dumps(
+            dict(dev=self.dev, ino=self.ino, anchor_len=self.anchor_len,
+                 anchor_digest=self.anchor_digest),
+            sort_keys=True, separators=(",", ":"),
+        )
+
+    @staticmethod
+    def unserialize(text, path):
+        """Rebuild a persisted identity; None when malformed (fail closed)."""
+        try:
+            data = json.loads(text)
+            anchor_len = data["anchor_len"]
+            anchor_digest = data["anchor_digest"]
+            if (
+                type(anchor_len) is not int
+                or not 0 < anchor_len <= ANCHOR_BYTES
+                or not isinstance(anchor_digest, str)
+                or len(anchor_digest) != 64
+            ):
+                return None
+            return FileIdentity(
+                path, int(data["dev"]), int(data["ino"]), 0, 0,
+                anchor_len, anchor_digest,
+            )
+        except (ValueError, KeyError, TypeError):
+            return None
+
 
 def identify(path) -> FileIdentity | None:
-    """File identity for replacement/truncation detection; None if unreadable."""
+    """Stat + anchor read bound to one opened handle; None if unreadable."""
     try:
-        stat = os.stat(path)
+        fd = os.open(path, os.O_RDONLY)
     except (OSError, ValueError):
         return None
+    try:
+        stat = os.fstat(fd)
+        anchor = os.read(fd, ANCHOR_BYTES)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
     return FileIdentity(
         path=str(Path(path).resolve(strict=False)),
         dev=stat.st_dev,
         ino=getattr(stat, "st_ino", 0),
         size=stat.st_size,
         mtime_ns=stat.st_mtime_ns,
+        anchor_len=len(anchor),
+        anchor_digest=hashlib.sha256(anchor).hexdigest(),
     )
 
 
 def same_file(identity: FileIdentity | None, current: FileIdentity | None) -> bool:
-    """Best-effort same-file check; Windows inodes may be zero."""
+    """Same persisted file? Requires the recorded prefix anchor to match."""
     if identity is None or current is None:
         return False
     if identity.path != current.path:
@@ -77,7 +143,9 @@ def same_file(identity: FileIdentity | None, current: FileIdentity | None) -> bo
         return False
     if identity.ino and current.ino and identity.ino != current.ino:
         return False
-    return True
+    if not identity.anchor_len or not identity.anchor_digest:
+        return False  # a persisted identity without an anchor fails closed
+    return current.anchor_for(identity.anchor_len) == identity.anchor_digest
 
 
 def _clip(value, limit):
