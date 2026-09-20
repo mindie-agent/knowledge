@@ -92,7 +92,8 @@ class Store:
             CREATE TABLE IF NOT EXISTS captures(id TEXT PRIMARY KEY,
                 root_session TEXT NOT NULL, session TEXT NOT NULL, turn TEXT NOT NULL,
                 transcript TEXT, summary TEXT NOT NULL, status TEXT NOT NULL,
-                detail TEXT NOT NULL, created REAL NOT NULL);
+                detail TEXT NOT NULL, created REAL NOT NULL,
+                generation TEXT, boundary REAL, scope TEXT);
             CREATE TABLE IF NOT EXISTS regions(id TEXT PRIMARY KEY,
                 capture_id TEXT NOT NULL, file_identity TEXT NOT NULL,
                 start INTEGER NOT NULL, finish INTEGER NOT NULL, digest TEXT NOT NULL,
@@ -103,13 +104,16 @@ class Store:
             CREATE TABLE IF NOT EXISTS votes(root_opaque TEXT NOT NULL,
                 entry_id TEXT NOT NULL, revision TEXT NOT NULL, rating TEXT NOT NULL,
                 reason TEXT NOT NULL, publishable INTEGER NOT NULL, batch_id TEXT,
-                updated REAL NOT NULL, PRIMARY KEY(root_opaque, entry_id));
+                updated REAL NOT NULL,
+                PRIMARY KEY(root_opaque, entry_id, revision));
             CREATE TABLE IF NOT EXISTS opaque_roots(root_hash TEXT PRIMARY KEY,
                 opaque TEXT NOT NULL, created REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS outbox(batch_id TEXT PRIMARY KEY,
                 revision TEXT NOT NULL, batch TEXT NOT NULL, status TEXT NOT NULL,
                 detail TEXT NOT NULL, pr_url TEXT, head_sha TEXT,
-                created REAL NOT NULL, attempted REAL, updated REAL NOT NULL);
+                created REAL NOT NULL, attempted REAL, updated REAL NOT NULL,
+                reconciliations INTEGER NOT NULL DEFAULT 0,
+                next_attempt REAL);
             CREATE TABLE IF NOT EXISTS feed_state(key TEXT PRIMARY KEY,
                 value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY,
@@ -272,26 +276,31 @@ class Store:
             return doc, True
 
     def drafts_changed(self):
-        """Draft revisions not yet included in any outbox batch."""
+        """Draft revision bodies not yet included in any outbox batch.
+
+        Read from the revisions table, never the visible ``entries.doc``: for a
+        published entry the visible doc is the published body, while the
+        outbound candidate is the newer local draft correction."""
         with self.lock:
-            return [
-                json.loads(r["doc"])
-                for r in self.db.execute(
-                    "SELECT doc FROM entries WHERE draft_revision IS NOT NULL "
-                    "AND draft_revision != COALESCE(batched_revision, '')"
-                )
-            ]
+            rows = self.db.execute(
+                "SELECT entry_id, draft_revision FROM entries "
+                "WHERE draft_revision IS NOT NULL "
+                "AND draft_revision != COALESCE(batched_revision, '')"
+            ).fetchall()
+            return [self._revision_doc(r["entry_id"], r["draft_revision"])
+                    for r in rows]
 
     def draft_headers(self, *, producer=None, limit=8, excerpt=600):
         """Compact headers plus short excerpts as organizer context."""
         with self.lock:
             rows = self.db.execute(
-                "SELECT doc FROM entries WHERE draft_revision IS NOT NULL "
+                "SELECT entry_id, draft_revision FROM entries "
+                "WHERE draft_revision IS NOT NULL "
                 "ORDER BY updated DESC LIMIT ?", (limit * 4,),
             ).fetchall()
         headers = []
         for row in rows:
-            doc = json.loads(row["doc"])
+            doc = self._revision_doc(row["entry_id"], row["draft_revision"]) or {}
             if producer is not None and producer not in doc["producers"]:
                 continue
             headers.append(dict(
@@ -321,7 +330,8 @@ class Store:
         with self.lock:
             rows = self.db.execute(
                 "SELECT * FROM entries WHERE status='active' AND (feed_active=1 "
-                "OR draft_revision IS NOT NULL) LIMIT ?", (MAX_ENTRIES + 1,),
+                "OR (draft_revision IS NOT NULL AND published_revision IS NULL)) "
+                "LIMIT ?", (MAX_ENTRIES + 1,),
             ).fetchall()
             if len(rows) > MAX_ENTRIES:
                 raise ValueError(
@@ -357,7 +367,8 @@ class Store:
             for hit in hits:
                 doc, row, supplemental = selected[hit.uri]
                 output.append(dict(
-                    ref=self.ref(doc["entry_id"]), revision=doc["revision"],
+                    ref=self.ref(doc["entry_id"], doc["revision"]),
+                    revision=doc["revision"],
                     kind=doc["kind"], title=doc["title"], summary=doc["summary"],
                     conditions=doc["conditions"], status=doc["status"],
                     origin=row["origin"], supplemental=supplemental,
@@ -424,32 +435,20 @@ class Store:
                         (doc["kind"], doc["title"], doc["status"], doc["revision"],
                          canonical(doc), now, doc["entry_id"]),
                     )
+            # Membership is authoritative for every entry, however it first
+            # appeared locally. Once an entry has a published revision its
+            # visibility is governed by the feed alone: leaving the tree (or a
+            # valid empty tree) removes it from search, and its stale draft
+            # copy is never resurrected. All bodies stay readable by pinned
+            # reference.
             if seen:
                 self.db.execute(
-                    "UPDATE entries SET feed_active=0 WHERE origin='feed' "
+                    "UPDATE entries SET feed_active=0 WHERE feed_active=1 "
                     f"AND entry_id NOT IN ({','.join('?' for _ in seen)})",
                     tuple(seen),
                 )
-                # Entries with a local draft keep it visible; feed-only entries
-                # leave search entirely but remain explainable.
-                self.db.execute(
-                    "UPDATE entries SET doc=(SELECT revisions.doc FROM revisions "
-                    "WHERE revisions.entry_id=entries.entry_id "
-                    "AND revisions.revision=entries.draft_revision), "
-                    "status='active' "
-                    "WHERE feed_active=0 AND origin='feed' AND draft_revision IS NOT NULL"
-                )
             else:
-                self.db.execute(
-                    "UPDATE entries SET feed_active=0 WHERE origin='feed'"
-                )
-                self.db.execute(
-                    "UPDATE entries SET doc=(SELECT revisions.doc FROM revisions "
-                    "WHERE revisions.entry_id=entries.entry_id "
-                    "AND revisions.revision=entries.draft_revision), "
-                    "status='active' "
-                    "WHERE feed_active=0 AND origin='feed' AND draft_revision IS NOT NULL"
-                )
+                self.db.execute("UPDATE entries SET feed_active=0 WHERE feed_active=1")
             return dict(entries=len(docs))
 
     # ----------------------------------------------------------------- votes
@@ -492,9 +491,9 @@ class Store:
                  1 if publishable else 0, time.time()),
             )
             return dict(
-                vote_id=digest(["vote", opaque, entry_id]), root_id=opaque,
-                entry_id=entry_id, revision=revision, rating=rating,
-                publishable=bool(publishable),
+                vote_id=digest(["vote", opaque, entry_id, revision]),
+                root_id=opaque, entry_id=entry_id, revision=revision,
+                rating=rating, publishable=bool(publishable),
             )
 
     def unbatched_votes(self):
@@ -519,8 +518,22 @@ class Store:
             raise ValueError("batch exceeds the storage envelope")
         now = time.time()
         with self._write_txn():
+            existing = self.db.execute(
+                "SELECT revision, status FROM outbox WHERE batch_id=?", (batch_id,)
+            ).fetchone()
+            if existing is not None:
+                resumable = {"submitted", "updated", "unchanged", "needs_review",
+                             "failed"}
+                if existing["status"] not in resumable:
+                    raise ValueError(
+                        f"batch lineage has an unresolved {existing['status']} "
+                        "receipt; reconcile it before new work"
+                    )
+                if existing["revision"] == revision:
+                    raise ValueError("this exact batch revision was already sent")
+                self.db.execute("DELETE FROM outbox WHERE batch_id=?", (batch_id,))
             self.db.execute(
-                "INSERT INTO outbox VALUES(?,?,?,?,?,NULL,NULL,?,NULL,?)",
+                "INSERT INTO outbox VALUES(?,?,?,?,?,NULL,NULL,?,NULL,?,0,NULL)",
                 (batch_id, revision, canonical(batch), "pending", "", now, now),
             )
             for entry_id in entry_ids:
@@ -530,10 +543,11 @@ class Store:
                         "UPDATE entries SET batched_revision=? WHERE entry_id=?",
                         (row["draft_revision"], entry_id),
                     )
-            for opaque, entry_id in vote_keys:
+            for opaque, entry_id, revision in vote_keys:
                 self.db.execute(
-                    "UPDATE votes SET batch_id=? WHERE root_opaque=? AND entry_id=?",
-                    (batch_id, opaque, entry_id),
+                    "UPDATE votes SET batch_id=? WHERE root_opaque=? "
+                    "AND entry_id=? AND revision=?",
+                    (batch_id, opaque, entry_id, revision),
                 )
 
     def mark_batch(self, batch_id, status, *, detail="", pr_url=None, head_sha=None,
@@ -566,6 +580,28 @@ class Store:
                 )
             ]
 
+    def reconcile_due(self, batch_id, *, limit=5):
+        """Durable finite reconciliation: bounded count and exponential
+        backoff persisted across restarts. True when another bounded read-only
+        reconciliation is allowed now."""
+        now = time.time()
+        with self._write_txn():
+            row = self.db.execute(
+                "SELECT reconciliations, next_attempt FROM outbox WHERE batch_id=?",
+                (batch_id,),
+            ).fetchone()
+            if row is None or row["reconciliations"] >= limit:
+                return False
+            if row["next_attempt"] is not None and now < row["next_attempt"]:
+                return False
+            count = row["reconciliations"] + 1
+            self.db.execute(
+                "UPDATE outbox SET reconciliations=?, next_attempt=? "
+                "WHERE batch_id=?",
+                (count, now + min(60.0, 2.0 ** count), batch_id),
+            )
+            return True
+
     def outbox_unresolved(self):
         """Attempted but outcome-unknown batches needing bounded reconciliation."""
         with self.lock:
@@ -579,7 +615,8 @@ class Store:
 
     # --------------------------------------------------------------- capture
 
-    def add_capture(self, *, root_session, session, turn, transcript, summary):
+    def add_capture(self, *, root_session, session, turn, transcript, summary,
+                    generation=None, boundary=None, scope=None):
         if not isinstance(turn, str) or not turn.strip() or len(turn) > 256:
             raise ValueError("turn_id must be nonempty text of at most 256 characters")
         if not isinstance(summary, str) or len(summary) > 32768:
@@ -592,9 +629,10 @@ class Store:
             if old:
                 return dict(id=ident, status=old[0], duplicate=True)
             self.db.execute(
-                "INSERT INTO captures VALUES(?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO captures VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (ident, root_session, session, turn.strip(), transcript,
-                 summary.strip(), "queued", "", time.time()),
+                 summary.strip(), "queued", "", time.time(),
+                 generation, boundary, scope),
             )
         return dict(id=ident, status="queued", duplicate=False)
 

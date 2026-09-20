@@ -198,10 +198,14 @@ class Service:
         if method == "feedback":
             settings = self.engine._settings()
             root_session = (lease or {}).get("root_session") or session
+            scope = self.admission.scope_root(session) if self.admission else None
+            publishable = bool(
+                settings.allows_capture() and scope and settings.in_scope(scope)
+            )
             vote = self.store.record_vote(
                 root_hash=session_key(root_session), ref=args["ref"],
                 rating=args["rating"], reason=args.get("reason", ""),
-                publishable=settings.allows_capture(),
+                publishable=publishable,
             )
             if vote["publishable"]:
                 self.engine.last_activity = time.monotonic()

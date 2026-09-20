@@ -79,7 +79,9 @@ def test_sync_installs_and_keeps_exact_history(env):
     revised = entry_doc("1" * 64, "Device gate revised")
     second = commit_docs(git, repo, [revised])
     assert feed.sync()["commit"] == second
-    current = store.get(hits[0]["ref"])
+    # A saved reference stays on its observed revision; re-querying shows the new one.
+    assert store.get(hits[0]["ref"])["revision"] == v1
+    current = store.query("Device gate")["results"][0]
     assert current["revision"] == revised["revision"]
     pinned = store.get(store.ref("1" * 64, v1))
     assert pinned["title"] == "Device gate"  # exact old body retained

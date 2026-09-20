@@ -300,7 +300,11 @@ def read_increment(path, start, *, session_id=None, not_before=None,
                 skipped += 1
                 continue
             if stamp is None:
+                # No usable timestamp: never admit text that might predate the
+                # authorization boundary; flag the whole increment unreliable.
                 result["timestamps_reliable"] = False
+                skipped += 1
+                continue
         if len(included) >= MAX_RECORDS:
             skipped += 1
             continue

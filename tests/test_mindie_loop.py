@@ -209,8 +209,16 @@ def test_outbox_coalesces_and_disable_cancels_unsent(gated, tmp_path):
     store.record_vote(root_hash=session_key("root-1"), ref=doc["entry_id"],
                       rating="up", reason="", publishable=True)
     from mindie_knowledge.loop.export import build_batch
+    from mindie_knowledge.loop.store import digest as _digest
 
-    built = build_batch(store, settings=settings_mod.load(tmp_path / "community.json"))
+    def test_revision_fn(files, domain, base_commit, entry_refs):
+        # Clearly labeled mechanism double for the community-owned digest.
+        return _digest({"files": sorted((f["path"], f["sha256"]) for f in files),
+                        "domain": domain, "base_commit": base_commit,
+                        "entry_refs": sorted(entry_refs)})
+
+    built = build_batch(store, settings=settings_mod.load(tmp_path / "community.json"),
+                        revision_fn=test_revision_fn)
     batch_id, revision, batch, ids, votes = built
     paths = {f["path"] for f in batch["files"]}
     assert any(p.startswith("cases/") for p in paths)
@@ -298,7 +306,8 @@ def test_transport_loopback_and_identity(tmp_path):
             service.call("query", dict(query="graph"))
         hit = service.call("query", dict(query="graph", _session_id="manual-A",
                                          _session_verified=True))
-        assert hit["results"][0]["ref"].endswith(doc["entry_id"])
+        assert doc["entry_id"] in hit["results"][0]["ref"]
+        assert "@" in hit["results"][0]["ref"]  # refs pin their observed revision
         vote = service.call("feedback", dict(ref=doc["entry_id"], rating="up",
                                              reason="", _session_id="manual-A",
                                              _session_verified=True))

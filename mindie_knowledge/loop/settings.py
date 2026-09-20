@@ -11,6 +11,7 @@ blocks read-only retrieval, plugin updates or knowledge sync.
 from __future__ import annotations
 
 import json
+import math
 import re
 import secrets
 import time
@@ -38,7 +39,9 @@ class CommunitySettings:
         enabled_at = self.raw.get("enabled_at")
         self.enabled_at = (
             enabled_at
-            if type(enabled_at) in (int, float) and enabled_at > 0
+            if type(enabled_at) in (int, float)
+            and math.isfinite(enabled_at)
+            and enabled_at > 0
             else None
         )
         repository = self.raw.get("repository")

@@ -224,6 +224,7 @@ def _bind_identity(params):
         or not thread_id
         or not isinstance(session_id, str)
         or not session_id
+        or thread_id != session_id
         or meta.get("threadId") != thread_id
     ):
         raise ValueError(IDENTITY_ERROR)
@@ -265,6 +266,17 @@ def mcp(config_path):
                     raise ValueError("invalid tool arguments")
                 try:
                     session = _bind_identity(params)
+                    # Check the task's EXISTING lease before any service start:
+                    # an unactivated caller must not create business state.
+                    config = config_at(config_path)
+                    if not config.get("session_activation"):
+                        raise ValueError(
+                            "no adapter admission is configured; identity unknown"
+                        )
+                    from .activation import Admission
+
+                    if Admission(config["session_activation"]).active_lease(session) is None:
+                        raise ValueError("session is not manually activated")
                     connection = ensure_service(config_path)
                     payload = rpc(
                         connection,

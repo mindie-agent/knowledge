@@ -34,6 +34,8 @@ ATTEMPT_LIMIT = 3
 ATTEMPT_SECONDS = 30
 _ENTRY_RE = re.compile(r"^(cases|topics)/[^/]+\.md$")
 _FEEDBACK_RE = re.compile(r"^feedback/[^/]+\.json$")
+_METADATA_FILES = {"README.md", "README", "AGENTS.md", "LICENSE", "LICENSE.md",
+                   "CONTRIBUTING.md", "CODE_OF_CONDUCT.md", "SECURITY.md"}
 
 
 def feed_ident(repository, ref, prefix=""):
@@ -124,6 +126,11 @@ class Feed:
             size_i = int(size)
             total += size_i
             if _ENTRY_RE.match(path):
+                if mode != "100644":
+                    raise ValueError(
+                        f"entry {path} has unsafe Git mode {mode}; only regular "
+                        "non-executable 100644 blobs are admitted"
+                    )
                 if size_i > documents.MAX_FILE_BYTES:
                     raise ValueError(f"entry {path} exceeds the byte limit")
                 entries.append((path, size_i))
@@ -131,7 +138,8 @@ class Feed:
                 # Feedback belongs to the repository side; non-Markdown files
                 # (workflows, scripts) are not knowledge content.
                 continue
-            elif path in {"README.md", "README"}:
+            elif path in _METADATA_FILES or path.startswith("docs/"):
+                # Repository metadata Markdown is never knowledge content.
                 continue
             else:
                 # Markdown outside cases/topics — e.g. the old corpus/ layout —

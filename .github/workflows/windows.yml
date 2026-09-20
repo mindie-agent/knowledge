@@ -24,7 +24,7 @@ jobs:
       - name: Install the local knowledge runtime and intake reader
         run: |
           uv venv
-          uv pip install -e '.[test]' -e tools/knowledge-intake
+          uv pip install -e '.[test]'
       - name: Native loop, feed, redaction, CLI and service lifecycle tests
         env:
           HOME: ${{ runner.temp }}/knowledge-test-home

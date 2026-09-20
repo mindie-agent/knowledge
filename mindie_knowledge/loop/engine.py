@@ -118,9 +118,15 @@ class Engine:
             return dict(status="discarded", reason="maintenance circuit paused")
         root_session = lease.get("root_session") or session_id
         root_hash = session_key(root_session)
+        activated_at = lease.get("activated_at")
+        boundary = max(
+            settings.enabled_at,
+            activated_at if type(activated_at) in (int, float) else 0,
+        )
         captured = self.store.add_capture(
             root_session=root_hash, session=session_id, turn=turn_id,
             transcript=transcript_path, summary=summary or "",
+            generation=settings.generation, boundary=boundary, scope=scope,
         )
         if captured["duplicate"]:
             return captured
@@ -142,7 +148,27 @@ class Engine:
         if not self._settings().allows_capture():
             raise MaintenanceCancelled("sharing disabled before model spawn")
 
-    def agent(self, payload, *, attempt_id, root_hash):
+    def _revalidate(self, row):
+        """The capture's persisted authorization must still hold exactly:
+        same settings generation, live lease, unchanged authorized scope.
+        Anything else is a revocation — the material never reaches a child."""
+        settings = self._settings()
+        if not settings.allows_capture():
+            raise MaintenanceCancelled("sharing disabled")
+        if row["generation"] is not None and settings.generation != row["generation"]:
+            raise MaintenanceCancelled("settings generation changed since admission")
+        if self.admission is not None:
+            lease = self.admission.active_lease(row["session"])
+            if lease is None:
+                raise MaintenanceCancelled("task deactivated")
+            scope = self.admission.scope_root(row["session"])
+            if row["scope"] and scope != row["scope"]:
+                raise MaintenanceCancelled("authorized project scope changed")
+            if row["scope"] and not settings.in_scope(row["scope"]):
+                raise MaintenanceCancelled("project scope is no longer allowed")
+        return settings
+
+    def agent(self, payload, *, attempt_id, root_hash, gate=None):
         raw = canonical(payload)
         if len(raw.encode("utf-8")) > MAX_INPUT:
             raise ValueError("maintenance input exceeds limit")
@@ -151,6 +177,8 @@ class Engine:
         outcome = False
         try:
             self._gate_live()
+            if gate is not None:
+                gate()  # identical-authorization recheck immediately before spawn
             output = bounded_run(
                 self.agent_command, raw, timeout=65, max_output=131072,
                 cancel=self._cancel,
@@ -192,7 +220,7 @@ class Engine:
     def _transcript_increment(self, row, settings, lease, region):
         """Read/filter the authorized increment; reserves regions as it goes.
         Returns (text, summary_only, notes) or None when there is no material."""
-        boundary = settings.enabled_at or (lease or {}).get("activated_at")
+        boundary = row["boundary"] or settings.enabled_at
         key = str(Path(row["transcript"]).resolve(strict=False))
         cursor = self.store.cursor(key)
         identity = transcript_mod.identify(row["transcript"])
@@ -225,10 +253,17 @@ class Engine:
         region.update(inc=inc, key=key, reserve=reserve)
         if status == "ok" and inc["text"].strip():
             region["region_id"] = reserve(inc["start"], inc["end"], inc["digest"])
-            notes = []
             if not inc.get("timestamps_reliable", True):
-                notes.append("some records lack usable timestamps")
-            return (inc["text"], False, notes)
+                # Filtering by the authorization boundary was unreliable:
+                # never admit possibly preauthorization text; degrade instead.
+                if row["summary"].strip():
+                    return ("", True, ["unreliable record timestamps; summary-only"])
+                self.store.finish_region(region["region_id"], "failed",
+                                         "unreliable timestamps and no summary")
+                self.store.mark_capture(row["id"], "failed",
+                                        "unreliable timestamps and no summary")
+                return None
+            return (inc["text"], False, [])
         if status in {"ok", "unchanged"}:
             if status == "ok" and inc["end"] > inc["start"]:
                 # Consumed bytes held no public material; consume them visibly.
@@ -319,6 +354,11 @@ class Engine:
             return
         region = {}
         try:
+            try:
+                self._revalidate(row)
+            except MaintenanceCancelled as exc:
+                self.store.mark_capture(ident, "cancelled", str(exc)[:500])
+                return
             if row["transcript"]:
                 outcome = self._transcript_increment(row, settings, lease, region)
             elif row["summary"].strip():
@@ -361,14 +401,16 @@ class Engine:
                 result = self.agent(
                     payload, attempt_id=f"organize:{ident}",
                     root_hash=row["root_session"],
+                    gate=lambda: self._revalidate(row),
                 )
-            except MaintenanceCancelled:
+                self._revalidate(row)  # again before applying any result
+            except MaintenanceCancelled as exc:
                 if region.get("region_id"):
                     self.store.finish_region(
-                        region["region_id"], "cancelled", "sharing disabled or shutdown"
+                        region["region_id"], "cancelled", str(exc)[:500]
                     )
-                self.store.mark_capture(ident, "cancelled", "maintenance cancelled")
-                raise
+                self.store.mark_capture(ident, "cancelled", str(exc)[:500])
+                return
             refs, applied_notes = self._apply(result, opaque=opaque, marker=marker)
             notes.extend(applied_notes)
             if region.get("region_id"):
@@ -378,8 +420,6 @@ class Engine:
             detail = canonical(dict(refs=refs, notes=notes))[:1000]
             self.store.mark_capture(ident, "organized", detail)
             self.last_activity = time.monotonic()
-        except MaintenanceCancelled:
-            raise
         except Exception as exc:
             detail = f"{type(exc).__name__}: {exc}"[:1000]
             self._error(detail)
@@ -512,7 +552,8 @@ class Engine:
                 self._generation = generation
                 if generation is not None:
                     for row in self.store.outbox_unresolved()[:2]:
-                        self._reconcile(row)
+                        if self.store.reconcile_due(row["batch_id"]):
+                            self._reconcile(row)
                     for row in self.store.outbox_pending()[:2]:
                         self._submit(row)
                     material = self.store.drafts_changed() or self.store.unbatched_votes()
