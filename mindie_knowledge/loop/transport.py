@@ -12,6 +12,7 @@ from __future__ import annotations
 import hmac
 import json
 import secrets
+import socketserver
 import threading
 import time
 import urllib.request
@@ -70,6 +71,14 @@ class _BoundedHTTPServer(ThreadingHTTPServer):
         self.slots = threading.BoundedSemaphore(max_workers)
         self.slot_wait = slot_wait
         super().__init__(address, handler)
+
+    def server_bind(self):
+        # Loopback bind must not reverse-DNS; HTTPServer.server_bind calls
+        # socket.getfqdn and stalls on some CI hosts.
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = host
+        self.server_port = port
 
     def process_request(self, request, client_address):
         try:

@@ -242,13 +242,23 @@ def show_file(work_dir: Path, commit: str, path: str, deadline: Deadline, *, env
 
 
 def fetch_commit(work_dir: Path, sha: str, deadline: Deadline, *, env=None) -> bool:
-    """Best-effort fetch of one exact commit; False when the server refuses."""
+    """Best-effort fetch of one exact commit; False when the server refuses
+    and the object is not already local."""
     remaining = deadline.step("git fetch commit")
     from .common import run_argv as _run
 
+    have = _run(
+        ["git", "cat-file", "-e", sha],
+        timeout=min(DEFAULT_GIT_OP_SECONDS, remaining),
+        max_output=4096,
+        cwd=work_dir,
+        env=env or GIT_ENV,
+    )
+    if have.code == 0:
+        return True
     result = _run(
         ["git", "fetch", "--quiet", "origin", sha],
-        timeout=min(DEFAULT_GIT_OP_SECONDS, remaining),
+        timeout=min(DEFAULT_GIT_OP_SECONDS, deadline.remaining()),
         max_output=MAX_GIT_OUTPUT,
         cwd=work_dir,
         env=env or GIT_ENV,

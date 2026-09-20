@@ -248,7 +248,7 @@ def test_restore_uses_exact_receipt_head_after_branch_deletion(tmp_path):
     assert store._row(doc["entry_id"])["draft_revision"] is None
 
     engine = Engine(store, settings_path=tmp_path / "community.json")
-    assert engine._restore_sent_draft(doc["entry_id"], settings.generation)
+    assert engine._restore_sent_draft(doc["entry_id"], settings.generation), engine.errors
     row = store._row(doc["entry_id"])
     assert row["draft_revision"] == doc["revision"]
     restored = store.get(store.ref(doc["entry_id"]))
@@ -275,7 +275,8 @@ def test_restore_uses_exact_receipt_head_after_branch_deletion(tmp_path):
         )
     store2.compact_confirmed(batch_id)
     engine2 = Engine(store2, settings_path=tmp_path / "community.json")
-    assert not engine2._restore_sent_draft(doc["entry_id"], settings.generation)
+    assert not engine2._restore_sent_draft(doc["entry_id"], settings.generation), engine2.errors
+    assert any("hash mismatch" in err for err in engine2.errors), engine2.errors
     store.close()
     store2.close()
 
@@ -335,7 +336,7 @@ def test_aba_continuation_after_lineage_replace_and_branch_removal(tmp_path):
                for row in store.db.execute("SELECT doc FROM revisions"))
 
     engine = Engine(store, settings_path=tmp_path / "community.json")
-    assert engine._restore_sent_draft(doc["entry_id"], settings.generation)
+    assert engine._restore_sent_draft(doc["entry_id"], settings.generation), engine.errors
     restored = store.get(store.ref(doc["entry_id"]))
     assert restored["content"] == "the sent body"
     updated, appended = store.append_observation(

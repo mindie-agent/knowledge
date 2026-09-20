@@ -2,8 +2,10 @@
 
 import json
 import shutil
+import socket
 import subprocess
 import sys
+import threading
 import time
 
 import transcript_double
@@ -21,7 +23,9 @@ def test_serve_starts_with_actual_configured_parser(tmp_path):
     )))
     diagnostics = tmp_path / "service.log"
     bootstrap = (
-        "import faulthandler, runpy; "
+        "import faulthandler, runpy, socket; "
+        "socket.getfqdn = lambda *a, **k: (_ for _ in ()).throw("
+        "RuntimeError('loopback bind must not reverse-DNS')); "
         "faulthandler.dump_traceback_later(8, repeat=False); "
         "runpy.run_module('mindie_knowledge.loop.cli', run_name='__main__')"
     )
@@ -56,6 +60,39 @@ def test_serve_starts_with_actual_configured_parser(tmp_path):
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=2)
+
+
+def test_loopback_bind_skips_reverse_dns(tmp_path, monkeypatch):
+    """Loopback service must bind without socket.getfqdn reverse-DNS."""
+    from mindie_knowledge.loop.engine import Engine
+    from mindie_knowledge.loop.store import Store
+    from mindie_knowledge.loop.transport import Service, rpc
+
+    def forbid_fqdn(*args, **kwargs):
+        raise AssertionError("loopback bind must not reverse-DNS")
+
+    monkeypatch.setattr(socket, "getfqdn", forbid_fqdn)
+    store = Store(tmp_path / "store", "test")
+    engine = Engine(store)
+    service = Service(engine, connection_path=tmp_path / "connection.json")
+    assert service.http.server_name == "127.0.0.1"
+    assert service.http.server_port == int(service.connection["url"].rsplit(":", 1)[-1])
+    assert service.http.slots is not None and service.http.slot_wait > 0
+    thread = threading.Thread(target=service.serve, daemon=True)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not (tmp_path / "connection.json").is_file():
+            time.sleep(0.05)
+        assert (tmp_path / "connection.json").is_file()
+        connection = json.loads((tmp_path / "connection.json").read_text())
+        assert connection["url"].startswith("http://127.0.0.1:")
+        status = rpc(connection, "status", timeout=5)
+        assert status["domain"] == "test"
+    finally:
+        service.close()
+        thread.join(timeout=5)
+    store.close()
 
 
 def test_stop_if_idle_refuses_in_flight_and_queued_work(tmp_path):

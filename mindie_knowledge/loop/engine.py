@@ -362,20 +362,25 @@ class Engine:
         a withdrawn entry is never resurrected and a maintainer correction is
         never overwritten (the retained hash stays the honest expected base).
         """
-        if self.community is None or not generation:
+        def fail(reason):
+            self._error(f"restore: {reason}"[:240])
             return False
+
+        if self.community is None or not generation:
+            return fail("community unavailable")
         receipt = self.store.sent_receipt(entry_id)
         if not receipt or receipt.get("generation") not in (generation, None):
-            return False
+            return fail("no matching receipt")
         head_sha = receipt.get("head_sha")
         path = receipt.get("path")
         expected_hash = receipt.get("sha256")
         expected_revision = receipt.get("sent_revision")
         if not head_sha or not path or not expected_revision:
-            return False
+            return fail("incomplete receipt")
         settings = self._settings()
         if not settings.allows_capture() or not settings.repository:
-            return False
+            return fail("capture disabled")
+        last = None
         try:
             from mindie_knowledge.community import gitops
             from mindie_knowledge.community.common import Deadline
@@ -394,27 +399,36 @@ class Engine:
                 deadline, env=env,
             )
             if not gitops.fetch_commit(work_dir, head_sha, deadline, env=env):
+                last = "commit fetch refused"
                 number = self._pr_number(receipt.get("pr_url"))
                 if number is None:
-                    return False
-                fetched = gitops.fetch_pr_head(work_dir, number, "",
-                                               deadline, env=env)
-                if fetched != head_sha:
-                    return False
+                    last = "commit fetch refused and no PR"
+                else:
+                    try:
+                        fetched = gitops.fetch_pr_head(
+                            work_dir, number, "", deadline, env=env
+                        )
+                        if fetched != head_sha:
+                            last = "pr head mismatch"
+                    except Exception as exc:
+                        last = f"{type(exc).__name__}: {exc}"
+            # Clone of main may already hold the receipt head even when a
+            # SHA fetch is refused; show the exact commit either way.
             raw = gitops.show_file(work_dir, head_sha, path, deadline, env=env)
-            if raw is None or len(raw.encode("utf-8")) > 128 * 1024:
-                return False
-            if expected_hash:
-                normalized = raw.encode("utf-8").replace(b"\r\n", b"\n").replace(b"\r", b"\n")
-                if hashlib.sha256(normalized).hexdigest() != expected_hash:
-                    return False
-            doc = parse_entry(raw)
+            if raw is None:
+                return fail(last or "missing blob at receipt head")
+            normalized = raw.encode("utf-8").replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+            if len(normalized) > 128 * 1024:
+                return fail("blob exceeds limit")
+            if expected_hash and hashlib.sha256(normalized).hexdigest() != expected_hash:
+                return fail("hash mismatch")
+            doc = parse_entry(normalized)
             if doc["entry_id"] != entry_id or doc["revision"] != expected_revision:
-                return False
+                return fail("entry or revision mismatch")
             self.store.restore_draft(entry_id, doc, generation=generation)
             return True
-        except Exception:
-            return False
+        except Exception as exc:
+            return fail(f"{type(exc).__name__}: {exc}")
 
     def _apply(self, result, *, opaque, marker, generation):
         """Deterministic metadata update + append; no repair model call."""
