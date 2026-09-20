@@ -33,7 +33,7 @@ the knowledge service, or authorize a public contribution.
 ## Ordinary use (not this skill)
 
 - `knowledge_query(query, limit?, conditions?)` — search visible entries. Published revisions win; `supplemental: true` marks a private draft overlay.
-- `knowledge_explain(ref, offset?, limit?)` — exact body for one `mindie://<domain>/<id>[@<revision>]` reference, including retired entries and their reason.
+- `knowledge_explain(ref, offset?, limit?)` — exact body for one `mindie://<domain>/<id>[@<revision>]` reference, including an explicit historical/withdrawn flag for entries removed from the feed.
 - `knowledge_feedback(ref, rating, reason?)` — optional up/down with an optional one-line reason. Never required; silence is not a signal; there is no follow-up form.
 
 Calls are bound to the host's per-call task metadata; a host that does not
@@ -67,7 +67,7 @@ tasks, home directories, or private stores to "fill" gaps.
 - Separate a confirmed cause from a plausible explanation.
 - Version mismatch means "not applicable here", not "the old note was false".
 - No hit, unused hit, and absent feedback stay unknown. Do not fill them.
-- A retired entry's reason and replacement reference stay part of its explanation.
+- A withdrawn entry remains readable as historical material; the withdrawal reason lives in Git/PR history, not a mandatory public metadata field.
 
 Report the substantive edits and operational status when relevant. Do not
 author a second summary for the knowledge store, and never treat a feed

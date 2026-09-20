@@ -31,12 +31,14 @@ Skill before allowing an ordinary PR to merge.
    authority. Multiple independent PRs may be handled normally. There is no
    product-imposed per-run candidate count, twenty-minute budget, single-PR
    limit or single-write limit. Use the external app's normal runtime behavior.
-5. Reuse the existing review record for an unchanged head; CI finishing later
+5. Reuse a successfully completed review for an unchanged head; CI finishing later
    does not require another content review. A new head requires checking the
    new content. Record an intended write before sending it. If its outcome is
    uncertain, check GitHub's actual state instead of blindly repeating it.
-   Self-generated events must not repeatedly process the same head. Leave
-   failures pending with their reason instead of starting an automatic retry loop.
+   An attempted record is not a completed review: interruptions remain pending
+   for a later normal scheduled/event run, without an immediate retry loop.
+   Content blockers wait for changed content/evidence or maintainer direction.
+   Self-generated events must not repeat a completed review of the same head.
 
 These rules do not change the contributor's Hook/MCP timeouts or bounded retry
 behavior. No new quota service or per-run approval procedure is required.
