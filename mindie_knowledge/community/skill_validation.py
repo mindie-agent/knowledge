@@ -31,12 +31,20 @@ def check_skill_package_path(name: str, prefix: str = DEFAULT_SKILL_PREFIX) -> N
     """Allowed Skill package paths: <prefix>/<slug>/{SKILL.md,
     agents/openai.yaml, references/*.md} — no executables, hooks, workflows."""
     pure = PurePosixPath(name)
+    if (
+        pure.is_absolute()
+        or str(pure) != name
+        or "\\" in name
+        or any(ord(character) < 32 for character in name)
+        or ".." in pure.parts
+    ):
+        raise CommunityError(f"{name!r}: Skill package path must be canonical and relative")
     parts = pure.parts
     prefix_parts = PurePosixPath(prefix).parts
     if parts[: len(prefix_parts)] != prefix_parts:
         raise CommunityError(f"{name}: Skill packages live under {prefix}/<slug>/ only")
     tail_parts = parts[len(prefix_parts):]
-    if len(tail_parts) < 2:
+    if len(tail_parts) < 2 or not SLUG_RE.fullmatch(tail_parts[0]):
         raise CommunityError(f"{name}: Skill packages live under {prefix}/<slug>/ only")
     tail = tail_parts[-1]
     if tail == "SKILL.md" and len(tail_parts) == 2:
@@ -112,7 +120,14 @@ def validate_reference_files(references: Mapping[str, Any]) -> dict[str, str]:
     checked: dict[str, str] = {}
     for name, content in references.items():
         pure = PurePosixPath(str(name))
-        if pure.is_absolute() or ".." in pure.parts or not str(name).endswith(".md"):
+        if (
+            not isinstance(name, str)
+            or str(pure) != name
+            or len(pure.parts) != 1
+            or "\\" in name
+            or any(ord(character) < 32 for character in name)
+            or not name.endswith(".md")
+        ):
             raise CommunityError(f"reference name {name!r} is not an allowed markdown file")
         if not isinstance(content, str) or len(content.encode("utf-8")) > MAX_REFERENCE_BYTES:
             raise CommunityError(f"reference {name!r} exceeds the size limit")

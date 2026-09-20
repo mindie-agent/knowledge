@@ -54,6 +54,11 @@ def test_package_paths_scoped_to_prefix():
     check_skill_package_path(f"{prefix}/slug-a/references/case.md", prefix)
     for bad in ("skills/slug-a/SKILL.md", f"{prefix}/slug-a/run.py",
                 f"{prefix}/slug-a/hooks/hook.sh", f"{prefix}/SKILL.md",
+                f"{prefix}/../SKILL.md", f"{prefix}/Bad_Slug/SKILL.md",
+                f"{prefix}//slug-a/SKILL.md", f"{prefix}/./slug-a/SKILL.md",
+                f"{prefix}/slug-a/references/a\\b.md",
+                f"{prefix}/slug-a/references/a\nb.md",
+                f"/{prefix}/slug-a/SKILL.md",
                 ".github/workflows/x.yml"):
         with pytest.raises(CommunityError):
             check_skill_package_path(bad, prefix)
@@ -65,3 +70,6 @@ def test_reference_files_bounded():
         validate_reference_files({"../escape.md": "x"})
     with pytest.raises(CommunityError):
         validate_reference_files({"x.md": "x" * (64 * 1024 + 1)})
+    for name in ("nested/case.md", "./case.md", "a\\b.md", "a\nb.md", "/case.md"):
+        with pytest.raises(CommunityError):
+            validate_reference_files({name: "detail"})
