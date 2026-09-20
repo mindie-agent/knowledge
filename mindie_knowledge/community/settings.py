@@ -15,10 +15,8 @@ from typing import Any, Mapping
 
 from .common import (
     DEFAULT_TRANSACTION_SECONDS,
-    SCHEMA_CONFIG,
     CommunityError,
     check_account,
-    check_branch,
     check_repository,
 )
 
@@ -60,47 +58,26 @@ def load_settings_file(path: Path) -> dict[str, Any]:
 
 
 def validate_settings(data: Mapping[str, Any]) -> dict[str, Any]:
-    if data.get("schema") != SCHEMA_CONFIG:
-        raise CommunityError(f"community config must declare schema {SCHEMA_CONFIG}")
+    """Community-side view of the shared config. The shared keys (schema,
+    enabled, generation, enabled_at, repository, branch, project_roots,
+    idle_seconds) are validated by the ONE core normalizer — no duplicated
+    ranges; only the community-private extension keys are checked here."""
+    from mindie_knowledge.loop import settings as shared
+
+    try:
+        shared_normalized = shared.normalize(data)
+    except ValueError as exc:
+        raise CommunityError(str(exc)) from None
     out: dict[str, Any] = dict(DEFAULTS)
-    enabled = data.get("enabled", False)
-    if type(enabled) is not bool:
-        raise CommunityError("community config 'enabled' must be a boolean")
-    out["enabled"] = enabled
-    generation = data.get("generation")
-    if enabled and not (isinstance(generation, str) and generation):
-        raise CommunityError("enabled community config requires a nonempty string generation")
-    if generation is not None and not isinstance(generation, str):
-        generation = str(generation)
-    out["generation"] = generation
-    enabled_at = data.get("enabled_at")
-    if enabled and not (type(enabled_at) in (int, float)
-                        and math.isfinite(enabled_at) and enabled_at > 0):
-        # An enabled config without a finite positive start authorizes nothing.
-        raise CommunityError("enabled community config requires a finite positive 'enabled_at'")
-    out["enabled_at"] = enabled_at
+    for key in ("enabled", "generation", "enabled_at", "repository", "branch",
+                "project_roots", "idle_seconds"):
+        out[key] = shared_normalized[key]
+
     config_path = data.get("config_path")
     if config_path is not None:
         if not isinstance(config_path, str) or not Path(config_path).is_absolute():
             raise CommunityError("config_path must be an absolute path string")
         out["config_path"] = config_path
-
-    repository = data.get("repository")
-    if repository is not None:
-        out["repository"] = check_repository(repository)
-    else:
-        out["repository"] = None
-    out["branch"] = check_branch(str(data.get("branch") or DEFAULTS["branch"]))
-    roots = data.get("project_roots", [])
-    if not isinstance(roots, list) or not all(
-        isinstance(r, str) and Path(r).is_absolute() for r in roots
-    ):
-        raise CommunityError("community config 'project_roots' must be absolute paths")
-    out["project_roots"] = roots
-    idle = data.get("idle_seconds", DEFAULTS["idle_seconds"])
-    if type(idle) is not int or not 30 <= idle <= 86400:
-        raise CommunityError("idle_seconds must be 30..86400")
-    out["idle_seconds"] = idle
 
     fork = data.get("fork")
     out["fork"] = check_repository(fork, "fork") if fork else None

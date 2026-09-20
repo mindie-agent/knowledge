@@ -888,6 +888,135 @@ class Store:
                 )
             ]
 
+    # ---------------------------------------------- confirmed-PR compaction
+
+    CONFIRMED_BATCH = ("submitted", "updated", "unchanged")
+
+    def _protected_revisions(self, exclude_batch):
+        """Revisions still referenced by any unsent or unresolved batch."""
+        protected = set()
+        for row in self.db.execute(
+            "SELECT batch, status FROM outbox WHERE batch_id != ?", (exclude_batch,)
+        ):
+            if row["status"] in self.CONFIRMED_BATCH:
+                continue
+            try:
+                batch = json.loads(row["batch"])
+            except ValueError:
+                continue
+            for ref in batch.get("entry_refs", []):
+                token = ref.rsplit("/", 1)[-1]
+                entry, _, revision = token.partition("@")
+                if entry and revision:
+                    protected.add((entry, revision))
+        return protected
+
+    def compact_confirmed(self, batch_id):
+        """Post-confirmation payload cleanup: the GitHub branch is the durable
+        body source for a confirmed (submitted/updated/unchanged) batch.
+
+        Removes the sent draft bodies and history, raw capture summaries of
+        the same generation and the staging payload — but only when no newer
+        unsent/unresolved revision references them. Keeps IDs, hashes, the
+        small retrieval/continuation header (title/summary/conditions), the
+        private entry-owner relation, authorized cursor/dedup state and the
+        PR/head/path receipts. A withdrawn entry is never resurrected here.
+        """
+        import shutil
+
+        with self._write_txn():
+            row = self.db.execute(
+                "SELECT * FROM outbox WHERE batch_id=?", (batch_id,)
+            ).fetchone()
+            if row is None or row["status"] not in self.CONFIRMED_BATCH:
+                return None
+            batch = json.loads(row["batch"])
+            protected = self._protected_revisions(batch_id)
+            removed = dict(entries=0, revisions=0, captures=0, staging=0)
+            for ref in batch.get("entry_refs", []):
+                token = ref.rsplit("/", 1)[-1]
+                entry_id, _, sent_revision = token.partition("@")
+                entry = self._row(entry_id)
+                if entry is None:
+                    continue
+                if entry["draft_revision"] and (
+                    entry["draft_revision"] == sent_revision
+                    and (entry_id, entry["draft_revision"]) not in protected
+                ):
+                    # No newer unsent revision: the sent body leaves the device.
+                    if entry["published_revision"]:
+                        published = self._revision_doc(
+                            entry_id, entry["published_revision"]
+                        )
+                    else:
+                        published = None
+                    header = published or {
+                        **json.loads(entry["doc"]), "content": ""
+                    }
+                    cursor = self.db.execute(
+                        "DELETE FROM revisions WHERE entry_id=? AND source='draft' "
+                        "AND revision != COALESCE(?, '')",
+                        (entry_id, entry["published_revision"]),
+                    )
+                    self.db.execute(
+                        "UPDATE entries SET draft_revision=NULL, doc=?, updated=? "
+                        "WHERE entry_id=?",
+                        (canonical(header), time.time(), entry_id),
+                    )
+                    removed["revisions"] += cursor.rowcount
+                    removed["entries"] += 1
+                    try:
+                        (self.root / "drafts" / f"{entry_id}.md").unlink()
+                    except OSError:
+                        pass
+            generation = row["generation"]
+            if generation:
+                cursor = self.db.execute(
+                    "UPDATE captures SET summary='' WHERE generation=? AND "
+                    "summary != '' AND status IN "
+                    "('organized','no-new-material','no-shareable-material')",
+                    (generation,),
+                )
+                removed["captures"] += cursor.rowcount
+        staging = self.root / "outbox" / "staging" / batch_id
+        if staging.is_dir():
+            shutil.rmtree(staging, ignore_errors=True)
+            removed["staging"] = 1
+        return removed
+
+    def restore_draft(self, entry_id, doc, *, generation=None):
+        """Re-seed a compacted append-base from the exact confirmed remote
+        body (fetched boundedly by the caller). Never overwrites an existing
+        local draft, never resurrects a withdrawn entry and never fabricates
+        a base from only the new paragraph."""
+        now = time.time()
+        with self._write_txn():
+            row = self._row(entry_id)
+            if row is None:
+                raise ValueError("unknown draft in this domain")
+            if row["draft_revision"]:
+                raise ValueError("entry already has a local draft")
+            if self._withdrawn(row):
+                raise ValueError("entry was withdrawn upstream; not restored")
+            if not isinstance(doc, dict) or doc.get("entry_id") != entry_id:
+                raise ValueError("fetched body does not match the entry identity")
+            documents.validate(doc)
+            self._insert_revision(doc, "draft", now)
+            if generation is not None:
+                self.db.execute(
+                    "INSERT OR REPLACE INTO grants VALUES(?,?,?,?,?)",
+                    ("draft", entry_id, doc["revision"], generation, now),
+                )
+            visible = not row["feed_active"]
+            self.db.execute(
+                "UPDATE entries SET draft_revision=?, title=?, doc=?, updated=? "
+                "WHERE entry_id=?",
+                (doc["revision"], doc["title"],
+                 canonical(doc) if visible else row["doc"], now, entry_id),
+            )
+            self._write_draft_file(doc)
+            return doc
+
     # --------------------------------------------------------------- capture
 
     def add_capture(self, *, root_session, session, turn, transcript, summary,

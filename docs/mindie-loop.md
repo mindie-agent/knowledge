@@ -3,7 +3,11 @@
 `mindie-knowledge` is the single-domain runtime. Configuration requires `root`
 and `domain`; optional keys are `agent_command` (argv for the maintenance
 runner), `community_config` (shared `mindie-community-config/1` settings file),
-`session_activation` (adapter config for lease checks) and `feeds`.
+`admission_path` (the harness's explicit neutral admission SQLite file, owned
+by core's `Admission` API), `transcript_adapter` (absolute local parser module
+path exporting `FileIdentity`/`identify`/`read_material`; without it capture
+is honest summary-only) and `feeds`. The legacy `session_activation` adapter
+config indirection is rejected, not aliased.
 
 ## The gate
 
@@ -145,13 +149,11 @@ community contribution off and never starts the maintenance service.
 
 ## MCP surface
 
-`knowledge_query(query, limit?, conditions?)`, `knowledge_explain(ref,
-offset?, limit?)` (both truthfully annotated read-only) and
-`knowledge_feedback(ref, rating, reason?)` (a write). Every delivered call is
-bound to the host's per-call metadata (`_meta['x-codex-turn-metadata']` with
-matching `threadId`); missing or contradictory metadata fails closed — there
-is no latest-lease guess. Discovery (`initialize`/`tools/list`) is static and
-starts nothing.
+Native MCP dispatch belongs to the harness adapters; the former core MCP host
+shim (bound to Codex-only turn metadata) is retired. Core keeps the
+authenticated loopback RPC the adapters forward to (`query`, `explain`,
+`feedback`, `capture`), each still bound to a verified per-call identity and
+re-checked against the admission store.
 
 ## Commands
 
@@ -163,8 +165,21 @@ mindie-knowledge sync --config domain.json       # one bounded knowledge sync
 mindie-knowledge maintenance-resume --config domain.json
 mindie-knowledge stop --config domain.json
 mindie-knowledge hook --config domain.json       # Stop envelope on stdin
-mindie-knowledge mcp --config domain.json
+mindie-knowledge contribution-inspect --config domain.json --batch ID
+mindie-knowledge contribution-reconcile --config domain.json --batch ID
+mindie-knowledge contribution-retry --config domain.json --batch ID
+mindie-knowledge contribution-compact --config domain.json --batch ID
 ```
+
+The contribution operations are deterministic and model-free: inspect is
+read-only (loop outbox + community ledger); reconcile runs the bounded
+read-only remote inspection and updates both stores (available even after the
+automatic read budget is exhausted); retry resubmits exactly one confirmed
+failed/unresolved stored payload with `explicit_retry`; compact removes the
+sent private payload (draft bodies/history, raw capture summaries, staging)
+of a confirmed batch while keeping IDs, hashes, the retrieval header and
+PR/head receipts. None of them reruns the organizer, resets a capture cursor
+or replays failed model attempts.
 
 Shutdown cancels in-flight maintenance through the shared cancel event,
 drains the queue as never-attempted, and joins workers with bounded waits.

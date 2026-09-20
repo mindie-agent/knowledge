@@ -27,11 +27,12 @@ from pathlib import Path
 from mindie_knowledge.redact import scan_text
 
 from . import settings as settings_mod
-from . import transcript as transcript_mod
 from .budget import BudgetExceeded, MaintenanceBudget
 from .documents import DraftFull
 from .process import MaintenanceCancelled, bounded_run
-from .store import canonical, digest, session_key
+from .store import Store, canonical, digest, session_key
+
+Store_confirmed = Store.CONFIRMED_BATCH
 
 ORGANIZE_FIELDS = {"entry_id", "title", "summary", "conditions", "content"}
 MAX_STRUCTURED_RESULT = 32 * 1024
@@ -50,7 +51,11 @@ def mask_text(text):
 
 class Engine:
     def __init__(self, store, *, agent_command=None, settings_path=None,
-                 admission=None, state_dir=None):
+                 admission=None, state_dir=None, transcript_adapter=None):
+        """``transcript_adapter`` is the already-loaded trusted parser module
+        (absolute local module from engine config ``transcript_adapter``)
+        exporting ``FileIdentity``/``identify``/``read_material``. Without it
+        capture degrades to honest summary-only; core never guesses a format."""
         if agent_command is not None and (
             not isinstance(agent_command, list)
             or not agent_command
@@ -61,6 +66,7 @@ class Engine:
         self.agent_command = agent_command
         self.settings_path = settings_path
         self.admission = admission
+        self.transcript = transcript_adapter
         self.state_dir = Path(state_dir) if state_dir else store.root / "outbox"
         self.budget = MaintenanceBudget(store)
         self.queue = queue.Queue(maxsize=8)
@@ -226,10 +232,20 @@ class Engine:
     def _transcript_increment(self, row, settings, lease, region):
         """Read/filter the authorized increment; reserves regions as it goes.
         Returns (text, summary_only, notes) or None when there is no material."""
+        parser = self.transcript
+        if parser is None:
+            # Missing parser: honest summary-only, never a format guess.
+            if row["summary"].strip():
+                return ("", True, ["no transcript adapter is configured; summary-only"])
+            self.store.mark_capture(
+                row["id"], "failed",
+                "no transcript adapter is configured and no summary",
+            )
+            return None
         boundary = row["boundary"] or settings.enabled_at
         key = str(Path(row["transcript"]).resolve(strict=False))
         cursor = self.store.cursor(key)
-        identity = transcript_mod.identify(row["transcript"])
+        identity = parser.identify(row["transcript"])
         idtext = identity.serialize() if identity else ""
 
         def reserve(start, finish, rdigest, status="attempted", detail=""):
@@ -245,7 +261,7 @@ class Engine:
         start = cursor["finish"] if cursor else 0
         expected = None
         if cursor:
-            expected = transcript_mod.FileIdentity.unserialize(
+            expected = parser.FileIdentity.unserialize(
                 cursor["identity"], key
             )
             if expected is None:
@@ -256,7 +272,7 @@ class Engine:
                     "persisted transcript identity is unusable; not rereading",
                 )
                 return None
-        inc = transcript_mod.read_material(
+        inc = parser.read_material(
             row["transcript"], start, session_id=row["session"],
             not_before=boundary, expected=expected,
         )
@@ -320,6 +336,54 @@ class Engine:
                                 "transcript unreadable and no summary")
         return None
 
+    def _restore_sent_draft(self, entry_id, generation):
+        """Fetch the exact body this lineage last sent (bounded, read-only Git)
+        so a later same-task observation appends to/updates the prior body
+        instead of replacing it with only the new paragraph. Never fabricates
+        a base; any failure simply keeps the update refused."""
+        if self.community is None or not generation:
+            return False
+        from .export import lineage_of
+
+        batch_row = self.store.batch(lineage_of(self.store.domain, generation))
+        if not batch_row or batch_row["status"] not in Store_confirmed:
+            return False
+        settings = self._settings()
+        if not settings.allows_capture() or not settings.repository:
+            return False
+        try:
+            from mindie_knowledge.community import gitops
+            from mindie_knowledge.community.batch import contribution_branch
+            from mindie_knowledge.community.common import Deadline
+            from mindie_knowledge.community.publish import _remote_url
+
+            from .documents import parse_entry
+
+            cfg = settings.as_dict()
+            write_repo = cfg.get("fork") or settings.repository
+            deadline = Deadline(cfg.get("transaction_seconds", 120), 30,
+                                cancel=self._cancel)
+            env = gitops.git_env(cfg)
+            work_dir = gitops.ensure_clone(
+                _remote_url(cfg, write_repo),
+                self.state_dir / "git" / write_repo.replace("/", "_"),
+                deadline, env=env,
+            )
+            branch = contribution_branch(self.store.domain, batch_row["batch_id"])
+            if not gitops.checkout_existing(work_dir, branch, deadline, env=env):
+                return False
+            for path in (f"cases/{entry_id}.md", f"topics/{entry_id}.md"):
+                raw = gitops.read_tree_file(work_dir, path)
+                if raw is None or len(raw.encode("utf-8")) > 128 * 1024:
+                    continue
+                self.store.restore_draft(
+                    entry_id, parse_entry(raw), generation=generation
+                )
+                return True
+        except Exception:
+            return False
+        return False
+
     def _apply(self, result, *, opaque, marker, generation):
         """Deterministic metadata update + append; no repair model call."""
         refs, notes = [], []
@@ -333,11 +397,24 @@ class Engine:
             try:
                 ident = entry.get("entry_id")
                 if ident:
-                    doc, _appended = self.store.append_observation(
-                        ident, entry["content"], marker=marker, producer=opaque,
-                        generation=generation, header={k: entry[k] for k in
-                            ("title", "summary", "conditions") if k in entry},
-                    )
+                    try:
+                        doc, _appended = self.store.append_observation(
+                            ident, entry["content"], marker=marker, producer=opaque,
+                            generation=generation, header={k: entry[k] for k in
+                                ("title", "summary", "conditions") if k in entry},
+                        )
+                    except ValueError as exc:
+                        # A compacted (confirmed-sent) draft has no local body:
+                        # fetch the exact prior remote body once, then append.
+                        if "no local draft" not in str(exc) or not self._restore_sent_draft(
+                            ident, generation
+                        ):
+                            raise
+                        doc, _appended = self.store.append_observation(
+                            ident, entry["content"], marker=marker, producer=opaque,
+                            generation=generation, header={k: entry[k] for k in
+                                ("title", "summary", "conditions") if k in entry},
+                        )
                 else:
                     doc = self.store.create_draft(
                         kind="experience", title=entry["title"],
@@ -575,6 +652,10 @@ class Engine:
             attempted=True, detail=receipt.get("detail", ""),
             pr_url=receipt.get("pr_url"), head_sha=receipt.get("head_sha"),
         )
+        if receipt.get("status") in Store_confirmed:
+            # The GitHub branch is now the durable body source: drop the sent
+            # private payload (draft bodies/history, raw summaries, staging).
+            self.store.compact_confirmed(batch_row["batch_id"])
 
     def _reconcile(self, batch_row):
         if self.community is None:
@@ -590,6 +671,8 @@ class Engine:
             detail=receipt.get("detail", ""), pr_url=receipt.get("pr_url"),
             head_sha=receipt.get("head_sha"),
         )
+        if receipt.get("status") in Store_confirmed:
+            self.store.compact_confirmed(batch_row["batch_id"])
 
     def _flush(self):
         """Coalesce all pending material into one batch and send it."""

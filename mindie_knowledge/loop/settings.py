@@ -21,6 +21,79 @@ SCHEMA = "mindie-community-config/1"
 DEFAULT_IDLE_SECONDS = 300
 MAX_IDLE_SECONDS = 86400
 _REPOSITORY_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+_BRANCH_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,120}")
+
+
+def check_repository(value, name="repository"):
+    if not isinstance(value, str) or not _REPOSITORY_RE.fullmatch(value):
+        raise ValueError(f"{name} must look like owner/repo")
+    return value
+
+
+def check_branch(value):
+    if (
+        not isinstance(value, str)
+        or not _BRANCH_RE.fullmatch(value)
+        or ".." in value
+    ):
+        raise ValueError("branch name is not usable")
+    return value
+
+
+def normalized_roots(value):
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) and Path(item).is_absolute() for item in value
+    ):
+        raise ValueError("'project_roots' must be absolute paths")
+    return [
+        str(Path(item).expanduser().resolve(strict=False)) for item in value
+    ]
+
+
+def bounded_idle(value):
+    if value is None:
+        return DEFAULT_IDLE_SECONDS
+    if type(value) is not int or not 30 <= value <= MAX_IDLE_SECONDS:
+        raise ValueError(f"idle_seconds must be 30..{MAX_IDLE_SECONDS}")
+    return value
+
+
+def normalize(data):
+    """The ONE strict validator/normalizer for ``mindie-community-config/1``.
+
+    Core, adapters (through the configured interpreter) and the community
+    package all share this — no duplicated ranges. Unknown/incompatible data
+    is rejected clearly with a ValueError naming the problem. Extension keys
+    owned by sibling components pass through uninterpreted. A config change
+    is data only: never a task deactivation or an automatic permission grant.
+    """
+    if not isinstance(data, dict) or data.get("schema") != SCHEMA:
+        raise ValueError(f"sharing settings must declare schema {SCHEMA}")
+    out = dict(data)
+    enabled = data.get("enabled", False)
+    if type(enabled) is not bool:
+        raise ValueError("'enabled' must be a boolean")
+    out["enabled"] = enabled
+    generation = data.get("generation")
+    if generation is not None and not isinstance(generation, str):
+        generation = str(generation)
+    if enabled and not (isinstance(generation, str) and generation):
+        raise ValueError("enabled sharing settings require a nonempty string generation")
+    out["generation"] = generation
+    enabled_at = data.get("enabled_at")
+    if enabled and not (
+        type(enabled_at) in (int, float)
+        and math.isfinite(enabled_at)
+        and enabled_at > 0
+    ):
+        raise ValueError("enabled sharing settings require a finite positive 'enabled_at'")
+    out["enabled_at"] = enabled_at
+    repository = data.get("repository")
+    out["repository"] = check_repository(repository) if repository is not None else None
+    out["branch"] = check_branch(str(data.get("branch") or "main"))
+    out["project_roots"] = normalized_roots(data.get("project_roots", []))
+    out["idle_seconds"] = bounded_idle(data.get("idle_seconds"))
+    return out
 
 
 class CommunitySettings:
@@ -45,29 +118,26 @@ class CommunitySettings:
             else None
         )
         repository = self.raw.get("repository")
-        self.repository = (
-            repository
-            if isinstance(repository, str) and _REPOSITORY_RE.fullmatch(repository)
-            else None
-        )
-        branch = self.raw.get("branch", "main")
-        self.branch = branch if isinstance(branch, str) and branch else "main"
-        roots = self.raw.get("project_roots")
-        self.project_roots = []
-        if isinstance(roots, list):
-            for item in roots:
-                if isinstance(item, str) and item.strip() and Path(item).is_absolute():
-                    try:
-                        self.project_roots.append(
-                            Path(item).expanduser().resolve(strict=False)
-                        )
-                    except OSError:
-                        continue
-        idle = self.raw.get("idle_seconds", DEFAULT_IDLE_SECONDS)
-        self.idle_seconds = (
-            idle if type(idle) is int and 30 <= idle <= MAX_IDLE_SECONDS
-            else DEFAULT_IDLE_SECONDS
-        )
+        try:
+            self.repository = (
+                check_repository(repository) if repository is not None else None
+            )
+        except ValueError:
+            self.repository = None
+        try:
+            self.branch = check_branch(str(self.raw.get("branch") or "main"))
+        except ValueError:
+            self.branch = "main"
+        try:
+            self.project_roots = [
+                Path(item) for item in normalized_roots(self.raw.get("project_roots", []))
+            ]
+        except (ValueError, OSError):
+            self.project_roots = []
+        try:
+            self.idle_seconds = bounded_idle(self.raw.get("idle_seconds"))
+        except ValueError:
+            self.idle_seconds = DEFAULT_IDLE_SECONDS
 
     @property
     def configured(self):

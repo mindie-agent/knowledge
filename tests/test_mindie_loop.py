@@ -12,12 +12,13 @@ import time
 import pytest
 
 from mindie_knowledge.loop import settings as settings_mod
+from mindie_knowledge.loop import transcript as transcript_mod
 from mindie_knowledge.loop.cli import capture_hook
 from mindie_knowledge.loop.engine import Engine
 from mindie_knowledge.loop.store import Store, canonical, session_key
 from mindie_knowledge.loop.transport import Service
 
-from conftest import make_admission, write_settings
+from conftest import admission_token, make_admission, write_settings
 
 PRODUCER = "a" * 64
 
@@ -219,6 +220,7 @@ def gated(tmp_path):
         agent_command=[sys.executable, str(runner)],
         settings_path=tmp_path / "community.json",
         admission=Admission(adapter),
+        transcript_adapter=transcript_mod,
     )
     yield store, engine, settings, adapter
     store.close()
@@ -401,36 +403,35 @@ def test_outbox_coalesces_and_disable_cancels_unsent(gated, tmp_path):
     assert store.unbatched_votes(generation=current.generation) == []
 
 
-def test_mcp_identity_binding_and_annotations(tmp_path):
+def test_core_mcp_host_shim_is_retired(tmp_path):
+    """Native MCP dispatch belongs to the adapters; core no longer interprets
+    any host's turn metadata. The retired operation is refused and starts
+    nothing."""
     config = tmp_path / "engine.json"
     config.write_text(json.dumps(dict(root=str(tmp_path / "root"), domain="test")))
-    calls = [
-        dict(jsonrpc="2.0", id=1, method="initialize", params={}),
-        dict(jsonrpc="2.0", id=2, method="tools/list", params={}),
-        dict(jsonrpc="2.0", id=3, method="tools/call",
-             params=dict(name="knowledge_query", arguments=dict(query="graph"))),
-        dict(jsonrpc="2.0", id=4, method="tools/call",
-             params=dict(name="knowledge_query", arguments=dict(query="graph"),
-                         _meta={"threadId": "t1",
-                                "x-codex-turn-metadata": {"thread_id": "t2",
-                                                          "session_id": "s"}})),
-    ]
     completed = subprocess.run(
         [sys.executable, "-m", "mindie_knowledge.loop.cli", "mcp", "--config",
          str(config)],
-        input="\n".join(canonical(c) for c in calls) + "\n",
+        input="", text=True, capture_output=True, timeout=10,
+    )
+    assert completed.returncode == 2  # invalid choice; no dispatch surface
+    assert not (tmp_path / "root").exists()
+
+
+def test_legacy_session_activation_config_is_rejected(tmp_path):
+    config = tmp_path / "engine.json"
+    config.write_text(json.dumps(dict(
+        root=str(tmp_path / "root"), domain="test",
+        session_activation=str(tmp_path / "adapter.json"),
+    )))
+    completed = subprocess.run(
+        [sys.executable, "-m", "mindie_knowledge.loop.cli", "status", "--config",
+         str(config)],
         text=True, capture_output=True, timeout=10,
     )
-    assert completed.returncode == 0, completed.stderr
-    replies = [json.loads(line)["result"] for line in completed.stdout.splitlines()]
-    tools = {t["name"]: t for t in replies[1]["tools"]}
-    assert set(tools) == {"knowledge_query", "knowledge_explain", "knowledge_feedback"}
-    assert tools["knowledge_query"]["annotations"]["readOnlyHint"] is True
-    assert tools["knowledge_feedback"]["annotations"]["readOnlyHint"] is False
-    for reply in replies[2:]:
-        assert reply["isError"] is True
-        assert "metadata" in reply["content"][0]["text"]
-    assert not (tmp_path / "root").exists()  # discovery started nothing
+    assert completed.returncode == 2
+    assert "admission_path" in completed.stderr
+    assert not (tmp_path / "root").exists()
 
 
 def test_hook_short_circuits_when_sharing_off(tmp_path):
@@ -441,12 +442,12 @@ def test_hook_short_circuits_when_sharing_off(tmp_path):
     engine_config.write_text(json.dumps(dict(
         root=str(tmp_path / "root"), domain="test",
         community_config=str(settings_path),
-        session_activation=str(adapter),
+        admission_path=str(adapter),
     )))
     start = time.monotonic()
     capture_hook(engine_config, dict(
         hook_event_name="Stop", session_id="manual-A", turn_id="t",
-        mindie_activation="cap-A", last_assistant_message="summary",
+        mindie_activation=admission_token(adapter), last_assistant_message="summary",
     ))
     assert time.monotonic() - start < 1
     assert not (tmp_path / "root").exists()
@@ -486,7 +487,7 @@ def test_transport_loopback_and_identity(tmp_path):
         queued = service.call(
             "capture",
             dict(session_id="manual-A", turn_id="t", summary="x",
-                 _session_id="manual-A", _activation="cap-A"),
+                 _session_id="manual-A", _activation=admission_token(adapter)),
         )
         assert queued["status"] == "queued"  # admission passes; runner is absent
         engine._process(queued["id"])
