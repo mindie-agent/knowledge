@@ -51,6 +51,13 @@ RECEIPT_STATUSES = (
 )
 
 
+def _valid_sha(value) -> bool:
+    """A present Git object name: 40-char SHA-1 or 64-char SHA-256 hex."""
+    if not isinstance(value, str) or len(value) not in (40, 64):
+        return False
+    return all(c in "0123456789abcdefABCDEF" for c in value)
+
+
 def _receipt(
     batch: Mapping[str, Any],
     *,
@@ -251,6 +258,8 @@ def _publish(checked, settings, state_dir, ledger, deadline, transport, *,
     committed = gitops.stage_and_commit(work_dir, [f["path"] for f in files], commit_message, deadline, env=genv)
     if committed is None:
         head_sha = gitops.current_head(work_dir, deadline, env=genv)
+        if _valid_sha(head_sha):
+            ledger.record_step(batch_id, revision, "git:intended-head", head_sha)
         if updating:
             ledger.record_step(batch_id, revision, "gate:before-metadata")
             _settings_gate(settings)
@@ -270,6 +279,10 @@ def _publish(checked, settings, state_dir, ledger, deadline, transport, *,
         head_sha = committed
         ledger.record_step(batch_id, revision, "gate:before-push")
         _settings_gate(settings)
+        # Persist the exact commit we intend to land independently of any later
+        # observed PR head (reconcile must never treat a rewritten head_sha as
+        # this revision's expected commit).
+        ledger.record_step(batch_id, revision, "git:intended-head", head_sha)
         ledger.record_step(batch_id, revision, "git:push")
         gitops.push_branch(work_dir, branch, deadline, env=genv, cancel=deadline.cancel)
         ledger.record_step(batch_id, revision, "git:pushed", head_sha)
@@ -365,28 +378,81 @@ def _own_prior_pr(ledger, batch_id, transport, repository, branch, deadline):
     return merged[-1] if merged else (own[-1] if own else None)
 
 
+def _expected_head(ledger, row) -> str | None:
+    """The exact commit this revision intended to land.
+
+    Taken only from the durable intended-push steps — never from the
+    ``head_sha`` column, which reconcile may have overwritten with a later
+    observed remote head that is not this revision.
+    """
+    steps = ledger.steps_for(row["batch_id"], row["revision"])
+    for name in ("git:pushed", "git:intended-head"):
+        matches = [s for s in steps if s["step"] == name and _valid_sha(s.get("detail"))]
+        if matches:
+            return matches[-1]["detail"]
+    return None
+
+
+def _verdict_for_pr(pr, expected_head) -> tuple[str, str]:
+    """Confirmation verdict for one located PR.
+
+    Confirmation requires a present, valid remote head SHA that equals the
+    saved expected commit. A matching branch/PR number alone is not proof
+    this revision arrived. A closed unmerged PR is a proven failure.
+    Unavailable or incomplete evidence stays ``unknown``.
+    """
+    remote_head = (pr.get("head") or {}).get("sha")
+    if pr.get("state") != "open" and not pr.get("merged"):
+        return "failed", "reconciled: PR closed unmerged"
+    if not _valid_sha(expected_head):
+        return "unknown", "no saved expected head; this revision is not confirmed"
+    if not _valid_sha(remote_head):
+        return "unknown", (
+            "remote PR has no valid head SHA; this revision is not confirmed"
+        )
+    if remote_head != expected_head:
+        return "unknown", (
+            "remote head does not match the saved expected head; "
+            "this revision is not confirmed"
+        )
+    if pr.get("merged"):
+        return "submitted", "reconciled: PR was merged at the expected head"
+    return "submitted", "reconciled: PR is open at the expected head"
+
+
+_INSPECT_HINT = (
+    "read-only reconciliation exhausted without confirming evidence; "
+    "status remains unknown. Inspect explicitly with contribution-inspect "
+    "or contribution-reconcile; do not retry an unconfirmed write"
+)
+
+
 def _resolve_unknown(ledger, row, settings, transport, deadline) -> dict[str, Any]:
     """Bounded READ-ONLY reconciliation of our own branch/PR. Never creates.
 
     Attempts are durably counted: repeated polling cannot turn an unresolved
     unknown into an unbounded lookup stream (contract note 26). After the cap
-    the row is marked failed; only an explicit retry creates new work.
+    the row stays ``unknown`` with an inspect hint — unavailable evidence is
+    never converted into proven failure. Only a proven remote failure
+    (closed unmerged PR) may become ``failed``. Confirmation requires the
+    exact expected head (see ``_verdict_for_pr``).
     """
     write_repo = row["repository"]
     prior_attempts = sum(
         1 for s in ledger.steps_for(row["batch_id"], row["revision"])
         if s["step"] == "reconcile:attempt"
     )
+    expected = _expected_head(ledger, row)
     if prior_attempts >= 5:
         ledger.finish_publication(
-            row["batch_id"], row["revision"], status="failed",
-            detail="read-only reconciliation exhausted; explicit retry required",
+            row["batch_id"], row["revision"], status="unknown",
+            detail=_INSPECT_HINT, head_sha=expected,
         )
         return ledger.receipt(ledger.get_publication(row["batch_id"], row["revision"]))
     ledger.record_step(row["batch_id"], row["revision"], "reconcile:attempt")
     status = "unknown"
     detail = "remote outcome remains unconfirmed; stopped without retrying"
-    pr_url, head_sha = row.get("pr_url"), row.get("head_sha")
+    pr_url = row.get("pr_url")
     try:
         prs = []
         if row.get("pr_number"):
@@ -399,21 +465,144 @@ def _resolve_unknown(ledger, row, settings, transport, deadline) -> dict[str, An
         own = [pr for pr in prs if pr.get("head", {}).get("ref") == row["branch"]]
         if own:
             pr = own[0]
-            pr_url = pr.get("html_url")
-            head_sha = pr.get("head", {}).get("sha") or head_sha
-            if pr.get("merged"):
-                status, detail = "submitted", "reconciled: PR was merged"
-            elif pr.get("state") == "open":
-                status, detail = "submitted", "reconciled: PR is open"
-            else:
-                status, detail = "failed", "reconciled: PR closed unmerged"
+            pr_url = pr.get("html_url") or pr_url
+            status, detail = _verdict_for_pr(pr, expected)
     except (CommunityError, UnknownOutcome) as exc:
         detail = f"reconciliation lookup failed: {exc}"
     ledger.finish_publication(
         row["batch_id"], row["revision"], status=status, detail=detail,
-        pr_url=pr_url, head_sha=head_sha,
+        pr_url=pr_url, head_sha=expected,
     )
     return ledger.receipt(ledger.get_publication(row["batch_id"], row["revision"]))
+
+
+def _inspect_row(ledger, row, settings, state_dir, transport, deadline) -> dict[str, Any]:
+    """EXPLICIT bounded read-only inspection of one row in ANY unresolved
+    state (intent/unknown/failed, including cap-exhausted rows).
+
+    Verifies the exact saved expected PR head before confirming; a merged PR
+    whose head moved past the expected commit is confirmed only when the
+    expected commit is a proven ancestor of the merged head (the branch may
+    be deleted after merge, so ancestry uses the durable refs/pull/N/head
+    plus an exact-commit fetch). Lookup failures, mismatches and
+    no-evidence stay ``unknown`` — a historical falsely-failed cap row is
+    not kept failed. Only a proven closed unmerged PR is ``failed``.
+    """
+    ledger.record_step(row["batch_id"], row["revision"], "inspect:attempt")
+    status = "unknown"
+    detail = "explicit inspection found no confirming remote evidence"
+    expected = _expected_head(ledger, row)
+    pr_url = row.get("pr_url")
+    write_repo = row["repository"]
+    try:
+        prs = []
+        if row.get("pr_number"):
+            try:
+                prs.append(transport.get_pull_request(write_repo, row["pr_number"], deadline))
+            except CommunityError:
+                pass
+        if not prs and row.get("branch"):
+            prs = transport.find_pull_requests(write_repo, head_branch=row["branch"], deadline=deadline)
+        own = [pr for pr in prs if pr.get("head", {}).get("ref") == row["branch"]]
+        if not own:
+            detail = (
+                "no matching remote PR evidence; not confirmed "
+                "(unknown, not a proven failure)"
+            )
+        else:
+            pr = own[0]
+            pr_url = pr.get("html_url") or pr_url
+            remote_head = (pr.get("head") or {}).get("sha")
+            status, detail = _verdict_for_pr(pr, expected)
+            if (
+                status == "unknown"
+                and pr.get("merged")
+                and _valid_sha(expected)
+                and _valid_sha(remote_head)
+                and remote_head != expected
+            ):
+                # Branch HEAD moved (in-place update) and the branch may be
+                # deleted after merge: prove the expected commit is an
+                # ancestor of the merged head instead of trusting the branch.
+                verdict = _merged_ancestor_verdict(
+                    row, settings, state_dir, expected, pr, deadline
+                )
+                if verdict is True:
+                    status = "submitted"
+                    detail = ("confirmed by explicit inspection: expected head "
+                              "is an ancestor of the merged PR head")
+                elif verdict is False:
+                    status, detail = "unknown", (
+                        "expected head is not part of the merged PR; not confirmed"
+                    )
+    except (CommunityError, UnknownOutcome) as exc:
+        status, detail = "unknown", f"explicit inspection lookup failed: {exc}"
+    ledger.finish_publication(
+        row["batch_id"], row["revision"], status=status, detail=detail,
+        pr_url=pr_url, head_sha=expected,
+    )
+    return ledger.receipt(ledger.get_publication(row["batch_id"], row["revision"]))
+
+
+def _merged_ancestor_verdict(row, settings, state_dir, expected, pr, deadline) -> bool | None:
+    """True when the expected pushed commit is provably inside the merged PR
+    head; None when local evidence is insufficient (stays unknown)."""
+    write_repo = settings.get("fork") or row["repository"]
+    genv = gitops.git_env(settings)
+    work_dir = gitops.ensure_clone(
+        _remote_url(settings, write_repo),
+        Path(state_dir) / "git" / write_repo.replace("/", "_"),
+        deadline, env=genv,
+    )
+    if not gitops.fetch_commit(work_dir, expected, deadline, env=genv):
+        return None
+    if pr.get("number"):
+        try:
+            merged_head = gitops.fetch_pr_head(
+                work_dir, pr["number"], row["branch"], deadline, env=genv
+            )
+        except CommunityError:
+            return None
+    else:
+        return None
+    return gitops.is_ancestor(work_dir, expected, merged_head, deadline, env=genv)
+
+
+def inspect_batch(batch_id: str, settings: dict, state_dir: Path, *, transport: Transport | None = None) -> dict:
+    """Explicit post-exhaustion inspection: bounded, read-only on the remote,
+    verifies the exact expected PR head, updates the durable ledger.
+
+    Works on rows in any unresolved state — including rows a previous
+    automatic budget falsely marked failed — because an exhausted lookup
+    budget is not proof of failure. No-evidence stays ``unknown``. Retry
+    remains reserved for proven remote failures."""
+    state_dir = Path(state_dir)
+    ledger = Ledger(state_dir)
+    try:
+        if not sharing_enabled(settings):
+            return {"status": "disabled", "batch_id": batch_id, "revision": None,
+                    "pr_url": None, "head_sha": None,
+                    "detail": "community sharing is disabled or unconfigured"}
+        transport = transport or transport_from_settings(settings, state_dir)
+        deadline = Deadline(settings.get("transaction_seconds", 120),
+                            settings.get("operation_limit", 60))
+        rows = [
+            row for row in ledger.all_for_batch(batch_id)
+            if row["status"] in ("intent", "unknown", "failed")
+        ]
+        if not rows:
+            latest = ledger.latest_for_batch(batch_id)
+            if latest is None:
+                return {"status": "unknown", "batch_id": batch_id, "revision": None,
+                        "pr_url": None, "head_sha": None,
+                        "detail": "no publication record for this batch"}
+            return ledger.receipt(latest)
+        result = None
+        for row in rows:
+            result = _inspect_row(ledger, row, settings, state_dir, transport, deadline)
+        return result
+    finally:
+        ledger.close()
 
 
 def reconcile_batch(batch_id: str, settings: dict, state_dir: Path, *, transport: Transport | None = None) -> dict:

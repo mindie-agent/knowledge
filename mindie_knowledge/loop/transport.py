@@ -12,6 +12,7 @@ from __future__ import annotations
 import hmac
 import json
 import secrets
+import socketserver
 import threading
 import time
 import urllib.request
@@ -70,6 +71,14 @@ class _BoundedHTTPServer(ThreadingHTTPServer):
         self.slots = threading.BoundedSemaphore(max_workers)
         self.slot_wait = slot_wait
         super().__init__(address, handler)
+
+    def server_bind(self):
+        # Loopback bind must not reverse-DNS; HTTPServer.server_bind calls
+        # socket.getfqdn and stalls on some CI hosts.
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = host
+        self.server_port = port
 
     def process_request(self, request, client_address):
         try:
@@ -192,6 +201,39 @@ class Service:
         return args, session, lease
 
     def call(self, method, args):
+        if method == "stop_if_idle":
+            return self._stop_if_idle()
+        if method == "status":
+            return self.engine.status()
+        if method == "sharing_status":
+            return dict(
+                self.engine._settings().public_status(),
+                outbox=self.store.status()["outbox"],
+            )
+        if method == "stop":
+            threading.Thread(target=self.close, daemon=True).start()
+            return dict(status="stopping")
+        work = method in {
+            "query", "explain", "feedback", "capture", "sync", "maintenance_resume",
+        }
+        if work and not self.engine.begin_work():
+            raise ValueError("service is not admitting new work")
+        try:
+            return self._dispatch(method, args)
+        finally:
+            if work:
+                self.engine.end_work()
+
+    def _stop_if_idle(self):
+        result = self.engine.stop_if_idle()
+        if result.get("idle"):
+            threading.Thread(target=self.close, daemon=True).start()
+            return dict(result, status="stopping")
+        return result
+
+    def _dispatch(self, method, args):
+        lease = None
+        session = None
         if method in {"query", "explain", "feedback", "capture"}:
             args, session, lease = self._identify(args, capture=method == "capture")
         if method == "query":
@@ -221,20 +263,10 @@ class Service:
             return vote
         if method == "capture":
             return self.engine.capture(**args)
-        if method == "status":
-            return self.engine.status()
-        if method == "sharing_status":
-            return dict(
-                self.engine._settings().public_status(),
-                outbox=self.store.status()["outbox"],
-            )
         if method == "sync":
             return [feed.sync(force=True) for feed in self.feeds]
         if method == "maintenance_resume":
             return self.engine.budget.resume()
-        if method == "stop":
-            threading.Thread(target=self.close, daemon=True).start()
-            return dict(status="stopping")
         raise ValueError("unsupported operation")
 
     # -------------------------------------------------------------- serving

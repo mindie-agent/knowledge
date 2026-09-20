@@ -27,11 +27,12 @@ from pathlib import Path
 from mindie_knowledge.redact import scan_text
 
 from . import settings as settings_mod
-from . import transcript as transcript_mod
 from .budget import BudgetExceeded, MaintenanceBudget
 from .documents import DraftFull
 from .process import MaintenanceCancelled, bounded_run
-from .store import canonical, digest, session_key
+from .store import Store, canonical, digest, session_key
+
+Store_confirmed = Store.CONFIRMED_BATCH
 
 ORGANIZE_FIELDS = {"entry_id", "title", "summary", "conditions", "content"}
 MAX_STRUCTURED_RESULT = 32 * 1024
@@ -50,7 +51,11 @@ def mask_text(text):
 
 class Engine:
     def __init__(self, store, *, agent_command=None, settings_path=None,
-                 admission=None, state_dir=None):
+                 admission=None, state_dir=None, transcript_adapter=None):
+        """``transcript_adapter`` is the already-loaded trusted parser module
+        (absolute local module from engine config ``transcript_adapter``)
+        exporting ``FileIdentity``/``identify``/``read_material``. Without it
+        capture degrades to honest summary-only; core never guesses a format."""
         if agent_command is not None and (
             not isinstance(agent_command, list)
             or not agent_command
@@ -61,6 +66,7 @@ class Engine:
         self.agent_command = agent_command
         self.settings_path = settings_path
         self.admission = admission
+        self.transcript = transcript_adapter
         self.state_dir = Path(state_dir) if state_dir else store.root / "outbox"
         self.budget = MaintenanceBudget(store)
         self.queue = queue.Queue(maxsize=8)
@@ -75,6 +81,9 @@ class Engine:
         self.errors = []
         self.last_activity = time.monotonic()
         self._generation = None
+        self._activity_lock = threading.Lock()
+        self._activity = 0
+        self._frozen = False
         try:
             from mindie_knowledge.community import reconcile_batch, submit_batch
 
@@ -124,6 +133,9 @@ class Engine:
             activated_at if type(activated_at) in (int, float) else 0,
             self.store.capture_floor,
         )
+        if self._is_frozen():
+            return dict(status="skipped",
+                        reason="service is not admitting new work")
         captured = self.store.add_capture(
             root_session=root_hash, session=session_id, turn=turn_id,
             transcript=transcript_path, summary=summary or "",
@@ -226,10 +238,20 @@ class Engine:
     def _transcript_increment(self, row, settings, lease, region):
         """Read/filter the authorized increment; reserves regions as it goes.
         Returns (text, summary_only, notes) or None when there is no material."""
+        parser = self.transcript
+        if parser is None:
+            # Missing parser: honest summary-only, never a format guess.
+            if row["summary"].strip():
+                return ("", True, ["no transcript adapter is configured; summary-only"])
+            self.store.mark_capture(
+                row["id"], "failed",
+                "no transcript adapter is configured and no summary",
+            )
+            return None
         boundary = row["boundary"] or settings.enabled_at
         key = str(Path(row["transcript"]).resolve(strict=False))
         cursor = self.store.cursor(key)
-        identity = transcript_mod.identify(row["transcript"])
+        identity = parser.identify(row["transcript"])
         idtext = identity.serialize() if identity else ""
 
         def reserve(start, finish, rdigest, status="attempted", detail=""):
@@ -245,7 +267,7 @@ class Engine:
         start = cursor["finish"] if cursor else 0
         expected = None
         if cursor:
-            expected = transcript_mod.FileIdentity.unserialize(
+            expected = parser.FileIdentity.unserialize(
                 cursor["identity"], key
             )
             if expected is None:
@@ -256,7 +278,7 @@ class Engine:
                     "persisted transcript identity is unusable; not rereading",
                 )
                 return None
-        inc = transcript_mod.read_material(
+        inc = parser.read_material(
             row["transcript"], start, session_id=row["session"],
             not_before=boundary, expected=expected,
         )
@@ -320,6 +342,94 @@ class Engine:
                                 "transcript unreadable and no summary")
         return None
 
+    @staticmethod
+    def _pr_number(pr_url):
+        if not isinstance(pr_url, str):
+            return None
+        tail = pr_url.rstrip("/").rsplit("/", 1)[-1]
+        return int(tail) if tail.isdigit() else None
+
+    def _restore_sent_draft(self, entry_id, generation):
+        """Fetch the exact body this entry last sent so a later same-task
+        observation appends to/updates the prior body instead of replacing it
+        with only the new paragraph.
+
+        Addressed by the per-entry last-confirmed receipt (independent of the
+        newest lineage outbox row): exact confirmed head, path, hash and sent
+        revision. The fetched body must match the retained hash AND parse
+        back to the same entry identity and sent revision. Any mismatch or
+        failure simply keeps the update refused — no base is ever fabricated,
+        a withdrawn entry is never resurrected and a maintainer correction is
+        never overwritten (the retained hash stays the honest expected base).
+        """
+        def fail(reason):
+            self._error(f"restore: {reason}"[:240])
+            return False
+
+        if self.community is None or not generation:
+            return fail("community unavailable")
+        receipt = self.store.sent_receipt(entry_id)
+        if not receipt or receipt.get("generation") not in (generation, None):
+            return fail("no matching receipt")
+        head_sha = receipt.get("head_sha")
+        path = receipt.get("path")
+        expected_hash = receipt.get("sha256")
+        expected_revision = receipt.get("sent_revision")
+        if not head_sha or not path or not expected_revision:
+            return fail("incomplete receipt")
+        settings = self._settings()
+        if not settings.allows_capture() or not settings.repository:
+            return fail("capture disabled")
+        last = None
+        try:
+            from mindie_knowledge.community import gitops
+            from mindie_knowledge.community.common import Deadline
+            from mindie_knowledge.community.publish import _remote_url
+
+            from .documents import parse_entry
+
+            cfg = settings.as_dict()
+            write_repo = cfg.get("fork") or settings.repository
+            deadline = Deadline(cfg.get("transaction_seconds", 120), 30,
+                                cancel=self._cancel)
+            env = gitops.git_env(cfg)
+            work_dir = gitops.ensure_clone(
+                _remote_url(cfg, write_repo),
+                self.state_dir / "git" / write_repo.replace("/", "_"),
+                deadline, env=env,
+            )
+            if not gitops.fetch_commit(work_dir, head_sha, deadline, env=env):
+                last = "commit fetch refused"
+                number = self._pr_number(receipt.get("pr_url"))
+                if number is None:
+                    last = "commit fetch refused and no PR"
+                else:
+                    try:
+                        fetched = gitops.fetch_pr_head(
+                            work_dir, number, "", deadline, env=env
+                        )
+                        if fetched != head_sha:
+                            last = "pr head mismatch"
+                    except Exception as exc:
+                        last = f"{type(exc).__name__}: {exc}"
+            # Clone of main may already hold the receipt head even when a
+            # SHA fetch is refused; show the exact commit either way.
+            raw = gitops.show_file(work_dir, head_sha, path, deadline, env=env)
+            if raw is None:
+                return fail(last or "missing blob at receipt head")
+            normalized = raw.encode("utf-8").replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+            if len(normalized) > 128 * 1024:
+                return fail("blob exceeds limit")
+            if expected_hash and hashlib.sha256(normalized).hexdigest() != expected_hash:
+                return fail("hash mismatch")
+            doc = parse_entry(normalized)
+            if doc["entry_id"] != entry_id or doc["revision"] != expected_revision:
+                return fail("entry or revision mismatch")
+            self.store.restore_draft(entry_id, doc, generation=generation)
+            return True
+        except Exception as exc:
+            return fail(f"{type(exc).__name__}: {exc}")
+
     def _apply(self, result, *, opaque, marker, generation):
         """Deterministic metadata update + append; no repair model call."""
         refs, notes = [], []
@@ -333,11 +443,24 @@ class Engine:
             try:
                 ident = entry.get("entry_id")
                 if ident:
-                    doc, _appended = self.store.append_observation(
-                        ident, entry["content"], marker=marker, producer=opaque,
-                        generation=generation, header={k: entry[k] for k in
-                            ("title", "summary", "conditions") if k in entry},
-                    )
+                    try:
+                        doc, _appended = self.store.append_observation(
+                            ident, entry["content"], marker=marker, producer=opaque,
+                            generation=generation, header={k: entry[k] for k in
+                                ("title", "summary", "conditions") if k in entry},
+                        )
+                    except ValueError as exc:
+                        # A compacted (confirmed-sent) draft has no local body:
+                        # fetch the exact prior remote body once, then append.
+                        if "no local draft" not in str(exc) or not self._restore_sent_draft(
+                            ident, generation
+                        ):
+                            raise
+                        doc, _appended = self.store.append_observation(
+                            ident, entry["content"], marker=marker, producer=opaque,
+                            generation=generation, header={k: entry[k] for k in
+                                ("title", "summary", "conditions") if k in entry},
+                        )
                 else:
                     doc = self.store.create_draft(
                         kind="experience", title=entry["title"],
@@ -345,7 +468,7 @@ class Engine:
                         conditions=entry.get("conditions") or {}, owner=opaque,
                         generation=generation,
                     )
-                refs.append(self.store.ref(doc["entry_id"]))
+                refs.append(self.store.ref(doc["entry_id"], doc["revision"]))
             except DraftFull:
                 notes.append(f"draft full: {entry.get('entry_id')}")
             except ValueError as exc:
@@ -496,16 +619,27 @@ class Engine:
 
     def run(self):
         while not self.stop.is_set():
+            if self._is_frozen():
+                self.stop.wait(0.2)
+                continue
             try:
                 ident = self.queue.get(timeout=0.5)
             except queue.Empty:
+                if self._is_frozen() or self.stop.is_set():
+                    continue
                 ident = self.store.due_capture()
-                if ident:
-                    self._process(ident)
+                if ident and self.begin_work():
+                    try:
+                        self._process(ident)
+                    finally:
+                        self.end_work()
                 continue
             try:
-                if ident:
-                    self._process(ident)
+                if ident and self.begin_work():
+                    try:
+                        self._process(ident)
+                    finally:
+                        self.end_work()
             except MaintenanceCancelled:
                 pass
             except Exception as exc:  # never let the worker die silently
@@ -575,6 +709,10 @@ class Engine:
             attempted=True, detail=receipt.get("detail", ""),
             pr_url=receipt.get("pr_url"), head_sha=receipt.get("head_sha"),
         )
+        if receipt.get("status") in Store_confirmed:
+            # The GitHub branch is now the durable body source: drop the sent
+            # private payload (draft bodies/history, raw summaries, staging).
+            self.store.compact_confirmed(batch_row["batch_id"])
 
     def _reconcile(self, batch_row):
         if self.community is None:
@@ -590,6 +728,8 @@ class Engine:
             detail=receipt.get("detail", ""), pr_url=receipt.get("pr_url"),
             head_sha=receipt.get("head_sha"),
         )
+        if receipt.get("status") in Store_confirmed:
+            self.store.compact_confirmed(batch_row["batch_id"])
 
     def _flush(self):
         """Coalesce all pending material into one batch and send it."""
@@ -621,12 +761,23 @@ class Engine:
                         )
                         self._cancel.clear()
                 self._generation = generation
-                if generation is not None:
+                if generation is not None and not self._is_frozen():
                     for row in self.store.outbox_unresolved()[:2]:
-                        if self.store.reconcile_due(row["batch_id"]):
-                            self._reconcile(row)
+                        if self._is_frozen():
+                            break
+                        if self.store.reconcile_due(row["batch_id"]) and self.begin_work():
+                            try:
+                                self._reconcile(row)
+                            finally:
+                                self.end_work()
                     for row in self.store.outbox_pending()[:2]:
-                        self._submit(row)
+                        if self._is_frozen():
+                            break
+                        if self.begin_work():
+                            try:
+                                self._submit(row)
+                            finally:
+                                self.end_work()
                     material = self.store.drafts_changed(
                         generation=generation
                     ) or self.store.unbatched_votes(generation=generation)
@@ -636,8 +787,15 @@ class Engine:
                             self.admission is not None
                             and not self.admission.leases()
                         )
-                        if idle_for >= settings.idle_seconds or deactivated:
-                            self._flush()
+                        if (
+                            (idle_for >= settings.idle_seconds or deactivated)
+                            and not self._is_frozen()
+                            and self.begin_work()
+                        ):
+                            try:
+                                self._flush()
+                            finally:
+                                self.end_work()
             except Exception as exc:
                 self._error(f"outbox: {type(exc).__name__}: {exc}"[:500])
             self.stop.wait(1.0)
@@ -654,8 +812,58 @@ class Engine:
 
     # ---------------------------------------------------------------- status
 
+    def begin_work(self):
+        """Admit one actual service/worker operation. False when frozen or stopping."""
+        with self._activity_lock:
+            if self._frozen or self.stop.is_set():
+                return False
+            self._activity += 1
+            return True
+
+    def end_work(self):
+        with self._activity_lock:
+            if self._activity > 0:
+                self._activity -= 1
+
+    def _is_frozen(self):
+        with self._activity_lock:
+            return self._frozen or self.stop.is_set()
+
+    def stop_if_idle(self):
+        """Atomically freeze new admission and report whether anything is
+        actually running or queued. Unknown/pending receipts and idle task
+        grants are not activity. Never cancels in-flight work: a busy result
+        unfreezes so the service continues."""
+        with self._activity_lock:
+            if self.stop.is_set():
+                return dict(
+                    idle=True, status="stopping", activity=self._activity,
+                    queued_captures=self.queue.unfinished_tasks,
+                    due_capture=False,
+                )
+            self._frozen = True
+            activity = self._activity
+            queued = self.queue.unfinished_tasks
+        due = self.store.due_capture() is not None
+        busy = activity > 0 or queued > 0 or due
+        if busy:
+            with self._activity_lock:
+                if not self.stop.is_set():
+                    self._frozen = False
+            return dict(
+                idle=False, status="busy", activity=activity,
+                queued_captures=queued, due_capture=due,
+            )
+        return dict(
+            idle=True, status="stopping", activity=0,
+            queued_captures=0, due_capture=False,
+        )
+
     def status(self):
         settings = self._settings()
+        with self._activity_lock:
+            activity = self._activity
+            frozen = self._frozen
         return dict(
             **self.store.status(),
             maintenance_pending=self.queue.unfinished_tasks,
@@ -663,4 +871,6 @@ class Engine:
             sharing=settings.public_status(),
             community_package=self.community is not None,
             errors=self.errors,
+            activity=activity,
+            admission_frozen=frozen,
         )

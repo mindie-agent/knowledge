@@ -1,20 +1,44 @@
 """Explicit local historical planning. No model, service, grant or publication.
 
-The operator must name one source and its native task id. The output consists
-of bounded public-material packets and a durable byte cursor; it is NOT an
-experience corpus. It may contain private task data and must stay local.
+The operator must name one source, its native task id and the adapter-owned
+transcript parser module (core ships no native record parser). The output
+consists of bounded public-material packets and a durable byte cursor; it is
+NOT an experience corpus. It may contain private task data and must stay
+local.
 """
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
+import sys
 import time
 from pathlib import Path
 
-from .transcript import FileIdentity, identify, read_material
+
+def _load_parser(path):
+    """Load the trusted adapter parser module exactly once (registered in
+    sys.modules before execution so dataclasses resolve)."""
+    spec = importlib.util.spec_from_file_location("mindie_history_parser", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(spec.name, None)
+        raise
+    for name in ("FileIdentity", "identify", "read_material"):
+        if not hasattr(module, name):
+            raise ValueError(f"parser module must export {name}")
+    return module
 
 
-def plan(source, session_id, output, *, max_bytes=64*1024*1024, max_seconds=15):
+def plan(source, session_id, output, *, parser, max_bytes=64*1024*1024, max_seconds=15):
+    if parser is None:
+        raise ValueError("history planning requires an explicit transcript parser module")
+    FileIdentity, identify, read_material = (
+        parser.FileIdentity, parser.identify, parser.read_material
+    )
     source = Path(source).resolve()
     output = Path(output)
     if not 1 <= max_bytes <= 1024*1024*1024 or not 0 < max_seconds <= 60:
@@ -84,10 +108,13 @@ def main():
     cmd.add_argument("--source",required=True)
     cmd.add_argument("--session-id",required=True)
     cmd.add_argument("--output",required=True)
+    cmd.add_argument("--parser",required=True,
+                     help="absolute path of the adapter-owned transcript parser module")
     cmd.add_argument("--max-bytes",type=int,default=64*1024*1024)
     cmd.add_argument("--max-seconds",type=float,default=15)
     args=parser.parse_args()
     print(json.dumps(plan(args.source,args.session_id,args.output,
+                         parser=_load_parser(args.parser),
                          max_bytes=args.max_bytes,max_seconds=args.max_seconds)))
 
 

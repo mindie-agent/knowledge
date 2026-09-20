@@ -1,21 +1,24 @@
-"""MindIE domain service CLI and its small MCP surface.
+"""MindIE domain service CLI.
 
-Bounded local commands: ``serve``, ``hook``, ``status``, ``stop``, ``mcp``,
-``sync`` (model-free knowledge update, works with sharing off) and
-``sharing-status`` (read-only). There are no authority/upstream/judge modes.
+Bounded local commands: ``serve``, ``hook``, ``status``, ``stop``, ``sync``
+(model-free knowledge update, works with sharing off), ``sharing-status``
+(read-only) and the deterministic contribution recovery operations
+``contribution-inspect`` / ``contribution-reconcile`` / ``contribution-retry``
+/ ``contribution-compact`` (all require ``--batch``). There are no
+authority/upstream/judge modes.
 
-The MCP surface is exactly ``knowledge_query``, ``knowledge_explain`` and the
-optional ``knowledge_feedback`` — no use/judging forms, no attach tool, no
-capture tool. Each delivered ``tools/call`` is bound to the verified host
-metadata in ``params._meta['x-codex-turn-metadata']`` (thread_id, session_id,
-turn_id; ``_meta.threadId`` must agree). Missing or contradictory metadata is
-a fail-closed diagnostic, never a latest-lease guess. Discovery
-(``initialize``/``tools/list``) is static and starts nothing.
+Native MCP dispatch belongs to the harness adapters; the former core MCP host
+shim (bound to Codex-only turn metadata) is retired — core no longer
+interprets any adapter's metadata format. Engine configuration uses
+``admission_path`` (an explicit neutral admission SQLite file per harness
+domain root) and ``transcript_adapter`` (an absolute local parser module
+path); legacy adapter-config indirection is removed, not aliased.
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import subprocess
@@ -28,26 +31,63 @@ from .engine import Engine
 from .store import Store, canonical
 from .transport import Service, rpc
 
-READONLY = dict(
-    readOnlyHint=True, destructiveHint=False, idempotentHint=True,
-    openWorldHint=False,
-)
-WRITE = dict(
-    readOnlyHint=False, destructiveHint=False, idempotentHint=True,
-    openWorldHint=False,
-)
-
 
 def config_at(path):
     config = json.loads(Path(path).read_text())
     if not isinstance(config, dict) or not {"root", "domain"} <= set(config):
         raise ValueError("configuration requires root and domain")
+    if "session_activation" in config:
+        raise ValueError(
+            "session_activation was removed; configure the neutral "
+            "admission_path SQLite file instead"
+        )
     if "agent_command" in config and (
         not isinstance(config["agent_command"], list)
         or not all(isinstance(x, str) for x in config["agent_command"])
     ):
         raise ValueError("agent_command must be an argv list")
+    if "admission_path" in config and not isinstance(config["admission_path"], str):
+        raise ValueError("admission_path must be an explicit SQLite file path")
+    adapter = config.get("transcript_adapter")
+    if adapter is not None:
+        candidate = Path(adapter)
+        if (
+            not isinstance(adapter, str)
+            or not candidate.is_absolute()
+            or candidate.suffix != ".py"
+        ):
+            raise ValueError(
+                "transcript_adapter must be an absolute local parser module path"
+            )
     return config
+
+
+def load_transcript_adapter(config):
+    """Load the configured trusted parser module exactly once. Missing or
+    invalid configuration means honest summary-only behavior — core never
+    guesses a native format."""
+    adapter = (config or {}).get("transcript_adapter")
+    if not adapter:
+        return None
+    path = Path(adapter)
+    if not path.is_file():
+        raise ValueError(f"transcript_adapter module is missing: {adapter}")
+    spec = importlib.util.spec_from_file_location("mindie_transcript_adapter", path)
+    module = importlib.util.module_from_spec(spec)
+    # Register BEFORE exec: dataclasses and intra-module references resolve
+    # the module through sys.modules during execution.
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(spec.name, None)
+        raise
+    for name in ("FileIdentity", "identify", "read_material"):
+        if not hasattr(module, name):
+            raise ValueError(
+                f"transcript_adapter must export {name}; refusing to guess"
+            )
+    return module
 
 
 def connection_path(config):
@@ -149,180 +189,6 @@ def ensure_service(config_path):
             lock.release()
 
 
-def schema(properties, required):
-    return dict(
-        type="object",
-        properties=properties,
-        required=required,
-        additionalProperties=False,
-    )
-
-
-STRING = {"type": "string"}
-TOOLS = [
-    dict(
-        name="knowledge_query",
-        description="Search the selected domain's knowledge and experience. References are advisory.",
-        inputSchema=schema(
-            dict(
-                query=STRING,
-                limit={"type": "integer", "minimum": 1, "maximum": 20},
-                conditions={"type": "object", "description": "Optional known software versions or source commits; all other context belongs in the query."},
-            ),
-            ["query"],
-        ),
-        annotations=READONLY,
-    ),
-    dict(
-        name="knowledge_explain",
-        description=(
-            "Read the original content, conditions and revision for one domain "
-            "reference. offset and limit are character positions in the entry "
-            "body, not lines; without them the full body is returned."
-        ),
-        inputSchema=schema(
-            dict(
-                ref=STRING,
-                offset={"type": "integer", "minimum": 0,
-                        "description": "Body character offset (0-based), not a line number."},
-                limit={"type": "integer", "minimum": 1, "maximum": 65536,
-                       "description": "Maximum body characters to return, not lines."},
-            ),
-            ["ref"],
-        ),
-        annotations=READONLY,
-    ),
-    dict(
-        name="knowledge_feedback",
-        description=(
-            "Optionally record one up/down vote with an optional one-line reason "
-            "for a reference you actually consulted. Never required; silence is "
-            "not a signal."
-        ),
-        inputSchema=schema(
-            dict(ref=STRING, rating={"type": "string", "enum": ["up", "down"]},
-                 reason=STRING),
-            ["ref", "rating"],
-        ),
-        annotations=WRITE,
-    ),
-]
-
-IDENTITY_ERROR = (
-    "knowledge tools require a host that delivers per-call task metadata "
-    "(x-codex-turn-metadata with matching thread_id/session_id); this host "
-    "did not, so the call is refused instead of guessing an identity"
-)
-
-
-def _bind_identity(params):
-    """Verified per-call identity from host metadata; fail closed otherwise."""
-    meta = params.get("_meta")
-    if not isinstance(meta, dict):
-        raise ValueError(IDENTITY_ERROR)
-    turn = meta.get("x-codex-turn-metadata")
-    if not isinstance(turn, dict):
-        raise ValueError(IDENTITY_ERROR)
-    thread_id = turn.get("thread_id")
-    session_id = turn.get("session_id")
-    if (
-        not isinstance(thread_id, str)
-        or not thread_id
-        or not isinstance(session_id, str)
-        or not session_id
-        or thread_id != session_id
-        or meta.get("threadId") != thread_id
-    ):
-        raise ValueError(IDENTITY_ERROR)
-    return session_id
-
-
-def mcp(config_path):
-    for line in sys.stdin:
-        message = {}
-        try:
-            message = json.loads(line)
-            if not isinstance(message, dict):
-                raise ValueError("JSON-RPC object required")
-            if "id" not in message:
-                continue
-            method = message.get("method")
-            if method == "initialize":
-                result = dict(
-                    protocolVersion="2025-11-25",
-                    capabilities={"tools": {}},
-                    serverInfo={"name": "mindie-knowledge", "version": "0.8.0"},
-                )
-            elif method == "ping":
-                result = {}
-            elif method == "tools/list":
-                result = dict(tools=TOOLS)
-            elif method == "tools/call":
-                params = message.get("params", {})
-                name = params.get("name")
-                item = next((t for t in TOOLS if t["name"] == name), None)
-                if not item:
-                    raise ValueError("unknown tool")
-                args = params.get("arguments", {})
-                if (
-                    not isinstance(args, dict)
-                    or set(args) - set(item["inputSchema"]["properties"])
-                    or set(item["inputSchema"]["required"]) - set(args)
-                ):
-                    raise ValueError("invalid tool arguments")
-                try:
-                    session = _bind_identity(params)
-                    # Check the task's EXISTING lease before any service start:
-                    # an unactivated caller must not create business state.
-                    config = config_at(config_path)
-                    if not config.get("session_activation"):
-                        raise ValueError(
-                            "no adapter admission is configured; identity unknown"
-                        )
-                    from .activation import Admission
-
-                    if Admission(config["session_activation"]).active_lease(session) is None:
-                        raise ValueError("session is not manually activated")
-                    connection = ensure_service(config_path)
-                    payload = rpc(
-                        connection,
-                        name.removeprefix("knowledge_"),
-                        dict(args, _session_id=session, _session_verified=True),
-                        timeout=5,
-                    )
-                    result = dict(
-                        content=[dict(type="text", text=canonical(payload))],
-                        structuredContent=payload,
-                        isError=False,
-                    )
-                except (ValueError, OSError, RuntimeError) as exc:
-                    result = dict(
-                        content=[
-                            dict(
-                                type="text",
-                                text=f"Knowledge unavailable: {exc}. Continue the task independently."[:500],
-                            )
-                        ],
-                        isError=True,
-                    )
-            else:
-                response = dict(
-                    jsonrpc="2.0",
-                    id=message["id"],
-                    error=dict(code=-32601, message="Method not found"),
-                )
-                print(canonical(response), flush=True)
-                continue
-            response = dict(jsonrpc="2.0", id=message["id"], result=result)
-        except (ValueError, KeyError, TypeError) as exc:
-            response = dict(
-                jsonrpc="2.0",
-                id=message.get("id") if isinstance(message, dict) else None,
-                error=dict(code=-32602, message=str(exc)[:400]),
-            )
-        print(canonical(response), flush=True)
-
-
 def capture_hook(config_path, event):
     """Bounded Stop bridge. Fail open for the user's task: no service start,
     no transcript access, no offline queue. Sharing off short-circuits before
@@ -356,11 +222,11 @@ def capture_hook(config_path, event):
         if not settings.allows_capture():
             return  # community off: no capture row, cursor, draft, worker, model
         activation = fields.get("mindie_activation")
-        if not activation or not config.get("session_activation"):
+        if not activation or not config.get("admission_path"):
             return
         from .activation import Admission
 
-        admission = Admission(config["session_activation"])
+        admission = Admission(config["admission_path"])
         try:
             lease = admission.capture_lease(fields["session_id"], activation)
         except ValueError:
@@ -384,6 +250,101 @@ def capture_hook(config_path, event):
         )
     except (OSError, ValueError, KeyError, TypeError):
         pass
+
+
+def contribution_recovery(config, operation, batch_id):
+    """Deterministic, model-free recovery for one existing contribution.
+
+    ``contribution-inspect`` is read-only (loop outbox row + community ledger
+    receipts; starts nothing). ``contribution-reconcile`` runs the bounded
+    explicit read-only inspection — verifying the exact saved expected PR
+    head — and updates BOTH the loop outbox and the community ledger; it
+    stays available after the automatic read budget is exhausted, and
+    exhaustion or a lookup failure stays ``unknown``, never magically
+    confirmed-failed. ``contribution-retry`` resubmits exactly one PROVEN
+    failed stored payload with ``explicit_retry`` (never an unknown,
+    rebuilt or mutated batch).
+    ``contribution-compact`` removes the sent private payload of a confirmed
+    batch. None of these reruns the organizer, resets a capture cursor or
+    replays failed model attempts.
+    """
+    if operation == "contribution-inspect":
+        result = {"batch_id": batch_id, "outbox": None, "ledger": []}
+        store = _open_existing_store(config)
+        if store is not None:
+            try:
+                row = store.batch(batch_id)
+                if row is not None:
+                    result["outbox"] = {
+                        key: row[key]
+                        for key in ("batch_id", "revision", "status", "detail",
+                                    "pr_url", "head_sha", "attempted", "generation")
+                    }
+            finally:
+                store.close()
+        from mindie_knowledge.community.ledger import LEDGER_NAME
+
+        ledger_path = Path(config["root"]) / config["domain"] / "outbox" / LEDGER_NAME
+        if ledger_path.is_file():
+            import sqlite3
+
+            db = sqlite3.connect(ledger_path.as_uri() + "?mode=ro", uri=True)
+            try:
+                names = [r[1] for r in db.execute("PRAGMA table_info(publication)")]
+                result["ledger"] = [
+                    dict(zip(names, row))
+                    for row in db.execute(
+                        "SELECT * FROM publication WHERE batch_id=? ORDER BY created",
+                        (batch_id,),
+                    )
+                ]
+            finally:
+                db.close()
+        return result
+
+    store = _open_existing_store(config)
+    if store is None:
+        raise ValueError("no knowledge store exists for this domain")
+    state_dir = Path(config["root"]) / config["domain"] / "outbox"
+    settings = settings_mod.from_engine_config(config)
+    try:
+        row = store.batch(batch_id)
+        if row is None:
+            raise ValueError("unknown contribution batch in this domain")
+        if operation == "contribution-compact":
+            removed = store.compact_confirmed(batch_id)
+            if removed is None:
+                raise ValueError(
+                    "batch is not confirmed; unresolved/failed unsent work stays available"
+                )
+            return {"batch_id": batch_id, "compacted": removed}
+        from mindie_knowledge.community import inspect_batch, submit_batch
+
+        if operation == "contribution-reconcile":
+            # Explicit bounded read-only inspection: verifies the exact saved
+            # expected PR head and updates the community ledger; works on
+            # cap-exhausted rows too. Unknown stays unknown.
+            receipt = inspect_batch(batch_id, settings.as_dict(), state_dir)
+        else:
+            if row["status"] != "failed":
+                raise ValueError(
+                    "only a proven failed batch is retried explicitly; an "
+                    "uncertain (unknown/unresolved) write is inspected with "
+                    "contribution-reconcile, never replayed"
+                )
+            batch = json.loads(row["batch"])
+            batch["explicit_retry"] = True
+            receipt = submit_batch(batch, settings.as_dict(), state_dir)
+        store.mark_batch(
+            batch_id, receipt.get("status", "unknown"),
+            detail=receipt.get("detail", ""), pr_url=receipt.get("pr_url"),
+            head_sha=receipt.get("head_sha"),
+        )
+        if receipt.get("status") in Store.CONFIRMED_BATCH:
+            store.compact_confirmed(batch_id)
+        return receipt
+    finally:
+        store.close()
 
 
 def _feeds(config, store):
@@ -420,18 +381,25 @@ def main(argv=None):
             "hook",
             "status",
             "stop",
-            "mcp",
             "sync",
             "sharing-status",
             "maintenance-resume",
+            "contribution-inspect",
+            "contribution-reconcile",
+            "contribution-retry",
+            "contribution-compact",
         ],
     )
     parser.add_argument("--config", required=True)
+    parser.add_argument("--batch",
+                        help="Contribution batch id (contribution-* operations only)")
     parser.add_argument("--resume", action="store_true",
                         help="Explicitly resume deferred remote discovery and exhausted candidates (sync only)")
     args = parser.parse_args(argv)
     if args.resume and args.operation != "sync":
         parser.error("--resume applies only to sync")
+    if args.batch and not args.operation.startswith("contribution-"):
+        parser.error("--batch applies only to contribution-* operations")
     if args.operation == "hook":
         try:
             raw = sys.stdin.buffer.read(128 * 1024 + 1)
@@ -442,16 +410,13 @@ def main(argv=None):
         print("{}")
         return 0
     config = config_at(args.config)
-    if args.operation == "mcp":
-        mcp(args.config)
-        return 0
     if args.operation == "serve":
         from .activation import Admission
 
         store = Store(config["root"], config["domain"])
         admission = (
-            Admission(config["session_activation"])
-            if config.get("session_activation")
+            Admission(config["admission_path"])
+            if config.get("admission_path")
             else None
         )
         engine = Engine(
@@ -459,6 +424,7 @@ def main(argv=None):
             agent_command=config.get("agent_command"),
             settings_path=config.get("community_config"),
             admission=admission,
+            transcript_adapter=load_transcript_adapter(config),
         )
         Service(
             engine,
@@ -466,6 +432,12 @@ def main(argv=None):
             admission=admission,
             feeds=_feeds(config, store),
         ).serve()
+        return 0
+    if args.operation.startswith("contribution-"):
+        if not args.batch:
+            parser.error(f"{args.operation} requires --batch")
+        result = contribution_recovery(config, args.operation, args.batch)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     if args.operation == "sync":
         # Standalone model-free knowledge update; never starts the service.

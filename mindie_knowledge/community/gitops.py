@@ -229,8 +229,10 @@ def show_file(work_dir: Path, commit: str, path: str, deadline: Deadline, *, env
     remaining = deadline.step("git show")
     from .common import run_argv as _run
 
+    # `--` marks <rev>:<path> as an object so git does not stat the whole
+    # expression as a working-tree filename (Windows MAX_PATH).
     result = _run(
-        ["git", "show", f"{commit}:{path}"],
+        ["git", "show", f"{commit}:{path}", "--"],
         timeout=min(DEFAULT_GIT_OP_SECONDS, remaining),
         max_output=256 * 1024,
         cwd=work_dir,
@@ -239,6 +241,50 @@ def show_file(work_dir: Path, commit: str, path: str, deadline: Deadline, *, env
     if result.code != 0:
         return None
     return result.out_text
+
+
+def fetch_commit(work_dir: Path, sha: str, deadline: Deadline, *, env=None) -> bool:
+    """Best-effort fetch of one exact commit; False when the server refuses
+    and the object is not already local."""
+    remaining = deadline.step("git fetch commit")
+    from .common import run_argv as _run
+
+    have = _run(
+        ["git", "cat-file", "-e", sha],
+        timeout=min(DEFAULT_GIT_OP_SECONDS, remaining),
+        max_output=4096,
+        cwd=work_dir,
+        env=env or GIT_ENV,
+    )
+    if have.code == 0:
+        return True
+    result = _run(
+        ["git", "fetch", "--quiet", "origin", sha],
+        timeout=min(DEFAULT_GIT_OP_SECONDS, deadline.remaining()),
+        max_output=MAX_GIT_OUTPUT,
+        cwd=work_dir,
+        env=env or GIT_ENV,
+    )
+    return result.code == 0
+
+
+def is_ancestor(work_dir: Path, old: str, new: str, deadline: Deadline, *, env=None) -> bool | None:
+    """True/False ancestry verdict; None when it cannot be decided locally."""
+    remaining = deadline.step("git merge-base")
+    from .common import run_argv as _run
+
+    result = _run(
+        ["git", "merge-base", "--is-ancestor", old, new],
+        timeout=min(DEFAULT_GIT_OP_SECONDS, remaining),
+        max_output=MAX_GIT_OUTPUT,
+        cwd=work_dir,
+        env=env or GIT_ENV,
+    )
+    if result.code == 0:
+        return True
+    if result.code == 1:
+        return False
+    return None
 
 
 def push_branch(work_dir: Path, branch: str, deadline: Deadline, *, env=None, cancel=None) -> None:

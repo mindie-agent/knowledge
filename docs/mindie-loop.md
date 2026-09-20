@@ -3,7 +3,11 @@
 `mindie-knowledge` is the single-domain runtime. Configuration requires `root`
 and `domain`; optional keys are `agent_command` (argv for the maintenance
 runner), `community_config` (shared `mindie-community-config/1` settings file),
-`session_activation` (adapter config for lease checks) and `feeds`.
+`admission_path` (the harness's explicit neutral admission SQLite file, owned
+by core's `Admission` API), `transcript_adapter` (absolute local parser module
+path exporting `FileIdentity`/`identify`/`read_material`; without it capture
+is honest summary-only) and `feeds`. The legacy `session_activation` adapter
+config indirection is rejected, not aliased.
 
 ## The gate
 
@@ -28,12 +32,13 @@ event carries `session_id` and `turn_id`; `transcript_path` and
 summary is still accepted.
 
 The worker reads only the new byte region of the admitted task's own
-transcript (`loop/transcript.py`): structural-signature whitelist of Codex
-JSONL — user messages, public assistant commentary/final/final_answer messages,
-function and custom-tool input/output with call identities. Harness catalogue
-wrappers and duplicate native event wrappers are excluded. A native fork's
-creation time excludes inherited parent material. Hidden reasoning, analysis channels, system/developer content,
-credential fields and other tasks' history are never extracted. File
+transcript through the configured `transcript_adapter` module (an absolute
+local path loaded once at service start; core ships no native record parser —
+the Codex parser is the adapter deliverable, the Kimi parser belongs to the
+Kimi adapter). A missing parser means honest summary-only behavior, never a
+format guess. The adapter parser applies its structural public-material
+allowlist; hidden reasoning, system/developer content, credential fields and
+other tasks' history are never extracted. File
 replacement, truncation, unknown formats and partial trailing records are
 handled explicitly (summary-only degradation within the same attempt, or a
 visible coverage gap); a nonzero cursor resumes exactly where the last region
@@ -145,13 +150,11 @@ community contribution off and never starts the maintenance service.
 
 ## MCP surface
 
-`knowledge_query(query, limit?, conditions?)`, `knowledge_explain(ref,
-offset?, limit?)` (both truthfully annotated read-only) and
-`knowledge_feedback(ref, rating, reason?)` (a write). Every delivered call is
-bound to the host's per-call metadata (`_meta['x-codex-turn-metadata']` with
-matching `threadId`); missing or contradictory metadata fails closed — there
-is no latest-lease guess. Discovery (`initialize`/`tools/list`) is static and
-starts nothing.
+Native MCP dispatch belongs to the harness adapters; the former core MCP host
+shim (bound to Codex-only turn metadata) is retired. Core keeps the
+authenticated loopback RPC the adapters forward to (`query`, `explain`,
+`feedback`, `capture`), each still bound to a verified per-call identity and
+re-checked against the admission store.
 
 ## Commands
 
@@ -163,8 +166,21 @@ mindie-knowledge sync --config domain.json       # one bounded knowledge sync
 mindie-knowledge maintenance-resume --config domain.json
 mindie-knowledge stop --config domain.json
 mindie-knowledge hook --config domain.json       # Stop envelope on stdin
-mindie-knowledge mcp --config domain.json
+mindie-knowledge contribution-inspect --config domain.json --batch ID
+mindie-knowledge contribution-reconcile --config domain.json --batch ID
+mindie-knowledge contribution-retry --config domain.json --batch ID
+mindie-knowledge contribution-compact --config domain.json --batch ID
 ```
+
+The contribution operations are deterministic and model-free: inspect is
+read-only (loop outbox + community ledger); reconcile runs the bounded
+read-only remote inspection and updates both stores (available even after the
+automatic read budget is exhausted); retry resubmits exactly one confirmed
+failed stored payload with `explicit_retry` (unknown outcomes are refused); compact removes the
+sent private payload (draft bodies/history, raw capture summaries, staging)
+of a confirmed batch while keeping IDs, hashes, the retrieval header and
+PR/head receipts. None of them reruns the organizer, resets a capture cursor
+or replays failed model attempts.
 
 Shutdown cancels in-flight maintenance through the shared cancel event,
 drains the queue as never-attempted, and joins workers with bounded waits.
@@ -206,3 +222,26 @@ updates the same file. Pending contributions are rechecked for withdrawal,
 and a remote deletion of an expected base is a conflict, never permission to
 restore the removed body. Existing failed or unknown publication receipts stay
 non-replayable within this format.
+
+
+## Confirmed payload cleanup and idle updates
+
+Confirmation requires a matching remote PR head. Exhausted read-only
+reconciliation leaves an uncertain write `unknown`, preserving inspection
+material and preventing blind replay. Automatic cleanup removes exactly the
+sent draft payload and staging. Capture summaries are cleared only when all
+recorded entry-and-revision references are covered by that confirmed batch;
+newer unsent and ambiguous observations remain available.
+
+Tiny per-entry receipts retain the confirmed head, path, hash, revision,
+PR and contribution generation independently of the latest coalescing batch.
+After A is sent and compacted, a later B-only batch does not erase A's
+receipt. A future A update retrieves the exact prior remote body once before
+appending. This does not retain redundant local body history or authorize
+publishing into a different contribution scope.
+
+The authenticated local `stop_if_idle` RPC freezes admission and initiates
+shutdown only when no actual call, worker or admitted capture work remains.
+Idle authorization grants and pending/unknown durable PR receipts alone do
+not block a version switch. Adapters protect each complete call with their
+operation lock and use this RPC instead of status-then-stop inference.
