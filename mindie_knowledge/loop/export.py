@@ -23,7 +23,7 @@ from mindie_knowledge.markdown import _atomic_write_text
 from mindie_knowledge.redact import scan_text
 
 from .documents import render_entry
-from .store import canonical, digest
+from .store import REPLACEABLE_BATCH, canonical, digest
 
 def _filename(doc):
     subdir = "topics" if doc["kind"] == "knowledge" else "cases"
@@ -62,6 +62,12 @@ def build_batch(store, *, settings, revision_fn=None):
     files staged; the caller submits it. A durable receipt is reserved before
     scanning, so a failed unchanged material revision is never rebuilt.
     """
+    # Waiting for an older write is not an attempt to export new material.
+    # Keep new drafts/votes unconsumed until the lineage is available. The
+    # create_batch transaction repeats this check before replacing any receipt.
+    previous = store.batch(lineage_of(store.domain, settings.generation))
+    if previous is not None and previous["status"] not in REPLACEABLE_BATCH:
+        return None
     if revision_fn is None:
         revision_fn = _community_revision()
     drafts = store.drafts_changed(generation=settings.generation)

@@ -43,6 +43,7 @@ SCHEMA = "mindie-store/3"
 MAX_ENTRIES = 10000
 MAX_VOTE_REASON = 1000
 RATINGS = ("up", "down")
+REPLACEABLE_BATCH = frozenset({"submitted", "updated", "unchanged", "needs_review", "failed"})
 
 # Batch receipts that must never automatically write again.
 TERMINAL_BATCH = ("submitted", "updated", "unchanged", "needs_review", "failed",
@@ -785,9 +786,7 @@ class Store:
                 "SELECT revision, status FROM outbox WHERE batch_id=?", (batch_id,)
             ).fetchone()
             if existing is not None:
-                resumable = {"submitted", "updated", "unchanged", "needs_review",
-                             "failed"}
-                if existing["status"] not in resumable:
+                if existing["status"] not in REPLACEABLE_BATCH:
                     raise ValueError(
                         f"batch lineage has an unresolved {existing['status']} "
                         "receipt; reconcile it before new work"
