@@ -1,0 +1,14 @@
+{
+  "conditions": {},
+  "retrieval": {
+    "aliases": [
+      "A2 BNSD long cached prefill enable_prefill_bnsd",
+      "PR 16012 TND NHD paged KV Ascend attention",
+      "Atlas A2 BF16 head_dim 256 block 128 BNSD",
+      "mixed-layout attention cached prefill vllm-ascend",
+      "Qwen3 BNSD vs TND latency claim Ascend A2"
+    ],
+    "source_sha256": "60b906dcb9b63e04666518e3b05577e535b909127e6827b3f35ad7ca6bf17daa",
+    "topics": []
+  }
+}

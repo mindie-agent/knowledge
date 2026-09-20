@@ -1,0 +1,14 @@
+{
+  "conditions": {},
+  "retrieval": {
+    "aliases": [
+      "A5 Kimi K3 Flash MLA GQA DCP DSpark ACLGraph MRv1 MRv2",
+      "PR 16468 draft head 8a293f0 feat/rfc16464-a5-kimi-k3-flash-mla",
+      "replicated draft KV DCP1 target DCP2 DP4 TP8 acceptance",
+      "B035 AsStrided backing-size gpu_memory_utilization 0.88 workaround",
+      "a5_mla_common flash_mla_with_kvcache causal_conv1d_v2"
+    ],
+    "source_sha256": "38a11d6809b82b07873b6fe9dcbbda62a3d84c15f162ea47a937ae8b0c0d61b5",
+    "topics": []
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "conditions": {},
+  "retrieval": {
+    "aliases": [
+      "MiniMax-M3 CANN Ops generic_block_sparse_attention Ascend",
+      "PR 16904 remove msa_index_score sparse_attention_score",
+      "npu_msa_index_score ACLNN adapter GBSA BF16 FP8",
+      "A5 MiniMax-M3 mixed KV-cache BF16 dense GQA",
+      "vllm-ascend cann_ops_transformer sparse attention cleanup"
+    ],
+    "source_sha256": "72ae50deb34295044eef552569a4fe2ca6ea39c7821c49477b225863ed57239c",
+    "topics": []
+  }
+}

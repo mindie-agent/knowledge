@@ -1,0 +1,19 @@
+{
+  "conditions": {
+    "base_sha": "b255ab59662d8c665e5534e926f913b1c1179b1c",
+    "head_sha": "4f120cbe1b32edf7d9008e68bd22bf19bc696e17",
+    "pr_state": "OPEN",
+    "pull_request": "https://github.com/vllm-project/vllm-ascend/pull/16012",
+    "source_repository": "vllm-project/vllm-ascend",
+    "validation_scope": "source_control_flow_verified; author_claims_separated; NPU_e2e_unverified; OPEN_opt_in_A2_BNSD_prefill; performance_numbers_CLAIM_only"
+  },
+  "retrieval": {
+    "aliases": [
+      "enable_prefill_bnsd A2 BNSD Ascend",
+      "PR 16012 long cached prefill attention",
+      "TND vs BNSD NHD paged KV"
+    ],
+    "source_sha256": "9c489ee0dc5bc1b16d83b61c39b4c2194304897fc5341d9f0fbf1346d880f7fb",
+    "topics": []
+  }
+}

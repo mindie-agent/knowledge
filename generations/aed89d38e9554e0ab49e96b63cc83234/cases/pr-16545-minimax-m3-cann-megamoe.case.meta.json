@@ -1,0 +1,14 @@
+{
+  "conditions": {},
+  "retrieval": {
+    "aliases": [
+      "MiniMax-M3 CANN MegaMoe enable_fused_mc2=2 Ascend",
+      "PR 16545 SwiGLU-OAI activation binding",
+      "Ascend 950 MXFP8 MegaMoe fused_mc2",
+      "vllm-ascend MegaMoe wrapper API fail-closed",
+      "mergeCommit 9ad52992 MiniMax MegaMoe"
+    ],
+    "source_sha256": "9038cbcc4d8b137e143d863832c91f9ac41587a7c16db84e906c99d3edb1e3d3",
+    "topics": []
+  }
+}

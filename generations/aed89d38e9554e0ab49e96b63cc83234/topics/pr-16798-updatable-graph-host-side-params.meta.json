@@ -1,0 +1,19 @@
+{
+  "conditions": {
+    "base_sha": "b255ab59662d8c665e5534e926f913b1c1179b1c",
+    "head_sha": "9f4ac9d1fc2e723115e1bac48ed3c75a10260d4a",
+    "pr_state": "OPEN",
+    "pull_request": "https://github.com/vllm-project/vllm-ascend/pull/16798",
+    "source_repository": "vllm-project/vllm-ascend",
+    "validation_scope": "source_control_flow_verified; author_claims_separated; NPU_e2e_unverified; OPEN_BLOCKED"
+  },
+  "retrieval": {
+    "aliases": [
+      "UpdatableGraph ACL Graph host-side Ascend",
+      "PR 16798 MRV1 MRV2 FIA speculative decoding",
+      "compilation updatable_graph issue 13058"
+    ],
+    "source_sha256": "97edef1f15ea6f26f5fc097f906f9489ea3d4faf7e1b50dfa20ef2a4df3dcc7a",
+    "topics": []
+  }
+}
