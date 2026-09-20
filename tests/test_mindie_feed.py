@@ -3,6 +3,7 @@ empty generations, invalid layouts and persisted attempt budgets."""
 
 import json
 import subprocess
+import time
 
 import pytest
 
@@ -153,22 +154,89 @@ def test_attempts_persist_across_sync_restarts(env, monkeypatch):
     monkeypatch.setattr(feed, "_validate_tree",
                         lambda *a, **k: (_ for _ in ()).throw(OSError("network down")))
     for expected in (1, 2, 3):
-        assert feed.sync(force=True)["status"] == "unavailable"
+        assert feed.sync()["status"] == "unavailable"
         assert store.feed_get(f"feed-candidate:{feed.ident}")["attempts"] == expected
-    assert feed.sync(force=True)["status"] == "exhausted"
+    # Ordinary scheduled calls never reset the per-candidate attempt budget.
+    assert feed.sync()["status"] == "exhausted"
+    assert feed.sync()["status"] == "exhausted"
+    # An explicit resume grants the transiently exhausted candidate one fresh
+    # bounded round, which ordinary calls then keep consuming.
+    assert feed.sync(force=True)["status"] == "unavailable"
+    assert store.feed_get(f"feed-candidate:{feed.ident}")["attempts"] == 1
     monkeypatch.setattr(feed, "_validate_tree", original)
-    assert feed.sync(force=True)["status"] == "exhausted"  # no automatic retry
+    assert feed.sync()["status"] == "synced"
 
-def test_unresolved_remote_stops_after_three_attempts(tmp_path):
+
+def test_invalid_candidate_stays_quarantined_under_resume(env):
+    git, repo, store, feed = env
+    (repo / "corpus").mkdir()
+    (repo / "corpus" / "old.md").write_text("# old\n", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-qm", "unsupported layout")
+    assert feed.sync()["status"] == "invalid"
+    # Explicit resume never revalidates an invalid immutable candidate and
+    # never burns further attempts on it.
+    assert feed.sync(force=True)["status"] == "invalid"
+    candidate = store.feed_get(f"feed-candidate:{feed.ident}")
+    assert candidate["status"] == "invalid" and candidate["attempts"] == 1
+
+
+def test_unresolved_remote_backs_off_one_hour_then_rediscovers(tmp_path):
     store = Store(tmp_path / 'state', 'vllm-ascend')
     try:
         feed = Feed(store, dict(repository='org/knowledge', ref='main', domain='vllm-ascend',
                                 url=str(tmp_path / 'missing-remote')))
         for _ in range(3):
             assert feed.sync()['status'] == 'unavailable'
-        assert feed.sync()['status'] == 'exhausted'
+        discovery = store.feed_get(f'feed-discovery:{feed.ident}')
+        assert discovery['failures'] == 3
+        assert discovery['next_check'] > time.time() + 3500  # one-hour cadence
+        # Deferred ordinary calls stay off the network while backoff is due.
+        assert feed.sync()['status'] == 'deferred'
+        assert feed.sync()['status'] == 'deferred'
         assert store.feed_get(f'feed-discovery:{feed.ident}')['failures'] == 3
+        # Explicit resume skips the backoff and makes one bounded pass now.
         assert feed.sync(force=True)['status'] == 'unavailable'
-        assert store.feed_get(f'feed-discovery:{feed.ident}')['failures'] == 1
+        assert store.feed_get(f'feed-discovery:{feed.ident}')['failures'] == 4
+        # Once the backoff is due, an ordinary call discovers again.
+        store.feed_set(f'feed-discovery:{feed.ident}',
+                       dict(store.feed_get(f'feed-discovery:{feed.ident}'),
+                            next_check=time.time() - 1))
+        assert feed.sync()['status'] == 'unavailable'
+        assert store.feed_get(f'feed-discovery:{feed.ident}')['failures'] == 5
     finally:
         store.close()
+
+
+def test_legacy_exhausted_discovery_without_next_check_is_due_immediately(env):
+    git, repo, store, feed = env
+    commit = commit_docs(git, repo, [entry_doc("6" * 64, "Stranded latch")])
+    # State persisted by the old permanent latch has no next_check.
+    store.feed_set(f"feed-discovery:{feed.ident}", {"failures": 3})
+    assert feed.sync()["status"] == "synced"
+    assert feed.sync()["commit"] == commit
+    discovery = store.feed_get(f"feed-discovery:{feed.ident}")
+    assert discovery["failures"] == 0 and "next_check" not in discovery
+
+
+def test_offline_recovery_through_real_git_remote(env, tmp_path):
+    git, repo, store, feed = env
+    commit = commit_docs(git, repo, [entry_doc("7" * 64, "Returns after outage")])
+    hidden = tmp_path / "hidden-remote"
+    repo.rename(hidden)  # offline: the configured URL no longer resolves
+    try:
+        for _ in range(3):
+            assert feed.sync()["status"] == "unavailable"
+        assert feed.sync()["status"] == "deferred"
+        # Connectivity restored; the backoff is still due, so ordinary callers
+        # do not hammer the network, but nothing is permanently latched.
+        assert feed.sync()["status"] == "deferred"
+    finally:
+        hidden.rename(repo)
+    store.feed_set(f"feed-discovery:{feed.ident}",
+                   dict(store.feed_get(f"feed-discovery:{feed.ident}"),
+                        next_check=time.time() - 1))
+    receipt = feed.sync()  # ordinary invocation discovers again once due
+    assert receipt["status"] == "synced" and receipt["commit"] == commit
+    assert store.feed_get(f"feed-discovery:{feed.ident}")["failures"] == 0
+    assert store.query("Returns after outage")["results"]

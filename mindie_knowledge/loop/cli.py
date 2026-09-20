@@ -428,7 +428,7 @@ def main(argv=None):
     )
     parser.add_argument("--config", required=True)
     parser.add_argument("--resume", action="store_true",
-                        help="Explicitly resume exhausted remote discovery (sync only)")
+                        help="Explicitly resume deferred remote discovery and exhausted candidates (sync only)")
     args = parser.parse_args(argv)
     if args.resume and args.operation != "sync":
         parser.error("--resume applies only to sync")
