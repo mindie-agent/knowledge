@@ -59,6 +59,37 @@ def test_stable_id_revisions_and_pinned_reads(store):
                                  producer="d" * 64)
 
 
+def test_correction_changes_retrieval_header_but_preserves_old_body(store):
+    old=draft(store,summary='Prefix cache is the suspected cause.',content='Initial hypothesis: prefix cache.')
+    new,_=store.append_observation(old['entry_id'],'Later evidence: workspace underallocated.',
+        marker='f'*32,producer=PRODUCER,header={'summary':'Workspace underallocated; prefix hypothesis disproven.'})
+    assert new['summary'].startswith('Workspace')
+    assert 'Initial hypothesis' in new['content'] and 'Later evidence' in new['content']
+    assert store.get(store.ref(old['entry_id'],old['revision']))['summary']==old['summary']
+
+
+def test_quota_deferred_material_keeps_cursor_and_resumes(gated,tmp_path):
+    store,engine,_,_=gated
+    from datetime import datetime,timezone
+    stamp=datetime.now(timezone.utc).isoformat()
+    rollout=tmp_path/'native.jsonl'
+    rollout.write_text(json.dumps({'type':'session_meta','payload':{'id':'manual-A'}})+'\n'+
+        json.dumps({'timestamp':stamp,'type':'response_item','payload':{'type':'message','role':'assistant','phase':'final_answer','content':[{'type':'output_text','text':'Observed device mapping: physical id does not equal logical id.'}]}})+'\n')
+    root=session_key('manual-A')
+    for i in range(6):engine.budget.reserve(str(i),root,'organize');engine.budget.finish(str(i),True)
+    capture=engine.capture(session_id='manual-A',turn_id='defer',transcript_path=str(rollout))
+    # The fixture may root this native child elsewhere; use its actual root key.
+    actual_root=store.capture_row(capture['id'])['root_session']
+    with store.db:store.db.execute('UPDATE maintenance_attempts SET session=?',(actual_root,))
+    engine._process(capture['id'])
+    assert store.capture_row(capture['id'])['status']=='pending'
+    assert store.cursor(str(rollout.resolve())) is None
+    with store.db:store.db.execute('UPDATE maintenance_attempts SET started=started-3602')
+    engine._process(capture['id'])
+    assert store.capture_row(capture['id'])['status']=='organized'
+    assert store.cursor(str(rollout.resolve()))['finish']==rollout.stat().st_size
+
+
 def test_vote_replaces_per_root_and_stays_opaque(store):
     doc = draft(store)
     first = store.record_vote(root_hash=session_key("root-1"), ref=doc["entry_id"],
@@ -182,6 +213,7 @@ def test_cursor_persists_full_anchor_identity_and_tamper_fails_closed(gated, tmp
 
     stamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     with open(rollout, "w", encoding="utf-8", newline="\n") as f:
+        f.write(json.dumps({"type":"session_meta","payload":{"id":"manual-A"}})+"\n")
         f.write(json.dumps({"timestamp": stamp, "type": "response_item",
                             "payload": {"type": "message", "role": "user",
                                         "content": [{"type": "input_text",
@@ -220,6 +252,7 @@ def test_failed_region_is_consumed_and_never_replayed(gated, tmp_path):
 
     stamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     with open(rollout, "w", encoding="utf-8", newline="\n") as f:
+        f.write(json.dumps({"type":"session_meta","payload":{"id":"manual-A"}})+"\n")
         f.write(json.dumps({"timestamp": stamp, "type": "response_item",
                             "payload": {"type": "message", "role": "user",
                                         "content": [{"type": "input_text",

@@ -118,6 +118,8 @@ class Store:
                 value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY,
                 value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS continuations(capture_id TEXT PRIMARY KEY,
+                due REAL NOT NULL, reason TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS grants(kind TEXT NOT NULL,
                 identity TEXT NOT NULL, revision TEXT NOT NULL,
                 generation TEXT NOT NULL, created REAL NOT NULL,
@@ -289,7 +291,7 @@ class Store:
         return doc
 
     def append_observation(self, entry_id, addition, *, marker, producer=None,
-                           generation=None):
+                           generation=None, header=None):
         """Append one bounded observation/correction to a local draft.
 
         Idempotent on ``marker`` (the reserved increment identity): a repeated
@@ -320,6 +322,14 @@ class Store:
             doc, appended = documents.append_observation(base, addition, marker=marker)
             if not appended:
                 return doc, False
+            if header:
+                # The body remains an append-only evidence trail. Retrieval
+                # must describe the latest conclusion, including its correction.
+                for key in ("title", "summary", "conditions", "sources"):
+                    if key in header:
+                        doc[key] = header[key]
+                doc["revision"] = documents.revision_of(doc)
+                documents.validate(doc)
             self._insert_revision(doc, row["origin"], now)
             if generation is not None:
                 self.db.execute(
@@ -367,8 +377,8 @@ class Store:
             return [self._revision_doc(r["entry_id"], r["draft_revision"])
                     for r in rows]
 
-    def draft_headers(self, *, producer=None, limit=8, excerpt=600,
-                      generation=None):
+    def draft_headers(self, *, producer=None, limit=6, excerpt=1200,
+                      generation=None, query=""):
         """Compact headers plus short excerpts as organizer context. With
         ``generation``, only material granted to that sharing generation is
         offered as update context."""
@@ -382,13 +392,13 @@ class Store:
                     "AND grants.generation=? "
                     "WHERE entries.draft_revision IS NOT NULL "
                     "ORDER BY entries.updated DESC LIMIT ?",
-                    (generation, limit * 4),
+                    (generation, 256),
                 ).fetchall()
             else:
                 rows = self.db.execute(
                     "SELECT entry_id, draft_revision FROM entries "
                     "WHERE draft_revision IS NOT NULL "
-                    "ORDER BY updated DESC LIMIT ?", (limit * 4,),
+                    "ORDER BY updated DESC LIMIT ?", (256,),
                 ).fetchall()
         headers = []
         for row in rows:
@@ -398,11 +408,17 @@ class Store:
             headers.append(dict(
                 entry_id=doc["entry_id"], title=doc["title"],
                 revision=doc["revision"],
-                summary=doc["summary"], excerpt=doc["content"][:excerpt],
+                summary=doc["summary"],
+                excerpt=(doc["content"] if len(doc["content"]) <= excerpt else
+                         doc["content"][:excerpt//3] + "\n[earlier body omitted]\n" +
+                         doc["content"][-2*excerpt//3:]),
             ))
-            if len(headers) >= limit:
-                break
-        return headers
+        if query:
+            import re
+            terms = set(re.findall(r"[\w.-]{3,}", query.lower()))
+            headers.sort(key=lambda h: sum(term in (h["title"]+" "+h["summary"]+" "+h["excerpt"]).lower()
+                                           for term in terms), reverse=True)
+        return headers[:limit]
 
     # ---------------------------------------------------------------- search
 
@@ -795,6 +811,25 @@ class Store:
                 "UPDATE captures SET status=?, detail=? WHERE id=?",
                 (status, str(detail)[:1000], ident),
             )
+            if status not in {"queued", "pending", "deferred"}:
+                self.db.execute("DELETE FROM continuations WHERE capture_id=?", (ident,))
+
+    def defer_capture(self, ident, *, due, reason):
+        with self._write_txn():
+            self.db.execute("UPDATE captures SET status='pending', detail=? WHERE id=?",
+                            (reason[:1000], ident))
+            self.db.execute("INSERT OR REPLACE INTO continuations VALUES(?,?,?)",
+                            (ident, due, reason[:1000]))
+
+    def due_capture(self):
+        with self.lock:
+            row = self.db.execute(
+                "SELECT c.id FROM captures c LEFT JOIN continuations q ON q.capture_id=c.id "
+                "WHERE c.status IN ('queued','pending','deferred') "
+                "AND COALESCE(q.due,0)<=? ORDER BY COALESCE(q.due,0), c.created LIMIT 1",
+                (time.time(),),
+            ).fetchone()
+            return row[0] if row else None
 
     def cursor(self, file_identity):
         with self.lock:

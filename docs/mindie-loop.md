@@ -29,8 +29,10 @@ summary is still accepted.
 
 The worker reads only the new byte region of the admitted task's own
 transcript (`loop/transcript.py`): structural-signature whitelist of Codex
-JSONL — user messages, assistant `final`-channel messages, bounded tool
-input/output. Hidden reasoning, analysis channels, system/developer content,
+JSONL — user messages, public assistant commentary/final/final_answer messages,
+function and custom-tool input/output with call identities. Harness catalogue
+wrappers and duplicate native event wrappers are excluded. A native fork's
+creation time excludes inherited parent material. Hidden reasoning, analysis channels, system/developer content,
 credential fields and other tasks' history are never extracted. File
 replacement, truncation, unknown formats and partial trailing records are
 handled explicitly (summary-only degradation within the same attempt, or a
@@ -38,18 +40,36 @@ visible coverage gap); a nonzero cursor resumes exactly where the last region
 ended. Each region `(file identity, start, end, digest)` is durably reserved
 BEFORE the model call, so failures, crashes and cancellation all consume it;
 the attempted cursor and the last-successful cursor are separate, and failed
-regions stay visible as coverage gaps (`status` shows them).
+regions stay visible as coverage gaps (`status` shows them). Local scans are
+bounded to 16 MiB / 2 seconds and a 48 KiB public text envelope. Noise advances
+the durable cursor without calling a model. A public record that does not fit
+stays at the next cursor; head/tail field clipping and oversized record skips
+are explicit coverage gaps. Reads validate task identity, inode and prefix on
+the same file handle, including nonzero offsets.
 
 One organizer model call per accepted increment (input 64 KiB, structured
-result 32 KiB, runner 60s/outer 65s, one concurrent call, 6 per task, 20 per
+result 32 KiB, runner 120s/outer 125s, one concurrent call, 6 per task-hour, 20 per
 domain-hour, pause after three consecutive failures; attempts are persisted
-before spawn and never replayed). A deterministic redaction mask runs before
+before spawn and never replayed). Quota-deferred material stays unattempted;
+its persisted continuation survives restart. Only fresh/unattempted regions
+resume automatically; interrupted or failed model regions never replay.
+A deterministic redaction mask runs before
 the model, and every candidate entry is scanned again before becoming a
 draft. Organizer output is at most three entries: `entry_id: null` creates a
 draft owned by the producing task's opaque identity; a non-null id appends a
 self-contained observation to that draft, deduplicated by the increment
-marker. Bodies are capped at 64 KiB (`draft full` stops expansion — no
+marker. Corrections append to the body and update the current retrieval header;
+previous pinned revisions remain unchanged. Context selection includes recent
+correction tails and matches task-owned headers to the current material.
+Bodies are capped at 64 KiB (`draft full` stops expansion — no
 auto-condense or extra model).
+
+For explicit local historical experiments, `python -m
+mindie_knowledge.loop.history plan --source FILE --session-id ID --output DIR`
+creates bounded public-material packets and a resumable source snapshot.
+These are private local planning files, not experiences: this command never
+starts a model/service, creates a publication grant or uploads anything.
+Normal capture never invokes historical planning or backfills sharing-off time.
 
 ## Entries, drafts, publication
 

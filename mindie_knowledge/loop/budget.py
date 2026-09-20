@@ -4,11 +4,14 @@ import time
 
 
 class BudgetExceeded(RuntimeError):
-    pass
+    def __init__(self, message, *, retry_at=None):
+        super().__init__(message)
+        self.retry_at = retry_at  # only unattempted quota-deferred work may resume
 
 
 class MaintenanceBudget:
     SESSION_LIMIT = 6
+    SESSION_WINDOW = 3600
     HOURLY_LIMIT = 20
     FAILURE_LIMIT = 3
 
@@ -39,12 +42,17 @@ class MaintenanceBudget:
                 )
             if (
                 db.execute(
-                    "SELECT count(*) FROM maintenance_attempts WHERE session=?",
-                    (session,),
+                    "SELECT count(*) FROM maintenance_attempts WHERE session=? AND started>?",
+                    (session, now - self.SESSION_WINDOW),
                 ).fetchone()[0]
                 >= self.SESSION_LIMIT
             ):
-                raise BudgetExceeded("session maintenance call limit reached")
+                first = db.execute(
+                    "SELECT MIN(started) FROM maintenance_attempts WHERE session=? AND started>?",
+                    (session, now - self.SESSION_WINDOW),
+                ).fetchone()[0]
+                raise BudgetExceeded("session rolling maintenance limit reached",
+                                     retry_at=first + self.SESSION_WINDOW + 1)
             if (
                 db.execute(
                     "SELECT count(*) FROM maintenance_attempts WHERE started>?",
@@ -52,12 +60,15 @@ class MaintenanceBudget:
                 ).fetchone()[0]
                 >= self.HOURLY_LIMIT
             ):
-                raise BudgetExceeded("domain hourly maintenance call limit reached")
+                first = db.execute("SELECT MIN(started) FROM maintenance_attempts WHERE started>?",
+                                   (now - 3600,)).fetchone()[0]
+                raise BudgetExceeded("domain hourly maintenance call limit reached",
+                                     retry_at=first + 3601)
             if db.execute(
                 "SELECT 1 FROM maintenance_attempts WHERE status='running' AND started>?",
-                (now - 75,),
+                (now - 135,),
             ).fetchone():
-                raise BudgetExceeded("another maintenance call is in progress")
+                raise BudgetExceeded("another maintenance call is in progress", retry_at=now + 135)
             db.execute(
                 "INSERT INTO maintenance_attempts VALUES(?,?,?,?,?)",
                 (ident, session, role, now, "running"),
@@ -106,6 +117,7 @@ class MaintenanceBudget:
                     (time.time() - 3600,),
                 ).fetchone()[0],
                 session_call_limit=self.SESSION_LIMIT,
+                session_window_seconds=self.SESSION_WINDOW,
                 hourly_call_limit=self.HOURLY_LIMIT,
                 max_concurrent_calls=1,
             )

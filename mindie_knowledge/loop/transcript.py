@@ -22,6 +22,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -149,11 +151,15 @@ def same_file(identity: FileIdentity | None, current: FileIdentity | None) -> bo
 
 
 def _clip(value, limit):
+    """UTF-8 byte cap preserving both the cause and the last observed outcome."""
     text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
-    text = " ".join(text.split())
-    if len(text) > limit:
-        return text[: limit - 12].rstrip() + "…[truncated]"
-    return text
+    raw = text.encode("utf-8")
+    if len(raw) <= limit:
+        return text
+    marker = "\n…[field truncated; head and tail retained]…\n"
+    budget = max(0, limit - len(marker.encode()))
+    head = budget * 2 // 3
+    return raw[:head].decode("utf-8", "ignore") + marker + raw[-(budget-head):].decode("utf-8", "ignore")
 
 
 def _timestamp(record):
@@ -162,60 +168,65 @@ def _timestamp(record):
         return None
     try:
         parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
     except ValueError:
         return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.timestamp()
+
+
+PUBLIC = {None, "final", "final_answer", "commentary"}
+KNOWN = {"session_meta", "turn_context", "response_item", "event_msg", "compacted"}
+RECORD_LIMIT = 1024 * 1024
 
 
 def _extract(record):
-    """Whitelisted extraction from one parsed record.
-
-    Returns ``(kind, text)`` for content that may leave the local filter, or
-    None for records that are structurally recognized but not public content
-    (reasoning, system/developer material, bookkeeping).
-    """
+    """Structural public-field allowlist; never recursively traverse a payload."""
     rtype = record.get("type")
-    if rtype in _META_TYPES:
-        return ("meta", None)
-    if rtype != _ITEM_TYPE or not isinstance(record.get("payload"), dict):
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
         return None
-    payload = record["payload"]
+    if rtype == "session_meta":
+        return ("meta", None)
+    # Native event wrappers duplicate response_item messages. They are recognized
+    # as bookkeeping below, but not extracted twice into the model material.
+    if rtype != "response_item":
+        return None
+    if payload.get("channel") not in PUBLIC or payload.get("phase") not in PUBLIC:
+        return None
     ptype = payload.get("type")
-    if ptype == "message":
-        role = _MESSAGE_ROLES.get(payload.get("role"))
-        if role is None:
-            return None  # system/developer messages are never public content
-        # A role alone never makes content public: assistant messages carry an
-        # explicit channel and only the known public `final` channel may be
-        # extracted. `analysis` (private reasoning) and any unknown channel are
-        # excluded. User messages are the task's own public input.
-        if role == "assistant":
-            channel = payload.get("channel")
-            if channel is not None and channel != "final":
-                return None
-        parts = []
-        content = payload.get("content")
-        if isinstance(content, list):
-            for item in content:
-                if (
-                    isinstance(item, dict)
-                    and item.get("type") in _TEXT_CONTENT
-                    and isinstance(item.get("text"), str)
-                    and (role == "user" or item.get("channel") in (None, "final"))
-                ):
-                    parts.append(item["text"])
-        if not parts:
+    if ptype in {"message", "agent_message"}:
+        role = payload.get("role", "assistant" if ptype == "agent_message" else None)
+        if role not in {"user", "assistant"}:
             return None
-        return (role, _clip("\n".join(parts), MAX_FIELD))
-    if ptype == "function_call":
+        if ptype == "agent_message" and isinstance(payload.get("text"), str):
+            return (role, _clip(payload["text"], 12288))
+        content = payload.get("content")
+        if not isinstance(content, list):
+            return None
+        parts = [item["text"] for item in content if isinstance(item, dict)
+                 and item.get("type") in _TEXT_CONTENT
+                 and isinstance(item.get("text"), str)
+                 and item.get("channel") in PUBLIC]
+        text = "\n".join(parts)
+        if role == "user" and text.lstrip().startswith((
+            "<recommended_plugins>", "<environment_context>",
+            "# AGENTS.md instructions", "<permissions instructions>",
+            "<skills_instructions>", "<app-context>",
+        )):
+            return None
+        text = re.sub(r"<oai-mem-citation>.*?</oai-mem-citation>", "", text, flags=re.S)
+        return (role, _clip(text, 12288)) if text.strip() else None
+    if ptype in {"function_call", "custom_tool_call"}:
         name = payload.get("name")
         if not isinstance(name, str) or not name.strip():
             return None
-        return ("tool", f"{_clip(name, 120)} {_clip(payload.get('arguments', ''), MAX_TOOL_FIELD)}")
-    if ptype == "function_call_output":
-        return ("output", _clip(payload.get("output", ""), MAX_TOOL_FIELD))
+        value = payload.get("input", "") if ptype == "custom_tool_call" else payload.get("arguments", "")
+        call = _clip(payload.get("call_id", ""), 256)
+        return ("tool", f"{_clip(name, 120)} call_id={call} {_clip(value, 8192)}")
+    if ptype in {"function_call_output", "custom_tool_call_output"}:
+        call = _clip(payload.get("call_id", ""), 256)
+        return ("output", f"call_id={call} {_clip(payload.get('output', ''), 8192)}")
     return None
 
 
@@ -226,192 +237,153 @@ def _session_of(record):
     return ident if isinstance(ident, str) and ident else None
 
 
-def read_increment(path, start, *, session_id=None, not_before=None,
-                   expected: FileIdentity | None = None):
-    """Read and filter the new byte region of one transcript.
-
-    ``start`` is the previously consumed offset. ``not_before`` (Unix seconds)
-    is the capture-authorization boundary: older records are consumed but not
-    included, and if records without a usable timestamp had to be admitted the
-    result is flagged ``timestamps_reliable=False`` so the caller can degrade
-    to summary-only instead of backfilling unbounded history.
+def read_material(path, start, *, session_id=None, not_before=None, expected=None,
+                  max_scan_bytes=16777216, max_seconds=2.0, max_text_bytes=49152):
+    """Scan noise without model work, stopping BEFORE the next public record
+    would exceed the text envelope. Every consumed byte is hashed exactly.
+    Large records and field truncations are explicit coverage gaps, never
+    interpreted as evidence. All validation and reads use the same descriptor.
     """
-    result = dict(
-        status="ok", start=start, end=start, digest=hashlib.sha256(b"").hexdigest(),
-        text="", records=0, skipped_records=0, oversize_records=0, partial=False,
-        more=False, timestamps_reliable=True, session_match=None, coverage_note=None,
-    )
-    current = identify(path)
-    if current is None:
-        result.update(status="missing", coverage_note="transcript is unreadable")
-        return result
     if type(start) is not int or start < 0:
         raise ValueError("start must be a nonnegative offset")
-    if expected is not None and not same_file(expected, current):
-        result.update(status="replaced", coverage_note="transcript was replaced")
-        return result
-    if current.size < start:
-        result.update(status="replaced", coverage_note="transcript was truncated")
-        return result
-    if current.size == start:
-        result["status"] = "unchanged"
-        return result
-
+    if not 1024 <= max_scan_bytes <= 64*1024*1024 or not 0 < max_seconds <= 30:
+        raise ValueError("invalid scan budget")
+    if not 16384 <= max_text_bytes <= MAX_TEXT:
+        raise ValueError("invalid text budget")
+    result = dict(status="ok", start=start, end=start, digest=hashlib.sha256(b"").hexdigest(),
+                  text="", records=0, skipped_records=0, oversize_records=0,
+                  partial=False, more=False, timestamps_reliable=True,
+                  session_match=None, coverage_note=None, coverage=[])
     consumed = hashlib.sha256()
-    lines = []           # (line_bytes, offset, length_with_newline)
-    try:
-        with open(current.path, "rb", buffering=0) as stream:
-            # Check the handle that supplies the increment too: the path may
-            # have been replaced after the initial identity comparison.
-            stat = os.fstat(stream.fileno())
-            if expected is not None and (
-                (expected.dev and stat.st_dev != expected.dev)
-                or (expected.ino and stat.st_ino != expected.ino)
-                or hashlib.sha256(stream.read(expected.anchor_len)).hexdigest()
-                != expected.anchor_digest
-            ):
-                result.update(status="replaced", coverage_note="transcript changed before read")
-                return result
-            stream.seek(start)
-            window = stream.read(MAX_WINDOW + 1)
-    except OSError:
-        result.update(status="missing", coverage_note="transcript is unreadable")
-        return result
-    if not window:
-        result["status"] = "unchanged"
-        return result
-    more = len(window) > MAX_WINDOW
-    if more:
-        window = window[:MAX_WINDOW]
-    offset, cursor = start, start
-    while cursor < start + len(window):
-        newline = window.find(b"\n", cursor - start)
-        if newline == -1:
-            # Trailing partial record: never parsed, never consumed.
-            if cursor == start and (more or current.size > start + len(window)):
-                # One record larger than the whole window: consume it blind as
-                # an oversize skip so the cursor cannot stall forever.
-                blind = len(window)
-                result["oversize_records"] += 1
-                lines.append((None, cursor, blind))
-                cursor += blind
-            else:
-                result["partial"] = True
-            break
-        # `newline` is window-relative; `cursor` is absolute. Keep all
-        # accounting absolute so a nonzero start cannot loop or go negative.
-        line_end = start + newline + 1
-        raw_line = window[cursor - start : line_end - start]
-        lines.append((raw_line, cursor, line_end - cursor))
-        cursor = line_end
-    if lines and lines[-1][0] is None:
-        result["more"] = True
-    elif more or current.size > cursor:
-        result["more"] = True
-
-    included, skipped = [], 0
     recognized = 0
-    json_objects = 0
-    end = start
-    for raw_line, line_start, length in lines:
-        chunk = (
-            raw_line
-            if raw_line is not None
-            else window[line_start - start : line_start - start + length]
-        )
-        if raw_line is not None and len(raw_line) <= MAX_RECORD_BYTES:
-            owner = None
-            record = None
-            stripped = raw_line.strip()
-            if stripped:
-                try:
-                    record = json.loads(stripped.decode("utf-8"))
-                except (UnicodeDecodeError, ValueError):
-                    record = None
-                if isinstance(record, dict) and isinstance(record.get("type"), str):
-                    owner = _session_of(record)
-            if owner is not None and session_id and owner != session_id:
-                # Another task's file: stop before consuming the foreign record.
-                result.update(
-                    status="wrong-task",
-                    session_match=False,
-                    coverage_note="transcript belongs to another task",
-                    end=end,
-                    digest=consumed.hexdigest(),
-                )
+    included = []
+    text_size = 0
+    turn = None
+    begun = time.monotonic()
+    try:
+        with open(path, "rb") as stream:
+            stat = os.fstat(stream.fileno())
+            anchor = stream.read(ANCHOR_BYTES)
+            current = FileIdentity(str(Path(path).resolve()), stat.st_dev, stat.st_ino,
+                                   stat.st_size, stat.st_mtime_ns, len(anchor),
+                                   hashlib.sha256(anchor).hexdigest())
+            result["identity"] = current.serialize()
+            result["snapshot_size"] = stat.st_size
+            if expected is not None:
+                stream.seek(0)
+                if (expected.path != current.path or expected.dev != stat.st_dev
+                    or expected.ino != stat.st_ino or not expected.anchor_len
+                    or hashlib.sha256(stream.read(expected.anchor_len)).hexdigest() != expected.anchor_digest):
+                    result.update(status="replaced", coverage_note="transcript changed before read")
+                    return result
+            if stat.st_size < start:
+                result.update(status="replaced", coverage_note="transcript truncated")
                 return result
-        end = line_start + length
-        consumed.update(chunk)
-        if raw_line is None:
-            continue  # blind oversize skip accounted above
-        if len(raw_line) > MAX_RECORD_BYTES:
-            result["oversize_records"] += 1
-            skipped += 1
-            continue
-        stripped = raw_line.strip()
-        if not stripped:
-            continue
-        try:
-            record = json.loads(stripped.decode("utf-8"))
-        except (UnicodeDecodeError, ValueError):
-            skipped += 1
-            continue
-        if not isinstance(record, dict) or not isinstance(record.get("type"), str):
-            skipped += 1
-            continue
-        json_objects += 1
-        owner = _session_of(record)
-        if owner is not None:
-            recognized += 1
-            result["session_match"] = True
-            continue
-        extracted = _extract(record)
-        if extracted is None:
-            skipped += 1
-            continue
-        recognized += 1
-        kind, text = extracted
-        if kind == "meta":
-            continue
-        if not_before is not None:
-            stamp = _timestamp(record)
-            if stamp is not None and stamp < not_before:
-                skipped += 1
-                continue
-            if stamp is None:
-                # No usable timestamp: never admit text that might predate the
-                # authorization boundary; flag the whole increment unreliable.
-                result["timestamps_reliable"] = False
-                skipped += 1
-                continue
-        if len(included) >= MAX_RECORDS:
-            skipped += 1
-            continue
-        included.append(f"[{kind}] {text}")
-
-    text = "\n".join(included)
-    if len(text.encode("utf-8")) > MAX_TEXT:
-        raw_text = text.encode("utf-8")[: MAX_TEXT - 32]
-        text = raw_text.decode("utf-8", "ignore") + "\n…[increment truncated]"
-    result.update(
-        end=end,
-        digest=consumed.hexdigest(),
-        text=text,
-        records=len(included),
-        skipped_records=skipped,
-    )
-    if end > start and recognized == 0 and json_objects > 0:
-        result.update(
-            status="unknown-format",
-            text="",
-            coverage_note="no recognized transcript signature; summary-only",
-        )
-    elif end > start and recognized == 0 and json_objects == 0 and skipped:
-        result.update(
-            status="unknown-format",
-            text="",
-            coverage_note="no parseable transcript records; summary-only",
-        )
-    elif end == start:
+            # Task identity is checked even at a nonzero cursor. The metadata
+            # line alone is bounded; no foreign public material is returned.
+            stream.seek(0)
+            header = stream.readline(RECORD_LIMIT + 1)
+            try:
+                meta = json.loads(header) if len(header) <= RECORD_LIMIT else {}
+                owner = _session_of(meta) if isinstance(meta, dict) else None
+            except ValueError:
+                owner = None
+            if owner:
+                recognized += 1
+                result["session_match"] = not session_id or owner == session_id
+                if not result["session_match"]:
+                    result.update(status="wrong-task", coverage_note="transcript belongs to another task")
+                    return result
+            elif session_id:
+                result.update(status="unknown-format", coverage_note="task metadata unavailable; no public read")
+                return result
+            parent = meta.get("payload", {}).get("forked_from_id") if isinstance(meta, dict) else None
+            fork_time = None
+            if parent:
+                fork_time = _timestamp({"timestamp": meta["payload"].get("timestamp")})
+                if fork_time is None:
+                    result.update(status="unknown-format",coverage_note="fork timestamp unavailable; inherited material not read")
+                    return result
+            stream.seek(max(0, start-1))
+            middle = start > 0 and stream.read(1) != b"\n"
+            stream.seek(start)
+            end_limit = min(stat.st_size, start + max_scan_bytes)
+            while stream.tell() < end_limit and time.monotonic()-begun < max_seconds:
+                offset = stream.tell()
+                room = end_limit - offset
+                raw = stream.readline(min(RECORD_LIMIT+1, room))
+                if not raw:
+                    break
+                complete = raw.endswith(b"\n")
+                oversize = (middle or len(raw) > RECORD_LIMIT or
+                            (not complete and offset == start and len(raw) == max_scan_bytes
+                             and end_limit < stat.st_size))
+                if not complete and not oversize:
+                    # A budget boundary or incomplete append must not consume
+                    # a record that fits our record bound on the next call.
+                    result["partial"] = offset+len(raw) == stat.st_size
+                    break
+                if oversize:
+                    consumed.update(raw)
+                    result["end"] = stream.tell()
+                    result["oversize_records"] += 1
+                    result["coverage"].append(dict(start=offset,end=stream.tell(),reason="oversize record skipped"))
+                    middle = not complete
+                    continue
+                try:
+                    record = json.loads(raw)
+                except (ValueError, UnicodeDecodeError):
+                    record = None
+                extracted = None
+                if isinstance(record, dict):
+                    if record.get("type") in KNOWN:
+                        recognized += 1
+                    foreign = _session_of(record)
+                    if foreign and session_id and foreign != session_id:
+                        if foreign != parent:
+                            result.update(status="wrong-task",text="",session_match=False)
+                            return result
+                    if record.get("type") == "turn_context":
+                        turn = (record.get("payload") or {}).get("turn_id")
+                    extracted = _extract(record)
+                    if fork_time is not None:
+                        stamp = _timestamp(record)
+                        if stamp is None or stamp < fork_time:
+                            extracted = None  # inherited parent context, never a new experience
+                if extracted and extracted[1]:
+                    stamp = _timestamp(record)
+                    if not_before is not None and (stamp is None or stamp < not_before):
+                        if stamp is None:
+                            result["timestamps_reliable"] = False
+                        extracted = None
+                    else:
+                        kind, text = extracted
+                        label = f"[{kind} timestamp={record.get('timestamp','unknown')} turn={turn or 'unknown'} bytes={offset}:{stream.tell()}]"
+                        rendered = label + "\n" + text
+                        size = len(rendered.encode()) + 2
+                        if text_size + size > max_text_bytes or len(included) >= MAX_RECORDS:
+                            break  # cursor remains before this unadmitted record
+                        included.append(rendered)
+                        text_size += size
+                        if "[field truncated;" in text:
+                            result["coverage"].append(dict(start=offset,end=stream.tell(),reason="field head/tail truncation"))
+                if not extracted or not extracted[1]:
+                    result["skipped_records"] += 1
+                consumed.update(raw)
+                result["end"] = stream.tell()
+            result["more"] = result["end"] < stat.st_size
+    except OSError:
+        result.update(status="missing",coverage_note="transcript unreadable")
+        return result
+    result.update(digest=consumed.hexdigest(),text="\n\n".join(included),records=len(included))
+    if result["end"] == start:
         result["status"] = "unchanged"
+    elif not recognized:
+        result.update(status="unknown-format",text="",coverage_note="no recognized native signature")
     return result
+
+
+def read_increment(path, start, *, session_id=None, not_before=None, expected=None):
+    """Compatibility entry point for callers explicitly requesting a small scan."""
+    return read_material(path, start, session_id=session_id, not_before=not_before,
+                         expected=expected, max_scan_bytes=MAX_WINDOW)

@@ -41,6 +41,18 @@ def test_session_and_hourly_limits_apply_to_successes_too(store):
         budget.reserve("extra", "another", "organize")
 
 
+def test_session_quota_rolls_forward_without_replaying_old_attempts(store, monkeypatch):
+    clock=[10000.0];monkeypatch.setattr(time,'time',lambda:clock[0])
+    budget=MaintenanceBudget(store)
+    for i in range(6):
+        budget.reserve(str(i),'s','organize');budget.finish(str(i),True)
+    with pytest.raises(BudgetExceeded) as exc:budget.reserve('next','s','organize')
+    assert exc.value.retry_at>clock[0]
+    clock[0]+=3602
+    budget.reserve('next','s','organize');budget.finish('next',True)
+    with pytest.raises(BudgetExceeded,match='already been attempted'):budget.reserve('0','s','organize')
+
+
 def test_failures_pause_across_restart_and_resume_does_not_replay(store):
     budget = MaintenanceBudget(store)
     for i in range(3):

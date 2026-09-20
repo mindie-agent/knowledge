@@ -181,3 +181,60 @@ def test_authorization_boundary_filters_history(tmp_path):
     inc = transcript.read_increment(str(path), 0, not_before=boundary)
     assert "after enable" in inc["text"]
     assert "before enable" not in inc["text"]
+
+
+def test_custom_tools_public_phases_and_noise_are_recognized(tmp_path):
+    path=tmp_path/'native.jsonl'
+    write_jsonl(path,[meta(),message('assistant','private phase',phase='analysis'),
+        message('assistant','public final',phase='final_answer'),
+        {'type':'response_item','payload':{'type':'custom_tool_call','name':'functions.exec','call_id':'c1','input':'await tools.exec_command({cmd:"npu-smi"})'}},
+        {'type':'response_item','payload':{'type':'custom_tool_call_output','call_id':'c1','output':'actual bounded output'}},
+        {'type':'event_msg','payload':{'type':'token_count','secret':'not public'}}])
+    inc=transcript.read_material(path,0,session_id='task-1')
+    assert 'public final' in inc['text'] and 'npu-smi' in inc['text']
+    assert 'call_id=c1' in inc['text'] and 'actual bounded output' in inc['text']
+    assert 'private phase' not in inc['text'] and 'not public' not in inc['text']
+    old=path.stat().st_size
+    with path.open('a') as f:
+        f.write(json.dumps({'type':'event_msg','payload':{'type':'token_count'}})+'\n')
+    noise=transcript.read_material(path,old,session_id='task-1')
+    assert noise['status']=='ok' and not noise['text'] and noise['end']==path.stat().st_size
+
+
+def test_full_text_envelope_does_not_consume_the_next_record(tmp_path):
+    path=tmp_path/'native.jsonl'
+    write_jsonl(path,[meta()]+[message('user',f'unique-{i} '+ 'x'*10000) for i in range(9)])
+    cursor=0; texts=[]
+    for _ in range(10):
+        inc=transcript.read_material(path,cursor,session_id='task-1',max_text_bytes=16384)
+        texts.append(inc['text']);assert inc['end']>cursor
+        assert inc['digest']==__import__('hashlib').sha256(path.read_bytes()[cursor:inc['end']]).hexdigest()
+        cursor=inc['end']
+        if not inc['more']:break
+    assert cursor==path.stat().st_size
+    for i in range(9):assert '\n'.join(texts).count(f'unique-{i}')==1
+
+
+def test_foreign_identity_is_checked_at_nonzero_offset(tmp_path):
+    path=tmp_path/'native.jsonl';write_jsonl(path,[meta('foreign'),message('user','private')])
+    offset=path.read_bytes().index(b'\n')+1
+    inc=transcript.read_material(path,offset,session_id='task-1')
+    assert inc['status']=='wrong-task' and not inc['text']
+
+
+def test_fork_inherited_parent_material_is_excluded(tmp_path):
+    path=tmp_path/'fork.jsonl'
+    head=meta('child');head['payload'].update(forked_from_id='parent',timestamp='2026-09-20T00:30:00Z')
+    old=message('user','inherited parent secret');old['timestamp']='2026-09-20T00:00:00Z'
+    write_jsonl(path,[head,meta('parent'),old,message('assistant','child finding',phase='final_answer')])
+    inc=transcript.read_material(path,0,session_id='child')
+    assert inc['status']=='ok' and 'child finding' in inc['text']
+    assert 'inherited parent secret' not in inc['text']
+
+
+def test_harness_catalog_is_noise_not_task_material(tmp_path):
+    path=tmp_path/'native.jsonl'
+    write_jsonl(path,[meta(),message('user','<recommended_plugins>noise catalog</recommended_plugins>'),
+                     message('user','actual user task')])
+    inc=transcript.read_material(path,0,session_id='task-1')
+    assert 'catalog' not in inc['text'] and 'actual user task' in inc['text']

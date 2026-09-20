@@ -133,10 +133,8 @@ class Engine:
         try:
             self.queue.put_nowait(captured["id"])
         except queue.Full:
-            self.store.mark_capture(
-                captured["id"], "discarded", "maintenance queue full"
-            )
-            return dict(status="discarded", reason="maintenance queue full")
+            self.store.defer_capture(captured["id"], due=time.time()+1,
+                                     reason="bounded memory queue full; persisted for later scan")
         self.last_activity = time.monotonic()
         return captured
 
@@ -168,7 +166,7 @@ class Engine:
                 raise MaintenanceCancelled("project scope is no longer allowed")
         return settings
 
-    def agent(self, payload, *, attempt_id, root_hash, gate=None):
+    def agent(self, payload, *, attempt_id, root_hash, gate=None, reserve_region=None):
         raw = canonical(payload)
         if len(raw.encode("utf-8")) > MAX_INPUT:
             raise ValueError("maintenance input exceeds limit")
@@ -179,8 +177,10 @@ class Engine:
             self._gate_live()
             if gate is not None:
                 gate()  # identical-authorization recheck immediately before spawn
+            if reserve_region is not None:
+                reserve_region()  # budget admitted; consume exactly this input before spawn
             output = bounded_run(
-                self.agent_command, raw, timeout=65, max_output=131072,
+                self.agent_command, raw, timeout=125, max_output=131072,
                 cancel=self._cancel,
             )
             result = json.loads(output)
@@ -250,21 +250,21 @@ class Engine:
                     "persisted transcript identity is unusable; not rereading",
                 )
                 return None
-        inc = transcript_mod.read_increment(
+        inc = transcript_mod.read_material(
             row["transcript"], start, session_id=row["session"],
             not_before=boundary, expected=expected,
         )
+        idtext = inc.get("identity", idtext)
         status = inc["status"]
         region.update(inc=inc, key=key, reserve=reserve)
         if status == "ok" and inc["text"].strip():
-            region["region_id"] = reserve(inc["start"], inc["end"], inc["digest"])
             if not inc.get("timestamps_reliable", True):
                 # Filtering by the authorization boundary was unreliable:
                 # never admit possibly preauthorization text; degrade instead.
                 if row["summary"].strip():
                     return ("", True, ["unreliable record timestamps; summary-only"])
-                self.store.finish_region(region["region_id"], "failed",
-                                         "unreliable timestamps and no summary")
+                region_id = reserve(inc["start"], inc["end"], inc["digest"], status="failed")
+                self.store.finish_region(region_id, "failed", "unreliable timestamps and no summary")
                 self.store.mark_capture(row["id"], "failed",
                                         "unreliable timestamps and no summary")
                 return None
@@ -275,9 +275,11 @@ class Engine:
                 region_id = reserve(inc["start"], inc["end"], inc["digest"],
                                     status="succeeded", detail="no public material")
                 self.store.finish_region(region_id, "succeeded")
-            if row["summary"].strip():
-                return ("", True, ["no new public transcript material; summary-only"])
-            self.store.mark_capture(row["id"], "no-new-material")
+            if inc.get("more") and inc["end"] > inc["start"]:
+                self.store.defer_capture(row["id"], due=time.time()+1,
+                                         reason="noise scanned; more authorized bytes remain")
+            else:
+                self.store.mark_capture(row["id"], "no-new-material")
             return None
         if status == "unknown-format":
             region["region_id"] = reserve(inc["start"], inc["end"], inc["digest"])
@@ -325,7 +327,8 @@ class Engine:
                 if ident:
                     doc, _appended = self.store.append_observation(
                         ident, entry["content"], marker=marker, producer=opaque,
-                        generation=generation,
+                        generation=generation, header={k: entry[k] for k in
+                            ("title", "summary", "conditions", "sources") if k in entry},
                     )
                 else:
                     doc = self.store.create_draft(
@@ -345,6 +348,8 @@ class Engine:
     def _process(self, ident):
         row = self.store.capture_row(ident)
         if row is None:
+            return
+        if row["status"] not in {"queued", "pending", "deferred"}:
             return
         settings = self._settings()
         if not settings.allows_capture():
@@ -397,19 +402,31 @@ class Engine:
                     summary_only=summary_only, notes=notes,
                     gaps=len(self.store.coverage_gaps(region.get("key", "")))
                     if region.get("key") else 0,
+                    ranges=inc.get("coverage", []),
+                    start=inc.get("start"), end=inc.get("end"),
+                    more=inc.get("more", False),
                 ),
                 existing_drafts=self.store.draft_headers(
-                    producer=opaque, generation=row["generation"]),
+                    producer=opaque, generation=row["generation"], query=masked),
                 retrieved_refs=[
                     hit["ref"]
                     for hit in self.store.query(masked[:2000], limit=5)["results"]
                 ],
             )
+            # Keep the new evidence intact; older optional context yields first
+            # when UTF-8 headers would exceed the worker envelope.
+            while payload["existing_drafts"] and len(canonical(payload).encode()) > MAX_INPUT:
+                payload["existing_drafts"].pop()
+            def reserve_input():
+                if inc and not region.get("region_id"):
+                    region["region_id"] = region["reserve"](inc["start"], inc["end"], inc["digest"])
+                self.store.mark_capture(ident, "processing", "input reserved; no retry of this region")
             try:
                 result = self.agent(
-                    payload, attempt_id=f"organize:{ident}",
+                    payload, attempt_id=f"organize:{ident}:{marker}",
                     root_hash=row["root_session"],
                     gate=lambda: self._revalidate(row),
+                    reserve_region=reserve_input,
                 )
                 self._revalidate(row)  # again before applying any result
             except MaintenanceCancelled as exc:
@@ -428,7 +445,15 @@ class Engine:
                 )
             detail = canonical(dict(refs=refs, notes=notes))[:1000]
             self.store.mark_capture(ident, "organized", detail)
+            if inc.get("more") and inc["end"] > inc["start"]:
+                self.store.defer_capture(ident, due=time.time()+1,
+                                         reason="organized one bounded increment; continuation pending")
             self.last_activity = time.monotonic()
+        except BudgetExceeded as exc:
+            if exc.retry_at is not None and not region.get("region_id"):
+                self.store.defer_capture(ident, due=exc.retry_at, reason=str(exc))
+            else:
+                self.store.mark_capture(ident, "discarded", str(exc))
         except Exception as exc:
             detail = f"{type(exc).__name__}: {exc}"[:1000]
             self._error(detail)
@@ -441,10 +466,12 @@ class Engine:
     def start(self):
         with self.store.lock, self.store.db:
             self.store.db.execute(
-                "UPDATE captures SET status='discarded', "
-                "detail='service restarted before processing completed' "
-                "WHERE status='queued'"
+                "UPDATE captures SET status='failed', "
+                "detail='service restarted after input reservation; not replaying' "
+                "WHERE status='processing'"
             )
+            self.store.db.execute("UPDATE regions SET status='failed', detail='interrupted attempt; no replay' WHERE status='attempted'")
+            self.store.db.execute("UPDATE maintenance_attempts SET status='failed' WHERE status='running'")
         self.revoke_stale()
         self.thread.start()
         self.outbox_thread.start()
@@ -465,6 +492,9 @@ class Engine:
             try:
                 ident = self.queue.get(timeout=0.5)
             except queue.Empty:
+                ident = self.store.due_capture()
+                if ident:
+                    self._process(ident)
                 continue
             try:
                 if ident:
@@ -475,15 +505,11 @@ class Engine:
                 self._error(f"{type(exc).__name__}: {exc}"[:1000])
             finally:
                 self.queue.task_done()
-        while True:  # shutdown: drain explicitly; nothing replays
+        while True:  # unattempted queued work remains durable across restart
             try:
                 ident = self.queue.get_nowait()
             except queue.Empty:
                 break
-            if ident:
-                self.store.mark_capture(
-                    ident, "discarded", "service stopping before processing"
-                )
             self.queue.task_done()
 
     # ---------------------------------------------------------------- outbox
