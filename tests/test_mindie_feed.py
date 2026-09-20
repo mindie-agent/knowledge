@@ -20,7 +20,7 @@ def init_repo(path):
     def git(*args):
         return subprocess.check_output(["git", "-C", str(path), *args], text=True).strip()
 
-    git("init", "-q")
+    git("init", "-q", "-b", "main")
     git("config", "user.name", "test")
     git("config", "user.email", "test@example.com")
     git("config", "core.autocrlf", "false")
@@ -148,3 +148,17 @@ def test_attempts_persist_across_sync_restarts(env, monkeypatch):
     assert feed.sync(force=True)["status"] == "exhausted"
     monkeypatch.setattr(feed, "_validate_tree", original)
     assert feed.sync(force=True)["status"] == "exhausted"  # no automatic retry
+
+def test_unresolved_remote_stops_after_three_attempts(tmp_path):
+    store = Store(tmp_path / 'state', 'vllm-ascend')
+    try:
+        feed = Feed(store, dict(repository='org/knowledge', ref='main', domain='vllm-ascend',
+                                url=str(tmp_path / 'missing-remote')))
+        for _ in range(3):
+            assert feed.sync()['status'] == 'unavailable'
+        assert feed.sync()['status'] == 'exhausted'
+        assert store.feed_get(f'feed-discovery:{feed.ident}')['failures'] == 3
+        assert feed.sync(force=True)['status'] == 'unavailable'
+        assert store.feed_get(f'feed-discovery:{feed.ident}')['failures'] == 1
+    finally:
+        store.close()

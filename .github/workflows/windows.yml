@@ -21,7 +21,7 @@ jobs:
         with:
           python-version: '3.13'
           activate-environment: false
-      - name: Install the local knowledge runtime and intake reader
+      - name: Install the local knowledge runtime
         run: |
           uv venv
           uv pip install -e '.[test]'

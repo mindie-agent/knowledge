@@ -20,13 +20,14 @@ model, and it is bounded to 30 seconds per attempt.
 from __future__ import annotations
 
 import re
-import subprocess
+import os
 import time
 from pathlib import Path
 
 from . import documents
 from .locks import StartInProgress, StartLock
 from .store import digest
+from mindie_knowledge.community.common import CommunityError, run_argv
 
 MAX_FILES = 1024
 MAX_TOTAL_BYTES = 32 * 1024 * 1024
@@ -70,29 +71,43 @@ class Feed:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("knowledge sync attempt exceeded 30 seconds")
-        completed = subprocess.run(
+        maximum = documents.MAX_FILE_BYTES + 8192 if args[0] == "cat-file" else 1024 * 1024
+        try:
+            completed = run_argv(
             ["git", "-C", str(self.repo), *args],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            timeout=min(remaining, 25), check=False,
-        )
-        if completed.returncode != 0:
-            raise OSError(
-                f"git {args[0]} failed: {completed.stderr.decode('utf-8', 'replace')[:300]}"
+                timeout=min(remaining, 25), max_output=maximum, input_bytes=b"",
+                env={"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_COUNT": "1",
+                     "GIT_CONFIG_KEY_0": "core.hooksPath", "GIT_CONFIG_VALUE_0": os.devnull},
             )
-        return completed.stdout
+        except CommunityError as exc:
+            raise OSError(f"bounded git {args[0]} failed: {exc}") from exc
+        if completed.timed_out:
+            raise TimeoutError(f"git {args[0]} exceeded the sync deadline")
+        if completed.code != 0:
+            raise OSError(
+                f"git {args[0]} failed: {completed.err_text[:300]}"
+            )
+        return completed.out
 
     def _clone(self, deadline):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("knowledge sync attempt exceeded 30 seconds")
-        completed = subprocess.run(
-            ["git", "clone", "--bare", "--quiet", self.url, str(self.repo)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-            timeout=min(remaining, 25), check=False,
-        )
-        if completed.returncode != 0:
+        try:
+            completed = run_argv(
+                ["git", "clone", "--bare", "--quiet", "--depth=1", "--single-branch",
+                 "--branch", self.ref, self.url, str(self.repo)],
+                timeout=min(remaining, 25), max_output=65536, input_bytes=b"",
+                env={"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_COUNT": "1",
+                     "GIT_CONFIG_KEY_0": "core.hooksPath", "GIT_CONFIG_VALUE_0": os.devnull},
+            )
+        except CommunityError as exc:
+            raise OSError(f"bounded git clone failed: {exc}") from exc
+        if completed.timed_out:
+            raise TimeoutError("git clone exceeded the sync deadline")
+        if completed.code != 0:
             raise OSError(
-                f"git clone failed: {completed.stderr.decode('utf-8', 'replace')[:300]}"
+                f"git clone failed: {completed.err_text[:300]}"
             )
 
     # ----------------------------------------------------------------- sync
@@ -177,6 +192,16 @@ class Feed:
                         retained_commit=receipt.get("commit"))
         try:
             deadline = time.monotonic() + ATTEMPT_SECONDS
+            discovery_key = f"feed-discovery:{self.ident}"
+            discovery = self.store.feed_get(discovery_key) or {}
+            if force:
+                discovery = {}  # explicit operator action, never the updater path
+            if discovery.get("failures", 0) >= ATTEMPT_LIMIT:
+                return dict(status="exhausted", repository=self.repository,
+                            retained_commit=receipt.get("commit"),
+                            detail="remote discovery failed three times; explicit sync --resume required")
+            discovery["failures"] = discovery.get("failures", 0) + 1
+            self.store.feed_set(discovery_key, discovery)  # consume a crash before discovery
             try:
                 if not self.repo.is_dir():
                     self._clone(deadline)
@@ -192,6 +217,7 @@ class Feed:
                     checked=time.time(),
                 ))
                 return self.store.feed_get(receipt_key)
+            self.store.feed_set(discovery_key, {"failures": 0, "commit": commit})
             if receipt.get("commit") == commit and not force:
                 self.store.feed_set(receipt_key, dict(
                     receipt, status="unchanged", checked=time.time()))

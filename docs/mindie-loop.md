@@ -133,3 +133,18 @@ Process bounding is portable on POSIX (process groups); on Windows the Job
 Object assignment races the already-running child, so reliable tree ownership
 there is NOT proven and awaits an atomic create/assign/resume sequence plus
 real Windows acceptance.
+
+### Exhausted discovery and trusted publication validation
+
+Each feed refresh has a 30-second execution budget. Git output and process
+ownership are bounded. Three consecutive failures before resolving the remote
+commit stop automatic discovery for that feed; an operator may run
+`mindie-knowledge sync --config CONFIG --resume` to admit a new discovery
+attempt. This does not replay failed model work or clear invalid candidate
+history. Successful discovery resets this consecutive transport-failure count.
+
+Content CI invokes the pinned installed package with
+`python -I -m mindie_knowledge.publication_check --repo CHECKOUT --revision SHA`.
+The validator reads immutable Git blobs, accepts an empty publication, and
+checks canonical documents, feedback, file modes, sizes and private-data
+findings. Candidate repository Python is never imported or executed.

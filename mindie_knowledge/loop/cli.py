@@ -421,7 +421,11 @@ def main(argv=None):
         ],
     )
     parser.add_argument("--config", required=True)
+    parser.add_argument("--resume", action="store_true",
+                        help="Explicitly resume exhausted remote discovery (sync only)")
     args = parser.parse_args(argv)
+    if args.resume and args.operation != "sync":
+        parser.error("--resume applies only to sync")
     if args.operation == "hook":
         try:
             raw = sys.stdin.buffer.read(128 * 1024 + 1)
@@ -461,7 +465,7 @@ def main(argv=None):
         # Standalone model-free knowledge update; never starts the service.
         store = Store(config["root"], config["domain"])
         try:
-            result = [feed.sync() for feed in _feeds(config, store)]
+            result = [feed.sync(force=args.resume) for feed in _feeds(config, store)]
         finally:
             store.close()
         print(json.dumps(result, ensure_ascii=False, indent=2))

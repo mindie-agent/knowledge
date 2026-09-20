@@ -15,44 +15,10 @@ from pathlib import Path
 import pytest
 
 
-def _install_core_documents():
-    """Mount the in-flight core documents module exactly as root's integration will.
+from mindie_knowledge.loop import documents  # integrated package is required
 
-    The community package delegates to ``mindie_knowledge.loop.documents``. In
-    this worktree core has not landed yet, so tests load the sibling core
-    worktree's real file under that module name. If it is absent, document-
-    dependent tests skip with an explicit integration-dependency reason.
-    """
-    try:
-        import mindie_knowledge.loop.documents  # noqa: F401
-
-        return True
-    except ImportError:
-        pass
-    import importlib.util
-    import os
-
-    sibling = os.environ.get(
-        "MINDIE_CORE_WORKTREE", "/Users/maoxx241/code/mindie-sharing-20260920/core-kimi"
-    )
-    candidate = Path(sibling) / "mindie_knowledge/loop/documents.py"
-    if not candidate.is_file():
-        return False
-    spec = importlib.util.spec_from_file_location("mindie_knowledge.loop.documents", candidate)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    sys.modules["mindie_knowledge.loop.documents"] = module
-    import mindie_knowledge.loop as _loop
-
-    _loop.documents = module
-    return True
-
-
-CORE_DOCUMENTS = _install_core_documents()
-requires_core_documents = pytest.mark.skipif(
-    not CORE_DOCUMENTS,
-    reason="integration dependency: core mindie_knowledge.loop.documents not available",
-)
+CORE_DOCUMENTS = True
+requires_core_documents = pytest.mark.skipif(False, reason="integrated core is present")
 
 from mindie_knowledge.community import entrydoc  # noqa: F401  (delegates to core documents)
 from mindie_knowledge.community.batch import batch_revision

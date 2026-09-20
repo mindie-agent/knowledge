@@ -200,11 +200,11 @@ def bounded_run(command, payload, *, timeout, max_output, cancel=None):
         input_file.write(payload.encode())
         input_file.seek(0)
         process = _spawn(command, input_file)
-        # 256 x 4 KiB chunks caps in-flight pipe memory well under max_output.
-        chunks = queue.Queue(maxsize=256)
+        chunks = queue.Queue(maxsize=max(2, max_output // 4096 + 1))
+        readers_stop = threading.Event()
         readers = [
             threading.Thread(
-                target=_reader, args=(stream, tag, chunks, cancel), daemon=True
+                target=_reader, args=(stream, tag, chunks, readers_stop), daemon=True
             )
             for stream, tag in ((process.stdout, "out"), (process.stderr, "err"))
         ]
@@ -238,6 +238,7 @@ def bounded_run(command, payload, *, timeout, max_output, cancel=None):
                 raise RuntimeError(f"maintenance agent exited {code}")
             return output.decode()
         finally:
+            readers_stop.set()
             terminate_tree(process)
             try:
                 process.wait(timeout=1)
