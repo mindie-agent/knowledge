@@ -238,7 +238,7 @@ class Engine:
             return ("", True, ["no reliable authorization boundary; summary-only"])
         start = cursor["finish"] if cursor else 0
         expected = None
-        if cursor and cursor.get("identity"):
+        if cursor:
             expected = transcript_mod.FileIdentity.unserialize(
                 cursor["identity"], key
             )

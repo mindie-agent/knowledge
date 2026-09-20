@@ -261,6 +261,17 @@ def read_increment(path, start, *, session_id=None, not_before=None,
     lines = []           # (line_bytes, offset, length_with_newline)
     try:
         with open(current.path, "rb", buffering=0) as stream:
+            # Check the handle that supplies the increment too: the path may
+            # have been replaced after the initial identity comparison.
+            stat = os.fstat(stream.fileno())
+            if expected is not None and (
+                (expected.dev and stat.st_dev != expected.dev)
+                or (expected.ino and stat.st_ino != expected.ino)
+                or hashlib.sha256(stream.read(expected.anchor_len)).hexdigest()
+                != expected.anchor_digest
+            ):
+                result.update(status="replaced", coverage_note="transcript changed before read")
+                return result
             stream.seek(start)
             window = stream.read(MAX_WINDOW + 1)
     except OSError:
