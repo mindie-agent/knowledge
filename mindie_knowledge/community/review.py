@@ -96,6 +96,14 @@ def _review(repo, number, settings, bot, ledger, transport, deadline, state_dir)
                                  ledger, transport, deadline, state_dir)
     if not ledger.reserve_review(repo, number, head_sha):
         recorded = ledger.get_review(repo, number, head_sha)
+        if (recorded["status"] == "pending"
+                and recorded["verdict"] in MERGEABLE_VERDICTS):
+            # The review itself is done (model ran at most once, long ago);
+            # only the deterministic merge guard re-runs once checks finish.
+            return _merge_reviewed(repo, number, pr, head_sha, recorded["verdict"],
+                                   "resumed after checks settled", settings, bot, ledger,
+                                   transport, deadline, state_dir, reviewed_sha=head_sha,
+                                   patch_sha=recorded.get("patch_sha") or None)
         return _review_receipt(repo, number, head_sha, recorded["status"], recorded["verdict"],
                                "this head was already reviewed once; not repeating")
 
@@ -209,7 +217,8 @@ def _validate_snapshot(snapshot, settings) -> list[str]:
         name = item.get("filename", "")
         try:
             if profile == "plugin":
-                _check_plugin_path(name)
+                _check_plugin_path(name, (settings.get("bot") or {}).get("skill_prefix")
+                                     or "plugins/mindie-agent/skills")
             else:
                 check_path(name)
         except CommunityError as exc:
@@ -250,21 +259,10 @@ def _validate_snapshot(snapshot, settings) -> list[str]:
     return problems
 
 
-def _check_plugin_path(name: str) -> None:
-    pure = PurePosixPath(name)
-    parts = pure.parts
-    if len(parts) < 3 or parts[0] != "skills":
-        raise CommunityError(f"{name}: plugin PRs may only touch skills/<slug>/ package files")
-    tail = parts[-1]
-    if tail == "SKILL.md" and len(parts) == 3:
-        return
-    if tail == "openai.yaml" and parts[-2] == "agents" and len(parts) == 4:
-        return
-    if parts[-2] == "references" and tail.endswith(".md"):
-        return
-    raise CommunityError(
-        f"{name}: not an allowed Skill package path (SKILL.md, agents/openai.yaml, references/*.md)"
-    )
+def _check_plugin_path(name: str, prefix: str) -> None:
+    from .skill import check_skill_package_path
+
+    check_skill_package_path(name, prefix)
 
 
 def _is_pure_structural_votes(snapshot) -> bool:
@@ -391,19 +389,32 @@ def _validate_proposal(payload: Mapping[str, Any], snapshot) -> dict[str, Any]:
         if findings:
             raise CommunityError(f"{path}: proposed edit carries redaction findings")
         checked_edits.append({"path": path, "content": content})
-    conditions = payload.get("conditions") or {}
-    if not isinstance(conditions, Mapping):
-        raise CommunityError("review proposal conditions must be a mapping of path to mapping")
+    conditions = payload.get("conditions") or []
+    # The adapter's strict native schema carries conditions as a bounded array
+    # of {path,key,value}; convert deterministically to the path->mapping form.
+    if isinstance(conditions, Mapping):
+        conditions = [
+            {"path": path, "key": k, "value": v}
+            for path, mapping in conditions.items()
+            if isinstance(mapping, Mapping)
+            for k, v in mapping.items()
+        ]
+    if not isinstance(conditions, list) or len(conditions) > 20:
+        raise CommunityError("review proposal conditions must be a bounded list")
     checked_conditions: dict[str, dict[str, str]] = {}
-    for path, mapping in conditions.items():
-        path = check_path(path)
+    for item in conditions:
+        if not isinstance(item, Mapping):
+            raise CommunityError("review proposal condition must be an object")
+        path = check_path(item.get("path"))
         if path.startswith("feedback/"):
             raise CommunityError("conditions edits do not apply to feedback files")
-        if not isinstance(mapping, Mapping) or not all(
-            isinstance(k, str) and isinstance(v, str) for k, v in mapping.items()
-        ):
-            raise CommunityError(f"{path}: conditions must be a string mapping")
-        checked_conditions[path] = {str(k): str(v) for k, v in mapping.items()}
+        key = item.get("key")
+        value = item.get("value")
+        if not isinstance(key, str) or not key.strip() or len(key) > 128:
+            raise CommunityError(f"{path}: condition key must be bounded text")
+        if not isinstance(value, str) or not value.strip() or len(value) > 512:
+            raise CommunityError(f"{path}: condition value must be bounded text")
+        checked_conditions.setdefault(path, {})[key.strip()] = value.strip()
     retire = payload.get("retire")
     checked_retire = None
     if retire is not None:

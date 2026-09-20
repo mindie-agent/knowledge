@@ -86,6 +86,11 @@ def validate_vote(vote: Any, index: int) -> dict[str, Any]:
     return out
 
 
+def vote_key(vote: Mapping[str, Any]) -> tuple[str, str, str]:
+    """One current vote per opaque root + entry + revision (contract note 19)."""
+    return (vote["root_id"], vote["entry_id"], vote["revision"])
+
+
 def validate_feedback(text: str, path: str) -> dict[str, Any]:
     try:
         data = json.loads(text)
@@ -97,12 +102,19 @@ def validate_feedback(text: str, path: str) -> dict[str, Any]:
     if not isinstance(votes, list) or len(votes) > 500:
         raise CommunityError(f"{path}: votes must be a list of at most 500")
     seen: set[str] = set()
+    seen_keys: set[tuple[str, str, str]] = set()
     out = []
     for index, vote in enumerate(votes):
         checked = validate_vote(vote, index)
         if checked["vote_id"] in seen:
             raise CommunityError(f"{path}: duplicate vote_id {checked['vote_id']!r}")
+        key = vote_key(checked)
+        if key in seen_keys:
+            raise CommunityError(
+                f"{path}: duplicate vote for the same root/entry/revision"
+            )
         seen.add(checked["vote_id"])
+        seen_keys.add(key)
         out.append(checked)
     unknown = set(data) - {"schema", "votes"}
     if unknown:
@@ -111,17 +123,22 @@ def validate_feedback(text: str, path: str) -> dict[str, Any]:
 
 
 def merge_votes(existing: Iterable[Mapping[str, Any]], new: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """Append new authorized votes; a repeated vote_id updates, never doubles."""
-    merged: dict[str, dict[str, Any]] = {}
+    """Append new authorized votes; the same root/entry/revision updates in place.
+
+    Keying on the (root_id, entry_id, revision) tuple — not only vote_id —
+    means a revision change is preserved as a distinct vote while cross-file
+    or cross-batch duplicates of the same vote can never multiply counts.
+    """
+    merged: dict[tuple[str, str, str], dict[str, Any]] = {}
     for vote in existing:
-        merged[vote["vote_id"]] = dict(vote)
+        merged[vote_key(vote)] = dict(vote)
     for vote in new:
-        merged[vote["vote_id"]] = dict(vote)
+        merged[vote_key(vote)] = dict(vote)
     return [merged[key] for key in sorted(merged)]
 
 
 def render_feedback(votes: list[Mapping[str, Any]]) -> str:
-    ordered = sorted((dict(v) for v in votes), key=lambda v: v["vote_id"])
+    ordered = sorted((dict(v) for v in votes), key=vote_key)
     return json.dumps({"schema": SCHEMA_FEEDBACK, "votes": ordered}, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
 
 

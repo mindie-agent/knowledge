@@ -363,8 +363,24 @@ def _own_prior_pr(ledger, batch_id, transport, repository, branch, deadline):
 
 
 def _resolve_unknown(ledger, row, settings, transport, deadline) -> dict[str, Any]:
-    """Bounded READ-ONLY reconciliation of our own branch/PR. Never creates."""
+    """Bounded READ-ONLY reconciliation of our own branch/PR. Never creates.
+
+    Attempts are durably counted: repeated polling cannot turn an unresolved
+    unknown into an unbounded lookup stream (contract note 26). After the cap
+    the row is marked failed; only an explicit retry creates new work.
+    """
     write_repo = row["repository"]
+    prior_attempts = sum(
+        1 for s in ledger.steps_for(row["batch_id"], row["revision"])
+        if s["step"] == "reconcile:attempt"
+    )
+    if prior_attempts >= 5:
+        ledger.finish_publication(
+            row["batch_id"], row["revision"], status="failed",
+            detail="read-only reconciliation exhausted; explicit retry required",
+        )
+        return ledger.receipt(ledger.get_publication(row["batch_id"], row["revision"]))
+    ledger.record_step(row["batch_id"], row["revision"], "reconcile:attempt")
     status = "unknown"
     detail = "remote outcome remains unconfirmed; stopped without retrying"
     pr_url, head_sha = row.get("pr_url"), row.get("head_sha")

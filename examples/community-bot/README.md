@@ -8,7 +8,11 @@ config, and shipping these files does not establish live event delivery.
 
 - `community-bot.yml` — GitHub Actions workflow (trigger shape only)
 - `bot-settings.example.json` — community config for the bot runner
-- `grok-review-wrapper.example.sh` — how the configured `grok_argv` is invoked
+
+The model bridge is the packaged adapter `mindie_knowledge.community.grok_adapter`
+(see `docs/community-sharing.md`); the example shell wrapper is gone because
+the real Grok CLI speaks `--prompt-file`/`--output-format json`/`--json-schema`,
+not invented flags.
 
 ## Credential and environment ownership
 
@@ -16,11 +20,25 @@ config, and shipping these files does not establish live event delivery.
 | --- | --- | --- |
 | Content-repo token (PR read/merge, checks read) | GitHub Actions secret `MINDIE_BOT_TOKEN` | env `GH_TOKEN` (never in files) |
 | Plugin-repo token (Skill PRs) | Actions secret `MINDIE_PLUGIN_TOKEN` | env `MINDIE_PLUGIN_TOKEN` |
-| Grok CLI + its own credentials | self-hosted runner image | `bot.grok_argv` argv |
+| Grok CLI + its own credentials | self-hosted runner image | `bot.grok_argv` / `bot.skill_grok_argv` pointing at the packaged adapter |
 
 Least scope: contents:write (merge), pull-requests:write, checks:read on the
 content repo; a *separate* token for the plugin repo. The bot account's own
 login goes in `bot.account` so its own events are ignored (no self-recursion).
+
+Exact adapter argv (verified against the installed Grok CLI 1.0.30 `--help`):
+
+```json
+"grok_argv": ["python", "-m", "mindie_knowledge.community.grok_adapter", "--kind", "review"],
+"skill_grok_argv": ["python", "-m", "mindie_knowledge.community.grok_adapter", "--kind", "skill"]
+```
+
+The adapter runs one bounded single turn:
+`grok --prompt-file <tmp> --output-format json --json-schema <tmp>
+--max-turns 1 --no-subagents --disable-web-search --permission-mode plan
+--deny Bash --deny Write --deny Edit --deny NotebookEdit`, extracts only the
+structured result from the JSON envelope (hidden reasoning is never parsed),
+and deletes its temporary prompt/schema files.
 
 ## Concurrency and triggers
 

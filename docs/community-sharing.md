@@ -16,9 +16,12 @@ maintainer's own credentials and the maintainer's own Grok CLI installation.
 - Credentials never appear in settings, receipts, logs or Git content.
   Settings carry only the *name* of the token environment variable
   (`token_env`, default `GH_TOKEN`; plugin repo: `bot.plugin_token_env`).
-- The sharing gate is re-read from the live config file
-  (`settings["config_path"]`, private, never exported) before **every**
-  outbound write: Git mutation, push, and each API call. Disabling sharing
+- The sharing gate requires the actual absolute shared config path
+  (`settings["config_path"]`, private, never exported) and re-reads the
+  validated file before **every** outbound write: enabled, nonempty string
+  generation, repository, branch, fork, account and project_roots must all
+  still match this run's admitted settings. Missing path, missing generation
+  or any mismatch fails closed — a stale in-memory bool never publishes. Disabling sharing
   mid-flight stops the next write; already-public writes stay accurately
   recorded — the ledger never claims a rollback that did not happen.
 - All subprocesses (git, gh, the review CLI) run with argv only, bounded
@@ -43,6 +46,9 @@ maintainer's own credentials and the maintainer's own Grok CLI installation.
 - Unknown outcomes (timeout after a write) resolve only through bounded
   read-only reconciliation of our own branch/PR; unresolved stays `unknown`
   and blocks new revisions of the same batch lineage until reconciled.
+  Reconciliation attempts are durably counted and stop after five per
+  revision (explicit retry required), so repeated polling cannot turn an
+  unresolved unknown into an unbounded lookup stream.
 - Our own open PR is updated in place (fast-forward commit, never force
   push). A merged prior PR plus a genuine delta opens a follow-up PR on a new
   branch referencing the merged one. Remote content that moved away from the
@@ -59,15 +65,19 @@ maintainer's own credentials and the maintainer's own Grok CLI installation.
    head branch) and the transport file list; a head that moved mid-snapshot
    aborts the round.
 2. Deterministic gates before any model: path allowlist (`cases/`, `topics/`,
-   `feedback/` for the content repo; `skills/<slug>/{SKILL.md,
-   agents/openai.yaml, references/*.md}` for the plugin repo), Git modes must
+   `feedback/` for the content repo; the configured Skill prefix
+   (`bot.skill_prefix`, default `plugins/mindie-agent/skills`):
+   `<prefix>/<slug>/{SKILL.md, agents/openai.yaml, references/*.md}` — for the plugin repo), Git modes must
    be plain `100644`, entry documents must satisfy the canonical
    `mindie-entry/1` schema (via core `loop.documents`), feedback files the
    `mindie-feedback/1` schema, and everything passes the redaction scan.
 3. Pure structural vote batches (only `feedback/*.json`, all votes `up` or
    reason-free `down`) merge without any model call.
-4. Other content invokes the configured `bot.grok_argv` exactly once, with
-   bounded stdin JSON, `bot.review_timeout_seconds` (default 300) and
+4. Other content invokes the configured `bot.grok_argv` exactly once (the
+   packaged `mindie_knowledge.community.grok_adapter` bridges to the installed
+   Grok CLI 1.0.30: `--prompt-file`, `--output-format json`, `--json-schema`,
+   `--max-turns 1`, `--no-subagents`, `--disable-web-search`, tool denials),
+   with bounded stdin JSON, `bot.review_timeout_seconds` (default 300) and
    `bot.review_output_bytes` (default 128 KiB). The attempt row is durable
    before the call: a failed head is never retried, and the bot's own patch
    head never recurses into a new review round.
@@ -93,9 +103,10 @@ Events authored by the bot account are ignored.
 root-task up votes (a scheduling heuristic, not a quality proof). Work is
 deduplicated by a material digest over (entry, revision, supporter votes,
 target Skill); the same material is attempted at most once. Generation is one
-bounded call to the same configured CLI. The package (SKILL.md with
-`source_entries`, `agents/openai.yaml` with `allow_implicit_invocation: false`,
-`references/*.md`) is validated — existing reference IDs, no author absolute
+bounded call to the configured adapter (`bot.skill_grok_argv`). The package
+(SKILL.md with frontmatter `metadata.mindie_source_entries`, a deterministic
+`agents/openai.yaml` carrying the nested `policy.allow_implicit_invocation: false`
+— never model output — and `references/*.md`) is validated — existing reference IDs, no author absolute
 paths, no executables — and published as an ordinary PR to the separately
 configured `bot.plugin_repository` under its own credential. Missing plugin
 permission is reported as `pending`, never as success; a pending Skill PR is

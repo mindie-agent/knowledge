@@ -13,7 +13,13 @@
   "token_env": "GH_TOKEN",
   "bot": {
     "account": "mindie-community-bot",
-    "grok_argv": ["/opt/mindie/bin/grok-review-wrapper.sh"],
+    "grok_argv": [
+      "python",
+      "-m",
+      "mindie_knowledge.community.grok_adapter",
+      "--kind",
+      "review"
+    ],
     "review_timeout_seconds": 300,
     "review_input_bytes": 65536,
     "review_output_bytes": 131072,
@@ -22,6 +28,14 @@
     "merge_method": "squash",
     "plugin_repository": "mindie-agent/mindie-plugin",
     "plugin_branch": "main",
-    "plugin_token_env": "MINDIE_PLUGIN_TOKEN"
+    "plugin_token_env": "MINDIE_PLUGIN_TOKEN",
+    "skill_grok_argv": [
+      "python",
+      "-m",
+      "mindie_knowledge.community.grok_adapter",
+      "--kind",
+      "skill"
+    ],
+    "skill_prefix": "plugins/mindie-agent/skills"
   }
 }

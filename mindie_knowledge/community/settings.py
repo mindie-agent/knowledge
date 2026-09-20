@@ -9,7 +9,7 @@ caller receives ``disabled`` and no Git mutation or outbound request happens.
 from __future__ import annotations
 
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
 from .common import (
@@ -51,7 +51,11 @@ def load_settings_file(path: Path) -> dict[str, Any]:
         raise CommunityError(f"community config is not valid JSON: {exc}")
     if not isinstance(data, dict):
         raise CommunityError("community config must be a JSON object")
-    return validate_settings(data)
+    validated = validate_settings(data)
+    # The actual absolute path of the file just read is authoritative; a path
+    # embedded inside the JSON is never trusted (no redirection).
+    validated["config_path"] = str(Path(path).resolve())
+    return validated
 
 
 def validate_settings(data: Mapping[str, Any]) -> dict[str, Any]:
@@ -63,9 +67,11 @@ def validate_settings(data: Mapping[str, Any]) -> dict[str, Any]:
         raise CommunityError("community config 'enabled' must be a boolean")
     out["enabled"] = enabled
     generation = data.get("generation")
-    if generation is not None and not (isinstance(generation, (str, int)) and str(generation)):
-        raise CommunityError("community config 'generation' must be a nonempty opaque value")
-    out["generation"] = None if generation is None else str(generation)
+    if enabled and not (isinstance(generation, str) and generation):
+        raise CommunityError("enabled community config requires a nonempty string generation")
+    if generation is not None and not isinstance(generation, str):
+        generation = str(generation)
+    out["generation"] = generation
     enabled_at = data.get("enabled_at")
     if enabled and not (type(enabled_at) in (int, float) and enabled_at > 0):
         # An enabled config without a finite positive start authorizes nothing.
@@ -73,8 +79,8 @@ def validate_settings(data: Mapping[str, Any]) -> dict[str, Any]:
     out["enabled_at"] = enabled_at
     config_path = data.get("config_path")
     if config_path is not None:
-        if not isinstance(config_path, str) or not config_path:
-            raise CommunityError("config_path must be a path string")
+        if not isinstance(config_path, str) or not Path(config_path).is_absolute():
+            raise CommunityError("config_path must be an absolute path string")
         out["config_path"] = config_path
 
     repository = data.get("repository")
@@ -134,12 +140,21 @@ def _validate_bot(bot: Mapping[str, Any]) -> dict[str, Any]:
     account = bot.get("account")
     out["account"] = check_account(account) if account else None
     argv = bot.get("grok_argv")
-    if argv is not None:
-        if not isinstance(argv, list) or not argv or not all(isinstance(a, str) and a for a in argv):
-            raise CommunityError("bot.grok_argv must be a nonempty list of strings")
-        out["grok_argv"] = list(argv)
-    else:
-        out["grok_argv"] = None
+    for key in ("grok_argv", "skill_grok_argv"):
+        argv = bot.get(key)
+        if argv is not None:
+            if not isinstance(argv, list) or not argv or not all(isinstance(a, str) and a for a in argv):
+                raise CommunityError(f"bot.{key} must be a nonempty list of strings")
+            out[key] = list(argv)
+        else:
+            out[key] = None
+    skill_prefix = bot.get("skill_prefix", "plugins/mindie-agent/skills")
+    if not isinstance(skill_prefix, str) or not skill_prefix or skill_prefix.startswith("/"):
+        raise CommunityError("bot.skill_prefix must be a clean relative path")
+    parts = PurePosixPath(skill_prefix).parts
+    if ".." in parts or any(p.startswith(".") for p in parts):
+        raise CommunityError("bot.skill_prefix must be a clean relative path")
+    out["skill_prefix"] = str(PurePosixPath(skill_prefix))
     out["review_timeout_seconds"] = _bounded_int(bot, "review_timeout_seconds", 300, 30, 1800)
     out["review_input_bytes"] = _bounded_int(bot, "review_input_bytes", 64 * 1024, 1024, 1024 * 1024)
     out["review_output_bytes"] = _bounded_int(bot, "review_output_bytes", 128 * 1024, 1024, 1024 * 1024)
@@ -182,28 +197,28 @@ def live_gate(settings: Mapping[str, Any]) -> None:
     """Re-read the live shared config BEFORE every outbound write.
 
     ``settings['config_path']`` (private, never exported into receipts or logs)
-    points at the shared community JSON. A stale in-memory ``enabled`` bool is
-    insufficient: revocation, a generation bump or a retargeted repository all
-    stop the write immediately. Fail closed on any mismatch or read error.
+    must be the actual absolute path of the shared community JSON. The file is
+    re-validated fresh and must still match this run's admitted settings:
+    enabled, nonempty string generation, repository, branch, fork, account and
+    project_roots. Any mismatch, absence or malformation stops the write.
     """
     require_sharing(settings)
     path = settings.get("config_path")
-    if not path:
-        return  # API callers without a file still pass the in-memory gate above
+    if not isinstance(path, str) or not path or not Path(path).is_absolute():
+        raise SharingDisabled("publication requires the actual absolute shared config path")
     try:
-        raw = Path(path).read_bytes()
-        if len(raw) > MAX_CONFIG_BYTES:
-            raise CommunityError("community config exceeds the size limit")
-        live = json.loads(raw.decode("utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, CommunityError) as exc:
+        live = load_settings_file(Path(path))
+    except CommunityError as exc:
         raise SharingDisabled(f"live community config unreadable: {str(exc)[:120]}")
-    if not isinstance(live, dict) or live.get("schema") != SCHEMA_CONFIG:
-        raise SharingDisabled("live community config is malformed")
     if live.get("enabled") is not True:
         raise SharingDisabled("community sharing was disabled")
-    if live.get("repository") != settings.get("repository"):
-        raise SharingDisabled("community repository changed since this run started")
     live_generation = live.get("generation")
-    current = settings.get("generation")
-    if current is not None and str(live_generation) != str(current):
+    if not (isinstance(live_generation, str) and live_generation):
+        raise SharingDisabled("live config carries no admitted nonempty generation")
+    for key in ("repository", "branch", "fork", "account"):
+        if live.get(key) != settings.get(key):
+            raise SharingDisabled(f"community {key} changed since this run started")
+    if live_generation != settings.get("generation"):
         raise SharingDisabled("community settings generation changed; restart with fresh settings")
+    if list(live.get("project_roots") or []) != list(settings.get("project_roots") or []):
+        raise SharingDisabled("community project scope changed since this run started")

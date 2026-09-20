@@ -166,7 +166,8 @@ def remote_url(tmp_path):
 
 @pytest.fixture
 def settings(tmp_path, remote_url):
-    return {
+    # The live gate requires a real, validated shared config file on disk.
+    data = {
         "schema": "mindie-community-config/1",
         "enabled": True,
         "generation": "g1",
@@ -182,6 +183,10 @@ def settings(tmp_path, remote_url):
         "token_env": "GH_TOKEN",
         "bot": {},
     }
+    config = tmp_path / "community.json"
+    config.write_text(json.dumps(data), encoding="utf-8")
+    data["config_path"] = str(config.resolve())
+    return data
 
 
 @pytest.fixture

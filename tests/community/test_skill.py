@@ -66,8 +66,8 @@ def test_material_digest_covers_source_feedback_target():
 GOOD_SKILL_MD = """---
 name: npu-device-numbering
 description: Map physical NPU devices to container-logical numbering.
-source_entries:
-  - ENTRYID
+metadata:
+  mindie_source_entries: "ENTRYID"
 ---
 
 # Method
@@ -83,23 +83,27 @@ def test_skill_markdown_validation():
     meta = validate_skill_markdown(text)
     assert meta["name"] == "npu-device-numbering"
     assert meta["source_entries"] == [doc["entry_id"]]
-    with pytest.raises(ValueError, match="implicit"):
-        validate_skill_markdown(text.replace("description:", "allow_implicit_invocation: true\ndescription:"))
     with pytest.raises(ValueError, match="absolute paths"):
         validate_skill_markdown(text + "\nSee /Users/alice/secrets for more.\n")
-    with pytest.raises(ValueError):
-        validate_openai_yaml("allow_implicit_invocation: true\n")
-    validate_openai_yaml("allow_implicit_invocation: false\n")
+    # The native policy is nested and explicit; the harness default is true.
+    validate_openai_yaml("policy:\n  allow_implicit_invocation: false\n")
+    for bad in ("allow_implicit_invocation: false\n",
+                "interface:\n  display_name: Test\n",
+                "policy:\n  allow_implicit_invocation: true\n"):
+        with pytest.raises(ValueError):
+            validate_openai_yaml(bad)
 
 
 def test_skill_package_validation_rejects_bad_refs():
     doc = make_entry()
     good = {"schema": "mindie-skill/1", "slug": "npu-device-numbering",
             "skill_md": GOOD_SKILL_MD.replace("ENTRYID", doc["entry_id"]),
-            "openai_yaml": "allow_implicit_invocation: false\n",
             "references": {"case.md": "Detail."}}
     package = validate_skill_package(good, doc["entry_id"])
     assert package["slug"] == "npu-device-numbering"
+    # The openai.yaml is generated deterministically with the nested policy.
+    assert "policy:" in package["openai_yaml"]
+    validate_openai_yaml(package["openai_yaml"])
     with pytest.raises(CommunityError, match="source entry"):
         validate_skill_package({**good, "skill_md": GOOD_SKILL_MD}, doc["entry_id"])
     with pytest.raises(CommunityError, match="reference"):
@@ -112,7 +116,7 @@ def test_skill_scan_pending_without_plugin_repo(settings, state_dir, transport, 
         "mindie_knowledge.community.skill._load_repo_state",
         lambda repo, ref, t, d: ({doc["entry_id"]: doc}, _votes(doc, "r1", "r2")),
     )
-    settings["bot"] = {"grok_argv": grok_script(tmp_path, {
+    settings["bot"] = {"skill_grok_argv": grok_script(tmp_path, {
         "schema": "mindie-skill/1", "slug": "npu-device-numbering",
         "skill_md": GOOD_SKILL_MD.replace("ENTRYID", doc["entry_id"]),
         "openai_yaml": "allow_implicit_invocation: false\n", "references": {}})}
@@ -135,7 +139,7 @@ def test_skill_scan_publishes_plugin_pr(settings, state_dir, tmp_path, monkeypat
     transport = FileTransport(state_dir / "dev-github.json", settings["dev_remotes"])
     settings["bot"] = {
         "plugin_repository": PLUGIN_REPO,
-        "grok_argv": grok_script(tmp_path, {
+        "skill_grok_argv": grok_script(tmp_path, {
             "schema": "mindie-skill/1", "slug": "npu-device-numbering",
             "skill_md": GOOD_SKILL_MD.replace("ENTRYID", "PLACEHOLDER"),
             "openai_yaml": "allow_implicit_invocation: false\n",
@@ -164,9 +168,9 @@ def test_skill_scan_publishes_plugin_pr(settings, state_dir, tmp_path, monkeypat
     assert len(prs) == 1
     files = transport.pull_request_files(PLUGIN_REPO, prs[0]["number"], Deadline(60, 30))
     paths = {f["filename"] for f in files}
-    assert paths == {"skills/npu-device-numbering/SKILL.md",
-                     "skills/npu-device-numbering/agents/openai.yaml",
-                     "skills/npu-device-numbering/references/case.md"}
+    assert paths == {"plugins/mindie-agent/skills/npu-device-numbering/SKILL.md",
+                     "plugins/mindie-agent/skills/npu-device-numbering/agents/openai.yaml",
+                     "plugins/mindie-agent/skills/npu-device-numbering/references/case.md"}
     # A repeat scan updates nothing new: same material digest is recorded.
     again = scan_skill_candidates(settings, state_dir, transport=transport)
     assert again["results"][0]["detail"].startswith("same material")
