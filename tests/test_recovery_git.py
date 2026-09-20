@@ -8,6 +8,7 @@ import hashlib
 import json
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -225,7 +226,7 @@ def _restore_diagnostics(engine, entry_id):
     repo = settings.as_dict().get("fork") or settings.repository
     work = engine.state_dir / "git" / repo.replace("/", "_")
     result = run_argv(
-        ["git", "show", f"{receipt['head_sha']}:{receipt['path']}"],
+        ["git", "show", f"{receipt['head_sha']}:{receipt['path']}", "--"],
         cwd=work, env=gitops.git_env(settings.as_dict()), timeout=5,
         max_output=8192,
     )
@@ -364,3 +365,71 @@ def test_aba_continuation_after_lineage_replace_and_branch_removal(tmp_path):
     assert appended and "the sent body" in updated["content"]
     assert "A continued after B" in updated["content"]
     store.close()
+
+
+def _clone_workdir_in_windows_max_path_window(tmp_path):
+    """Workdir long enough that cwd + `<sha>:cases/<64>.md` exceeds 260, while
+    the real case file path stays at or under 260 — the native CI failure."""
+    suffix = Path("outbox") / "git" / "mindie-agent_knowledge-test"
+    path = f"cases/{'d' * 64}.md"
+    object_expr_len = 40 + 1 + len(path)
+    min_work = 260 - object_expr_len  # combined length 261 once a separator is added
+    max_work = 260 - 1 - len(path)
+    for n in range(0, 240):
+        candidate = tmp_path / ("w" * n) / suffix if n else tmp_path / suffix
+        if min_work <= len(str(candidate)) <= max_work:
+            return candidate, path
+    pytest.skip("cannot construct a workdir in the Windows MAX_PATH window")
+
+
+def test_show_file_exact_blob_from_long_workdir_full_entry_id(tmp_path):
+    """Real Git: show_file returns the blob at the exact SHA, not a filename.
+
+    Native Windows CI at 7008e8a failed `git show <sha>:cases/<64chars>.md`
+    because git statted the whole object expression as a working-tree path.
+    workdir length 152 + expression 114 exceeds MAX_PATH 260; the case file
+    itself is shorter. `--` after the object stops that probe.
+    """
+    from mindie_knowledge.community import gitops
+    from mindie_knowledge.community.common import Deadline
+
+    work, path = _clone_workdir_in_windows_max_path_window(tmp_path)
+    work.mkdir(parents=True)
+    _git(["init"], work)
+    _git(["config", "user.email", "t@t"], work)
+    _git(["config", "user.name", "t"], work)
+    marker = "exact-blob-body-at-receipt-head"
+    body = f"{marker}\n"
+    (work / "cases").mkdir()
+    (work / path).write_bytes(body.encode("utf-8"))
+    _git(["add", "--", path], work)
+    _git(["commit", "-m", "sent"], work)
+    sha = _git(["rev-parse", "HEAD"], work)
+    assert len(sha) == 40
+    object_expr = f"{sha}:{path}"
+    assert len(str(work)) + 1 + len(object_expr) > 260
+    assert len(str(work / path)) <= 260
+
+    # Untracked file whose relative path equals the object expression: without
+    # `--`, git reports an ambiguous filename instead of showing the blob.
+    # Windows cannot create a colon in a path component.
+    try:
+        decoy = work / f"{sha}:cases" / Path(path).name
+        decoy.parent.mkdir(parents=True)
+        decoy.write_bytes(b"not the blob\n")
+    except OSError:
+        pass
+
+    cat = subprocess.run(
+        ["git", "cat-file", "-p", object_expr],
+        cwd=work, capture_output=True, timeout=30,
+    )
+    assert cat.returncode == 0, cat.stderr
+    blob = cat.stdout.decode("utf-8")
+    assert marker in blob
+
+    raw = gitops.show_file(work, sha, path, Deadline(), env=gitops.GIT_ENV)
+    assert raw == blob
+    assert gitops.show_file(
+        work, sha, "cases/missing.md", Deadline(), env=gitops.GIT_ENV,
+    ) is None

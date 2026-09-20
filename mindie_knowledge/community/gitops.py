@@ -229,8 +229,10 @@ def show_file(work_dir: Path, commit: str, path: str, deadline: Deadline, *, env
     remaining = deadline.step("git show")
     from .common import run_argv as _run
 
+    # `--` marks <rev>:<path> as an object so git does not stat the whole
+    # expression as a working-tree filename (Windows MAX_PATH).
     result = _run(
-        ["git", "show", f"{commit}:{path}"],
+        ["git", "show", f"{commit}:{path}", "--"],
         timeout=min(DEFAULT_GIT_OP_SECONDS, remaining),
         max_output=256 * 1024,
         cwd=work_dir,
