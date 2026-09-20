@@ -163,22 +163,3 @@ def transport(settings, state_dir):
     state_dir.mkdir(parents=True, exist_ok=True)
     return FileTransport(state_dir / "dev-github.json", settings["dev_remotes"])
 
-
-def grok_script(tmp_path: Path, payload: dict, counter: str = "grok-calls") -> list[str]:
-    """A stand-in for the maintainer-configured review CLI (argv contract)."""
-    script = tmp_path / "fake_grok.py"
-    counter_path = tmp_path / counter
-    script.write_text(
-        "import json, sys, pathlib\n"
-        "sys.stdin.read()\n"
-        f"count = pathlib.Path({str(counter_path)!r})\n"
-        "count.write_text(str(int(count.read_text() or '0') + 1) if count.exists() else '1')\n"
-        f"print(json.dumps({json.dumps(payload)}))\n",
-        encoding="utf-8",
-    )
-    return [sys.executable, str(script)]
-
-
-def grok_calls(tmp_path: Path, counter: str = "grok-calls") -> int:
-    path = tmp_path / counter
-    return int(path.read_text()) if path.exists() else 0

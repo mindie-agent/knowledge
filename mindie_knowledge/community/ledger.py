@@ -57,31 +57,10 @@ class Ledger:
                 step TEXT NOT NULL,
                 detail TEXT NOT NULL,
                 at REAL NOT NULL);
-            CREATE TABLE IF NOT EXISTS review_attempt(
-                repo TEXT NOT NULL,
-                pr INTEGER NOT NULL,
-                head_sha TEXT NOT NULL,
-                status TEXT NOT NULL,
-                verdict TEXT NOT NULL,
-                detail TEXT NOT NULL,
-                at REAL NOT NULL,
-                patch_sha TEXT NOT NULL DEFAULT '',
-                PRIMARY KEY(repo, pr, head_sha));
-            CREATE TABLE IF NOT EXISTS skill_material(
-                digest TEXT PRIMARY KEY,
-                status TEXT NOT NULL,
-                detail TEXT NOT NULL,
-                at REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             """
         )
         self.db.commit()
-        columns = {row[1] for row in self.db.execute("PRAGMA table_info(review_attempt)")}
-        if "patch_sha" not in columns:
-            self.db.execute(
-                "ALTER TABLE review_attempt ADD COLUMN patch_sha TEXT NOT NULL DEFAULT ''"
-            )
-            self.db.commit()
 
     def close(self) -> None:
         with self.lock:

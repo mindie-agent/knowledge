@@ -1,9 +1,9 @@
-"""Executable community CLI: submit / reconcile / review / event / poll-once / skill-scan.
+"""Executable community CLI: submit / reconcile.
 
-Every subcommand reads the shared community config, works under an explicit
-private state directory and prints one JSON receipt. Development deployments
-may select the file-backed transport with real local Git remotes; production
-uses the maintainer-owned ``gh`` CLI with its own token environment.
+Contributor-side publication only. Repository-side review and Skill
+consolidation are performed by the EXTERNAL Grok Bot software under the
+maintainer's own deployment — see docs/repository-bot-contract.md; this
+package intentionally ships no bot runtime, no model bridge and no scheduler.
 """
 
 from __future__ import annotations
@@ -17,9 +17,7 @@ from mindie_knowledge._common import EXIT_OK, EXIT_USAGE, ToolError, configure_u
 
 from .common import CommunityError
 from .publish import reconcile_batch, submit_batch
-from .review import handle_event, poll_once, review_pull_request
 from .settings import load_settings_file
-from .skill import retirement_corrections, scan_skill_candidates
 
 
 def _load_settings(args) -> dict:
@@ -51,7 +49,7 @@ def _read_json_arg(value: str):
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m mindie_knowledge.community",
-        description="MindIE community contribution and repository review automation.",
+        description="MindIE community contribution: publish or reconcile a batch.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -65,15 +63,6 @@ def main(argv: list[str] | None = None) -> int:
     p_submit.add_argument("--batch", required=True, help="batch JSON file, or - for stdin")
     p_reconcile = base("reconcile", "read-only reconciliation of one batch id")
     p_reconcile.add_argument("--batch-id", required=True)
-    p_review = base("review", "review one pull request once")
-    p_review.add_argument("--pr", required=True, type=int)
-    p_review.add_argument("--repo", help="owner/repo (default: configured repository)")
-    p_event = base("event", "ingest one GitHub webhook event JSON")
-    p_event.add_argument("--file", default="-", help="event JSON file, or - for stdin")
-    base("poll-once", "one bounded sweep over open pull requests")
-    p_skill = base("skill-scan", "evaluate Skill candidates and publish when warranted")
-    p_skill.add_argument("--retirements", action="store_true",
-                         help="also locate Skills referencing retired entries")
 
     args = parser.parse_args(argv)
     try:
@@ -83,19 +72,6 @@ def main(argv: list[str] | None = None) -> int:
             result = submit_batch(_read_json_arg(args.batch), settings, state_dir)
         elif args.command == "reconcile":
             result = reconcile_batch(args.batch_id, settings, state_dir)
-        elif args.command == "review":
-            repo = args.repo or settings.get("repository")
-            if not repo:
-                raise ToolError("review needs --repo or a configured repository")
-            result = review_pull_request(repo, args.pr, settings, state_dir)
-        elif args.command == "event":
-            result = handle_event(_read_json_arg(args.file), settings, state_dir)
-        elif args.command == "poll-once":
-            result = poll_once(settings, state_dir)
-        elif args.command == "skill-scan":
-            result = scan_skill_candidates(settings, state_dir)
-            if args.retirements:
-                result["retirement_corrections"] = retirement_corrections(settings, state_dir)
         else:  # pragma: no cover - argparse enforces choices
             parser.error("unknown command")
             return EXIT_USAGE

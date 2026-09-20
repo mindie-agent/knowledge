@@ -19,7 +19,6 @@ from .conftest import (
     entry_file,
     feedback_file,
     git,
-    grok_calls,
     make_batch,
     make_entry,
     vote,

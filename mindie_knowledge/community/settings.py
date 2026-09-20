@@ -130,50 +130,8 @@ def validate_settings(data: Mapping[str, Any]) -> dict[str, Any]:
         raise CommunityError("token_env must name an environment variable, never a token")
     out["token_env"] = token_env
 
-    bot = data.get("bot") or {}
-    if not isinstance(bot, Mapping):
-        raise CommunityError("bot settings must be an object")
-    out["bot"] = _validate_bot(bot)
     return out
 
-
-def _validate_bot(bot: Mapping[str, Any]) -> dict[str, Any]:
-    out: dict[str, Any] = {}
-    account = bot.get("account")
-    out["account"] = check_account(account) if account else None
-    argv = bot.get("grok_argv")
-    for key in ("grok_argv", "skill_grok_argv"):
-        argv = bot.get(key)
-        if argv is not None:
-            if not isinstance(argv, list) or not argv or not all(isinstance(a, str) and a for a in argv):
-                raise CommunityError(f"bot.{key} must be a nonempty list of strings")
-            out[key] = list(argv)
-        else:
-            out[key] = None
-    skill_prefix = bot.get("skill_prefix", "plugins/mindie-agent/skills")
-    if not isinstance(skill_prefix, str) or not skill_prefix or skill_prefix.startswith("/"):
-        raise CommunityError("bot.skill_prefix must be a clean relative path")
-    parts = PurePosixPath(skill_prefix).parts
-    if ".." in parts or any(p.startswith(".") for p in parts):
-        raise CommunityError("bot.skill_prefix must be a clean relative path")
-    out["skill_prefix"] = str(PurePosixPath(skill_prefix))
-    out["review_timeout_seconds"] = _bounded_int(bot, "review_timeout_seconds", 300, 30, 1800)
-    out["review_input_bytes"] = _bounded_int(bot, "review_input_bytes", 64 * 1024, 1024, 1024 * 1024)
-    out["review_output_bytes"] = _bounded_int(bot, "review_output_bytes", 128 * 1024, 1024, 1024 * 1024)
-    out["max_files_per_pr"] = _bounded_int(bot, "max_files_per_pr", 100, 1, 500)
-    out["poll_max_prs"] = _bounded_int(bot, "poll_max_prs", 20, 1, 100)
-    plugin_repo = bot.get("plugin_repository")
-    out["plugin_repository"] = check_repository(plugin_repo, "plugin_repository") if plugin_repo else None
-    plugin_branch = bot.get("plugin_branch")
-    out["plugin_branch"] = check_branch(str(plugin_branch)) if plugin_branch else "main"
-    plugin_token_env = bot.get("plugin_token_env")
-    if plugin_token_env is not None and (
-        not isinstance(plugin_token_env, str) or not plugin_token_env.replace("_", "").isalnum()
-    ):
-        raise CommunityError("bot.plugin_token_env must name an environment variable")
-    out["plugin_token_env"] = plugin_token_env
-    out["merge_method"] = bot.get("merge_method") if bot.get("merge_method") in ("squash", "merge") else "squash"
-    return out
 
 
 def _bounded_int(data: Mapping[str, Any], key: str, default: int, low: int, high: int) -> int:
