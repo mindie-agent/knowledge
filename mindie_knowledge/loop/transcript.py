@@ -29,15 +29,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 MAX_WINDOW = 256 * 1024          # one read window per increment
-MAX_RECORD_BYTES = 64 * 1024     # one JSONL line; larger lines are skipped visibly
-MAX_FIELD = 4096                 # characters per extracted text field
-MAX_TOOL_FIELD = 1024            # characters per tool argument/output field
 MAX_TEXT = 48 * 1024             # extracted increment text cap
 MAX_RECORDS = 200                # extracted records per increment
 
-_META_TYPES = {"session_meta"}
-_ITEM_TYPE = "response_item"
-_MESSAGE_ROLES = {"user": "user", "assistant": "assistant"}
 _TEXT_CONTENT = {"input_text", "output_text"}
 
 
@@ -72,7 +66,7 @@ class FileIdentity:
     def anchor_for(self, count):
         """SHA256 of the first ``count`` bytes read on one fresh handle."""
         try:
-            fd = os.open(self.path, os.O_RDONLY)
+            fd = os.open(self.path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
         except (OSError, ValueError):
             return None
         try:
@@ -114,7 +108,7 @@ class FileIdentity:
 def identify(path) -> FileIdentity | None:
     """Stat + anchor read bound to one opened handle; None if unreadable."""
     try:
-        fd = os.open(path, os.O_RDONLY)
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
     except (OSError, ValueError):
         return None
     try:
