@@ -68,8 +68,8 @@ def build_batch(store, *, settings, revision_fn=None):
     """
     if revision_fn is None:
         revision_fn = _community_revision()
-    drafts = store.drafts_changed()
-    votes = store.unbatched_votes()
+    drafts = store.drafts_changed(generation=settings.generation)
+    votes = store.unbatched_votes(generation=settings.generation)
     if not drafts and not votes:
         return None
     lineage = lineage_of(store.domain, settings.generation)
@@ -153,5 +153,6 @@ def build_batch(store, *, settings, revision_fn=None):
     store.create_batch(
         batch_id=lineage, revision=revision, batch=batch,
         entry_ids=[d["entry_id"] for d in drafts], vote_keys=vote_keys,
+        generation=settings.generation,
     )
     return lineage, revision, batch, [d["entry_id"] for d in drafts], vote_keys

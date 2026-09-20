@@ -113,11 +113,15 @@ class Store:
                 detail TEXT NOT NULL, pr_url TEXT, head_sha TEXT,
                 created REAL NOT NULL, attempted REAL, updated REAL NOT NULL,
                 reconciliations INTEGER NOT NULL DEFAULT 0,
-                next_attempt REAL);
+                next_attempt REAL, generation TEXT);
             CREATE TABLE IF NOT EXISTS feed_state(key TEXT PRIMARY KEY,
                 value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY,
                 value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS grants(kind TEXT NOT NULL,
+                identity TEXT NOT NULL, revision TEXT NOT NULL,
+                generation TEXT NOT NULL, created REAL NOT NULL,
+                PRIMARY KEY(kind, identity, revision));
         """)
         self.db.execute(
             "INSERT OR REPLACE INTO meta VALUES('schema', ?)", (SCHEMA,)
@@ -141,6 +145,38 @@ class Store:
 
     def close(self):
         self.db.close()
+
+    # ------------------------------------------------- material authorization
+
+    def grant(self, kind, identity, revision, generation):
+        """Durably authorize exactly one material revision for one sharing
+        generation. Anything without an explicit grant is local-only and is
+        never selected for a batch, however it was created."""
+        if kind not in {"draft", "vote"}:
+            raise ValueError("grant kind must be draft or vote")
+        if not isinstance(generation, str) or not generation:
+            raise ValueError("grant requires a nonempty sharing generation")
+        with self._write_txn():
+            self.db.execute(
+                "INSERT OR REPLACE INTO grants VALUES(?,?,?,?,?)",
+                (kind, identity, revision, generation, time.time()),
+            )
+
+    def granted(self, kind, identity, revision, generation):
+        with self.lock:
+            return (
+                self.db.execute(
+                    "SELECT 1 FROM grants WHERE kind=? AND identity=? "
+                    "AND revision=? AND generation=?",
+                    (kind, identity, revision, generation),
+                ).fetchone()
+                is not None
+            )
+
+    @staticmethod
+    def vote_identity(root_opaque, entry_id):
+        return f"{root_opaque}:{entry_id}"
+
 
     # ------------------------------------------------------------------ refs
 
@@ -218,8 +254,12 @@ class Store:
         )
 
     def create_draft(self, *, kind, title, summary, content, conditions=None,
-                     sources=(), producers=(), entry_id=None, origin="draft"):
-        """Create one local draft with a fresh opaque stable identity."""
+                     sources=(), producers=(), entry_id=None, origin="draft",
+                     generation=None):
+        """Create one local draft with a fresh opaque stable identity.
+
+        Without ``generation`` the draft is local-only: it is never selected
+        for a contribution batch just because a flush happens."""
         if origin not in {"draft"}:
             raise ValueError("local entries start as drafts")
         entry_id = entry_id or new_identity()
@@ -240,16 +280,25 @@ class Store:
                 (entry_id, kind, doc["title"], "active", origin, doc["revision"],
                  None, 0, None, canonical(doc), now),
             )
+            if generation is not None:
+                self.db.execute(
+                    "INSERT OR REPLACE INTO grants VALUES(?,?,?,?,?)",
+                    ("draft", entry_id, doc["revision"], generation, now),
+                )
             self._write_draft_file(doc)
         return doc
 
-    def append_observation(self, entry_id, addition, *, marker, producer=None):
+    def append_observation(self, entry_id, addition, *, marker, producer=None,
+                           generation=None):
         """Append one bounded observation/correction to a local draft.
 
         Idempotent on ``marker`` (the reserved increment identity): a repeated
         Stop never creates a near-duplicate section. Only the producing root
         may extend a draft; published bodies are never rewritten locally.
-        Returns ``(doc, appended)``.
+        With ``generation``, the base draft must already be granted to that
+        same sharing generation — an update id can never smuggle an
+        old-generation private body into a new publication. Without it the
+        new revision is local-only. Returns ``(doc, appended)``.
         """
         now = time.time()
         with self._write_txn():
@@ -258,6 +307,13 @@ class Store:
                 raise ValueError("unknown draft in this domain")
             if not row["draft_revision"]:
                 raise ValueError("entry has no local draft to update")
+            if generation is not None and not self.granted(
+                "draft", entry_id, row["draft_revision"], generation
+            ):
+                raise ValueError(
+                    "draft material belongs to another sharing generation; "
+                    "it stays local instead of being republished"
+                )
             base = self._revision_doc(entry_id, row["draft_revision"])
             if producer is not None and producer not in base["producers"]:
                 raise ValueError("only the producing task may update its draft")
@@ -265,6 +321,11 @@ class Store:
             if not appended:
                 return doc, False
             self._insert_revision(doc, row["origin"], now)
+            if generation is not None:
+                self.db.execute(
+                    "INSERT OR REPLACE INTO grants VALUES(?,?,?,?,?)",
+                    ("draft", entry_id, doc["revision"], generation, now),
+                )
             visible = not row["feed_active"]
             self.db.execute(
                 "UPDATE entries SET draft_revision=?, title=?, doc=?, updated=? "
@@ -275,29 +336,60 @@ class Store:
             self._write_draft_file(doc)
             return doc, True
 
-    def drafts_changed(self):
+    def drafts_changed(self, *, generation=None):
         """Draft revision bodies not yet included in any outbox batch.
 
         Read from the revisions table, never the visible ``entries.doc``: for a
         published entry the visible doc is the published body, while the
-        outbound candidate is the newer local draft correction."""
+        outbound candidate is the newer local draft correction. With
+        ``generation`` (the outbound path), only material explicitly granted
+        to that sharing generation is selected — anything else stays local
+        and inert, never backfilled. Without it, this is the local
+        bookkeeping view across generations."""
         with self.lock:
-            rows = self.db.execute(
-                "SELECT entry_id, draft_revision FROM entries "
-                "WHERE draft_revision IS NOT NULL "
-                "AND draft_revision != COALESCE(batched_revision, '')"
-            ).fetchall()
+            if generation is not None:
+                rows = self.db.execute(
+                    "SELECT entries.entry_id, entries.draft_revision FROM entries "
+                    "JOIN grants ON grants.kind='draft' "
+                    "AND grants.identity=entries.entry_id "
+                    "AND grants.revision=entries.draft_revision "
+                    "AND grants.generation=? "
+                    "WHERE entries.draft_revision IS NOT NULL "
+                    "AND entries.draft_revision != COALESCE(entries.batched_revision, '')",
+                    (generation,),
+                ).fetchall()
+            else:
+                rows = self.db.execute(
+                    "SELECT entry_id, draft_revision FROM entries "
+                    "WHERE draft_revision IS NOT NULL "
+                    "AND draft_revision != COALESCE(batched_revision, '')"
+                ).fetchall()
             return [self._revision_doc(r["entry_id"], r["draft_revision"])
                     for r in rows]
 
-    def draft_headers(self, *, producer=None, limit=8, excerpt=600):
-        """Compact headers plus short excerpts as organizer context."""
+    def draft_headers(self, *, producer=None, limit=8, excerpt=600,
+                      generation=None):
+        """Compact headers plus short excerpts as organizer context. With
+        ``generation``, only material granted to that sharing generation is
+        offered as update context."""
         with self.lock:
-            rows = self.db.execute(
-                "SELECT entry_id, draft_revision FROM entries "
-                "WHERE draft_revision IS NOT NULL "
-                "ORDER BY updated DESC LIMIT ?", (limit * 4,),
-            ).fetchall()
+            if generation is not None:
+                rows = self.db.execute(
+                    "SELECT entries.entry_id, entries.draft_revision FROM entries "
+                    "JOIN grants ON grants.kind='draft' "
+                    "AND grants.identity=entries.entry_id "
+                    "AND grants.revision=entries.draft_revision "
+                    "AND grants.generation=? "
+                    "WHERE entries.draft_revision IS NOT NULL "
+                    "ORDER BY entries.updated DESC LIMIT ?",
+                    (generation, limit * 4),
+                ).fetchall()
+            else:
+                rows = self.db.execute(
+                    "SELECT entry_id, draft_revision FROM entries "
+                    "WHERE draft_revision IS NOT NULL "
+                    "ORDER BY updated DESC LIMIT ?", (limit * 4,),
+                ).fetchall()
         headers = []
         for row in rows:
             doc = self._revision_doc(row["entry_id"], row["draft_revision"]) or {}
@@ -469,7 +561,8 @@ class Store:
             )
             return opaque
 
-    def record_vote(self, *, root_hash, ref, rating, reason, publishable):
+    def record_vote(self, *, root_hash, ref, rating, reason, publishable,
+                    generation=None):
         """One current vote per opaque root and entry; a new vote on the same
         entry replaces it (including its revision and reason)."""
         if rating not in RATINGS:
@@ -490,14 +583,33 @@ class Store:
                 (opaque, entry_id, revision, rating, reason.strip(),
                  1 if publishable else 0, time.time()),
             )
+            if publishable and generation:
+                self.db.execute(
+                    "INSERT OR REPLACE INTO grants VALUES(?,?,?,?,?)",
+                    ("vote", self.vote_identity(opaque, entry_id), revision,
+                     generation, time.time()),
+                )
             return dict(
                 vote_id=digest(["vote", opaque, entry_id, revision]),
                 root_id=opaque, entry_id=entry_id, revision=revision,
                 rating=rating, publishable=bool(publishable),
             )
 
-    def unbatched_votes(self):
+    def unbatched_votes(self, *, generation=None):
+        """Publishable unbatched votes. With ``generation`` (the outbound
+        path), only votes explicitly granted to that sharing generation."""
         with self.lock:
+            if generation is not None:
+                return [
+                    dict(r)
+                    for r in self.db.execute(
+                        "SELECT votes.* FROM votes JOIN grants ON grants.kind='vote' "
+                        "AND grants.identity=votes.root_opaque||':'||votes.entry_id "
+                        "AND grants.revision=votes.revision AND grants.generation=? "
+                        "WHERE votes.publishable=1 AND votes.batch_id IS NULL",
+                        (generation,),
+                    )
+                ]
             return [
                 dict(r)
                 for r in self.db.execute(
@@ -507,7 +619,8 @@ class Store:
 
     # ---------------------------------------------------------------- outbox
 
-    def create_batch(self, *, batch_id, revision, batch, entry_ids, vote_keys):
+    def create_batch(self, *, batch_id, revision, batch, entry_ids, vote_keys,
+                     generation=None):
         """Record one built batch as pending and bind its material.
 
         Material bound to a batch is never silently re-batched: only a newer
@@ -533,8 +646,9 @@ class Store:
                     raise ValueError("this exact batch revision was already sent")
                 self.db.execute("DELETE FROM outbox WHERE batch_id=?", (batch_id,))
             self.db.execute(
-                "INSERT INTO outbox VALUES(?,?,?,?,?,NULL,NULL,?,NULL,?,0,NULL)",
-                (batch_id, revision, canonical(batch), "pending", "", now, now),
+                "INSERT INTO outbox VALUES(?,?,?,?,?,NULL,NULL,?,NULL,?,0,NULL,?)",
+                (batch_id, revision, canonical(batch), "pending", "", now, now,
+                 generation),
             )
             for entry_id in entry_ids:
                 row = self._row(entry_id)
@@ -569,6 +683,18 @@ class Store:
                 "SELECT * FROM outbox WHERE batch_id=?", (batch_id,)
             ).fetchone()
         return dict(row) if row else None
+
+    def disable_foreign_pending(self, generation):
+        """Pending batches from another settings generation are cancelled,
+        never sent: durable across restarts and missed polling edges."""
+        with self._write_txn():
+            cursor = self.db.execute(
+                "UPDATE outbox SET status='disabled', "
+                "detail='settings generation changed before send', updated=? "
+                "WHERE status='pending' AND generation IS NOT ?",
+                (time.time(), generation),
+            )
+            return cursor.rowcount
 
     def outbox_pending(self):
         """Never-attempted batches (resumable after a forced shutdown)."""

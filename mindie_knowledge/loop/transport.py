@@ -206,6 +206,7 @@ class Service:
                 root_hash=session_key(root_session), ref=args["ref"],
                 rating=args["rating"], reason=args.get("reason", ""),
                 publishable=publishable,
+                generation=settings.generation if publishable else None,
             )
             if vote["publishable"]:
                 self.engine.last_activity = time.monotonic()

@@ -305,7 +305,7 @@ class Engine:
                                 "transcript unreadable and no summary")
         return None
 
-    def _apply(self, result, *, opaque, marker):
+    def _apply(self, result, *, opaque, marker, generation):
         """Deterministic metadata update + append; no repair model call."""
         refs, notes = [], []
         for entry in result["entries"]:
@@ -319,7 +319,8 @@ class Engine:
                 ident = entry.get("entry_id")
                 if ident:
                     doc, _appended = self.store.append_observation(
-                        ident, entry["content"], marker=marker, producer=opaque
+                        ident, entry["content"], marker=marker, producer=opaque,
+                        generation=generation,
                     )
                 else:
                     doc = self.store.create_draft(
@@ -327,6 +328,7 @@ class Engine:
                         summary=entry["summary"], content=entry["content"],
                         conditions=entry.get("conditions") or {},
                         sources=entry.get("sources") or [], producers=[opaque],
+                        generation=generation,
                     )
                 refs.append(self.store.ref(doc["entry_id"]))
             except DraftFull:
@@ -391,7 +393,8 @@ class Engine:
                     gaps=len(self.store.coverage_gaps(region.get("key", "")))
                     if region.get("key") else 0,
                 ),
-                existing_drafts=self.store.draft_headers(producer=opaque),
+                existing_drafts=self.store.draft_headers(
+                    producer=opaque, generation=row["generation"]),
                 retrieved_refs=[
                     hit["ref"]
                     for hit in self.store.query(masked[:2000], limit=5)["results"]
@@ -411,7 +414,8 @@ class Engine:
                     )
                 self.store.mark_capture(ident, "cancelled", str(exc)[:500])
                 return
-            refs, applied_notes = self._apply(result, opaque=opaque, marker=marker)
+            refs, applied_notes = self._apply(result, opaque=opaque, marker=marker,
+                                              generation=row["generation"])
             notes.extend(applied_notes)
             if region.get("region_id"):
                 self.store.finish_region(
@@ -436,8 +440,20 @@ class Engine:
                 "detail='service restarted before processing completed' "
                 "WHERE status='queued'"
             )
+        self.revoke_stale()
         self.thread.start()
         self.outbox_thread.start()
+
+    def revoke_stale(self):
+        """Restart/poll-edge safety net: when sharing is enabled, pending
+        batches of any other generation become disabled; when it is disabled,
+        every unsent batch and publishable vote is cancelled. Old material is
+        never backfilled into a new generation."""
+        settings = self._settings()
+        if settings.allows_capture():
+            self.store.disable_foreign_pending(settings.generation)
+        else:
+            self._cancel_unsent("sharing disabled; unsent work cancelled")
 
     def run(self):
         while not self.stop.is_set():
@@ -480,6 +496,12 @@ class Engine:
     def _submit(self, batch_row):
         settings = self._settings()
         if not settings.allows_capture():
+            return
+        if batch_row["generation"] != settings.generation:
+            self.store.mark_batch(
+                batch_row["batch_id"], "disabled",
+                detail="settings generation changed before send",
+            )
             return
         if self.community is None:
             self.store.mark_batch(
@@ -556,7 +578,9 @@ class Engine:
                             self._reconcile(row)
                     for row in self.store.outbox_pending()[:2]:
                         self._submit(row)
-                    material = self.store.drafts_changed() or self.store.unbatched_votes()
+                    material = self.store.drafts_changed(
+                        generation=generation
+                    ) or self.store.unbatched_votes(generation=generation)
                     if material:
                         idle_for = time.monotonic() - self.last_activity
                         deactivated = (

@@ -23,11 +23,21 @@ PRODUCER = "a" * 64
 
 
 def draft(store, title="ACL graph investigation", content="Compare eager first.",
-          summary="Narrow the execution mode before debugging capture."):
+          summary="Narrow the execution mode before debugging capture.",
+          generation=None):
     return store.create_draft(
         kind="experience", title=title, summary=summary, content=content,
-        producers=[PRODUCER],
+        producers=[PRODUCER], generation=generation,
     )
+
+
+def _revision_double(files, domain, base_commit, entry_refs):
+    # Clearly labeled mechanism double for the community-owned batch digest.
+    from mindie_knowledge.loop.store import digest as _digest
+
+    return _digest({"files": sorted((f["path"], f["sha256"]) for f in files),
+                    "domain": domain, "base_commit": base_commit,
+                    "entry_refs": sorted(entry_refs)})
 
 
 def test_stable_id_revisions_and_pinned_reads(store):
@@ -54,15 +64,19 @@ def test_vote_replaces_per_root_and_stays_opaque(store):
     first = store.record_vote(root_hash=session_key("root-1"), ref=doc["entry_id"],
                               rating="up", reason="helped", publishable=False)
     second = store.record_vote(root_hash=session_key("root-1"), ref=doc["entry_id"],
-                               rating="down", reason="stale", publishable=True)
+                               rating="down", reason="stale", publishable=True,
+                               generation="gen-1")
     assert first["vote_id"] == second["vote_id"]
     assert first["root_id"] == second["root_id"] != session_key("root-1")
-    votes = store.unbatched_votes()
+    # The off-period vote has no grant; only the publishable granted one counts.
+    votes = store.unbatched_votes(generation="gen-1")
     assert len(votes) == 1 and votes[0]["rating"] == "down"
+    assert store.unbatched_votes(generation="gen-2") == []
     other = store.record_vote(root_hash=session_key("root-2"), ref=doc["entry_id"],
-                              rating="up", reason="", publishable=True)
+                              rating="up", reason="", publishable=True,
+                              generation="gen-1")
     assert other["vote_id"] != first["vote_id"]
-    assert len(store.unbatched_votes()) == 2
+    assert len(store.unbatched_votes(generation="gen-1")) == 2
 
 
 @pytest.fixture
@@ -206,32 +220,30 @@ def test_disable_while_queued_cancels_without_model(gated, tmp_path):
 def test_outbox_coalesces_and_disable_cancels_unsent(gated, tmp_path):
     store, engine, _, _ = gated
     doc = draft(store)
-    store.record_vote(root_hash=session_key("root-1"), ref=doc["entry_id"],
-                      rating="up", reason="", publishable=True)
     from mindie_knowledge.loop.export import build_batch
-    from mindie_knowledge.loop.store import digest as _digest
 
-    def test_revision_fn(files, domain, base_commit, entry_refs):
-        # Clearly labeled mechanism double for the community-owned digest.
-        return _digest({"files": sorted((f["path"], f["sha256"]) for f in files),
-                        "domain": domain, "base_commit": base_commit,
-                        "entry_refs": sorted(entry_refs)})
-
-    built = build_batch(store, settings=settings_mod.load(tmp_path / "community.json"),
-                        revision_fn=test_revision_fn)
+    current = settings_mod.load(tmp_path / "community.json")
+    doc_entry = store.get(store.ref(doc["entry_id"]))
+    store.grant("draft", doc["entry_id"], doc_entry["revision"], current.generation)
+    vote = store.record_vote(root_hash=session_key("root-1"), ref=doc["entry_id"],
+                             rating="up", reason="", publishable=True,
+                             generation=current.generation)
+    built = build_batch(store, settings=current, revision_fn=_revision_double)
     batch_id, revision, batch, ids, votes = built
     paths = {f["path"] for f in batch["files"]}
     assert any(p.startswith("cases/") for p in paths)
     assert any(p.startswith("feedback/") for p in paths)
     assert (store.root / "outbox" / "staging" / batch_id).is_dir()
-    assert store.drafts_changed() == [] and store.unbatched_votes() == []
+    current = settings_mod.load(tmp_path / "community.json")
+    assert store.drafts_changed(generation=current.generation) == []
+    assert store.unbatched_votes(generation=current.generation) == []
     with pytest.raises(ValueError, match="invalid batch status"):
         store.mark_batch(batch_id, "maybe")
     # Forced shutdown keeps an unattempted batch pending; disable cancels it.
     assert store.outbox_pending()[0]["batch_id"] == batch_id
     engine._cancel_unsent("sharing disabled; unsent work cancelled")
     assert store.batch(batch_id)["status"] == "disabled"
-    assert store.unbatched_votes() == []  # no disabled-period backfill
+    assert store.unbatched_votes(generation=current.generation) == []
 
 
 def test_mcp_identity_binding_and_annotations(tmp_path):
@@ -328,3 +340,98 @@ def test_transport_loopback_and_identity(tmp_path):
         service.http.shutdown()
         service.http.server_close()
         store.close()
+
+
+def test_unsent_draft_never_backfills_after_reenable(gated, tmp_path):
+    """Generation-A material organized and granted, then OFF/ON: the new
+    generation must never auto-prepare the old draft for publication."""
+    from mindie_knowledge.loop.export import build_batch
+
+    store, engine, _, _ = gated
+    result = engine.capture(session_id="manual-A", turn_id="t1",
+                            summary="Mapped physical device 8; container uses 0.")
+    engine._process(result["id"])
+    assert store.capture_row(result["id"])["status"] == "organized"
+    gen_a = settings_mod.load(tmp_path / "community.json").generation
+    assert store.drafts_changed(generation=gen_a)  # publishable under A
+    engine._cancel_unsent("sharing disabled; unsent work cancelled")
+    write_settings(tmp_path / "community.json", enabled=False, roots=[tmp_path / "proj"])
+    write_settings(tmp_path / "community.json", enabled=True, roots=[tmp_path / "proj"])
+    gen_c = settings_mod.load(tmp_path / "community.json").generation
+    assert gen_c != gen_a
+    assert store.drafts_changed(generation=gen_c) == []
+    assert build_batch(store, settings=settings_mod.load(tmp_path / "community.json"),
+                       revision_fn=_revision_double) is None
+    # The old draft stays local and inert — content and history preserved.
+    assert store.query("device mapping")["results"]
+    engine.revoke_stale()  # restart/missed-poll-edge path agrees
+    assert build_batch(store, settings=settings_mod.load(tmp_path / "community.json"),
+                       revision_fn=_revision_double) is None
+
+
+def test_old_pending_batch_disabled_after_restart(gated, tmp_path):
+    from mindie_knowledge.loop.export import build_batch
+
+    store, engine, _, _ = gated
+    current = settings_mod.load(tmp_path / "community.json")
+    doc = draft(store, generation=current.generation)
+    built = build_batch(store, settings=current, revision_fn=_revision_double)
+    batch_id = built[0]
+    assert store.batch(batch_id)["status"] == "pending"
+    write_settings(tmp_path / "community.json", enabled=True, roots=[tmp_path / "proj"])
+    restarted = Engine(store, agent_command=None,
+                       settings_path=tmp_path / "community.json",
+                       admission=engine.admission)
+    restarted.revoke_stale()  # what start() runs before any thread
+    row = store.batch(batch_id)
+    assert row["status"] == "disabled"
+    assert row["generation"] == current.generation
+    # A pending batch also cannot slip past the submit-time generation check.
+    restarted._submit(store.batch(batch_id))
+    assert store.batch(batch_id)["status"] == "disabled"
+
+
+def test_old_generation_update_id_cannot_republish(gated, tmp_path):
+    store, engine, _, _ = gated
+    gen_a = settings_mod.load(tmp_path / "community.json").generation
+    doc = draft(store, generation=gen_a)
+    write_settings(tmp_path / "community.json", enabled=True, roots=[tmp_path / "proj"])
+    gen_c = settings_mod.load(tmp_path / "community.json").generation
+    # A (malicious or confused) organizer result naming the old draft as an
+    # update id must not append — that would republish the whole old body.
+    result = {"entries": [dict(entry_id=doc["entry_id"], title=doc["title"],
+                               summary=doc["summary"], content="smuggled update",
+                               conditions={}, sources=[])]}
+    refs, notes = engine._apply(result, opaque=PRODUCER, marker="f" * 32,
+                                generation=gen_c)
+    assert refs == [] and any("generation" in note for note in notes)
+    assert store.drafts_changed(generation=gen_c) == []
+    # Fresh material in the current generation works normally.
+    result = {"entries": [dict(entry_id=None, title="Fresh note", summary="s",
+                               content="current generation body", conditions={},
+                               sources=[])]}
+    refs, _ = engine._apply(result, opaque=PRODUCER, marker="e" * 32,
+                            generation=gen_c)
+    assert len(refs) == 1
+    assert len(store.drafts_changed(generation=gen_c)) == 1
+
+
+def test_current_generation_draft_and_vote_publish(gated, tmp_path):
+    from mindie_knowledge.loop.export import build_batch
+
+    store, engine, _, _ = gated
+    current = settings_mod.load(tmp_path / "community.json")
+    doc = draft(store, generation=current.generation)
+    store.record_vote(root_hash=session_key("root-9"), ref=doc["entry_id"],
+                      rating="up", reason="", publishable=True,
+                      generation=current.generation)
+    store.record_vote(root_hash=session_key("root-9"), ref=doc["entry_id"],
+                      rating="down", reason="counterexample", publishable=True,
+                      generation=current.generation)
+    built = build_batch(store, settings=current, revision_fn=_revision_double)
+    batch = built[2]
+    cases = [f for f in batch["files"] if f["path"].startswith("cases/")]
+    feedback = [f for f in batch["files"] if f["path"].startswith("feedback/")]
+    assert len(cases) == 1 and len(feedback) == 1
+    votes = json.loads(feedback[0]["content"])["votes"]
+    assert len(votes) == 1 and votes[0]["rating"] == "down"
