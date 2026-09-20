@@ -10,18 +10,18 @@ current implementation is not enough reason to publish it.
 
 | Field | Observed use | Decision |
 | --- | --- | --- |
-| `title` | Search/display | Keep. |
+| `title` | Search/display | Keep stable by default. Correct only a misleading title or a materially changed finding/scope; ordinary appended observations do not require automatic renaming. |
 | `summary` | Short retrieval result | Keep, without generating a second summary artifact. |
 | `conditions` | Returned context; optional conflicting-version filtering for reference knowledge | Only known software versions/source commits; omit when empty. Other details stay in the body. |
-| `entry_id` | Stable lineage, pinned references, feedback and Skill source links | Keep. Titles/paths/content change; they cannot replace identity. |
+| `entry_id` | Stable lineage, pinned references, feedback and Skill source links | Keep as the fixed object for updates and feedback, including distinct experiences with the same title. Title edits are exceptional, not the reason to introduce a renaming workflow. |
 | `revision` | Exact historical reads, feedback version, publication grants and content integrity | Keep the internal content fingerprint, compute it during parse/write, and remove the redundant public hash field. A Git commit alone does not identify a local unpublished revision. |
 | `producers` | Organizer's local draft ownership checks and task-owned draft selection | Remove from public Markdown; store ownership privately. It is not used for retrieval ranking or vote counting, and an opaque public producer does not authenticate an independent human/agent. |
 | `kind` | Distinguishes sourced reference knowledge from observed experience; affects source validation and condition filtering | Keep one explicit line. The directory is consistent with it, but a standalone entry retains its meaning. |
 | `domain` | Rejects wrong-domain feed content and forms references | Keep one explicit line. It is inexpensive and preserves standalone/cross-feed validation. |
 | `schema` | Rejects unsupported document formats | Keep one explicit format marker; avoid a second repository manifest solely to remove this line. |
-| `sources` | Public source references; required for reference knowledge | Include only when nonempty. Never publish private transcript paths/URLs to fill it. An original experience can omit it. |
-| `status` | Retired entries leave normal retrieval but remain explainable | Default to active when absent; serialize only retired. |
-| `retirement_reason` | Explains why a retired entry should no longer be used | Require only for retired entries; omit for active entries. |
+| `sources` | Currently a mandatory public reference list for reference knowledge, optional for experience | Remove the separate public header. Keep generation-session provenance privately. Preserve relevant public documentation/code/issue links in the body; a task being the production source does not make external evidence unnecessary. Update the old structured-source publication requirement when changing the format. |
+| `status` | Currently two withdrawal mechanisms: explicit retired state and absence from the authoritative feed tree | Remove from public Markdown. Withdraw by deleting the file from the public main tree; successful sync removes it from ordinary retrieval. Preserve enough local membership state to prevent stale drafts from restoring it. |
+| `retirement_reason` | Currently explains an explicit retired entry | Remove from public Markdown. Record the withdrawal reason in its PR/commit, whose Git history retains the previous content. |
 
 Typical header after the proposed serialization change:
 
@@ -52,7 +52,13 @@ conditions:
    CI validator and Bot validator support it. Do not silently serve an empty
    corpus when a client sees an unsupported format.
 4. Verify a real create -> correction -> publication -> sync -> pinned read ->
-   optional feedback -> retirement flow, including cross-task update refusal.
+   optional feedback -> upstream deletion -> sync withdrawal flow, including
+   cross-task update refusal. Current `Store.install_feed` already excludes
+   missing upstream entries and their stale drafts from normal search. An old
+   cached pinned reference may remain readable for history, but its response
+   must clearly identify it as withdrawn; this disclosure still needs work.
+   Do not add an independent local authority to delete public entries or imply
+   that an offline client can observe an upstream deletion before syncing.
    An existing model-extraction success does not prove this format transition.
 
 This review adds no new scoring, promotion threshold, source service or model
