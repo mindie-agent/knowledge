@@ -25,6 +25,10 @@ from .store import canonical, session_key
 MAX_BODY = 2 * 1024 * 1024
 
 
+class RequestRejected(ValueError):
+    """A structured request rejection, distinct from wire/runtime failure."""
+
+
 def rpc(connection, method, arguments=None, *, timeout=10):
     url = connection["url"]
     if not url.startswith("http://127.0.0.1:"):
@@ -50,7 +54,10 @@ def rpc(connection, method, arguments=None, *, timeout=10):
         raise ValueError("knowledge response exceeds limit")
     result = json.loads(raw)
     if not result.get("ok"):
-        raise ValueError(result.get("error", "knowledge request failed"))
+        error = result.get("error", "knowledge request failed")
+        if result.get("error_kind") == "invalid_request":
+            raise RequestRejected(error)
+        raise RuntimeError(error)
     return result["result"]
 
 
@@ -124,14 +131,15 @@ class Service:
                         ok=True,
                         result=service.call(payload["method"], payload["arguments"]),
                     )
-                except (ValueError, KeyError, TypeError) as exc:
-                    result = dict(ok=False, error=str(exc)[:500])
+                except ValueError as exc:
+                    result = dict(ok=False, error_kind="invalid_request", error=str(exc)[:500])
                 except (TimeoutError, OSError):
                     self.close_connection = True
                     return
                 except Exception:
                     result = dict(
                         ok=False,
+                        error_kind="operation_failed",
                         error="knowledge operation failed; inspect service diagnostics",
                     )
                 data = canonical(result).encode()
