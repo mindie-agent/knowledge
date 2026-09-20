@@ -5,9 +5,15 @@ description: Maintain local domain knowledge drafts and review contribution stat
 
 # Curate knowledge
 
-Knowledge is reference material with sources and applicability conditions.
+Knowledge is reference material with sources and applicability limits in its body.
 Experience is a detailed observation or method from a task. Neither is an
 execution instruction or a permission grant.
+
+The optional `conditions` header contains only observed software versions or
+source commit IDs; leave it empty when unknown. Hardware, topology,
+configuration, shape, seed, epsilon, device mapping, tolerances and validation
+limits belong in the detailed body. Preserve those details without duplicating
+them as header fields or inventing missing versions.
 
 This skill is for **explicit maintenance tasks only**. Ordinary domain work
 must not load it. There is no judge, no use-evidence form and no vote weight

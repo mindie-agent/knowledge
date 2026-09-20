@@ -33,3 +33,11 @@ def test_changed_body_without_new_revision_is_rejected(tmp_path):
     repo,sha=publish(tmp_path,{'cases/revision.md':render_entry(doc).replace('Original body.','Changed body.')})
     with pytest.raises(ValueError,match='revision'):
         validate(repo,sha,'vllm-ascend')
+
+def test_sourced_knowledge_can_leave_unknown_versions_empty(tmp_path):
+    doc=make_entry(entry_id='c'*64,domain='vllm-ascend',kind='knowledge',
+                   title='Reference with unspecified version',summary='Source omits a version.',
+                   content='The detailed reference states its applicability limits.',
+                   sources=['https://example.com/reference'],conditions={})
+    repo,sha=publish(tmp_path,{'topics/reference.md':render_entry(doc)})
+    assert validate(repo,sha,'vllm-ascend')['entries']==1

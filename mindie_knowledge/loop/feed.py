@@ -173,8 +173,8 @@ class Feed:
             doc = documents.parse_entry(raw)
             if doc["domain"] != self.store.domain:
                 raise ValueError(f"entry {path} belongs to another domain")
-            if doc["kind"] == "knowledge" and (not doc["conditions"] or not doc["sources"]):
-                raise ValueError("knowledge requires sources and applicability")
+            if doc["kind"] == "knowledge" and not doc["sources"]:
+                raise ValueError("knowledge requires sources")
             if doc["entry_id"] in seen:
                 raise ValueError("duplicate entry identity in feed")
             seen.add(doc["entry_id"])

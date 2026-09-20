@@ -126,14 +126,14 @@ def test_old_corpus_layout_is_not_an_empty_feed(env):
     assert candidate["status"] == "invalid" and candidate["attempts"] == 1
 
 
-def test_knowledge_requires_sources_and_applicability(env):
+def test_knowledge_requires_sources_but_versions_can_be_unknown(env):
     git, repo, store, feed = env
     commit_docs(git, repo, [entry_doc("4" * 64, "Ungrounded topic", kind="knowledge")])
     assert feed.sync()["status"] == "invalid"
     commit_docs(git, repo, [entry_doc("4" * 64, "Grounded topic", kind="knowledge",
-                                      conditions={"CANN": "9"},
                                       sources=["https://example.com/spec@abc"])])
     assert feed.sync()["status"] == "synced"
+    assert store.query("Grounded")["results"][0]["conditions"] == {}
 
 
 def test_attempts_persist_across_sync_restarts(env, monkeypatch):

@@ -30,10 +30,13 @@ alignment; nothing here claims they are configured or completed.
    (`mindie_knowledge.redact`) over file content and PR text. Referenced
    entry ids/revisions in feedback must resolve to canonical published
    entries at the pinned head; unknown references stay pending.
-4. **Decide semantics bounded**: accept / correct / add conditions / retire /
+4. **Decide semantics bounded**: accept / correct / clarify applicability / retire /
    no change. A concrete counterexample can justify correction or retirement
    without vote thresholds; retired entries keep content, history and a
    reason. Vote counts alone never delete or demote content.
+   The `conditions` header contains only known software versions or source
+   commits and may be empty. Other applicability context and experimental
+   details stay in the body; do not invent unknown versions.
 5. **Verify before merge**: current PR head equals the reviewed head (or the
    bot's own recorded patch successor), CI/checks for that exact head are
    complete and green, and the bot's own credential actually has merge

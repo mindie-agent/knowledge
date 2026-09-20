@@ -167,7 +167,7 @@ TOOLS = [
             dict(
                 query=STRING,
                 limit={"type": "integer", "minimum": 1, "maximum": 20},
-                conditions={"type": "object"},
+                conditions={"type": "object", "description": "Optional known software versions or source commits; all other context belongs in the query."},
             ),
             ["query"],
         ),

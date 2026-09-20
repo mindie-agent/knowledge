@@ -80,6 +80,17 @@ and `revision` as the SHA256 of the canonical JSON of all fields except
 documents are rejected, never silently rewritten, so render/parse/revision
 always agree.
 
+`title` names the finding and `summary` is its short retrieval abstract.
+`conditions` contains only observed software versions or source commit IDs
+(for example `torch_version` or `vllm_ascend_commit`); use an empty map when
+unknown. Hardware, topology, configuration, shape, seed, epsilon, device
+mapping, tolerances and applicability limits belong in the detailed body.
+Observed versions do not establish universal compatibility. Experience
+queries return this context without excluding a case
+because a requested condition differs. Reference `knowledge` entries can be
+filtered by conflicting caller-supplied conditions. Neither path replaces the
+agent's assessment of the detailed evidence and limits.
+
 Search folds draft and published lineage: the published revision wins,
 retired entries leave ordinary search but stay explainable (with their
 retirement reason), and a draft that advances beyond its published revision
@@ -118,7 +129,7 @@ commit messages or PR text.
 per candidate persisted across restarts): it follows the configured content
 repository branch as an immutable Git commit, validates the complete
 candidate tree (canonical layout under `cases/`+`topics/`, sizes, UTF-8/LF,
-schema, revisions, domain, knowledge sources/applicability) and switches
+schema, revisions, domain, knowledge sources) and switches
 atomically. A valid empty or retired-only tree empties ordinary search; an
 unsupported old layout (e.g. `corpus/`) fails loudly instead of looking like
 an empty feed; a bad candidate always keeps the old cache. Sync works with
