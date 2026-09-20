@@ -1,7 +1,0 @@
-interface:
-  display_name: "Curate Knowledge"
-  short_description: "Maintain VA and NPU reference topics, cases and digests"
-  default_prompt: "Use $curate-knowledge for the requested VA, vLLM, NPU, AI or infrastructure maintenance. Reuse available source-linked material, preserve conditions and uncertainty, and use an independent agent for research or synthesis without adding steps to ordinary development tasks."
-
-policy:
-  allow_implicit_invocation: false

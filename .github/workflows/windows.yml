@@ -21,13 +21,12 @@ jobs:
         with:
           python-version: '3.13'
           activate-environment: false
-      - name: Install the complete local knowledge backend
+      - name: Install the local knowledge runtime
         run: |
           uv venv
           uv pip install -e '.[test]'
-      - name: Native capture, query, distribution, CLI and OpenViking lifecycle
+      - name: Native loop, feed, redaction, CLI and service lifecycle tests
         env:
-          VAWS_KNOWLEDGE_LIVE_OV: "1"
           HOME: ${{ runner.temp }}/knowledge-test-home
           USERPROFILE: ${{ runner.temp }}/knowledge-test-home
         run: |

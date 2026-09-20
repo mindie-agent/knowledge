@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "vaws-knowledge"
-version = "0.7.5"
-description = "Local Markdown knowledge indexed through OpenViking"
+name = "mindie-knowledge"
+version = "0.8.0"
+description = "Local knowledge and experience loop: bounded capture, optional community sharing, Git-published retrieval"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
@@ -13,29 +13,21 @@ authors = [
   { name = "vLLM Ascend contributors" },
 ]
 dependencies = [
-  "vaws-diagnostics @ git+https://github.com/vllm-ascend-workspace/vaws-diagnostics@96fcdfaa0f25fa59f12e948eb4e17ead775f3287",
   "PyYAML>=6.0",
-  "openviking==0.4.19",
-  "openviking-sdk==0.1.10",
-  "fastembed==0.8.0",
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8,<10", "tree-sitter==0.25.2", "tree-sitter-cpp==0.23.4"]
-code = ["tree-sitter==0.25.2", "tree-sitter-cpp==0.23.4"]
+test = ["pytest>=8,<10"]
 
 [project.scripts]
-vaws-knowledge = "vaws_knowledge.cli:main"
+mindie-knowledge = "mindie_knowledge.loop.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/vllm-ascend-workspace/vaws-knowledge"
-Repository = "https://github.com/vllm-ascend-workspace/vaws-knowledge"
+Homepage = "https://github.com/mindie-agent/knowledge"
+Repository = "https://github.com/mindie-agent/knowledge"
 
 [tool.hatch.metadata]
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["vaws_knowledge"]
-
-[tool.hatch.build.targets.wheel.force-include]
-"corpus" = "vaws_knowledge/data/corpus"
+packages = ["mindie_knowledge"]

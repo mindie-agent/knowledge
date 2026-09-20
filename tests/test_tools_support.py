@@ -18,15 +18,19 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 FIXTURES = REPO_ROOT / "tests" / "fixtures" / "tools"
-EXAMPLE_ENTRY = REPO_ROOT / "examples" / "corpus-contribution" / "ordinary.md"
+EXAMPLE_ENTRY = REPO_ROOT / "tests" / "fixtures" / "ordinary.md"
 
 def run_tool(name: str, *args: str, python: str | None = None) -> subprocess.CompletedProcess:
-    """Run ``python -m vaws_knowledge <name> ARGS`` from the repo root."""
-    cmd = [python or sys.executable, "-m", "vaws_knowledge", name, *args]
-    # This helper also supports direct unittest execution without conftest.
-    with tempfile.TemporaryDirectory(prefix="vaws-tool-diagnostics-") as diagnostic_root:
-        env = dict(os.environ, VAWS_DIAGNOSTICS_ROOT=diagnostic_root)
-        return subprocess.run(cmd, cwd=REPO_ROOT, env=env, capture_output=True, text=True, encoding="utf-8")
+    """Run ``python -m mindie_knowledge.<name> ARGS`` from the repo root."""
+    cmd = [python or sys.executable, "-m", f"mindie_knowledge.{name}", *args]
+    return subprocess.run(
+        cmd,
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="strict",
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -117,7 +121,7 @@ class EnvironmentTests(unittest.TestCase):
     def test_no_tracked_fixture_contains_a_redaction_hit(self):
         # Belt and braces: the fixture tree itself must be clean under the
         # built-in ruleset, otherwise a test fixture is the leak.
-        proc = run_tool("redact", "--check", str(FIXTURES), str(REPO_ROOT / "examples"))
+        proc = run_tool("redact", "--check", str(FIXTURES))
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
 

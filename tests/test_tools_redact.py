@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
+import sys
 import unittest
 
 from test_tools_support import (
     EXAMPLE_ENTRY,
     FIXTURES,
+    REPO_ROOT,
     TempDir,
     calibration_sentence,
     run_tool,
@@ -28,7 +31,7 @@ from test_tools_support import (
     versionlike,
 )
 
-from vaws_knowledge import redact
+from mindie_knowledge import redact
 
 
 def rules_hit(text: str, allow: redact.Allowlist | None = None) -> set[str]:
@@ -258,6 +261,20 @@ class CliTests(unittest.TestCase):
         payload = json.loads(proc.stdout)
         self.assertEqual(payload["redaction_profile"], "r2")
         self.assertEqual({f["rule"] for f in payload["findings"]}, {"ipv4-address", "user-path"})
+
+    def test_cli_findings_are_utf8_stdio(self):
+        with TempDir() as tmp:
+            path = self._leaky_file(tmp)
+            proc = subprocess.run(
+                [sys.executable, "-m", "mindie_knowledge.redact", "--check", str(path)],
+                cwd=REPO_ROOT,
+                capture_output=True,
+            )
+        self.assertEqual(proc.returncode, 1)
+        stdout = proc.stdout.decode("utf-8")
+        self.assertIn("…", stdout)
+        self.assertIn("—", stdout)
+        self.assertIn("[ipv4-address]", stdout)
 
     def test_clean_input_check_passes(self):
         proc = run_tool("redact", "--check", str(EXAMPLE_ENTRY))

@@ -1,0 +1,7 @@
+interface:
+  display_name: "Curate Knowledge"
+  short_description: "Maintain local knowledge drafts and review contribution state; not used for ordinary query or capture"
+  default_prompt: "Use $curate-knowledge for the requested maintenance or contribution-state review. Use installed domain tools, preserve sources and applicability, and report actual changes and operational status."
+
+policy:
+  allow_implicit_invocation: false
