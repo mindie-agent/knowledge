@@ -186,9 +186,6 @@ def test_conflict_divergence_parks_needs_review(settings, state_dir, transport, 
     receipt = submit_batch(batch2, settings, state_dir, transport=transport)
     assert receipt["status"] == "needs_review"
     # The maintainer edit is still the remote tip: we did not overwrite it.
-    assert "Maintainer note" in git(["show", "origin/mindie-contrib/npu/batch-i:"
-                                     f"cases/{doc['entry_id']}.md"] if False else
-                                    ["--version"]) is False or True
     check = state_dir / "check"
     git(["clone", "--quiet", "-b", "mindie-contrib/npu/batch-i", remote_url, str(check)])
     assert "Maintainer note" in (check / "cases" / f"{doc['entry_id']}.md").read_text()
@@ -243,3 +240,24 @@ def _deadline():
     from mindie_knowledge.community.common import Deadline
 
     return Deadline(120, 60)
+
+
+def test_deleted_entry_is_not_restored_by_a_pending_correction(settings, state_dir, transport, remote_url):
+    doc = make_entry()
+    first = submit_batch(make_batch('batch-delete', [entry_file(doc)]), settings,
+                         state_dir, transport=transport)
+    assert first['status'] == 'submitted'
+    work = state_dir / 'withdraw'
+    git(['clone', '--quiet', '-b', 'mindie-contrib/npu/batch-delete', remote_url, str(work)])
+    path = f"cases/{doc['entry_id']}.md"
+    git(['rm', path], cwd=work)
+    git(['-c', 'user.name=maintainer', '-c', 'user.email=m@example.invalid',
+         'commit', '-m', 'Withdraw incorrect entry'], cwd=work)
+    git(['push', 'origin', 'HEAD'], cwd=work)
+    before = git(['rev-parse', 'HEAD'], cwd=work)
+    correction = make_entry(content='Later observation retained privately.')
+    batch = make_batch('batch-delete', [dict(entry_file(correction),
+                       base_sha256=entry_file(doc)['sha256'])])
+    result = submit_batch(batch, settings, state_dir, transport=transport)
+    assert result['status'] == 'needs_review' and 'deleted' in result['detail']
+    assert git(['ls-remote', remote_url, 'refs/heads/mindie-contrib/npu/batch-delete']).split()[0] == before

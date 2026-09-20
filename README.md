@@ -20,7 +20,7 @@ contribution batches and feed sync. A Harness provides the model runner; the
 ## Boundaries
 
 - Community contribution is a single explicit switch (`mindie-community-config/1`). Off means no capture, extraction or sanitization at all — not local-only capture. Retrieval, updates and sync keep working.
-- Entries have stable opaque IDs and content revisions; publication state (active/retired) comes only from the content repository. Local drafts update by append-only observations and never hide published content.
+- Entries have stable opaque IDs and internally computed content revisions. Upstream deletion withdraws an entry; cached pinned reads explicitly identify historical material. Local drafts update by append-only observations and never restore withdrawn content.
 - The MCP surface is `knowledge_query`, `knowledge_explain` and optional `knowledge_feedback`; each call is bound to verified host task metadata. Feedback is fully optional up/down with an optional one-line reason; there is no judge and no voting weight.
 - Raw task records stay with the user's Harness. Only redaction-scanned canonical entry Markdown and vote files ever reach the contribution staging directory.
 
@@ -31,4 +31,4 @@ python -m pip install -e '.[test]'
 python -m pytest -q tests
 ```
 
-The public knowledge base starts empty in the new `mindie-entry/1` format; there is no legacy migration or compatibility layer. Pre-existing private user files stay inert.
+The public knowledge base starts empty in the new `mindie-entry/2` format; there is no legacy migration or compatibility layer. Pre-existing private user files stay inert.

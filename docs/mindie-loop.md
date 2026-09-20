@@ -73,12 +73,16 @@ Normal capture never invokes historical planning or backfills sharing-off time.
 
 ## Entries, drafts, publication
 
-`loop/documents.py` owns the canonical `mindie-entry/1` format: YAML
-frontmatter with every field but `content`, the detailed body as Markdown,
-and `revision` as the SHA256 of the canonical JSON of all fields except
-`revision`. Text fields are canonical (stripped) at admission — noncanonical
-documents are rejected, never silently rewritten, so render/parse/revision
-always agree.
+`loop/documents.py` owns the canonical `mindie-entry/2` format: YAML
+frontmatter with `schema`, `entry_id`, `domain`, `kind`, `title`, `summary`
+and optional `conditions`; the detailed body as Markdown. There is no public
+`revision`, `producers`, `sources`, `status` or `retirement_reason` — the
+internal content `revision` is computed at parse/write as the SHA256 of the
+canonical JSON of the public semantic fields (body included), and draft
+ownership lives in a private entry-owner relation. Text fields are canonical
+(stripped) at admission — noncanonical documents are rejected, never silently
+rewritten, so render/parse/revision always agree. Duplicate YAML keys and
+unknown fields fail loudly.
 
 `title` names the finding and `summary` is its short retrieval abstract.
 `conditions` contains only observed software versions or source commit IDs
@@ -91,12 +95,15 @@ because a requested condition differs. Reference `knowledge` entries can be
 filtered by conflicting caller-supplied conditions. Neither path replaces the
 agent's assessment of the detailed evidence and limits.
 
-Search folds draft and published lineage: the published revision wins,
-retired entries leave ordinary search but stay explainable (with their
-retirement reason), and a draft that advances beyond its published revision
-is labeled `supplemental`, never a second hit. Pinned references
-(`mindie://<domain>/<entry_id>@<revision>`) always read the exact historical
-body.
+Search folds draft and published lineage: the published revision wins, and a
+draft that advances beyond its published revision is labeled `supplemental`,
+never a second hit. Withdrawal is deletion from the upstream main tree: after
+a successful sync the entry leaves ordinary search and is never resurrected
+by its local draft, while retained pinned reads return an explicit
+`withdrawn` flag with a readable note. Query references pin short 16-hex
+entry/revision prefixes (`mindie://<domain>/<entry>@<revision>`, full hashes
+only on the rare collision) and always read the exact historical body;
+ambiguous prefixes fail instead of guessing.
 
 ## Optional feedback
 
@@ -129,8 +136,9 @@ commit messages or PR text.
 per candidate persisted across restarts): it follows the configured content
 repository branch as an immutable Git commit, validates the complete
 candidate tree (canonical layout under `cases/`+`topics/`, sizes, UTF-8/LF,
-schema, revisions, domain, knowledge sources) and switches
-atomically. A valid empty or retired-only tree empties ordinary search; an
+schema, revisions, domain) and switches
+atomically. A valid empty tree empties ordinary search (withdrawal is
+upstream deletion); an
 unsupported old layout (e.g. `corpus/`) fails loudly instead of looking like
 an empty feed; a bad candidate always keeps the old cache. Sync works with
 community contribution off and never starts the maintenance service.
@@ -179,3 +187,15 @@ Content CI invokes the pinned installed package with
 The validator reads immutable Git blobs, accepts an empty publication, and
 checks canonical documents, feedback, file modes, sizes and private-data
 findings. Candidate repository Python is never imported or executed.
+
+### Pre-release format boundary
+
+The v2 public format uses a fresh `store-v3.sqlite3`; old private database and
+Markdown files are not imported, opened as active records, or deleted. Its
+persisted capture floor is combined with sharing and activation timestamps,
+so a fresh store cannot backfill transcript material from the previous format.
+Entry filenames use the stable entry ID, so correcting a misleading title
+updates the same file. Pending contributions are rechecked for withdrawal,
+and a remote deletion of an expected base is a conflict, never permission to
+restore the removed body. Existing failed or unknown publication receipts stay
+non-replayable within this format.

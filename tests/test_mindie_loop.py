@@ -27,7 +27,7 @@ def draft(store, title="ACL graph investigation", content="Compare eager first."
           generation=None):
     return store.create_draft(
         kind="experience", title=title, summary=summary, content=content,
-        producers=[PRODUCER], generation=generation,
+        owner=PRODUCER, generation=generation,
     )
 
 
@@ -54,9 +54,94 @@ def test_stable_id_revisions_and_pinned_reads(store):
     old = store.get(store.ref(doc["entry_id"], doc["revision"]))
     assert old["content"] == doc["content"]  # old ref stays fixed
     assert "Later:" in store.get(store.ref(doc["entry_id"]))["content"]
-    with pytest.raises(ValueError, match="producing task"):
+    with pytest.raises(ValueError, match="owning task"):
         store.append_observation(doc["entry_id"], "foreign", marker="c" * 32,
                                  producer="d" * 64)
+
+
+def test_same_title_entries_keep_distinct_identities(store):
+    first = draft(store, title="Shared symptom title")
+    second = draft(store, title="Shared symptom title")
+    assert first["entry_id"] != second["entry_id"]
+    hits = store.query("Shared symptom title")["results"]
+    assert {h["ref"].split("@")[0].rsplit("/", 1)[-1] for h in hits} == {
+        first["entry_id"][:16], second["entry_id"][:16]
+    }
+
+
+def test_imported_content_cannot_forge_ownership(store):
+    from mindie_knowledge.loop.documents import make_entry
+
+    doc = draft(store)
+    # A feed body for the same entry arrives; ownership is unaffected.
+    foreign = make_entry(
+        entry_id=doc["entry_id"], domain="vllm-ascend", kind="experience",
+        title="Downloaded entry", summary="Published elsewhere.",
+        content="A published body carrying no ownership claim.",
+    )
+    store.install_feed([foreign], feed_ident="f" * 64)
+    with pytest.raises(ValueError, match="owning task"):
+        store.append_observation(doc["entry_id"], "forged update", marker="b" * 32,
+                                 producer="d" * 64)
+    kept, appended = store.append_observation(
+        doc["entry_id"], "legitimate update", marker="b" * 32, producer=PRODUCER,
+    )
+    assert appended and kept["entry_id"] == doc["entry_id"]
+
+
+def test_title_is_stable_unless_explicitly_corrected(store):
+    doc = draft(store, title="Misleading old title")
+    # Ordinary append with a null title preserves the existing title.
+    kept, _ = store.append_observation(
+        doc["entry_id"], "Later: more evidence.", marker="b" * 32,
+        producer=PRODUCER, header={"title": None,
+                                   "summary": "Corrected current finding."},
+    )
+    assert kept["title"] == "Misleading old title"
+    assert kept["summary"] == "Corrected current finding."
+    # No title key at all also preserves it.
+    kept2, _ = store.append_observation(
+        doc["entry_id"], "Later: even more evidence.", marker="c" * 32,
+        producer=PRODUCER, header={"summary": "Still current."},
+    )
+    assert kept2["title"] == "Misleading old title"
+    # An explicitly supplied corrected title updates the misleading one.
+    fixed, _ = store.append_observation(
+        doc["entry_id"], "Later: final evidence.", marker="d" * 32,
+        producer=PRODUCER, header={"title": "Accurate corrected title"},
+    )
+    assert fixed["title"] == "Accurate corrected title"
+    assert store.get(store.ref(doc["entry_id"], doc["revision"]))["title"] == \
+        "Misleading old title"  # old pinned body untouched
+
+
+def test_short_refs_resolve_exactly_and_ambiguity_fails(store):
+    doc = draft(store)
+    updated, _ = store.append_observation(
+        doc["entry_id"], "Later: second revision.", marker="b" * 32,
+        producer=PRODUCER,
+    )
+    short = store.query("ACL graph")["results"][0]["ref"]
+    # Query pins a short ref: 16-hex prefixes, no separate revision field.
+    entry_tok, rev_tok = short.rsplit("/", 1)[-1].split("@")
+    assert entry_tok == doc["entry_id"][:16] and rev_tok == updated["revision"][:16]
+    assert store.get(short)["revision"] == updated["revision"]
+    # A short prefix pinned to the OLD revision reads the exact old body.
+    old_pin = f"{doc['entry_id'][:16]}@{doc['revision'][:16]}"
+    assert store.get(old_pin)["content"] == doc["content"]
+    # Full refs keep working.
+    assert store.get(store.ref(doc["entry_id"], doc["revision"]))["content"] == doc["content"]
+    # An entry prefix naming two entries fails, never picks the first.
+    other = store.create_draft(
+        kind="experience", title="Collision entry", summary="s",
+        content="c", entry_id=doc["entry_id"][:16] + "f" * 48,
+    )
+    with pytest.raises(ValueError, match="ambiguous"):
+        store.get(doc["entry_id"][:16])
+    assert store.get(doc["entry_id"])["entry_id"] == doc["entry_id"]
+    # The colliding entry's query ref falls back to its full identity.
+    refs = {h["ref"] for h in store.query("Collision entry")["results"]}
+    assert any(other["entry_id"] + "@" in ref for ref in refs)
 
 
 def test_correction_changes_retrieval_header_but_preserves_old_body(store):
@@ -124,7 +209,7 @@ def gated(tmp_path):
         "p=json.load(sys.stdin)\n"
         "print(json.dumps({'entries':[{'entry_id':None,'title':'Device mapping',"
         "'summary':'Container logical ids restart at zero.',"
-        "'content':p['increment'][:400],'conditions':{},'sources':[]}]}))\n"
+        "'content':p['increment'][:400],'conditions':{}}]}))\n"
     )
     store = Store(tmp_path / "store", "test")
     from mindie_knowledge.loop.activation import Admission
@@ -383,13 +468,17 @@ def test_transport_loopback_and_identity(tmp_path):
     thread.start()
     try:
         doc = store.create_draft(kind="experience", title="Graph capture",
-                                 summary="s", content="c", producers=[PRODUCER])
+                                 summary="s", content="c", owner=PRODUCER)
         with pytest.raises(ValueError, match="identity"):
             service.call("query", dict(query="graph"))
         hit = service.call("query", dict(query="graph", _session_id="manual-A",
                                          _session_verified=True))
-        assert doc["entry_id"] in hit["results"][0]["ref"]
+        assert doc["entry_id"][:16] in hit["results"][0]["ref"]
         assert "@" in hit["results"][0]["ref"]  # refs pin their observed revision
+        # The short pinned ref resolves back to the exact same document.
+        assert service.call("explain", dict(ref=hit["results"][0]["ref"],
+                                            _session_id="manual-A",
+                                            _session_verified=True))["entry_id"] == doc["entry_id"]
         vote = service.call("feedback", dict(ref=doc["entry_id"], rating="up",
                                              reason="", _session_id="manual-A",
                                              _session_verified=True))
@@ -469,17 +558,16 @@ def test_old_generation_update_id_cannot_republish(gated, tmp_path):
     gen_c = settings_mod.load(tmp_path / "community.json").generation
     # A (malicious or confused) organizer result naming the old draft as an
     # update id must not append — that would republish the whole old body.
-    result = {"entries": [dict(entry_id=doc["entry_id"], title=doc["title"],
+    result = {"entries": [dict(entry_id=doc["entry_id"], title=None,
                                summary=doc["summary"], content="smuggled update",
-                               conditions={}, sources=[])]}
+                               conditions={})]}
     refs, notes = engine._apply(result, opaque=PRODUCER, marker="f" * 32,
                                 generation=gen_c)
     assert refs == [] and any("generation" in note for note in notes)
     assert store.drafts_changed(generation=gen_c) == []
     # Fresh material in the current generation works normally.
     result = {"entries": [dict(entry_id=None, title="Fresh note", summary="s",
-                               content="current generation body", conditions={},
-                               sources=[])]}
+                               content="current generation body", conditions={})]}
     refs, _ = engine._apply(result, opaque=PRODUCER, marker="e" * 32,
                             generation=gen_c)
     assert len(refs) == 1
@@ -505,3 +593,48 @@ def test_current_generation_draft_and_vote_publish(gated, tmp_path):
     assert len(cases) == 1 and len(feedback) == 1
     votes = json.loads(feedback[0]["content"])["votes"]
     assert len(votes) == 1 and votes[0]["rating"] == "down"
+
+
+def test_v3_store_keeps_old_private_files_inert_and_persists_capture_floor(tmp_path):
+    root = tmp_path / 'test'
+    root.mkdir()
+    prior = root / 'store-v2.sqlite3'
+    prior.write_bytes(b'old private state; do not open, migrate or delete')
+    before = prior.read_bytes()
+    first = Store(tmp_path, 'test')
+    floor = first.capture_floor
+    assert first.query('old private')['results'] == []
+    first.close()
+    second = Store(tmp_path, 'test')
+    assert second.capture_floor == floor
+    assert prior.read_bytes() == before
+    assert (root / 'store-v3.sqlite3').is_file()
+    second.close()
+
+
+def test_title_correction_keeps_publication_path(store):
+    from mindie_knowledge.loop.export import _filename
+    first = draft(store)
+    second, _ = store.append_observation(first['entry_id'], 'Correction.',
+        marker='c' * 32, producer=PRODUCER, header={'title': 'Corrected scope'})
+    assert _filename(first) == _filename(second)
+
+
+def test_pending_votes_are_not_sent_after_upstream_withdrawal(gated):
+    from mindie_knowledge.loop.export import build_batch
+    store, engine, _, _ = gated
+    settings = engine._settings()
+    doc = draft(store)
+    store.install_feed([doc], feed_ident='f' * 64)
+    ref = store.ref(doc['entry_id'], doc['revision'])
+    store.record_vote(ref=ref, rating='down', reason='', root_hash=session_key('consumer'),
+                      publishable=True, generation=settings.generation)
+    built = build_batch(store, settings=settings)
+    pending = store.batch(built[0])
+    store.install_feed([], feed_ident='f' * 64)
+    writes = []
+    engine.community = {'submit_batch': lambda *args, **kwargs: writes.append(args)}
+    engine._submit(pending)
+    assert writes == []
+    assert store.batch(built[0])['status'] == 'disabled'
+    assert store.draft_headers(owner=PRODUCER) == []

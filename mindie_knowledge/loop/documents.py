@@ -1,13 +1,20 @@
-"""Canonical ``mindie-entry/1`` public entry documents.
+"""Canonical ``mindie-entry/2`` public entry documents.
 
-One Markdown file per entry: a YAML frontmatter header carrying every field
-except ``content`` (title, one summary, applicability, sources, producers,
-status) and the detailed body as the Markdown content. There is no separate
-summary artifact. The content ``revision`` is the SHA256 of the canonical
-sorted compact UTF-8 JSON of all fields except ``revision`` itself, so the
-same fields always produce the same revision on any host; no timestamps take
-part. Files are canonical LF bytes; hashing and Git commits see exactly what
-was rendered.
+One Markdown file per entry: a small YAML frontmatter header (schema,
+entry_id, domain, kind, title, summary, optional conditions) and the detailed
+body as the Markdown content. There is no separate summary artifact and no
+public revision/producers/sources/status/retirement metadata: the content
+``revision`` is an internal fingerprint computed during parse/write as the
+SHA256 of the canonical sorted compact UTF-8 JSON of the public semantic
+fields (including the detailed body and the normalized — possibly empty —
+conditions), excluding local ownership and state. Draft ownership lives in a
+private entry-owner relation, never in the Markdown. Withdrawal is deletion
+from the published tree, not a tombstone field. ``conditions`` carries only
+known relevant software versions or source commits; hardware, configuration,
+input parameters and documentation/code/issue citations stay in the body.
+Files are canonical LF bytes; hashing and Git commits see exactly what was
+rendered. Duplicate YAML keys and unknown fields are rejected so canonical
+identity is never ambiguous, and an unknown schema fails loudly.
 
 Only safe YAML is used: ``safe_load``/``safe_dump`` never execute constructors.
 """
@@ -20,9 +27,8 @@ import re
 
 import yaml
 
-SCHEMA = "mindie-entry/1"
+SCHEMA = "mindie-entry/2"
 KINDS = ("knowledge", "experience")
-STATUSES = ("active", "retired")
 
 MAX_FILE_BYTES = 128 * 1024
 MAX_TITLE = 240
@@ -30,28 +36,32 @@ MAX_SUMMARY_BYTES = 2048
 MAX_BODY_BYTES = 64 * 1024
 MAX_CONDITION_KEY = 128
 MAX_CONDITION_VALUE = 512
-MAX_SOURCE = 1024
-MAX_SOURCES = 32
-MAX_PRODUCERS = 64
-MAX_RETIREMENT_REASON = 1000
 
 DOMAIN_RE = re.compile(r"[a-z][a-z0-9-]{0,63}")
 HEX_RE = re.compile(r"[0-9a-f]{64}")
 
+# Internal normalized document fields. ``revision`` is computed, never parsed
+# from or rendered into the public file.
 FIELDS = (
     "schema",
     "entry_id",
     "revision",
     "domain",
     "kind",
-    "status",
     "title",
     "summary",
     "conditions",
-    "sources",
-    "producers",
-    "retirement_reason",
     "content",
+)
+
+PUBLIC_HEADER_FIELDS = (
+    "schema",
+    "entry_id",
+    "domain",
+    "kind",
+    "title",
+    "summary",
+    "conditions",
 )
 
 _OBSERVATION_HEADING = "## Later observations"
@@ -70,7 +80,7 @@ def digest(value) -> str:
 
 
 def revision_of(doc: dict) -> str:
-    """Content revision: SHA256 of the canonical JSON of every field but revision."""
+    """Content revision: SHA256 of the canonical JSON of the public fields."""
     return digest({key: doc[key] for key in FIELDS if key != "revision"})
 
 
@@ -99,7 +109,7 @@ def validate(doc: dict) -> dict:
     rewritten, so ``render_entry(parse_entry(x))`` and the revision digest can
     never disagree about what the bytes are."""
     if not isinstance(doc, dict) or set(doc) != set(FIELDS):
-        raise ValueError("entry must contain exactly the mindie-entry/1 fields")
+        raise ValueError("entry must contain exactly the mindie-entry/2 fields")
     if doc["schema"] != SCHEMA:
         raise ValueError("unsupported entry schema")
     if not isinstance(doc["entry_id"], str) or not HEX_RE.fullmatch(doc["entry_id"]):
@@ -110,8 +120,6 @@ def validate(doc: dict) -> dict:
         raise ValueError("invalid domain")
     if doc["kind"] not in KINDS:
         raise ValueError("kind must be knowledge or experience")
-    if doc["status"] not in STATUSES:
-        raise ValueError("status must be active or retired")
     _text(doc["title"], "title", MAX_TITLE)
     if doc["title"] != doc["title"].strip():
         raise ValueError("title must be canonical (no surrounding whitespace)")
@@ -130,32 +138,6 @@ def validate(doc: dict) -> dict:
         _text(value, f"condition {key!r}", MAX_CONDITION_VALUE)
         if key != key.strip() or value != value.strip():
             raise ValueError("conditions must be canonical text")
-    sources = doc["sources"]
-    if not isinstance(sources, list) or len(sources) > MAX_SOURCES:
-        raise ValueError("sources must be a bounded list")
-    for source in sources:
-        _text(source, "source", MAX_SOURCE)
-        if source != source.strip():
-            raise ValueError("sources must be canonical text")
-    producers = doc["producers"]
-    if not isinstance(producers, list) or len(producers) > MAX_PRODUCERS:
-        raise ValueError("producers must be a bounded list")
-    if any(not isinstance(p, str) or not HEX_RE.fullmatch(p) for p in producers):
-        raise ValueError("producers must be opaque 64-character hex identities")
-    if len(set(producers)) != len(producers):
-        raise ValueError("duplicate producer identities")
-    if producers != sorted(producers):
-        raise ValueError("producers must be canonically sorted")
-    if not isinstance(doc["retirement_reason"], str):
-        raise ValueError("retirement_reason must be text")
-    _text(doc["retirement_reason"], "retirement_reason", MAX_RETIREMENT_REASON,
-          nonempty=False)
-    if doc["retirement_reason"] != doc["retirement_reason"].strip():
-        raise ValueError("retirement_reason must be canonical text")
-    if doc["status"] == "retired" and not doc["retirement_reason"]:
-        raise ValueError("retired entries need a retirement_reason")
-    if doc["status"] == "active" and doc["retirement_reason"]:
-        raise ValueError("active entries carry an empty retirement_reason")
     if not isinstance(doc["content"], str) or not doc["content"].strip():
         raise ValueError("content must be nonempty text")
     if doc["content"] != doc["content"].strip():
@@ -166,8 +148,8 @@ def validate(doc: dict) -> dict:
     return doc
 
 
-def make_entry(*, entry_id, domain, kind, title, summary, content, conditions=None,
-               sources=(), producers=(), status="active", retirement_reason="") -> dict:
+def make_entry(*, entry_id, domain, kind, title, summary, content,
+               conditions=None) -> dict:
     """Build a validated entry, computing its revision from the fields."""
     doc = dict(
         schema=SCHEMA,
@@ -175,13 +157,9 @@ def make_entry(*, entry_id, domain, kind, title, summary, content, conditions=No
         revision="0" * 64,
         domain=domain,
         kind=kind,
-        status=status,
         title=title.strip(),
         summary=summary.strip(),
         conditions=dict(conditions or {}),
-        sources=list(sources),
-        producers=sorted(producers),
-        retirement_reason=retirement_reason.strip(),
         content=content.strip(),
     )
     doc["revision"] = revision_of(doc)
@@ -189,27 +167,45 @@ def make_entry(*, entry_id, domain, kind, title, summary, content, conditions=No
 
 
 def render_entry(doc: dict) -> str:
-    """Canonical Markdown: YAML header with every field but content, then the body."""
+    """Canonical Markdown: YAML header without the private revision, then the
+    body. Empty conditions are omitted rather than rendered as a placeholder."""
     validate(doc)
-    header = {key: doc[key] for key in FIELDS if key != "content"}
+    header = {key: doc[key] for key in PUBLIC_HEADER_FIELDS if key != "conditions"}
+    if doc["conditions"]:
+        header["conditions"] = dict(doc["conditions"])
     frontmatter = yaml.safe_dump(
         header, sort_keys=True, allow_unicode=True, width=10**6
     )
     return f"---\n{frontmatter}---\n\n{doc['content'].strip()}\n"
 
 
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """Safe YAML loader that rejects duplicate mapping keys outright."""
+
+    def construct_mapping(self, node, deep=False):
+        mapping = {}
+        for key_node, value_node in node.value:
+            key = self.construct_object(key_node, deep=True)
+            if key in mapping:
+                raise ValueError(f"duplicate YAML key {key!r}")
+            mapping[key] = self.construct_object(value_node, deep=True)
+        return mapping
+
+
 def parse_entry(markdown) -> dict:
     """Parse and validate one canonical entry document.
 
     Accepts ``str`` or UTF-8 ``bytes``. Byte and malformed-file limits apply;
-    CRLF input is rejected so hashing always sees canonical LF bytes.
+    CRLF input is rejected so hashing always sees canonical LF bytes. The
+    internal revision is computed from the parsed public fields; any revision,
+    ownership or status field in the file is an unknown field and fails loudly.
     """
     if isinstance(markdown, bytes):
         if len(markdown) > MAX_FILE_BYTES:
             raise ValueError("entry file exceeds the byte limit")
         try:
             text = markdown.decode("utf-8")
-        except UnicodeDecodeError as exc:
+        except UnicodeDecodeError:
             raise ValueError("entry file is not valid UTF-8") from None
     elif isinstance(markdown, str):
         if len(markdown.encode("utf-8")) > MAX_FILE_BYTES:
@@ -225,15 +221,28 @@ def parse_entry(markdown) -> dict:
     if end == -1:
         raise ValueError("unterminated YAML frontmatter block")
     try:
-        header = yaml.safe_load(text[4:end])
-    except yaml.YAMLError:
+        header = yaml.load(text[4:end], Loader=_UniqueKeyLoader)
+    except (yaml.YAMLError, TypeError):
         raise ValueError("malformed YAML frontmatter") from None
     if not isinstance(header, dict):
         raise ValueError("frontmatter must be a mapping")
+    if any(not isinstance(key, str) for key in header):
+        raise ValueError("frontmatter field names must be text")
+    unknown = set(header) - set(PUBLIC_HEADER_FIELDS)
+    if unknown:
+        raise ValueError(f"unknown entry fields: {sorted(unknown)}")
+    if header.get("schema") != SCHEMA:
+        raise ValueError("unsupported entry schema")
+    if set(PUBLIC_HEADER_FIELDS) - {"conditions"} - set(header):
+        raise ValueError("missing required entry fields")
     doc = dict(header)
+    if "conditions" in doc and not isinstance(doc["conditions"], dict):
+        raise ValueError("conditions must be a mapping when present")
+    doc.setdefault("conditions", {})
     doc["content"] = text[end + len("\n---\n") :].strip()
     if not doc["content"]:
         raise ValueError("entry body must be nonempty")
+    doc["revision"] = revision_of(doc)
     return validate(doc)
 
 

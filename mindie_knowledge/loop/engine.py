@@ -33,7 +33,7 @@ from .documents import DraftFull
 from .process import MaintenanceCancelled, bounded_run
 from .store import canonical, digest, session_key
 
-ORGANIZE_FIELDS = {"entry_id", "title", "summary", "conditions", "content", "sources"}
+ORGANIZE_FIELDS = {"entry_id", "title", "summary", "conditions", "content"}
 MAX_STRUCTURED_RESULT = 32 * 1024
 MAX_INPUT = 64 * 1024
 SUMMARY_FIELD = 4096
@@ -122,6 +122,7 @@ class Engine:
         boundary = max(
             settings.enabled_at,
             activated_at if type(activated_at) in (int, float) else 0,
+            self.store.capture_floor,
         )
         captured = self.store.add_capture(
             root_session=root_hash, session=session_id, turn=turn_id,
@@ -209,13 +210,18 @@ class Engine:
             ident = entry.get("entry_id")
             if ident is not None and not isinstance(ident, str):
                 raise ValueError("entry_id must be null or an identity string")
-            for name in ("title", "summary", "content"):
+            title = entry.get("title")
+            if ident:
+                # An update may pass title=null to preserve the existing one.
+                if title is not None and (not isinstance(title, str) or not title.strip()):
+                    raise ValueError("title must be null or nonempty text")
+            elif not isinstance(title, str) or not title.strip():
+                raise ValueError("a new entry requires a nonempty title")
+            for name in ("summary", "content"):
                 if not isinstance(entry.get(name), str) or not entry[name].strip():
                     raise ValueError(f"organized entry requires nonempty {name}")
             if not isinstance(entry.get("conditions", {}), dict):
                 raise ValueError("conditions must be an object")
-            if not isinstance(entry.get("sources", []), list):
-                raise ValueError("sources must be a list")
 
     def _transcript_increment(self, row, settings, lease, region):
         """Read/filter the authorized increment; reserves regions as it goes.
@@ -330,14 +336,13 @@ class Engine:
                     doc, _appended = self.store.append_observation(
                         ident, entry["content"], marker=marker, producer=opaque,
                         generation=generation, header={k: entry[k] for k in
-                            ("title", "summary", "conditions", "sources") if k in entry},
+                            ("title", "summary", "conditions") if k in entry},
                     )
                 else:
                     doc = self.store.create_draft(
                         kind="experience", title=entry["title"],
                         summary=entry["summary"], content=entry["content"],
-                        conditions=entry.get("conditions") or {},
-                        sources=entry.get("sources") or [], producers=[opaque],
+                        conditions=entry.get("conditions") or {}, owner=opaque,
                         generation=generation,
                     )
                 refs.append(self.store.ref(doc["entry_id"]))
@@ -409,7 +414,7 @@ class Engine:
                     more=inc.get("more", False),
                 ),
                 existing_drafts=self.store.draft_headers(
-                    producer=opaque, generation=row["generation"], query=masked),
+                    owner=opaque, generation=row["generation"], query=masked),
                 retrieved_refs=[
                     hit["ref"]
                     for hit in self.store.query(masked[:2000], limit=5)["results"]
@@ -544,6 +549,17 @@ class Engine:
             )
             return
         batch = json.loads(batch_row["batch"])
+        try:
+            withdrawn = any(self.store.get(ref).get("withdrawn", False)
+                            for ref in batch["entry_refs"])
+        except ValueError:
+            self.store.mark_batch(batch_row["batch_id"], "needs_review",
+                                  detail="pending contribution reference no longer resolves")
+            return
+        if withdrawn:
+            self.store.mark_batch(batch_row["batch_id"], "disabled",
+                                  detail="upstream withdrew pending contribution material")
+            return
         try:
             receipt = self.community["submit_batch"](
                 batch, settings.as_dict(), self.state_dir, cancel=self._cancel

@@ -28,14 +28,12 @@ def init_repo(path):
     return git
 
 
-def entry_doc(entry_id, title, *, status="active", reason="", kind="experience",
-              conditions=None, sources=None):
+def entry_doc(entry_id, title, *, kind="experience", conditions=None):
     return make_entry(
         entry_id=entry_id, domain="vllm-ascend", kind=kind, title=title,
         summary=f"Summary of {title}.",
         content=f"Detailed body of {title} with failure and fix context.",
-        conditions=conditions or {}, sources=sources or [],
-        producers=[PRODUCER], status=status, retirement_reason=reason,
+        conditions=conditions or {},
     )
 
 
@@ -81,23 +79,37 @@ def test_sync_installs_and_keeps_exact_history(env):
     assert feed.sync()["commit"] == second
     # A saved reference stays on its observed revision; re-querying shows the new one.
     assert store.get(hits[0]["ref"])["revision"] == v1
-    current = store.query("Device gate")["results"][0]
+    current = store.get(store.query("Device gate")["results"][0]["ref"])
     assert current["revision"] == revised["revision"]
     pinned = store.get(store.ref("1" * 64, v1))
     assert pinned["title"] == "Device gate"  # exact old body retained
 
 
-def test_retirement_leaves_search_but_stays_explainable(env):
+def test_upstream_deletion_withdraws_but_pinned_reads_stay_explicit(env):
     git, repo, store, feed = env
+    # A local draft of the same entry exists before publication.
+    store.create_draft(kind="experience", title="Old driver note",
+                       summary="stale local copy", content="stale body",
+                       entry_id="2" * 64, owner=PRODUCER, generation="gen-1")
     commit_docs(git, repo, [entry_doc("2" * 64, "Old driver note")])
     feed.sync()
-    assert store.query("Old driver")["results"]
-    commit_docs(git, repo, [entry_doc("2" * 64, "Old driver note", status="retired",
-                                      reason="superseded by the 8.x line")])
-    assert feed.sync()["retired"] == 1
-    assert store.query("Old driver")["results"] == []
-    doc = store.get(store.ref("2" * 64))
-    assert doc["status"] == "retired" and "8.x" in doc["retirement_reason"]
+    hits = store.query("Old driver")["results"]
+    assert hits and hits[0]["summary"].startswith("Summary of")  # published body wins
+    pinned = hits[0]["ref"]
+    commit_docs(git, repo, [])  # deleted from the upstream main tree
+    assert feed.sync()["entries"] == 0
+    assert store.query("Old driver")["results"] == []  # gone from retrieval
+    doc = store.get(pinned)  # cached pinned read remains for history
+    assert doc["withdrawn"] is True and "withdrawn" in doc["note"]
+    assert "Old driver" in doc["title"]
+    assert store.get(store.ref("2" * 64))["withdrawn"] is True
+    # The stale local draft neither resurrects the entry in search nor
+    # becomes a new publication candidate.
+    assert store.drafts_changed(generation="gen-1") == []
+    # Old feedback on the withdrawn entry may be recorded but stays local.
+    store.record_vote(root_hash="9" * 64, ref=pinned, rating="down",
+                      reason="superseded", publishable=True, generation="gen-1")
+    assert store.unbatched_votes(generation="gen-1") == []
 
 
 def test_empty_generation_is_valid_and_clears_search(env):
@@ -126,12 +138,10 @@ def test_old_corpus_layout_is_not_an_empty_feed(env):
     assert candidate["status"] == "invalid" and candidate["attempts"] == 1
 
 
-def test_knowledge_requires_sources_but_versions_can_be_unknown(env):
+def test_knowledge_needs_no_header_sources_and_versions_can_be_empty(env):
     git, repo, store, feed = env
-    commit_docs(git, repo, [entry_doc("4" * 64, "Ungrounded topic", kind="knowledge")])
-    assert feed.sync()["status"] == "invalid"
-    commit_docs(git, repo, [entry_doc("4" * 64, "Grounded topic", kind="knowledge",
-                                      sources=["https://example.com/spec@abc"])])
+    # mindie-entry/2 has no public sources header; citations live in the body.
+    commit_docs(git, repo, [entry_doc("4" * 64, "Grounded topic", kind="knowledge")])
     assert feed.sync()["status"] == "synced"
     assert store.query("Grounded")["results"][0]["conditions"] == {}
 

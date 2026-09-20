@@ -1,8 +1,10 @@
 # Public Markdown metadata review
 
-Status: code-path audit and proposed simplification. The versions-only meaning
-of `conditions` is implemented in the organizer instructions and documented
-contract; the remaining serialization changes below are not deployed.
+Status: implemented in this worktree. The versions-only meaning of
+`conditions`, the `mindie-entry/2` serialization (no public revision,
+producers, sources, status or retirement_reason; ownership in a private
+entry-owner relation; withdrawal by upstream deletion with explicit withdrawn
+pinned reads; short 16-hex pinned references) are all in force.
 
 The public experience is detailed reference material. It should not expose the
 local capture, authorization or maintenance ledger. A field being used by the

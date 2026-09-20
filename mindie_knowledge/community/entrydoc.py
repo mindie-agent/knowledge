@@ -1,4 +1,4 @@
-"""Canonical ``mindie-entry/1`` document access for the community package.
+"""Canonical ``mindie-entry/2`` document access for the community package.
 
 Core owns the single document definition in ``mindie_knowledge.loop.documents``
 (``render_entry`` / ``parse_entry`` / ``revision_of`` / ``append_observation``).
@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-SCHEMA = "mindie-entry/1"
+SCHEMA = "mindie-entry/2"
 
 
 def _core():
@@ -20,7 +20,7 @@ def _core():
     except ImportError as exc:
         raise RuntimeError(
             "mindie_knowledge.loop.documents is required (core package provides the "
-            "canonical mindie-entry/1 implementation); integrate the core module first"
+            "canonical mindie-entry/2 implementation); integrate the core module first"
         ) from exc
     missing = [
         name

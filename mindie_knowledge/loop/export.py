@@ -17,7 +17,6 @@ body that an old full draft must not overwrite.
 from __future__ import annotations
 
 import hashlib
-import re
 from pathlib import Path
 
 from mindie_knowledge.markdown import _atomic_write_text
@@ -26,13 +25,10 @@ from mindie_knowledge.redact import scan_text
 from .documents import render_entry
 from .store import canonical, digest
 
-_SLUG_UNSAFE = re.compile(r"[^a-z0-9]+")
-
-
 def _filename(doc):
-    base = _SLUG_UNSAFE.sub("-", doc["title"].casefold()).strip("-") or "entry"
     subdir = "topics" if doc["kind"] == "knowledge" else "cases"
-    return f"{subdir}/{base[:60]}-{doc['entry_id'][:12]}.md"
+    # Correcting a title must edit the same file, not add a duplicate identity.
+    return f"{subdir}/{doc['entry_id']}.md"
 
 
 def _sha(text):
@@ -149,9 +145,9 @@ def _stage_batch(store, settings, drafts, votes, revision_fn):
         )
         if receipt and receipt.get("commit"):
             base_commit = receipt["commit"]
-    entry_refs = [
-        store.ref(d["entry_id"], d["revision"]) for d in drafts
-    ]
+    entry_refs = sorted({
+        store.ref(d["entry_id"], d["revision"]) for d in [*drafts, *votes]
+    })
     summary = f"{store.domain}: {len(drafts)} entries, {len(vote_keys)} votes"
     file_dicts = [
         {k: f[k] for k in ("path", "content", "sha256", "base_sha256")}

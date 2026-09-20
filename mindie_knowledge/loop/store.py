@@ -1,13 +1,16 @@
 """Versioned local knowledge store, scoped to one domain.
 
-This is the ``mindie-store/2`` runtime store (``store-v2.sqlite3``). It
-replaces content-as-identity with stable opaque entry IDs plus an explicit
-revision history: every known body — local draft revisions and published
-revisions installed from the content repository — is retained, so an old
-pinned reference always reads the exact historical bytes while ordinary
-search shows the current published version. Local drafts update by
-append-only, marker-deduplicated observations; publication state
-(active/retired) arrives only from the canonical Git publication.
+This is the ``mindie-store/3`` runtime store (``store-v3.sqlite3``) serving
+canonical ``mindie-entry/2`` documents. It replaces content-as-identity with
+stable opaque entry IDs plus an explicit revision history: every known body —
+local draft revisions and published revisions installed from the content
+repository — is retained, so an old pinned reference always reads the exact
+historical bytes while ordinary search shows the current published version.
+Local drafts update by append-only, marker-deduplicated observations; draft
+ownership lives in a private entry-owner relation, never in a downloaded
+document. Withdrawal is upstream deletion: an entry the feed tree no longer
+carries leaves ordinary search, is never resurrected by its local draft, and
+its retained pinned reads carry an explicit ``withdrawn`` flag and note.
 
 Per explicit user steering there is no legacy compatibility layer: the public
 knowledge base restarts empty in this format, old public migration is
@@ -36,7 +39,7 @@ from mindie_knowledge.markdown import _atomic_write_text
 from . import documents
 from .documents import DraftFull
 
-SCHEMA = "mindie-store/2"
+SCHEMA = "mindie-store/3"
 MAX_ENTRIES = 10000
 MAX_VOTE_REASON = 1000
 RATINGS = ("up", "down")
@@ -75,14 +78,14 @@ class Store:
         self.root.chmod(0o700)
         self.lock = threading.RLock()
         self.db = sqlite3.connect(
-            self.root / "store-v2.sqlite3", check_same_thread=False
+            self.root / "store-v3.sqlite3", check_same_thread=False
         )
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS entries(entry_id TEXT PRIMARY KEY,
-                kind TEXT NOT NULL, title TEXT NOT NULL, status TEXT NOT NULL,
+                kind TEXT NOT NULL, title TEXT NOT NULL,
                 origin TEXT NOT NULL, draft_revision TEXT, published_revision TEXT,
                 feed_active INTEGER NOT NULL DEFAULT 0, batched_revision TEXT,
                 doc TEXT NOT NULL, updated REAL NOT NULL);
@@ -124,10 +127,19 @@ class Store:
                 identity TEXT NOT NULL, revision TEXT NOT NULL,
                 generation TEXT NOT NULL, created REAL NOT NULL,
                 PRIMARY KEY(kind, identity, revision));
+            CREATE TABLE IF NOT EXISTS owners(entry_id TEXT PRIMARY KEY,
+                owner TEXT NOT NULL, created REAL NOT NULL);
         """)
         self.db.execute(
             "INSERT OR REPLACE INTO meta VALUES('schema', ?)", (SCHEMA,)
         )
+        self.db.execute(
+            "INSERT OR IGNORE INTO meta VALUES('capture_floor', ?)",
+            (str(time.time()),),
+        )
+        self.capture_floor = float(self.db.execute(
+            "SELECT value FROM meta WHERE key='capture_floor'"
+        ).fetchone()[0])
         self.db.commit()
 
     @contextlib.contextmanager
@@ -182,25 +194,81 @@ class Store:
 
     # ------------------------------------------------------------------ refs
 
+    WITHDRAWN_NOTE = (
+        "withdrawn from the published knowledge base by upstream deletion; "
+        "this is a retained historical copy, not current published material"
+    )
+
     def ref(self, entry_id, revision=None):
         base = f"mindie://{self.domain}/{entry_id}"
         return f"{base}@{revision}" if revision else base
 
+    def _unique_token(self, value, rows):
+        """16-hex prefix when it names exactly one known value, else the full
+        hash — a rendered reference must always resolve back precisely."""
+        prefix = value[:16]
+        return value if any(other != value for other in rows) else prefix
+
+    def _short_ref(self, entry_id, revision):
+        with self.lock:
+            entries = [r[0] for r in self.db.execute(
+                "SELECT entry_id FROM entries WHERE entry_id LIKE ?",
+                (entry_id[:16] + "%",),
+            )]
+            revisions = [r[0] for r in self.db.execute(
+                "SELECT revision FROM revisions WHERE entry_id=? AND revision LIKE ?",
+                (entry_id, revision[:16] + "%"),
+            )]
+        return self.ref(
+            self._unique_token(entry_id, entries),
+            self._unique_token(revision, revisions),
+        )
+
+    def _resolve_entry(self, token):
+        if len(token) == 64:
+            return token
+        rows = [r[0] for r in self.db.execute(
+            "SELECT entry_id FROM entries WHERE entry_id LIKE ?", (token + "%",)
+        )]
+        if not rows:
+            raise ValueError("unknown reference in this domain")
+        if len(rows) > 1:
+            raise ValueError("ambiguous reference prefix; use the full 64-hex identity")
+        return rows[0]
+
+    def _resolve_revision(self, entry_id, token):
+        if len(token) == 64:
+            return token
+        rows = [r[0] for r in self.db.execute(
+            "SELECT revision FROM revisions WHERE entry_id=? AND revision LIKE ?",
+            (entry_id, token + "%"),
+        )]
+        if not rows:
+            raise ValueError("unknown pinned revision in this domain")
+        if len(rows) > 1:
+            raise ValueError("ambiguous pinned revision prefix; use the full 64-hex revision")
+        return rows[0]
+
     def _parse_ref(self, ref):
+        """Resolve a reference to a full ``(entry_id, revision)`` pair.
+
+        Accepts the full ``mindie://domain/<64-hex>[@<64-hex>]`` form and the
+        short 16-hex prefix form (with or without the scheme). Prefixes must
+        name exactly one known value; ambiguity fails, never picks the first.
+        Caller must hold the lock: resolution reads the catalogue."""
         prefix = f"mindie://{self.domain}/"
         text = ref if isinstance(ref, str) else ""
         if text.startswith(prefix):
             text = text[len(prefix):]
-        elif re.fullmatch(r"[0-9a-f]{64}(@[0-9a-f]{64})?", text or ""):
-            pass
-        else:
+        elif not re.fullmatch(r"[0-9a-f]{16,64}(@[0-9a-f]{16,64})?", text or ""):
             raise ValueError("reference is outside the selected domain")
         entry, _, revision = text.partition("@")
-        if not documents.HEX_RE.fullmatch(entry):
+        if not re.fullmatch(r"[0-9a-f]{16,64}", entry):
             raise ValueError("reference is outside the selected domain")
-        if revision and not documents.HEX_RE.fullmatch(revision):
+        if revision and not re.fullmatch(r"[0-9a-f]{16,64}", revision):
             raise ValueError("invalid pinned revision")
-        return entry, revision or None
+        entry_id = self._resolve_entry(entry)
+        return entry_id, self._resolve_revision(entry_id, revision) if revision else None
 
     def _row(self, entry_id):
         return self.db.execute(
@@ -214,26 +282,37 @@ class Store:
         ).fetchone()
         return json.loads(row[0]) if row else None
 
+    def _withdrawn(self, row):
+        """Published once, no longer carried by the feed tree after a
+        successful sync. Local drafts never resurrect it."""
+        return bool(
+            row is not None and row["published_revision"] and not row["feed_active"]
+        )
+
     def get(self, ref):
-        """Exact document for a reference; a pinned revision reads history."""
-        entry_id, revision = self._parse_ref(ref)
+        """Exact document for a reference; a pinned revision reads history.
+        A withdrawn entry stays readable with an explicit flag and note."""
         with self.lock:
+            entry_id, revision = self._parse_ref(ref)
+            row = self._row(entry_id)
             if revision:
                 doc = self._revision_doc(entry_id, revision)
                 if doc is None:
                     raise ValueError("unknown pinned revision in this domain")
-                return doc
-            row = self._row(entry_id)
-            if row is None:
-                raise ValueError("unknown reference in this domain")
-            return json.loads(row["doc"])
+            else:
+                if row is None:
+                    raise ValueError("unknown reference in this domain")
+                doc = json.loads(row["doc"])
+            if self._withdrawn(row):
+                return dict(doc, withdrawn=True, note=self.WITHDRAWN_NOTE)
+            return dict(doc, withdrawn=False)
 
     def explain(self, ref, *, offset=0, limit=None):
         doc = self.get(ref)
         if type(offset) is not int or offset < 0:
             raise ValueError("offset must be a nonnegative integer")
         if limit is not None and (type(limit) is not int or not 1 <= limit <= 65536):
-            raise ValueError("limit must be between 1 and 65536")
+            raise ValueError("limit must be between 1 and 65536 characters")
         body = doc["content"]
         total = len(body)
         sliced = body[offset : offset + limit if limit is not None else None]
@@ -255,22 +334,32 @@ class Store:
             (doc["entry_id"], doc["revision"], canonical(doc), source, created),
         )
 
+    def _owner_of(self, entry_id):
+        row = self.db.execute(
+            "SELECT owner FROM owners WHERE entry_id=?", (entry_id,)
+        ).fetchone()
+        return row[0] if row else None
+
     def create_draft(self, *, kind, title, summary, content, conditions=None,
-                     sources=(), producers=(), entry_id=None, origin="draft",
+                     owner=None, entry_id=None, origin="draft",
                      generation=None):
         """Create one local draft with a fresh opaque stable identity.
 
-        Without ``generation`` the draft is local-only: it is never selected
-        for a contribution batch just because a flush happens."""
+        ``owner`` is the producing task's opaque identity, recorded in the
+        private entry-owner relation; it is never rendered into the document
+        or folded into the revision. Without ``generation`` the draft is
+        local-only: it is never selected for a contribution batch just because
+        a flush happens."""
         if origin not in {"draft"}:
             raise ValueError("local entries start as drafts")
         entry_id = entry_id or new_identity()
         if not documents.HEX_RE.fullmatch(entry_id):
             raise ValueError("entry_id must be a 64-character hex identity")
+        if owner is not None and not documents.HEX_RE.fullmatch(owner):
+            raise ValueError("owner must be an opaque 64-character hex identity")
         doc = documents.make_entry(
             entry_id=entry_id, domain=self.domain, kind=kind, title=title,
             summary=summary, content=content, conditions=conditions,
-            sources=sources, producers=producers,
         )
         now = time.time()
         with self._write_txn():
@@ -278,10 +367,14 @@ class Store:
                 raise ValueError("entry identity already exists")
             self._insert_revision(doc, origin, now)
             self.db.execute(
-                "INSERT INTO entries VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (entry_id, kind, doc["title"], "active", origin, doc["revision"],
+                "INSERT INTO entries VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (entry_id, kind, doc["title"], origin, doc["revision"],
                  None, 0, None, canonical(doc), now),
             )
+            if owner is not None:
+                self.db.execute(
+                    "INSERT INTO owners VALUES(?,?,?)", (entry_id, owner, now)
+                )
             if generation is not None:
                 self.db.execute(
                     "INSERT OR REPLACE INTO grants VALUES(?,?,?,?,?)",
@@ -295,12 +388,14 @@ class Store:
         """Append one bounded observation/correction to a local draft.
 
         Idempotent on ``marker`` (the reserved increment identity): a repeated
-        Stop never creates a near-duplicate section. Only the producing root
-        may extend a draft; published bodies are never rewritten locally.
-        With ``generation``, the base draft must already be granted to that
-        same sharing generation — an update id can never smuggle an
-        old-generation private body into a new publication. Without it the
-        new revision is local-only. Returns ``(doc, appended)``.
+        Stop never creates a near-duplicate section. Only the owning task in
+        the private entry-owner relation may extend a draft; ownership claimed
+        by imported content is never trusted. Published bodies are never
+        rewritten locally. With ``generation``, the base draft must already be
+        granted to that same sharing generation — an update id can never
+        smuggle an old-generation private body into a new publication.
+        Without it the new revision is local-only. Returns
+        ``(doc, appended)``.
         """
         now = time.time()
         with self._write_txn():
@@ -317,17 +412,22 @@ class Store:
                     "it stays local instead of being republished"
                 )
             base = self._revision_doc(entry_id, row["draft_revision"])
-            if producer is not None and producer not in base["producers"]:
-                raise ValueError("only the producing task may update its draft")
+            if producer is not None and producer != self._owner_of(entry_id):
+                raise ValueError("only the owning task may append its draft")
             doc, appended = documents.append_observation(base, addition, marker=marker)
             if not appended:
                 return doc, False
             if header:
                 # The body remains an append-only evidence trail. Retrieval
-                # must describe the latest conclusion, including its correction.
-                for key in ("title", "summary", "conditions", "sources"):
-                    if key in header:
-                        doc[key] = header[key]
+                # must describe the latest conclusion, including its
+                # correction. The title is stable by default: null preserves
+                # it, only an explicitly supplied correction renames.
+                if header.get("title") is not None:
+                    doc["title"] = str(header["title"]).strip()
+                if "summary" in header:
+                    doc["summary"] = header["summary"]
+                if "conditions" in header and header["conditions"] is not None:
+                    doc["conditions"] = dict(header["conditions"])
                 doc["revision"] = documents.revision_of(doc)
                 documents.validate(doc)
             self._insert_revision(doc, row["origin"], now)
@@ -346,6 +446,10 @@ class Store:
             self._write_draft_file(doc)
             return doc, True
 
+    _NOT_WITHDRAWN = (
+        "NOT (entries.published_revision IS NOT NULL AND entries.feed_active=0)"
+    )
+
     def drafts_changed(self, *, generation=None):
         """Draft revision bodies not yet included in any outbox batch.
 
@@ -355,7 +459,8 @@ class Store:
         ``generation`` (the outbound path), only material explicitly granted
         to that sharing generation is selected — anything else stays local
         and inert, never backfilled. Without it, this is the local
-        bookkeeping view across generations."""
+        bookkeeping view across generations. A draft whose entry the feed no
+        longer carries is never a new publication."""
         with self.lock:
             if generation is not None:
                 rows = self.db.execute(
@@ -365,23 +470,26 @@ class Store:
                     "AND grants.revision=entries.draft_revision "
                     "AND grants.generation=? "
                     "WHERE entries.draft_revision IS NOT NULL "
-                    "AND entries.draft_revision != COALESCE(entries.batched_revision, '')",
+                    "AND entries.draft_revision != COALESCE(entries.batched_revision, '') "
+                    f"AND {self._NOT_WITHDRAWN}",
                     (generation,),
                 ).fetchall()
             else:
                 rows = self.db.execute(
                     "SELECT entry_id, draft_revision FROM entries "
                     "WHERE draft_revision IS NOT NULL "
-                    "AND draft_revision != COALESCE(batched_revision, '')"
+                    "AND draft_revision != COALESCE(batched_revision, '') "
+                    f"AND {self._NOT_WITHDRAWN.replace('entries.', '')}"
                 ).fetchall()
             return [self._revision_doc(r["entry_id"], r["draft_revision"])
                     for r in rows]
 
-    def draft_headers(self, *, producer=None, limit=6, excerpt=1200,
+    def draft_headers(self, *, owner=None, limit=6, excerpt=1200,
                       generation=None, query=""):
         """Compact headers plus short excerpts as organizer context. With
         ``generation``, only material granted to that sharing generation is
-        offered as update context."""
+        offered as update context; with ``owner``, only drafts that task owns
+        in the private entry-owner relation."""
         with self.lock:
             if generation is not None:
                 rows = self.db.execute(
@@ -390,20 +498,20 @@ class Store:
                     "AND grants.identity=entries.entry_id "
                     "AND grants.revision=entries.draft_revision "
                     "AND grants.generation=? "
-                    "WHERE entries.draft_revision IS NOT NULL "
+                    f"WHERE entries.draft_revision IS NOT NULL AND {self._NOT_WITHDRAWN} "
                     "ORDER BY entries.updated DESC LIMIT ?",
                     (generation, 256),
                 ).fetchall()
             else:
                 rows = self.db.execute(
                     "SELECT entry_id, draft_revision FROM entries "
-                    "WHERE draft_revision IS NOT NULL "
+                    f"WHERE draft_revision IS NOT NULL AND {self._NOT_WITHDRAWN} "
                     "ORDER BY updated DESC LIMIT ?", (256,),
                 ).fetchall()
         headers = []
         for row in rows:
             doc = self._revision_doc(row["entry_id"], row["draft_revision"]) or {}
-            if producer is not None and producer not in doc["producers"]:
+            if owner is not None and owner != self._owner_of(row["entry_id"]):
                 continue
             headers.append(dict(
                 entry_id=doc["entry_id"], title=doc["title"],
@@ -423,7 +531,7 @@ class Store:
     # ---------------------------------------------------------------- search
 
     def query(self, query, limit=5, conditions=None):
-        """BM25 over visible entries: published versions win; retired and
+        """BM25 over visible entries: published versions win;
         withdrawn-from-feed entries stay explainable but leave the results.
         Draft overlays on published entries are labeled, never a second hit."""
         from mindie_knowledge.markdown import Document
@@ -437,7 +545,7 @@ class Store:
             raise ValueError("conditions must be an object")
         with self.lock:
             rows = self.db.execute(
-                "SELECT * FROM entries WHERE status='active' AND (feed_active=1 "
+                "SELECT * FROM entries WHERE (feed_active=1 "
                 "OR (draft_revision IS NOT NULL AND published_revision IS NULL)) "
                 "LIMIT ?", (MAX_ENTRIES + 1,),
             ).fetchall()
@@ -475,10 +583,9 @@ class Store:
             for hit in hits:
                 doc, row, supplemental = selected[hit.uri]
                 output.append(dict(
-                    ref=self.ref(doc["entry_id"], doc["revision"]),
-                    revision=doc["revision"],
+                    ref=self._short_ref(doc["entry_id"], doc["revision"]),
                     kind=doc["kind"], title=doc["title"], summary=doc["summary"],
-                    conditions=doc["conditions"], status=doc["status"],
+                    conditions=doc["conditions"],
                     origin=row["origin"], supplemental=supplemental,
                     score=round(hit.score, 8),
                 ))
@@ -530,17 +637,17 @@ class Store:
                     self._insert_revision(doc, "feed", now)
                 if row is None:
                     self.db.execute(
-                        "INSERT INTO entries VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                        (doc["entry_id"], doc["kind"], doc["title"], doc["status"],
+                        "INSERT INTO entries VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        (doc["entry_id"], doc["kind"], doc["title"],
                          "feed", None, doc["revision"], 1, None,
                          canonical(doc), now),
                     )
                 else:
                     self.db.execute(
-                        "UPDATE entries SET kind=?, title=?, status=?, "
+                        "UPDATE entries SET kind=?, title=?, "
                         "published_revision=?, feed_active=1, doc=?, updated=? "
                         "WHERE entry_id=?",
-                        (doc["kind"], doc["title"], doc["status"], doc["revision"],
+                        (doc["kind"], doc["title"], doc["revision"],
                          canonical(doc), now, doc["entry_id"]),
                     )
             # Membership is authoritative for every entry, however it first
@@ -585,8 +692,8 @@ class Store:
             raise ValueError("rating must be up or down")
         if not isinstance(reason, str) or len(reason) > MAX_VOTE_REASON:
             raise ValueError("reason must be text of at most 1000 characters")
-        entry_id, pinned = self._parse_ref(ref)
         with self._write_txn():
+            entry_id, pinned = self._parse_ref(ref)
             row = self._row(entry_id)
             if row is None:
                 raise ValueError("unknown reference in this domain")
@@ -613,7 +720,12 @@ class Store:
 
     def unbatched_votes(self, *, generation=None):
         """Publishable unbatched votes. With ``generation`` (the outbound
-        path), only votes explicitly granted to that sharing generation."""
+        path), only votes explicitly granted to that sharing generation.
+        Votes on an entry the feed no longer carries stay local."""
+        withdrawn = (
+            "NOT EXISTS (SELECT 1 FROM entries e WHERE e.entry_id=votes.entry_id "
+            "AND e.published_revision IS NOT NULL AND e.feed_active=0)"
+        )
         with self.lock:
             if generation is not None:
                 return [
@@ -622,14 +734,16 @@ class Store:
                         "SELECT votes.* FROM votes JOIN grants ON grants.kind='vote' "
                         "AND grants.identity=votes.root_opaque||':'||votes.entry_id "
                         "AND grants.revision=votes.revision AND grants.generation=? "
-                        "WHERE votes.publishable=1 AND votes.batch_id IS NULL",
+                        "WHERE votes.publishable=1 AND votes.batch_id IS NULL "
+                        f"AND {withdrawn}",
                         (generation,),
                     )
                 ]
             return [
                 dict(r)
                 for r in self.db.execute(
-                    "SELECT * FROM votes WHERE publishable=1 AND batch_id IS NULL"
+                    "SELECT * FROM votes WHERE publishable=1 AND batch_id IS NULL "
+                    f"AND {withdrawn}"
                 )
             ]
 
@@ -916,8 +1030,9 @@ class Store:
                 domain=self.domain,
                 schema=SCHEMA,
                 entries=counts,
-                retired=self.db.execute(
-                    "SELECT count(*) FROM entries WHERE status='retired'"
+                withdrawn=self.db.execute(
+                    "SELECT count(*) FROM entries WHERE published_revision "
+                    "IS NOT NULL AND feed_active=0"
                 ).fetchone()[0],
                 captures=[
                     dict(r)

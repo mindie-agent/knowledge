@@ -59,25 +59,21 @@ def make_remote(tmp_path: Path, name: str) -> str:
 
 def make_entry(entry_id="entry-1", domain="npu", title="Container device numbering",
                content="Map the physical device, then number logically from zero.",
-               status="active", retirement_reason="", producers=None, revision=None,
-               kind="experience", conditions=None, summary="How device numbering works"):
+               revision=None, kind="experience", conditions=None,
+               summary="How device numbering works"):
     import hashlib
     import re
 
     if not re.fullmatch(r"[0-9a-f]{64}", entry_id):
         entry_id = hashlib.sha256(entry_id.encode("utf-8")).hexdigest()
     doc = {
-        "schema": "mindie-entry/1",
+        "schema": "mindie-entry/2",
         "entry_id": entry_id,
         "domain": domain,
         "kind": kind,
-        "status": status,
         "title": title,
         "summary": summary,
         "conditions": conditions or {"driver": "cann 8.0"},
-        "sources": [],
-        "producers": sorted(producers or []),
-        "retirement_reason": retirement_reason,
         # Core validates canonical form: no surrounding whitespace on content.
         "content": content.strip(),
     }

@@ -1,15 +1,16 @@
 """Model-free knowledge sync from the canonical Git publication.
 
 The configured content repository's branch is followed as one immutable Git
-commit whose tree holds canonical ``mindie-entry/1`` documents under
+commit whose tree holds canonical ``mindie-entry/2`` documents under
 ``cases/`` and ``topics/`` (``feedback/*.json`` belongs to the repository
 side and is ignored here). Every candidate commit is fully validated before
 the atomic switch: layout, sizes, UTF-8/LF bytes, schema, revisions, domain
 and entry identities. A structurally incompatible candidate stops
 immediately; a transient failure consumes one of three persisted attempts
-per candidate; a bad candidate always keeps the old cache. An empty or
-retired-only tree is valid and empties ordinary search, while every
-historical revision body stays readable by pinned reference.
+per candidate; a bad candidate always keeps the old cache. An empty tree is
+valid and empties ordinary search — withdrawal is deletion from the tree —
+while every historical revision body stays readable by pinned reference with
+an explicit withdrawn flag.
 
 Unsupported old layouts (e.g. ``corpus/``) fail loudly instead of looking
 like a valid empty new feed. Sync runs standalone (``sync --config``) with
@@ -173,8 +174,6 @@ class Feed:
             doc = documents.parse_entry(raw)
             if doc["domain"] != self.store.domain:
                 raise ValueError(f"entry {path} belongs to another domain")
-            if doc["kind"] == "knowledge" and not doc["sources"]:
-                raise ValueError("knowledge requires sources")
             if doc["entry_id"] in seen:
                 raise ValueError("duplicate entry identity in feed")
             seen.add(doc["entry_id"])
@@ -255,7 +254,6 @@ class Feed:
             receipt = dict(
                 status="synced", repository=self.repository, ref=self.ref,
                 prefix=self.prefix, commit=commit, entries=installed["entries"],
-                retired=sum(1 for d in docs if d["status"] == "retired"),
                 attempts=candidate["attempts"], checked=time.time(),
             )
             self.store.feed_set(receipt_key, receipt)

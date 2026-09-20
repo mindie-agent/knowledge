@@ -21,23 +21,24 @@ def test_empty_repository_metadata_is_valid(tmp_path):
     assert validate(repo,sha,'vllm-ascend')['entries']==0
 
 def test_plain_canonical_data_only(tmp_path):
-    doc=make_entry(entry_id='a'*64,domain='vllm-ascend',kind='experience',title='Observed boundary',summary='A bounded observation.',content='Detailed evidence and its limits.',producers=[])
+    doc=make_entry(entry_id='a'*64,domain='vllm-ascend',kind='experience',title='Observed boundary',summary='A bounded observation.',content='Detailed evidence and its limits.')
     repo,sha=publish(tmp_path,{'cases/observation.md':render_entry(doc)})
     assert validate(repo,sha,'vllm-ascend')['entries']==1
     git(repo,'update-index','--chmod=+x','cases/observation.md');git(repo,'commit','-qm','executable data')
     with pytest.raises(ValueError,match='plain data blob'):
         validate(repo,git(repo,'rev-parse','HEAD'),'vllm-ascend')
 
-def test_changed_body_without_new_revision_is_rejected(tmp_path):
-    doc=make_entry(entry_id='b'*64,domain='vllm-ascend',kind='experience',title='Revision integrity',summary='Digest binds body.',content='Original body.',producers=[])
-    repo,sha=publish(tmp_path,{'cases/revision.md':render_entry(doc).replace('Original body.','Changed body.')})
-    with pytest.raises(ValueError,match='revision'):
+def test_public_revision_or_legacy_field_is_rejected(tmp_path):
+    doc=make_entry(entry_id='b'*64,domain='vllm-ascend',kind='experience',title='Revision integrity',summary='Digest binds body.',content='Original body.')
+    text=render_entry(doc).replace('entry_id:',f'revision: {"0"*64}\nentry_id:',1)
+    repo,sha=publish(tmp_path,{'cases/revision.md':text})
+    with pytest.raises(ValueError,match='unknown entry fields'):
         validate(repo,sha,'vllm-ascend')
 
-def test_sourced_knowledge_can_leave_unknown_versions_empty(tmp_path):
+def test_knowledge_with_citations_in_body_and_empty_conditions_is_valid(tmp_path):
     doc=make_entry(entry_id='c'*64,domain='vllm-ascend',kind='knowledge',
                    title='Reference with unspecified version',summary='Source omits a version.',
-                   content='The detailed reference states its applicability limits.',
-                   sources=['https://example.com/reference'],conditions={})
+                   content='See https://example.com/reference for the detailed limits.',
+                   conditions={})
     repo,sha=publish(tmp_path,{'topics/reference.md':render_entry(doc)})
     assert validate(repo,sha,'vllm-ascend')['entries']==1

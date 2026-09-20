@@ -175,12 +175,18 @@ TOOLS = [
     ),
     dict(
         name="knowledge_explain",
-        description="Read the original content, conditions and revision for one domain reference.",
+        description=(
+            "Read the original content, conditions and revision for one domain "
+            "reference. offset and limit are character positions in the entry "
+            "body, not lines; without them the full body is returned."
+        ),
         inputSchema=schema(
             dict(
                 ref=STRING,
-                offset={"type": "integer", "minimum": 0},
-                limit={"type": "integer", "minimum": 1, "maximum": 65536},
+                offset={"type": "integer", "minimum": 0,
+                        "description": "Body character offset (0-based), not a line number."},
+                limit={"type": "integer", "minimum": 1, "maximum": 65536,
+                       "description": "Maximum body characters to return, not lines."},
             ),
             ["ref"],
         ),
@@ -399,7 +405,7 @@ def _feeds(config, store):
 
 
 def _open_existing_store(config):
-    path = Path(config["root"]) / config["domain"] / "store-v2.sqlite3"
+    path = Path(config["root"]) / config["domain"] / "store-v3.sqlite3"
     if not path.is_file():
         return None
     return Store(config["root"], config["domain"])

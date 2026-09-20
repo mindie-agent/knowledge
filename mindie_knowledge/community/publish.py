@@ -307,6 +307,8 @@ def _prepare_files(checked, work_dir):
         path = item["path"]
         current_sha = gitops.tree_sha256(work_dir, path)
         if current_sha is None:
+            if item["base_sha256"] is not None and not path.startswith("feedback/"):
+                return None, f"{path} was deleted from the remote; not restoring withdrawn content"
             out.append(item)
             continue
         if current_sha == item["sha256"]:

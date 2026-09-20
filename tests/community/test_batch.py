@@ -143,23 +143,23 @@ def test_entrydoc_roundtrip_and_revision_stability():
     parsed = entrydoc.parse_entry(text)
     assert parsed["entry_id"] == doc["entry_id"]
     assert parsed["revision"] == doc["revision"]
-    assert parsed["status"] == "active"
-    retired = dict(doc, status="retired", retirement_reason="superseded")
-    retired["revision"] = entrydoc.revision_of({**retired, "revision": None})
-    parsed_retired = entrydoc.parse_entry(entrydoc.render_entry(retired))
-    assert parsed_retired["status"] == "retired"
-    assert parsed_retired["retirement_reason"] == "superseded"
+    assert parsed["kind"] == "experience"
+    # mindie-entry/2 carries no private or tombstone fields in the file.
+    for leaked in ("revision", "producers", "sources", "status", "retirement_reason"):
+        assert f"{leaked}:" not in text
 
 
-def test_entrydoc_rejects_retired_without_reason():
-    doc = make_entry(status="retired", retirement_reason="")
-    doc["revision"] = entrydoc.revision_of({**doc, "revision": None})
-    with pytest.raises(ValueError, match="reason"):
-        entrydoc.parse_entry(entrydoc.render_entry(doc))
+def test_entrydoc_rejects_unknown_fields():
+    doc = make_entry()
+    text = entrydoc.render_entry(doc) + ""
+    with_status = text.replace("kind:", "status: retired\nkind:", 1)
+    with pytest.raises(ValueError, match="unknown entry fields"):
+        entrydoc.parse_entry(with_status)
 
 
-def test_entrydoc_rejects_tampered_revision():
+def test_entrydoc_tampered_body_changes_the_revision():
     doc = make_entry()
     text = entrydoc.render_entry(doc).replace(doc["summary"], "tampered summary")
-    with pytest.raises(ValueError, match="revision"):
-        entrydoc.parse_entry(text)
+    # No public revision field exists to mismatch; tampering yields a new identity.
+    parsed = entrydoc.parse_entry(text)
+    assert parsed["revision"] != doc["revision"]

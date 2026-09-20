@@ -58,8 +58,6 @@ def validate(repo,revision,domain):
         expected='topics/' if doc['kind']=='knowledge' else 'cases/'
         if not path.startswith(expected):raise ValueError(f'{path}: kind does not match directory')
         if doc['entry_id'] in entries:raise ValueError('Duplicate canonical entry identity')
-        if doc['kind']=='knowledge' and not doc['sources']:
-            raise ValueError(f'{path}: knowledge needs sources')
         entries[doc['entry_id']]=doc
     return {'commit':revision,'entries':len(entries),'feedback_files':len(feedback),'bytes':total}
 
