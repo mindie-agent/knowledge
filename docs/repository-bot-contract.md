@@ -46,7 +46,15 @@ alignment; nothing here claims they are configured or completed.
    bot's own workspace (repo, PR, head SHA, verdict, time). Bounded wall time
    per attempt. An unknown outcome (timeout, lost response) is reconciled by
    bounded read-only lookups of that PR — never blind retry, never duplicate
-   merges.
+   merges. Select at most one eligible candidate before reading its body;
+   do not review a second candidate in the same run. Record a write attempt
+   durably before the single permitted GitHub mutation. After that mutation,
+   allow one read-only result check and end the run, including when its
+   outcome remains unknown. A previous write-attempt receipt prevents another
+   mutation in that run. These are requirements for the external application,
+   not enforcement provided by this package: a configured prompt alone is not
+   proof of a hard tool budget. Acceptance must inspect actual run receipts
+   and write counts separately from successful merges.
 7. **Optional Skill proposals** go to the plugin repo as ordinary PRs under
    `plugins/mindie-agent/skills/<slug>/` (`SKILL.md`, `agents/openai.yaml`
    with explicit `policy.allow_implicit_invocation: false`,

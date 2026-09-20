@@ -25,16 +25,30 @@ class Hit:
 
 _WORDS = re.compile(r"[a-z0-9_]+(?:[./+:-][a-z0-9_]+)*|[\u3400-\u9fff]+", re.I)
 _CJK = re.compile(r"^[\u3400-\u9fff]+$")
+_IDENTIFIER = re.compile(r"^[a-z_][a-z0-9_]*$", re.I)
 
 
 def tokens(text: str) -> list[str]:
-    """Keep code identifiers and adjacent Chinese characters searchable."""
+    """Keep exact identifiers and their components searchable, without
+    turning software versions into common numeric aliases."""
     result: list[str] = []
     for word in _WORDS.findall(text.casefold()):
         if _CJK.fullmatch(word) and len(word) > 1:
             result.extend(word[i:i + 2] for i in range(len(word) - 1))
         else:
             result.append(word)
+            aliases = []
+            for part in re.split(r"[./+:-]", word):
+                if not _IDENTIFIER.fullmatch(part):
+                    continue
+                aliases.append(part)
+                aliases.extend(part.split("_"))
+            # Preserve the qualified name, but also allow npu_rms_norm or
+            # rms_norm to find torch_npu.npu_rms_norm. One alias per source
+            # occurrence avoids overweighting repeated namespace components.
+            result.extend(dict.fromkeys(
+                part for part in aliases if len(part) > 1 and part != word
+            ))
     return result
 
 
