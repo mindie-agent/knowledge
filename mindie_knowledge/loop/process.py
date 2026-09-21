@@ -30,6 +30,22 @@ class MaintenanceCancelled(RuntimeError):
     """The owning service is stopping; interrupted work is not replayed."""
 
 
+# Trusted adapters report these categories through their exit status. Never
+# parse provider stderr: it can contain secrets, task material or reasoning.
+# An unclassified/older adapter exit remains unknown, not a guessed timeout.
+AGENT_ERROR_EXIT_CODES = {
+    "configuration": 78,
+    "deadline": 124,
+    "native": 70,
+    "invalid_result": 65,
+    "output_limit": 75,
+}
+
+
+def _failure_detail(category, started):
+    return f"category={category}; elapsed={time.monotonic() - started:.3f}s"
+
+
 _JOB_KILL_ON_CLOSE = 0x2000
 _JOBOBJECT_EXTENDED_LIMIT_INFORMATION = 9
 
@@ -196,6 +212,7 @@ def _reader(stream, tag, chunks, cancel):
 
 
 def bounded_run(command, payload, *, timeout, max_output, cancel=None):
+    started = time.monotonic()
     with tempfile.TemporaryFile() as input_file:
         input_file.write(payload.encode())
         input_file.seek(0)
@@ -213,14 +230,17 @@ def bounded_run(command, payload, *, timeout, max_output, cancel=None):
         output = bytearray()
         total = 0
         open_streams = len(readers)
-        deadline = time.monotonic() + timeout
+        deadline = started + timeout
         try:
             while open_streams:
                 if cancel is not None and cancel.is_set():
                     raise MaintenanceCancelled("maintenance cancelled by shutdown")
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise TimeoutError("maintenance deadline exceeded")
+                    raise TimeoutError(
+                        "maintenance deadline exceeded; "
+                        + _failure_detail("deadline", started)
+                    )
                 try:
                     tag, chunk = chunks.get(timeout=min(0.1, remaining))
                 except queue.Empty:
@@ -230,12 +250,28 @@ def bounded_run(command, payload, *, timeout, max_output, cancel=None):
                     continue
                 total += len(chunk)
                 if total > max_output:
-                    raise ValueError("maintenance output exceeds limit")
+                    raise ValueError(
+                        "maintenance output exceeds limit; "
+                        + _failure_detail("output_limit", started)
+                    )
                 if tag == "out":
                     output.extend(chunk)
-            code = process.wait(timeout=max(0.01, deadline - time.monotonic()))
+            try:
+                code = process.wait(timeout=max(0.01, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                raise TimeoutError(
+                    "maintenance deadline exceeded; "
+                    + _failure_detail("deadline", started)
+                ) from None
             if code:
-                raise RuntimeError(f"maintenance agent exited {code}")
+                category = next(
+                    (name for name, value in AGENT_ERROR_EXIT_CODES.items()
+                     if value == code), "unknown"
+                )
+                raise RuntimeError(
+                    f"maintenance agent exited {code}; "
+                    + _failure_detail(category, started)
+                )
             return output.decode()
         finally:
             readers_stop.set()

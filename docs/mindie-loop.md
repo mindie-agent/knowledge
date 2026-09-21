@@ -58,6 +58,14 @@ domain-hour, pause after three consecutive failures; attempts are persisted
 before spawn and never replayed). Quota-deferred material stays unattempted;
 its persisted continuation survives restart. Only fresh/unattempted regions
 resume automatically; interrupted or failed model regions never replay.
+Failed runners retain only the exit status, a trusted adapter category and
+elapsed seconds in the existing diagnostic. The adapter exit contract is
+`78=configuration`, `124=deadline`, `70=native`, `65=invalid_result`, and
+`75=output_limit`. An older or unrecognized exit remains `unknown`; elapsed
+time alone never proves a timeout. Raw stderr is counted against the output
+bound but discarded because it may contain task material or credentials.
+The core's own deadline/output bound report their directly observed category.
+These diagnostics neither change attempt ownership nor permit replay.
 A deterministic redaction mask runs before
 the model, and every candidate entry is scanned again before becoming a
 draft. The organizer records actual actions and observations from the supplied

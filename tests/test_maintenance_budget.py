@@ -1,5 +1,6 @@
 import concurrent.futures
 import os
+import re
 import sys
 import time
 
@@ -106,20 +107,53 @@ def test_denied_budget_does_not_spawn_runner(store, tmp_path):
 
 
 def test_bounded_runner_timeout_and_output_limit():
-    with pytest.raises(TimeoutError):
+    with pytest.raises(TimeoutError, match=r"category=deadline; elapsed=\d+\.\d+s"):
         bounded_run(
             [sys.executable, "-c", "import time; time.sleep(10)"],
             "input",
             timeout=0.2,
             max_output=4096,
         )
-    with pytest.raises(ValueError, match="output"):
+    with pytest.raises(ValueError, match=r"category=output_limit; elapsed=\d+\.\d+s"):
         bounded_run(
             [sys.executable, "-c", "print('x'*100000)"],
             "input",
             timeout=2,
             max_output=4096,
         )
+
+
+@pytest.mark.parametrize("code, category", [
+    (78, "configuration"), (124, "deadline"), (70, "native"),
+    (65, "invalid_result"), (75, "output_limit"), (2, "unknown"),
+])
+def test_failed_process_keeps_only_safe_diagnostic(code, category):
+    command = [sys.executable, "-c",
+               f"import sys; print('PRIVATE_TASK_SECRET', file=sys.stderr); sys.exit({code})"]
+    with pytest.raises(RuntimeError) as failure:
+        bounded_run(command, "", timeout=2, max_output=4096)
+    assert re.fullmatch(
+        rf"maintenance agent exited {code}; category={category}; elapsed=\d+\.\d+s",
+        str(failure.value),
+    )
+
+
+def test_diagnostic_does_not_grant_failed_attempt_a_retry(store, tmp_path):
+    from conftest import write_settings
+
+    settings_path = tmp_path / "community.json"
+    write_settings(settings_path, enabled=True, roots=[tmp_path])
+    marker = tmp_path / "spawns"
+    command = [sys.executable, "-c",
+               f"import sys; from pathlib import Path; p=Path({str(marker)!r}); "
+               "p.write_text(p.read_text()+'x' if p.exists() else 'x'); sys.exit(124)"]
+    engine = Engine(store, agent_command=command, settings_path=settings_path)
+    with pytest.raises(RuntimeError, match="category=deadline"):
+        engine.agent(dict(role="organize"), attempt_id="failed", root_hash="s")
+    restarted = Engine(store, agent_command=command, settings_path=settings_path)
+    with pytest.raises(BudgetExceeded, match="already been attempted"):
+        restarted.agent(dict(role="organize"), attempt_id="failed", root_hash="s")
+    assert marker.read_text() == "x"
 
 
 def test_timeout_stops_descendants(tmp_path):
