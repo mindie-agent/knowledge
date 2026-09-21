@@ -542,38 +542,67 @@ class Store:
         """Compact headers plus short excerpts as organizer context. With
         ``generation``, only material granted to that sharing generation is
         offered as update context; with ``owner``, only drafts that task owns
-        in the private entry-owner relation."""
+        in the private entry-owner relation. A compacted sent entry (no local
+        draft body left) is offered as a bare receipt header — retained
+        title/summary plus the exact sent revision, empty excerpt — never a
+        body, never a draft or publication candidate; the caller restores the
+        exact remote head on demand."""
         with self.lock:
+            sql = (
+                "SELECT entries.entry_id, entries.draft_revision, entries.doc, "
+                "sent_receipts.sent_revision "
+                "FROM entries LEFT JOIN sent_receipts "
+                "ON sent_receipts.entry_id=entries.entry_id "
+                f"WHERE {self._NOT_WITHDRAWN} "
+            )
+            params = []
+            if owner is not None:
+                sql += (
+                    "AND EXISTS (SELECT 1 FROM owners "
+                    "WHERE owners.entry_id=entries.entry_id AND owners.owner=?) "
+                )
+                params.append(owner)
+            live = "entries.draft_revision IS NOT NULL"
+            compacted = (
+                "entries.draft_revision IS NULL "
+                "AND sent_receipts.sent_revision != '' "
+                "AND sent_receipts.path != '' "
+                "AND sent_receipts.sha256 != '' "
+                "AND sent_receipts.head_sha != ''"
+            )
             if generation is not None:
-                rows = self.db.execute(
-                    "SELECT entries.entry_id, entries.draft_revision FROM entries "
-                    "JOIN grants ON grants.kind='draft' "
+                live += (
+                    " AND EXISTS (SELECT 1 FROM grants "
+                    "WHERE grants.kind='draft' "
                     "AND grants.identity=entries.entry_id "
                     "AND grants.revision=entries.draft_revision "
-                    "AND grants.generation=? "
-                    f"WHERE entries.draft_revision IS NOT NULL AND {self._NOT_WITHDRAWN} "
-                    "ORDER BY entries.updated DESC LIMIT ?",
-                    (generation, 256),
-                ).fetchall()
-            else:
-                rows = self.db.execute(
-                    "SELECT entry_id, draft_revision FROM entries "
-                    f"WHERE draft_revision IS NOT NULL AND {self._NOT_WITHDRAWN} "
-                    "ORDER BY updated DESC LIMIT ?", (256,),
-                ).fetchall()
+                    "AND grants.generation=?)"
+                )
+                compacted += " AND sent_receipts.generation=?"
+                params.extend([generation, generation])
+            sql += f"AND (({live}) OR ({compacted})) "
+            sql += "ORDER BY entries.updated DESC LIMIT 256"
+            rows = self.db.execute(sql, params).fetchall()
         headers = []
         for row in rows:
-            doc = self._revision_doc(row["entry_id"], row["draft_revision"]) or {}
-            if owner is not None and owner != self._owner_of(row["entry_id"]):
-                continue
-            headers.append(dict(
-                entry_id=doc["entry_id"], title=doc["title"],
-                revision=doc["revision"],
-                summary=doc["summary"],
-                excerpt=(doc["content"] if len(doc["content"]) <= excerpt else
-                         doc["content"][:excerpt//3] + "\n[earlier body omitted]\n" +
-                         doc["content"][-2*excerpt//3:]),
-            ))
+            if row["draft_revision"] is not None:
+                doc = self._revision_doc(row["entry_id"], row["draft_revision"]) or {}
+                headers.append(dict(
+                    entry_id=doc["entry_id"], title=doc["title"],
+                    revision=doc["revision"],
+                    summary=doc["summary"],
+                    excerpt=(doc["content"] if len(doc["content"]) <= excerpt else
+                             doc["content"][:excerpt//3] + "\n[earlier body omitted]\n" +
+                             doc["content"][-2*excerpt//3:]),
+                ))
+            else:
+                header = json.loads(row["doc"])
+                headers.append(dict(
+                    entry_id=row["entry_id"], title=header["title"],
+                    revision=row["sent_revision"],
+                    summary=header["summary"],
+                    excerpt="",
+                ))
         if query:
             import re
             terms = set(re.findall(r"[\w.-]{3,}", query.lower()))

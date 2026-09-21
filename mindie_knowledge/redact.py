@@ -78,6 +78,17 @@ from mindie_knowledge._common import (  # noqa: E402
 #: ``_`` or ``-`` (``remote_000_cann_...`` still hits ``remote_000``). This
 #: is a relaxation, not a tightening; entries already cleared under r2 do
 #: not need a re-scan.
+#: r2 (correction): ``username-at-host`` skips a finding only when its whole
+#: span sits inside a complete standalone ``mindie://`` reference token
+#: (domain grammar matching documents.DOMAIN_RE; 16- or 64-char lowercase
+#: hex id and revision; strict token boundaries). Other rules still apply
+#: to the same text. Hex@hex without this scheme is unchanged.
+#: r2 (correction): ``ipv6-address`` skips a finding only when the match is
+#: inside an unambiguous Python numeric subscript/slice tightly attached to
+#: an identifier or ``)`` / ``]`` (for example ``x[:, ::2]``,
+#: ``torch.randn(...)[::2]``). Bare ``::2``, standalone ``[::2]``, quoted
+#: address literals, and host/URL forms stay reported. Other rules are
+#: unchanged. Both corrections are relaxations; keep profile r2.
 REDACTION_PROFILE = "r2"
 
 
@@ -145,6 +156,116 @@ _HOST_PREFIXES = (
 _MACHINE_WORDS = "remote|machine|box|server|bastion|workstation"
 _INTERNAL_TLDS = "local|localdomain|internal|intranet|lan|corp|home|priv|private|localnet"
 
+# Standalone MindIE reference: mindie://<domain>/<id>@<revision>. Domain is the
+# same grammar as documents.DOMAIN_RE (duplicated here so the redactor does
+# not import loop/storage). Id and revision are 16- or 64-char lowercase hex.
+# Only a complete token with a strict opening delimiter-or-start and closing
+# delimiter-or-end is recognized. Permitted surroundings: whitespace, quotes,
+# backticks, Markdown-link parentheses, angle brackets. URI prefixes and any
+# joined suffix (path, query, fragment, port, alnum, underscore, dash) fail.
+_MINDIE_REF_OPEN = r"(?:^|(?<=[\s\"'`<(]))"
+_MINDIE_REF_CLOSE = r"(?:$|(?=[\s\"'`>)]|[.!?,;](?:$|[\s\"'`>)])))"
+_MINDIE_REF_TOKEN = re.compile(
+    _MINDIE_REF_OPEN
+    + r"mindie://"
+    r"[a-z][a-z0-9-]{0,63}/"
+    r"(?:[a-f0-9]{16}|[a-f0-9]{64})@"
+    r"(?:[a-f0-9]{16}|[a-f0-9]{64})"
+    + _MINDIE_REF_CLOSE
+)
+
+_IPV6_PATTERN = re.compile(
+    r"(?<![0-9a-z:])(?:"
+    r"(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}"
+    r"|(?:[0-9a-f]{1,4}:){1,7}:"
+    r"|(?:[0-9a-f]{1,4}:){1,6}:[0-9a-f]{1,4}"
+    r"|(?:[0-9a-f]{1,4}:){1,5}(?::[0-9a-f]{1,4}){1,2}"
+    r"|(?:[0-9a-f]{1,4}:){1,4}(?::[0-9a-f]{1,4}){1,3}"
+    r"|(?:[0-9a-f]{1,4}:){1,3}(?::[0-9a-f]{1,4}){1,4}"
+    r"|(?:[0-9a-f]{1,4}:){1,2}(?::[0-9a-f]{1,4}){1,5}"
+    r"|[0-9a-f]{1,4}:(?::[0-9a-f]{1,4}){1,6}"
+    r"|:(?:(?::[0-9a-f]{1,4}){1,7}|:)"
+    r"|::(?:ffff(?::0{1,4})?:)?(?:" + _OCTET + r"\.){3}" + _OCTET +
+    r")(?:%[0-9a-z]+)?(?![0-9a-z:])",
+    re.IGNORECASE,
+)
+
+_USERNAME_AT_HOST_PATTERN = re.compile(
+    r"(?<![\w.+-])[a-z_][\w-]{0,31}@[a-z0-9][\w-]*(?:\.[\w-]+)*(?![\w.-])",
+    re.IGNORECASE,
+)
+
+_SLICE_ITEM = re.compile(
+    r"^(?:\.\.\.|(?:-?\d+)?(?::(?:-?\d+)?(?::(?:-?\d+)?)?)?)$"
+)
+
+
+def _span_in_complete_mindie_ref(text: str, start: int, end: int) -> bool:
+    for m in _MINDIE_REF_TOKEN.finditer(text):
+        if m.start() <= start and end <= m.end():
+            return True
+    return False
+
+
+def _is_numeric_python_slice(inner: str) -> bool:
+    """True when ``inner`` is only numeric index/slice items (and ellipsis)."""
+    if any(c in inner for c in "'\"/@\\"):
+        return False
+    if re.search(r"[A-Za-z]", inner):
+        return False
+    parts = re.split(r"\s*,\s*", inner.strip())
+    if not parts or any(p == "" for p in parts):
+        return False
+    return all(_SLICE_ITEM.fullmatch(p.strip()) for p in parts)
+
+
+def _in_attached_numeric_subscript(text: str, start: int, end: int) -> bool:
+    """IPv6 match sits in ``operand[numeric slice]`` with no intervening space."""
+    i = start - 1
+    open_idx = None
+    while i >= 0:
+        c = text[i]
+        if c == "]":
+            return False
+        if c == "[":
+            open_idx = i
+            break
+        i -= 1
+    if open_idx is None or open_idx == 0:
+        return False
+    j = open_idx + 1
+    close_idx = None
+    while j < len(text):
+        if text[j] == "[":
+            return False
+        if text[j] == "]":
+            close_idx = j
+            break
+        j += 1
+    if close_idx is None or not (open_idx < start and end <= close_idx):
+        return False
+    if not _is_numeric_python_slice(text[open_idx + 1 : close_idx]):
+        return False
+    prev = text[open_idx - 1]
+    # ASCII identifier / expression terminator only. CJK prose such as
+    # ``取[::2]`` is not an operand; narrative bare slices stay protected.
+    return (prev.isascii() and prev.isalnum()) or prev in ")]_"
+
+
+def _ipv6_spans(text: str) -> Iterator[tuple[int, int]]:
+    for m in _IPV6_PATTERN.finditer(text):
+        if _in_attached_numeric_subscript(text, m.start(), m.end()):
+            continue
+        yield m.span()
+
+
+def _username_at_host_spans(text: str) -> Iterator[tuple[int, int]]:
+    for m in _USERNAME_AT_HOST_PATTERN.finditer(text):
+        if _span_in_complete_mindie_ref(text, m.start(), m.end()):
+            continue
+        yield m.span()
+
+
 RULES: tuple[Rule, ...] = (
     # --- credentials ------------------------------------------------------
     Rule(
@@ -203,21 +324,7 @@ RULES: tuple[Rule, ...] = (
         id="ipv6-address",
         description="IPv6 address",
         hint="describe the network role instead of the address",
-        pattern=re.compile(
-            r"(?<![0-9a-z:])(?:"
-            r"(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}"
-            r"|(?:[0-9a-f]{1,4}:){1,7}:"
-            r"|(?:[0-9a-f]{1,4}:){1,6}:[0-9a-f]{1,4}"
-            r"|(?:[0-9a-f]{1,4}:){1,5}(?::[0-9a-f]{1,4}){1,2}"
-            r"|(?:[0-9a-f]{1,4}:){1,4}(?::[0-9a-f]{1,4}){1,3}"
-            r"|(?:[0-9a-f]{1,4}:){1,3}(?::[0-9a-f]{1,4}){1,4}"
-            r"|(?:[0-9a-f]{1,4}:){1,2}(?::[0-9a-f]{1,4}){1,5}"
-            r"|[0-9a-f]{1,4}:(?::[0-9a-f]{1,4}){1,6}"
-            r"|:(?:(?::[0-9a-f]{1,4}){1,7}|:)"
-            r"|::(?:ffff(?::0{1,4})?:)?(?:" + _OCTET + r"\.){3}" + _OCTET +
-            r")(?:%[0-9a-z]+)?(?![0-9a-z:])",
-            re.IGNORECASE,
-        ),
+        finder=_ipv6_spans,
     ),
     Rule(
         id="ipv4-address",
@@ -241,10 +348,7 @@ RULES: tuple[Rule, ...] = (
         id="username-at-host",
         description="user@host login target",
         hint="remove login targets; they name both a user and a machine",
-        pattern=re.compile(
-            r"(?<![\w.+-])[a-z_][\w-]{0,31}@[a-z0-9][\w-]*(?:\.[\w-]+)*(?![\w.-])",
-            re.IGNORECASE,
-        ),
+        finder=_username_at_host_spans,
     ),
     Rule(
         id="user-path",
@@ -496,6 +600,8 @@ class Finding:
     value: str
     hint: str
     file: str | None = None
+    start: int | None = None
+    end: int | None = None
 
     def masked(self) -> str:
         v = self.value
@@ -527,7 +633,16 @@ def scan_text(text: str, allow: Allowlist | None = None, path: str = "<text>") -
                 claimed.append((start, end))
                 continue
             claimed.append((start, end))
-            findings.append(Finding(path=path, rule=rule.id, value=value, hint=rule.hint))
+            findings.append(
+                Finding(
+                    path=path,
+                    rule=rule.id,
+                    value=value,
+                    hint=rule.hint,
+                    start=start,
+                    end=end,
+                )
+            )
     return findings
 
 

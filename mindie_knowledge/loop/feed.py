@@ -241,8 +241,12 @@ class Feed:
                 return self.store.feed_get(receipt_key)
             self.store.feed_set(discovery_key, {"failures": 0, "commit": commit})
             if receipt.get("commit") == commit and not force:
-                self.store.feed_set(receipt_key, dict(
-                    receipt, status="unchanged", checked=time.time()))
+                cleaned = dict(receipt)
+                cleaned.pop("detail", None)
+                cleaned.pop("retained_commit", None)
+                cleaned["status"] = "unchanged"
+                cleaned["checked"] = time.time()
+                self.store.feed_set(receipt_key, cleaned)
                 return self.store.feed_get(receipt_key)
             candidate = self._candidate()
             if candidate.get("commit") != commit:
