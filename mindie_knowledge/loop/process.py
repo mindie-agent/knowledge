@@ -58,7 +58,7 @@ def annotated_error(exc, category, started, exit_code=None, stage="run"):
         exception=exc,
         elapsed_ms=(time.monotonic() - started) * 1000,
         exit_code=exit_code,
-        reportable=category != "configuration",
+        reportable=category in {"invalid_result", "output_limit", "cleanup"},
     )
     return exc
 
@@ -306,7 +306,10 @@ def bounded_run(command, payload, *, timeout, max_output, cancel=None):
                     started,
                     exit_code=code,
                 )
-            return output.decode()
+            try:
+                return output.decode()
+            except UnicodeDecodeError as exc:
+                raise annotated_error(exc, "invalid_result", started, stage="decode")
         finally:
             original_error = sys.exc_info()[1]
             try:

@@ -21,7 +21,7 @@ def reports(monkeypatch):
     return records
 
 
-@pytest.mark.parametrize('code,category,reportable', [(70, 'native', True), (78, 'configuration', False), (2, 'unknown', True)])
+@pytest.mark.parametrize('code,category,reportable', [(70, 'native', False), (78, 'configuration', False), (2, 'unknown', False)])
 def test_actual_child_exit_recorded_without_stderr(reports, code, category, reportable):
     with pytest.raises(RuntimeError, match=f'maintenance agent exited {code}') as caught:
         bounded_run([sys.executable, '-c', f'import sys;sys.stderr.write("private_provider_sentinel");sys.exit({code})'], '', timeout=3, max_output=4096)
@@ -151,3 +151,19 @@ def test_capture_hook_records_only_authorized_rpc_internal(reports, tmp_path, mo
     event = {'hook_event_name': 'Stop', 'session_id': 'manual-A', 'turn_id': 'turn', 'mindie_activation': admission_token(admission)}
     assert cli.capture_hook(config, event) is None
     assert len(calls) == len(reports) == int(enabled)
+
+
+def test_actual_invalid_utf8_is_recorded_at_decode_owner(reports):
+    with pytest.raises(UnicodeDecodeError) as caught:
+        bounded_run([sys.executable, '-c', 'import os;os.write(1,bytes([255]))'], '', timeout=3, max_output=4096)
+    assert len(reports) == 1
+    assert reports[0]['stage'] == 'decode' and reports[0]['category'] == 'invalid_result'
+    assert reports[0]['reportable'] is True
+    assert caught.value.mindie_diagnostic['incident_id'] == 'a' * 32
+
+
+@pytest.mark.parametrize('code', [70, 2, 78, 124])
+def test_model_exit_alone_is_local_diagnostic_not_product_bug(reports, code):
+    with pytest.raises(RuntimeError):
+        bounded_run([sys.executable, '-c', f'raise SystemExit({code})'], '', timeout=3, max_output=4096)
+    assert len(reports) == 1 and reports[0]['reportable'] is False
