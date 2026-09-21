@@ -5,7 +5,6 @@ An externally supplied ``diagnostic`` dict is never treated as proof.
 """
 
 import os
-import select
 
 
 _warned = False
@@ -17,7 +16,7 @@ def _unavailable():
         _warned = True
         try:
             # A full redirected stderr must not delay the original failure.
-            if select.select([], [2], [], 0)[1]:
+            if os.name == "posix" and not os.get_blocking(2):
                 os.write(2, b"mindie-knowledge: diagnostic logging unavailable\n")
         except Exception:
             pass
