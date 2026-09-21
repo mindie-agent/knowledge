@@ -22,4 +22,4 @@ def package_version() -> str:
     try:
         return version("mindie-knowledge")
     except PackageNotFoundError:
-        return "0.8.0"
+        return "0.8.1"

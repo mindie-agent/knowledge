@@ -28,6 +28,7 @@ from mindie_knowledge.redact import scan_text
 
 from . import settings as settings_mod
 from .budget import BudgetExceeded, MaintenanceBudget
+from .dfx import failure
 from .documents import DraftFull
 from .process import MaintenanceCancelled, bounded_run
 from .store import Store, canonical, digest, session_key
@@ -91,7 +92,13 @@ class Engine:
 
             self.community = dict(submit_batch=submit_batch,
                                   reconcile_batch=reconcile_batch)
-        except Exception:
+        except Exception as exc:
+            failure(
+                "community.import",
+                stage="import",
+                category="dependency",
+                exception=exc,
+            )
             self.community = None
 
     # -------------------------------------------------------------- settings
@@ -101,6 +108,23 @@ class Engine:
 
     def _error(self, detail):
         self.errors = (self.errors + [detail])[-20:]
+
+    def _unexpected(self, operation, stage, exc):
+        """Report an unhandled internal error. Expected cancellation, budget,
+        config/caller, and community business errors are not incidents."""
+        if isinstance(exc, (MaintenanceCancelled, BudgetExceeded, OSError,
+                            ValueError, TypeError)):
+            return
+        try:
+            from mindie_knowledge.community.common import CommunityError
+        except Exception:
+            pass
+        else:
+            if isinstance(exc, CommunityError):
+                return
+        failure(
+            operation, stage=stage, category="internal_exception", exception=exc,
+        )
 
     # --------------------------------------------------------------- capture
 
@@ -198,12 +222,21 @@ class Engine:
                 self.agent_command, raw, timeout=125, max_output=131072,
                 cancel=self._cancel,
             )
-            result = json.loads(output)
-            if not isinstance(result, dict):
-                raise ValueError("agent must return one JSON object")
-            if len(canonical(result).encode("utf-8")) > MAX_STRUCTURED_RESULT:
-                raise ValueError("structured result exceeds the 32 KiB limit")
-            self._validate_organize(result)
+            try:
+                result = json.loads(output)
+                if not isinstance(result, dict):
+                    raise ValueError("agent must return one JSON object")
+                if len(canonical(result).encode("utf-8")) > MAX_STRUCTURED_RESULT:
+                    raise ValueError("structured result exceeds the 32 KiB limit")
+                self._validate_organize(result)
+            except (ValueError, UnicodeError, TypeError) as exc:
+                failure(
+                    "organizer.result",
+                    stage="validate",
+                    category="invalid_result",
+                    exception=exc,
+                )
+                raise
             outcome = True
             return result
         except MaintenanceCancelled:
@@ -587,6 +620,7 @@ class Engine:
             else:
                 self.store.mark_capture(ident, "discarded", str(exc))
         except Exception as exc:
+            self._unexpected("knowledge.capture", "process", exc)
             detail = f"{type(exc).__name__}: {exc}"[:1000]
             self._error(detail)
             if region.get("region_id"):
@@ -629,12 +663,16 @@ class Engine:
             except queue.Empty:
                 if self._is_frozen() or self.stop.is_set():
                     continue
-                ident = self.store.due_capture()
-                if ident and self.begin_work():
-                    try:
-                        self._process(ident)
-                    finally:
-                        self.end_work()
+                try:
+                    ident = self.store.due_capture()
+                    if ident and self.begin_work():
+                        try:
+                            self._process(ident)
+                        finally:
+                            self.end_work()
+                except Exception as exc:
+                    self._unexpected("knowledge.worker", "run", exc)
+                    raise  # Preserve the original terminal path; do not retry it.
                 continue
             try:
                 if ident and self.begin_work():
@@ -645,6 +683,7 @@ class Engine:
             except MaintenanceCancelled:
                 pass
             except Exception as exc:  # never let the worker die silently
+                self._unexpected("knowledge.worker", "run", exc)
                 self._error(f"{type(exc).__name__}: {exc}"[:1000])
             finally:
                 self.queue.task_done()
@@ -701,6 +740,7 @@ class Engine:
                 batch, settings.as_dict(), self.state_dir, cancel=self._cancel
             )
         except Exception as exc:
+            self._unexpected("knowledge.publish", "submit", exc)
             self.store.mark_batch(
                 batch_row["batch_id"], "unknown", attempted=True,
                 detail=f"{type(exc).__name__}: {exc}"[:500],
@@ -723,7 +763,8 @@ class Engine:
             receipt = self.community["reconcile_batch"](
                 batch_row["batch_id"], self._settings().as_dict(), self.state_dir
             )
-        except Exception:
+        except Exception as exc:
+            self._unexpected("knowledge.publish", "reconcile", exc)
             return
         self.store.mark_batch(
             batch_row["batch_id"], receipt.get("status", "unknown"),
@@ -799,6 +840,7 @@ class Engine:
                             finally:
                                 self.end_work()
             except Exception as exc:
+                self._unexpected("knowledge.outbox", "tick", exc)
                 self._error(f"outbox: {type(exc).__name__}: {exc}"[:500])
             self.stop.wait(1.0)
 

@@ -27,9 +27,10 @@ import time
 from pathlib import Path
 
 from . import settings as settings_mod
+from .dfx import failure
 from .engine import Engine
 from .store import Store, canonical
-from .transport import Service, rpc
+from .transport import RequestRejected, Service, rpc
 
 
 def config_at(path):
@@ -201,6 +202,7 @@ def capture_hook(config_path, event):
     """Bounded Stop bridge. Fail open for the user's task: no service start,
     no transcript access, no offline queue. Sharing off short-circuits before
     any capture state exists; read-only config/lease inspection is allowed."""
+    rpc_started = False
     try:
         if (
             not isinstance(event, dict)
@@ -242,8 +244,10 @@ def capture_hook(config_path, event):
         scope = admission.scope_root(fields["session_id"])
         if not scope or not settings.in_scope(scope):
             return
+        connection = connect(config)
+        rpc_started = True
         rpc(
-            connect(config),
+            connection,
             "capture",
             dict(
                 session_id=fields["session_id"],
@@ -256,8 +260,15 @@ def capture_hook(config_path, event):
             ),
             timeout=0.8,
         )
-    except (OSError, ValueError, KeyError, TypeError):
+    except (OSError, RequestRejected, ValueError):
         pass
+    except (KeyError, TypeError) as exc:
+        if rpc_started:
+            failure("knowledge.capture", stage="rpc", category="internal_exception", exception=exc)
+    except RuntimeError as exc:
+        if rpc_started:
+            failure("knowledge.capture", stage="rpc", category="internal_exception", exception=exc)
+        raise  # Preserve the original propagation; never restart the hook.
 
 
 def contribution_recovery(config, operation, batch_id):
@@ -403,6 +414,13 @@ def _serve(config_path, config):
         service.serve()
         return 0
     except Exception as exc:
+        failure(
+            "knowledge.service",
+            stage="startup",
+            category="internal_exception",
+            exception=exc,
+            reportable=not isinstance(exc, (ValueError, TypeError, OSError)),
+        )
         published = False
         if service is not None:
             try:

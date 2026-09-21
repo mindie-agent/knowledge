@@ -21,9 +21,12 @@ import os
 import queue
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
+
+from .dfx import failure
 
 
 class MaintenanceCancelled(RuntimeError):
@@ -44,6 +47,20 @@ AGENT_ERROR_EXIT_CODES = {
 
 def _failure_detail(category, started):
     return f"category={category}; elapsed={time.monotonic() - started:.3f}s"
+
+
+def annotated_error(exc, category, started, exit_code=None, stage="run"):
+    """Attach diagnostics and return the same exception object."""
+    failure(
+        "organizer.process",
+        stage=stage,
+        category=category,
+        exception=exc,
+        elapsed_ms=(time.monotonic() - started) * 1000,
+        exit_code=exit_code,
+        reportable=category in {"invalid_result", "output_limit", "cleanup"},
+    )
+    return exc
 
 
 _JOB_KILL_ON_CLOSE = 0x2000
@@ -237,9 +254,13 @@ def bounded_run(command, payload, *, timeout, max_output, cancel=None):
                     raise MaintenanceCancelled("maintenance cancelled by shutdown")
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise TimeoutError(
-                        "maintenance deadline exceeded; "
-                        + _failure_detail("deadline", started)
+                    raise annotated_error(
+                        TimeoutError(
+                            "maintenance deadline exceeded; "
+                            + _failure_detail("deadline", started)
+                        ),
+                        "deadline",
+                        started,
                     )
                 try:
                     tag, chunk = chunks.get(timeout=min(0.1, remaining))
@@ -250,38 +271,66 @@ def bounded_run(command, payload, *, timeout, max_output, cancel=None):
                     continue
                 total += len(chunk)
                 if total > max_output:
-                    raise ValueError(
-                        "maintenance output exceeds limit; "
-                        + _failure_detail("output_limit", started)
+                    raise annotated_error(
+                        ValueError(
+                            "maintenance output exceeds limit; "
+                            + _failure_detail("output_limit", started)
+                        ),
+                        "output_limit",
+                        started,
                     )
                 if tag == "out":
                     output.extend(chunk)
             try:
                 code = process.wait(timeout=max(0.01, deadline - time.monotonic()))
             except subprocess.TimeoutExpired:
-                raise TimeoutError(
-                    "maintenance deadline exceeded; "
-                    + _failure_detail("deadline", started)
+                raise annotated_error(
+                    TimeoutError(
+                        "maintenance deadline exceeded; "
+                        + _failure_detail("deadline", started)
+                    ),
+                    "deadline",
+                    started,
                 ) from None
             if code:
                 category = next(
                     (name for name, value in AGENT_ERROR_EXIT_CODES.items()
                      if value == code), "unknown"
                 )
-                raise RuntimeError(
-                    f"maintenance agent exited {code}; "
-                    + _failure_detail(category, started)
+                raise annotated_error(
+                    RuntimeError(
+                        f"maintenance agent exited {code}; "
+                        + _failure_detail(category, started)
+                    ),
+                    category,
+                    started,
+                    exit_code=code,
                 )
-            return output.decode()
-        finally:
-            readers_stop.set()
-            terminate_tree(process)
             try:
-                process.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=1)
-            for reader in readers:
-                reader.join(timeout=1)
-            process.stdout.close()
-            process.stderr.close()
+                return output.decode()
+            except UnicodeDecodeError as exc:
+                raise annotated_error(exc, "invalid_result", started, stage="decode")
+        finally:
+            original_error = sys.exc_info()[1]
+            try:
+                readers_stop.set()
+                terminate_tree(process)
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=1)
+                for reader in readers:
+                    reader.join(timeout=1)
+                process.stdout.close()
+                process.stderr.close()
+            except Exception as cleanup_error:
+                failure(
+                    "organizer.process",
+                    stage="cleanup",
+                    category="cleanup",
+                    exception=cleanup_error,
+                    elapsed_ms=(time.monotonic() - started) * 1000,
+                )
+                if original_error is None:
+                    raise
