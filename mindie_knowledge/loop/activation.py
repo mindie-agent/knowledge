@@ -145,6 +145,40 @@ class Admission:
 
     # ------------------------------------------------------------ activation
 
+    def inspect(self, session):
+        """Read one diagnostic lease, including paused/disabled rows; never grant.
+
+        Unlike ``active_lease``, this reports a broken or locked store honestly.
+        It never returns a token, initializes schema, or resets the circuit.
+        """
+        result = dict(status="missing", enabled=False)
+        if not isinstance(session, str) or not session.strip() or len(session) > 256:
+            return dict(status="unavailable", enabled=False, error_class="ValueError")
+        db = None
+        try:
+            self.path.stat()
+            db = sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True, timeout=0.1)
+            deadline = time.monotonic() + 0.25
+            db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+            row = db.execute(
+                "SELECT enabled, failures, project_root FROM leases WHERE session=? LIMIT 1",
+                (session,),
+            ).fetchone()
+            if row is not None:
+                enabled, failures, project_root = row
+                paused = bool(enabled) and failures >= MAX_FAILURES
+                result = dict(status="paused" if paused else "active" if enabled else "inactive",
+                              enabled=bool(enabled) and not paused, failures=failures,
+                              project_root=project_root)
+        except FileNotFoundError:
+            pass
+        except (OSError, sqlite3.Error, TypeError) as exc:
+            result = dict(status="unavailable", enabled=False, error_class=type(exc).__name__)
+        finally:
+            if db is not None:
+                db.close()
+        return result
+
     def activate(self, session, *, project_root, root_session=None):
         """Explicitly authorize one native task for capture.
 

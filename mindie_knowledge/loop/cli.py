@@ -33,7 +33,12 @@ from .transport import Service, rpc
 
 
 def config_at(path):
-    config = json.loads(Path(path).read_text())
+    from .diagnostics import _bytes
+
+    return validate_config(json.loads(_bytes(path)))
+
+
+def validate_config(config):
     if not isinstance(config, dict) or not {"root", "domain"} <= set(config):
         raise ValueError("configuration requires root and domain")
     if "session_activation" in config:
@@ -116,6 +121,9 @@ def ensure_service(config_path):
             raise RuntimeError("knowledge startup deadline exceeded")
         connection = connect(config)
         rpc(connection, "status", timeout=min(0.5, remaining))
+        from .diagnostics import clear_startup_failure
+
+        clear_startup_failure(config_path, config)
         return connection
 
     try:
@@ -372,6 +380,55 @@ def _open_existing_store(config):
     return Store(config["root"], config["domain"])
 
 
+def _serve(config_path, config):
+    """Record only failures before this owned service publishes readiness."""
+    from .activation import Admission
+    from .diagnostics import record_startup_failure
+
+    stage = "store"
+    store = service = engine = None
+    try:
+        store = Store(config["root"], config["domain"])
+        stage = "admission"
+        admission = Admission(config["admission_path"]) if config.get("admission_path") else None
+        stage = "transcript_adapter"
+        transcript = load_transcript_adapter(config)
+        stage = "engine"
+        engine = Engine(store, agent_command=config.get("agent_command"),
+                        settings_path=config.get("community_config"), admission=admission,
+                        transcript_adapter=transcript)
+        stage = "service"
+        service = Service(engine, connection_path=connection_path(config),
+                          admission=admission, feeds=_feeds(config, store))
+        service.serve()
+        return 0
+    except Exception as exc:
+        published = False
+        if service is not None:
+            try:
+                published = connect(config) == service.connection
+            except (OSError, ValueError):
+                pass
+        if not published:
+            try:
+                record_startup_failure(config_path, config, stage, exc)
+            except (OSError, ValueError):
+                pass  # An unwritable state root cannot retain its own failure.
+        raise
+    finally:
+        if engine is not None and (engine.thread.is_alive() or engine.outbox_thread.is_alive()):
+            try:
+                engine.shutdown()
+            except RuntimeError:
+                # A partial Engine.start can leave one thread unstarted;
+                # shutdown already signals cancellation before joining it.
+                pass
+        if service is not None:
+            service.http.server_close()
+        if store is not None:
+            store.close()
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="MindIE single-domain knowledge loop")
     parser.add_argument(
@@ -380,6 +437,7 @@ def main(argv=None):
             "serve",
             "hook",
             "status",
+            "diagnostic-status",
             "stop",
             "sync",
             "sharing-status",
@@ -391,11 +449,14 @@ def main(argv=None):
         ],
     )
     parser.add_argument("--config", required=True)
+    parser.add_argument("--session", help="Local diagnostic identity; never grants authorization")
     parser.add_argument("--batch",
                         help="Contribution batch id (contribution-* operations only)")
     parser.add_argument("--resume", action="store_true",
                         help="Explicitly resume deferred remote discovery and exhausted candidates (sync only)")
     args = parser.parse_args(argv)
+    if args.session and args.operation != "diagnostic-status":
+        parser.error("--session applies only to diagnostic-status")
     if args.resume and args.operation != "sync":
         parser.error("--resume applies only to sync")
     if args.batch and not args.operation.startswith("contribution-"):
@@ -409,30 +470,14 @@ def main(argv=None):
             pass
         print("{}")
         return 0
+    if args.operation == "diagnostic-status":
+        from .diagnostics import snapshot
+
+        print(json.dumps(snapshot(args.config, session=args.session), ensure_ascii=False, indent=2))
+        return 0
     config = config_at(args.config)
     if args.operation == "serve":
-        from .activation import Admission
-
-        store = Store(config["root"], config["domain"])
-        admission = (
-            Admission(config["admission_path"])
-            if config.get("admission_path")
-            else None
-        )
-        engine = Engine(
-            store,
-            agent_command=config.get("agent_command"),
-            settings_path=config.get("community_config"),
-            admission=admission,
-            transcript_adapter=load_transcript_adapter(config),
-        )
-        Service(
-            engine,
-            connection_path=connection_path(config),
-            admission=admission,
-            feeds=_feeds(config, store),
-        ).serve()
-        return 0
+        return _serve(args.config, config)
     if args.operation.startswith("contribution-"):
         if not args.batch:
             parser.error(f"{args.operation} requires --batch")
