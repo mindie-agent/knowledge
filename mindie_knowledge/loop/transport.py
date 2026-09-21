@@ -21,6 +21,7 @@ from pathlib import Path
 
 from mindie_knowledge.markdown import _atomic_write_text
 
+from .dfx import attach_reference, failure
 from .store import canonical, session_key
 
 MAX_BODY = 2 * 1024 * 1024
@@ -51,15 +52,26 @@ def rpc(connection, method, arguments=None, *, timeout=10):
         request, timeout=timeout
     ) as response:
         raw = response.read(MAX_BODY + 1)
-    if len(raw) > MAX_BODY:
-        raise ValueError("knowledge response exceeds limit")
-    result = json.loads(raw)
-    if not result.get("ok"):
+    try:
+        if len(raw) > MAX_BODY:
+            raise ValueError("knowledge response exceeds limit")
+        result = json.loads(raw)
+        ok = result.get("ok")
+    except (ValueError, TypeError, AttributeError) as exc:
+        failure("knowledge.rpc", stage="response", category="protocol", exception=exc)
+        raise
+    if not ok:
         error = result.get("error", "knowledge request failed")
         if result.get("error_kind") == "invalid_request":
             raise RequestRejected(error)
-        raise RuntimeError(error)
-    return result["result"]
+        exception = RuntimeError(error)
+        attach_reference(exception, result.get("diagnostic"))
+        raise exception
+    try:
+        return result["result"]
+    except (KeyError, TypeError) as exc:
+        failure("knowledge.rpc", stage="response", category="protocol", exception=exc)
+        raise
 
 
 class _BoundedHTTPServer(ThreadingHTTPServer):
@@ -132,25 +144,37 @@ class Service:
                         self.send_error(413)
                         return
                     payload = json.loads(self.rfile.read(length))
-                    if set(payload) != {"method", "arguments"} or not isinstance(
-                        payload["arguments"], dict
+                    if (
+                        not isinstance(payload, dict)
+                        or set(payload) != {"method", "arguments"}
+                        or not isinstance(payload["method"], str)
+                        or not isinstance(payload["arguments"], dict)
                     ):
                         raise ValueError("invalid RPC payload")
                     result = dict(
                         ok=True,
                         result=service.call(payload["method"], payload["arguments"]),
                     )
-                except ValueError as exc:
+                except (ValueError, TypeError) as exc:
                     result = dict(ok=False, error_kind="invalid_request", error=str(exc)[:500])
                 except (TimeoutError, OSError):
                     self.close_connection = True
                     return
-                except Exception:
+                except Exception as exc:
+                    failure(
+                        "knowledge.rpc",
+                        stage="dispatch",
+                        category="internal_exception",
+                        exception=exc,
+                    )
                     result = dict(
                         ok=False,
                         error_kind="operation_failed",
                         error="knowledge operation failed; inspect service diagnostics",
                     )
+                    diagnostic = getattr(exc, "mindie_diagnostic", None)
+                    if diagnostic is not None:
+                        result["diagnostic"] = diagnostic
                 data = canonical(result).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -272,17 +296,28 @@ class Service:
     # -------------------------------------------------------------- serving
 
     def serve(self):
-        self.engine.start()
-        if self.connection_path:
-            _atomic_write_text(self.connection_path, canonical(self.connection) + "\n")
-            self.connection_path.chmod(0o600)
         try:
-            self.http.serve_forever(poll_interval=0.2)
-        finally:
-            # Cancel in-flight model work first; interrupted attempts are
-            # recorded and never replayed.
-            self.engine.shutdown()
-            self.http.server_close()
+            self.engine.start()
+            if self.connection_path:
+                _atomic_write_text(self.connection_path, canonical(self.connection) + "\n")
+                self.connection_path.chmod(0o600)
+            try:
+                self.http.serve_forever(poll_interval=0.2)
+            finally:
+                # Cancel in-flight model work first; interrupted attempts are
+                # recorded and never replayed.
+                self.engine.shutdown()
+                self.http.server_close()
+        except Exception as exc:
+            # Marker on exc stops the CLI startup path from recording twice.
+            failure(
+                "knowledge.service",
+                stage="serve",
+                category="internal_exception",
+                exception=exc,
+                reportable=not isinstance(exc, (ValueError, TypeError, OSError)),
+            )
+            raise
 
     def close(self):
         self.engine.stop.set()
