@@ -60,7 +60,12 @@ its persisted continuation survives restart. Only fresh/unattempted regions
 resume automatically; interrupted or failed model regions never replay.
 A deterministic redaction mask runs before
 the model, and every candidate entry is scanned again before becoming a
-draft. Organizer output is at most three entries: `entry_id: null` creates a
+draft. The organizer records actual actions and observations from the supplied
+material. It preserves useful commands, numbers, errors and source-stated
+uncertainty without extracting lessons, inventing causes or forcing a
+failure-fix-success story. Unmentioned details are omitted, not listed as
+unknown. Title and summary are neutral retrieval introductions.
+Organizer output is at most three entries: `entry_id: null` creates a
 draft owned by the producing task's opaque identity; a non-null id appends a
 self-contained observation to that draft, deduplicated by the increment
 marker. Corrections append to the body and update the current retrieval header;
@@ -89,7 +94,7 @@ ownership lives in a private entry-owner relation. Text fields are canonical
 rewritten, so render/parse/revision always agree. Duplicate YAML keys and
 unknown fields fail loudly.
 
-`title` names the finding and `summary` is its short retrieval abstract.
+`title` names the case and `summary` is its short retrieval abstract.
 `conditions` contains only observed software versions or source commit IDs
 (for example `torch_version` or `vllm_ascend_commit`); use an empty map when
 unknown. Hardware, topology, configuration, shape, seed, epsilon, device
@@ -237,7 +242,12 @@ Tiny per-entry receipts retain the confirmed head, path, hash, revision,
 PR and contribution generation independently of the latest coalescing batch.
 After A is sent and compacted, a later B-only batch does not erase A's
 receipt. A future A update retrieves the exact prior remote body once before
-appending. This does not retain redundant local body history or authorize
+appending. Normal organizer context includes the compacted entry's retained
+title, summary and sent revision with an empty excerpt, restricted to the same
+task and contribution generation. Reading this header neither fetches the
+body nor makes it a pending draft; restoration happens only when the organizer
+actually extends that entry. Withdrawn entries remain excluded.
+This does not retain redundant local body history or authorize
 publishing into a different contribution scope.
 
 The authenticated local `stop_if_idle` RPC freezes admission and initiates

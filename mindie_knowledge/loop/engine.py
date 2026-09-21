@@ -44,8 +44,10 @@ def mask_text(text):
     """Deterministic pre-model privacy filter; returns (masked, rules)."""
     findings = scan_text(text)
     for finding in findings:
-        if finding.value:
-            text = text.replace(finding.value, f"[redacted:{finding.rule}]")
+        if finding.start is None or finding.end is None:
+            raise ValueError("redaction finding is missing original source offsets")
+    for finding in sorted(findings, key=lambda f: f.start, reverse=True):
+        text = text[: finding.start] + f"[redacted:{finding.rule}]" + text[finding.end :]
     return text, sorted({finding.rule for finding in findings})
 
 

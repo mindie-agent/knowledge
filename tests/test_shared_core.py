@@ -338,3 +338,115 @@ def test_compact_capture_coverage_requires_all_exact_sent_revisions(tmp_path):
     assert store._revision_doc(old["entry_id"], old["revision"]) is None
     assert store._revision_doc(newer["entry_id"], newer["revision"])["content"].endswith("not yet sent")
     store.close()
+
+
+def test_draft_headers_offer_compacted_sent_receipt_header(tmp_path):
+    settings = write_settings(tmp_path / "community.json", enabled=True,
+                              roots=[tmp_path])
+    store = Store(tmp_path / "store", "test")
+    doc, batch_id = _confirmed_batch(store, settings)
+    store.compact_confirmed(batch_id)
+    headers = store.draft_headers(owner=PRODUCER, generation=settings.generation)
+    assert len(headers) == 1
+    header = headers[0]
+    assert header["entry_id"] == doc["entry_id"]
+    assert header["title"] == "Sent case" and header["summary"] == "s"
+    assert header["revision"] == doc["revision"]  # the exact sent revision
+    assert header["excerpt"] == ""
+    # Body and revision history stay absent; this is a bare receipt header.
+    row = store._row(doc["entry_id"])
+    assert row["draft_revision"] is None
+    assert store._revision_doc(doc["entry_id"], header["revision"]) is None
+    # Cross-owner and cross-generation readers see nothing.
+    assert store.draft_headers(owner="c" * 64,
+                               generation=settings.generation) == []
+    assert store.draft_headers(owner=PRODUCER, generation="other-gen") == []
+    store.close()
+
+
+def test_draft_headers_receipt_not_duplicated_after_restore(tmp_path):
+    settings = write_settings(tmp_path / "community.json", enabled=True,
+                              roots=[tmp_path])
+    store = Store(tmp_path / "store", "test")
+    doc, batch_id = _confirmed_batch(store, settings)
+    store.compact_confirmed(batch_id)
+    remote = documents.make_entry(
+        entry_id=doc["entry_id"], domain="test", kind="experience",
+        title="Sent case", summary="s", content="the sent body",
+    )
+    store.restore_draft(doc["entry_id"], remote, generation=settings.generation)
+    headers = store.draft_headers(owner=PRODUCER, generation=settings.generation)
+    assert len(headers) == 1  # the current draft, not a receipt duplicate
+    assert headers[0]["revision"] == remote["revision"]
+    assert "the sent body" in headers[0]["excerpt"]
+    store.close()
+
+
+def test_draft_headers_limit_withdrawal_and_incomplete_receipt(tmp_path):
+    settings = write_settings(tmp_path / "community.json", enabled=True,
+                              roots=[tmp_path])
+    store = Store(tmp_path / "store", "test")
+    doc, batch_id = _confirmed_batch(store, settings)
+    store.compact_confirmed(batch_id)
+    store.create_draft(
+        kind="experience", title="Ordinary draft", summary="o",
+        content="ordinary body", owner=PRODUCER,
+        generation=settings.generation,
+    )
+    headers = store.draft_headers(owner=PRODUCER, generation=settings.generation)
+    assert len(headers) == 2
+    limited = store.draft_headers(owner=PRODUCER, limit=1,
+                                  generation=settings.generation)
+    assert len(limited) == 1
+    # Feed withdrawal removes the compacted receipt header.
+    store.install_feed([doc], feed_ident="x")
+    assert len(store.draft_headers(owner=PRODUCER,
+                                   generation=settings.generation)) == 2
+    store.install_feed([], feed_ident="x")
+    headers = store.draft_headers(owner=PRODUCER, generation=settings.generation)
+    assert [h["title"] for h in headers] == ["Ordinary draft"]
+    store.close()
+
+
+def test_draft_headers_skip_incomplete_receipt(tmp_path):
+    settings = write_settings(tmp_path / "community.json", enabled=True,
+                              roots=[tmp_path])
+    store = Store(tmp_path / "store", "test")
+    doc, batch_id = _confirmed_batch(store, settings)
+    store.compact_confirmed(batch_id)
+    with store._write_txn():
+        store.db.execute(
+            "UPDATE sent_receipts SET sha256='' WHERE entry_id=?",
+            (doc["entry_id"],),
+        )
+    assert store.draft_headers(owner=PRODUCER,
+                               generation=settings.generation) == []
+    store.close()
+
+
+def test_draft_headers_current_generation_not_hidden_by_old_limit(tmp_path):
+    settings = write_settings(tmp_path / "community.json", enabled=True,
+                              roots=[tmp_path])
+    store = Store(tmp_path / "store", "test")
+    doc, batch_id = _confirmed_batch(store, settings)
+    store.compact_confirmed(batch_id)
+    live = store.create_draft(
+        kind="experience", title="Current live", summary="live",
+        content="current live body", owner=PRODUCER,
+        generation=settings.generation,
+    )
+    for i in range(256):
+        store.create_draft(
+            kind="experience", title=f"Old draft {i}", summary="old",
+            content="old generation body", owner=PRODUCER,
+            generation="old-gen",
+        )
+    headers = store.draft_headers(owner=PRODUCER,
+                                  generation=settings.generation)
+    by_title = {h["title"]: h for h in headers}
+    assert set(by_title) == {"Sent case", "Current live"}
+    assert by_title["Sent case"]["revision"] == doc["revision"]
+    assert by_title["Sent case"]["excerpt"] == ""
+    assert by_title["Current live"]["revision"] == live["revision"]
+    assert "current live body" in by_title["Current live"]["excerpt"]
+    store.close()

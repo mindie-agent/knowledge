@@ -240,3 +240,29 @@ def test_offline_recovery_through_real_git_remote(env, tmp_path):
     assert receipt["status"] == "synced" and receipt["commit"] == commit
     assert store.feed_get(f"feed-discovery:{feed.ident}")["failures"] == 0
     assert store.query("Returns after outage")["results"]
+
+
+def test_same_commit_refresh_drops_stale_unavailable_recovery_fields(env):
+    git, repo, store, feed = env
+    commit = commit_docs(git, repo, [entry_doc("8" * 64, "Recovered same commit")])
+    first = feed.sync()
+    assert first["status"] == "synced" and first["commit"] == commit
+    entries = first["entries"]
+    store.feed_set(
+        f"feed:{feed.ident}",
+        dict(
+            first,
+            status="unavailable",
+            detail="HTTP 404: remote not found",
+            retained_commit=commit,
+            checked=time.time(),
+        ),
+    )
+    receipt = feed.sync()
+    assert receipt["status"] == "unchanged"
+    assert receipt["commit"] == commit
+    assert receipt["entries"] == entries
+    assert "detail" not in receipt
+    assert "retained_commit" not in receipt
+    hits = store.query("Recovered same commit")["results"]
+    assert hits and "Recovered same commit" in store.get(hits[0]["ref"])["title"]
