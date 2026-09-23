@@ -14,8 +14,10 @@ Design
   scalars) and inspects every string, including mapping keys. The same code
   runs as the fork-side export gate and as the main-repo bulk re-scan.
 - Rules are regular expressions plus a couple of function rules. They are
-  tuned towards false positives: a benign 4-part version string that looks like
-  an IPv4 address is reported and must be allowlisted explicitly, because the
+  tuned towards false positives: a 4-part dotted token that looks like an IPv4
+  address is reported unless it sits in unambiguous package-version grammar
+  (a ``pip check`` requires/has-requirement line); any other
+  benign version string must be allowlisted explicitly, because the
   alternative is a silent leak into public git history that cannot be recalled.
 - Findings are reported with the *masked* match by default. The report itself
   may end up in a public CI log, and a redaction report that prints the leaked
@@ -89,6 +91,12 @@ from mindie_knowledge._common import (  # noqa: E402
 #: ``torch.randn(...)[::2]``). Bare ``::2``, standalone ``[::2]``, quoted
 #: address literals, and host/URL forms stay reported. Other rules are
 #: unchanged. Both corrections are relaxations; keep profile r2.
+#: r2 (correction): ``ipv4-address`` skips a finding only when the whole match
+#: is exactly a four-part version token in unambiguous package grammar: a
+#: pip-check "PACKAGE VERSION requires ..." / "... has requirement ..." line
+#: with a plausible distribution name. CIDR, range, and port forms, endpoint
+#: words as the name, and bare version-looking tokens stay reported. A
+#: relaxation; keep profile r2.
 REDACTION_PROFILE = "r2"
 
 
@@ -266,6 +274,48 @@ def _username_at_host_spans(text: str) -> Iterator[tuple[int, int]]:
         yield m.span()
 
 
+_IPV4_PATTERN = re.compile(
+    r"(?<![\w.])(?:" + _OCTET + r"\.){3}" + _OCTET +
+    r"(?:\s*-\s*(?:(?:" + _OCTET + r"\.){0,3}" + _OCTET + r"))?"
+    r"(?:/\d{1,2})?(?![\w])"
+)
+
+# Strong software-version grammar in which a four-part dotted token is a
+# public distribution version, not an address: a pip-check line
+# ("<dist> <version> requires <dist>..." / "<dist> <version> has requirement
+# ..."). The token must be bounded exactly: a CIDR, range, or port
+# continuation disqualifies it.
+_PACKAGE_NAME = r"[A-Za-z][A-Za-z0-9._-]*"
+_PACKAGE_VERSION_CONTEXT = re.compile(
+    r"(?<![\w.-])(" + _PACKAGE_NAME + r")[ \t]+(\d+(?:\.\d+){3})"
+    r"(?=[ \t]+(?:requires|has[ \t]+requirement)[ \t]+[A-Za-z0-9])"
+)
+
+# Endpoint/network words that must not pass as a distribution name.
+_NOT_A_PACKAGE = frozenset({
+    "host", "hostname", "server", "node", "machine", "endpoint", "target",
+    "addr", "address", "ip", "ipv4", "ipv6", "localhost", "gateway", "peer",
+    "remote", "client", "url", "uri", "subnet",
+})
+
+
+def _package_version_spans(text: str) -> set[tuple[int, int]]:
+    spans = set()
+    for m in _PACKAGE_VERSION_CONTEXT.finditer(text):
+        if m.group(1).lower() in _NOT_A_PACKAGE:
+            continue
+        spans.add(m.span(2))
+    return spans
+
+
+def _ipv4_spans(text: str) -> Iterator[tuple[int, int]]:
+    versions = _package_version_spans(text)
+    for m in _IPV4_PATTERN.finditer(text):
+        if m.span() in versions:
+            continue
+        yield m.span()
+
+
 RULES: tuple[Rule, ...] = (
     # --- credentials ------------------------------------------------------
     Rule(
@@ -329,13 +379,10 @@ RULES: tuple[Rule, ...] = (
     Rule(
         id="ipv4-address",
         description="IPv4 address (optionally a range or CIDR)",
-        hint="describe the network role instead of the address; allowlist a "
-        "benign 4-part version string explicitly if this is one",
-        pattern=re.compile(
-            r"(?<![\w.])(?:" + _OCTET + r"\.){3}" + _OCTET +
-            r"(?:\s*-\s*(?:(?:" + _OCTET + r"\.){0,3}" + _OCTET + r"))?"
-            r"(?:/\d{1,2})?(?![\w])"
-        ),
+        hint="describe the network role instead of the address; a benign "
+        "4-part version outside package-version grammar still needs an "
+        "explicit allowlist entry",
+        finder=_ipv4_spans,
     ),
     # --- people -------------------------------------------------------------
     Rule(
