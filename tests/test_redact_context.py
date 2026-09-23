@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from test_tools_support import synthetic_ipv6
+from test_tools_support import synthetic_ipv4, synthetic_ipv6
 
 from mindie_knowledge import redact
 from mindie_knowledge.loop.engine import mask_text
@@ -143,6 +143,67 @@ class FindingOffsetsAndMaskTests(unittest.TestCase):
         self.assertNotIn("http://[::2]:8080", masked)
         self.assertIn("[redacted:ipv6-address]", masked)
         self.assertTrue(masked.startswith("取 "))
+
+
+class PackageVersionIpv4Tests(unittest.TestCase):
+    def test_package_grammar_versions_survive(self):
+        clean = (
+            # Public pip-check shape: the four-part token is a version.
+            "opencv-python-headless 5.0.0.93 requires numpy>=2; "
+            'python_version >= "3.9", but you have numpy 1.26.4.',
+            "prometheus-fastapi-instrumentator 8.0.2.1 has requirement "
+            "starlette<2.0.0,>=1.0.0, but you have starlette 0.50.0.",
+        )
+        for text in clean:
+            self.assertNotIn("ipv4-address", rules_hit(text), text)
+
+    def test_masquerade_and_ambiguous_forms_stay_detected(self):
+        addr = synthetic_ipv4()
+        still = (
+            # An endpoint word is not a distribution name.
+            "host 5.0.0.93 requires numpy>=2",
+            # The same digits outside package grammar are still an address.
+            "ping 5.0.0.93",
+            f"http://{addr}/",
+            f"ssh user@{addr}",
+            f"subnet {addr}/24",
+            f"range {synthetic_ipv4(1)}-{synthetic_ipv4(9)}",
+            f"listen {addr}:8080",
+            f"host: {addr}",
+            # Requirement-pin and URL/path text is not pip-check grammar.
+            "pkg==5.0.0.93:80",
+            "package==5.0.0.93",
+            "package==5.0.0.93/path",
+            "http://package==5.0.0.93/",
+            "http://example.com/?package==5.0.0.93",
+            # A CIDR continuation is not an exact version token.
+            "pkg 5.0.0.93/24 requires numpy>=2",
+            # Bare version-looking text stays ambiguous and reported.
+            "driver 7.0.0.1",
+        )
+        for text in still:
+            self.assertIn("ipv4-address", rules_hit(text), text)
+
+    def test_same_digits_version_kept_network_use_masked(self):
+        text = (
+            "opencv-python-headless 5.0.0.93 requires numpy>=2, "
+            "but you have numpy 1.26.4; also http://5.0.0.93/ answered"
+        )
+        version_at = text.find("5.0.0.93")
+        host_at = text.find("5.0.0.93", version_at + 1)
+        self.assertNotEqual(host_at, -1)
+        findings = [f for f in redact.scan_text(text) if f.rule == "ipv4-address"]
+        self.assertEqual(len(findings), 1)
+        hit = findings[0]
+        self.assertEqual(hit.value, "5.0.0.93")
+        self.assertEqual(hit.start, host_at)
+        self.assertEqual(hit.end, host_at + len("5.0.0.93"))
+        self.assertEqual(text[hit.start:hit.end], "5.0.0.93")
+        masked, rules = mask_text(text)
+        self.assertIn("ipv4-address", rules)
+        self.assertIn("opencv-python-headless 5.0.0.93 requires", masked)
+        self.assertNotIn("http://5.0.0.93/", masked)
+        self.assertIn("[redacted:ipv4-address]", masked)
 
 
 if __name__ == "__main__":
