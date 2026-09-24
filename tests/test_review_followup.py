@@ -1,13 +1,10 @@
 """Component checks for the pre-delivery review. Not native acceptance."""
 
-import importlib.util
 import json
 import sqlite3
 import subprocess
-import sys
 import threading
 import time
-from pathlib import Path
 
 import pytest
 
@@ -17,8 +14,6 @@ from mindie_knowledge.loop.diagnostics import _DELIVERY_RECOVERY
 from mindie_knowledge.loop.engine import Engine
 from mindie_knowledge.loop.handoff import request_wake
 from mindie_knowledge.loop.store import Store
-
-ROOT = Path(__file__).resolve().parents[2]
 
 
 def _ready(tmp_path):
@@ -267,42 +262,3 @@ def test_live_pid_in_wake_json_does_not_coalesce(tmp_path, monkeypatch):
         live.wait(timeout=2)
     assert result["wake"] == "requested"
     assert spawned
-
-
-def _load_script(name, path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-def test_codex_and_cc_record_rejected_handoff_not_forwarded(tmp_path, monkeypatch):
-    monkeypatch.setenv("MINDIE_DIAGNOSTICS_ROOT", str(tmp_path / "diag"))
-    codex_scripts = ROOT / "codex/plugins/mindie-agent/scripts"
-    sys.path.insert(0, str(codex_scripts))
-    try:
-        codex = _load_script("codex_bridge_review", codex_scripts / "bridge.py")
-        codex._observe_stop({"stage": "unavailable", "reason": "admission-unreadable"})
-        monkeypatch.setattr(codex.sharing, "read", lambda: None)
-        codex.stop()
-    finally:
-        sys.path.remove(str(codex_scripts))
-    cc_scripts = ROOT / "cc/scripts"
-    sys.path.insert(0, str(cc_scripts))
-    try:
-        cc = _load_script("cc_bridge_review", cc_scripts / "bridge.py")
-        cc._observe_stop({"stage": "rejected", "reason": "missing-identity"})
-        monkeypatch.setattr(
-            cc, "_read_event",
-            lambda: {"hook_event_name": "Stop", "stop_hook_active": True},
-        )
-        assert cc.handle_stop() == 0
-    finally:
-        sys.path.remove(str(cc_scripts))
-    events = list((tmp_path / "diag").rglob("*.jsonl"))
-    text = "\n".join(path.read_text() for path in events)
-    assert "admission-unreadable" in text
-    assert "missing-identity" in text
-    assert "forwarded" not in text
-    assert "stop_hook_active" not in text

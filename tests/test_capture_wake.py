@@ -8,7 +8,16 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
 
+
+@pytest.mark.skipif(
+    os.name == "nt" or not hasattr(os, "killpg"),
+    reason=(
+        "POSIX process groups only (os.killpg). Skipped on Windows; "
+        "this skip is not a Windows acceptance result."
+    ),
+)
 def test_wake_survives_hook_process_group_kill(tmp_path):
     from tests.conftest import admission_token, make_admission, write_settings
 
