@@ -27,11 +27,12 @@ from pathlib import Path
 from mindie_knowledge.redact import scan_text
 
 from . import settings as settings_mod
+from .activation import activation_epoch
 from .budget import BudgetExceeded, MaintenanceBudget
 from .dfx import failure
 from .documents import DraftFull
 from .process import MaintenanceCancelled, bounded_run
-from .store import Store, canonical, digest, session_key
+from .store import Store, canonical, digest, new_identity, session_key
 
 Store_confirmed = Store.CONFIRMED_BATCH
 
@@ -39,6 +40,16 @@ ORGANIZE_FIELDS = {"entry_id", "title", "summary", "conditions", "content"}
 MAX_STRUCTURED_RESULT = 32 * 1024
 MAX_INPUT = 64 * 1024
 SUMMARY_FIELD = 4096
+_EOF_SETTLE_LIMIT = 3
+_PARTIAL_LIMIT = 4
+
+
+class AdmissionUnreadable(Exception):
+    """Admission storage could not be read. This is not a revocation."""
+
+
+class CursorConflict(Exception):
+    """The shared cursor moved. Do not call the model or count a failure."""
 
 
 def mask_text(text):
@@ -84,6 +95,7 @@ class Engine:
         self.errors = []
         self.last_activity = time.monotonic()
         self._generation = None
+        self._worker_failed = False
         self._activity_lock = threading.Lock()
         self._activity = 0
         self._frozen = False
@@ -112,8 +124,8 @@ class Engine:
     def _unexpected(self, operation, stage, exc):
         """Report an unhandled internal error. Expected cancellation, budget,
         config/caller, and community business errors are not incidents."""
-        if isinstance(exc, (MaintenanceCancelled, BudgetExceeded, OSError,
-                            ValueError, TypeError)):
+        if isinstance(exc, (MaintenanceCancelled, AdmissionUnreadable, CursorConflict,
+                            BudgetExceeded, OSError, ValueError, TypeError)):
             return
         try:
             from mindie_knowledge.community.common import CommunityError
@@ -129,9 +141,14 @@ class Engine:
     # --------------------------------------------------------------- capture
 
     def capture(self, *, session_id, turn_id, transcript_path=None, summary="",
-                cwd=None):
-        """Admission gate for one Stop event. Community off short-circuits
-        before any row, cursor, draft, worker or model exists."""
+                cwd=None, harness=""):
+        """Admit one Stop event into the capture table.
+
+        Community off short-circuits before any row. A paused maintenance
+        circuit still records the turn and holds it until explicit resume;
+        it does not drop the event. The Stop hook commits through the same
+        identity before it talks to this process.
+        """
         settings = self._settings()
         if not settings.allows_capture():
             return dict(status="skipped",
@@ -149,8 +166,7 @@ class Engine:
         if not scope or not settings.in_scope(scope):
             return dict(status="skipped",
                         reason="the lease's project root is outside the authorized scope")
-        if self.budget.status()["paused"]:
-            return dict(status="discarded", reason="maintenance circuit paused")
+        paused = self.budget.status()["paused"]
         root_session = lease.get("root_session") or session_id
         root_hash = session_key(root_session)
         activated_at = lease.get("activated_at")
@@ -162,19 +178,26 @@ class Engine:
         if self._is_frozen():
             return dict(status="skipped",
                         reason="service is not admitting new work")
+        namespace = harness if isinstance(harness, str) else ""
         captured = self.store.add_capture(
             root_session=root_hash, session=session_id, turn=turn_id,
             transcript=transcript_path, summary=summary or "",
             generation=settings.generation, boundary=boundary, scope=scope,
+            namespace=namespace,
+            activation_epoch=activation_epoch(lease["token"]),
+            hold="maintenance-paused" if paused else None,
         )
-        if captured["duplicate"]:
+        if captured.get("revoked") or paused:
             return captured
-        try:
-            self.queue.put_nowait(captured["id"])
-        except queue.Full:
-            self.store.defer_capture(captured["id"], due=time.time()+1,
-                                     reason="bounded memory queue full; persisted for later scan")
-        self.last_activity = time.monotonic()
+        if captured["status"] in {"queued", "pending", "deferred"}:
+            try:
+                self.queue.put_nowait(captured["id"])
+            except queue.Full:
+                self.store.defer_capture(
+                    captured["id"], due=time.time() + 1,
+                    reason="bounded memory queue full; persisted for later scan",
+                )
+            self.last_activity = time.monotonic()
         return captured
 
     # -------------------------------------------------------------- organize
@@ -197,7 +220,13 @@ class Engine:
         if self.admission is not None:
             lease = self.admission.active_lease(row["session"])
             if lease is None:
+                inspected = self.admission.inspect(row["session"])
+                if inspected.get("status") == "unavailable":
+                    raise AdmissionUnreadable("admission unreadable; not reading transcript")
                 raise MaintenanceCancelled("task deactivated")
+            epoch = row["activation_epoch"] if "activation_epoch" in row.keys() else None
+            if not epoch or activation_epoch(lease["token"]) != epoch:
+                raise MaintenanceCancelled("activation epoch does not match this lease")
             scope = self.admission.scope_root(row["session"])
             if row["scope"] and scope != row["scope"]:
                 raise MaintenanceCancelled("authorized project scope changed")
@@ -212,12 +241,14 @@ class Engine:
         self._cancel.clear()
         self.budget.reserve(attempt_id, root_hash, payload.get("role", "organize"))
         outcome = False
+        started = False
         try:
             self._gate_live()
             if gate is not None:
                 gate()  # identical-authorization recheck immediately before spawn
             if reserve_region is not None:
                 reserve_region()  # budget admitted; consume exactly this input before spawn
+            started = True
             output = bounded_run(
                 self.agent_command, raw, timeout=125, max_output=131072,
                 cancel=self._cancel,
@@ -242,8 +273,17 @@ class Engine:
         except MaintenanceCancelled:
             outcome = None
             raise
+        except (AdmissionUnreadable, CursorConflict):
+            if not started:
+                self.budget.abandon_unstarted(attempt_id)
+                outcome = "abandoned"
+            raise
         finally:
-            self.budget.finish(attempt_id, outcome)
+            # A validated result stays 'running' until the caller checkpoints
+            # it. Finishing success here would drop the output on an apply crash.
+            # An unstarted admission or cursor conflict is abandoned, not failed.
+            if outcome is not True and outcome != "abandoned":
+                self.budget.finish(attempt_id, outcome)
 
     @staticmethod
     def _validate_organize(result):
@@ -270,22 +310,124 @@ class Engine:
             if not isinstance(entry.get("conditions", {}), dict):
                 raise ValueError("conditions must be an object")
 
+    @staticmethod
+    def _is_notification(row):
+        return row.get("identity_kind") == "notification"
+
+    def _defer_counted(self, ident, prefix, limit, *, dormant_reason=None, terminal=None):
+        """Finite model-free waits. The last state is dormant or a terminal status."""
+        reason = self.store.continuation_reason(ident) or ""
+        try:
+            count = int(reason.split(":", 1)[1]) if reason.startswith(prefix + ":") else 0
+        except ValueError:
+            count = 0
+        count += 1
+        if count > limit:
+            if dormant_reason:
+                self.store.dormant_capture(ident, reason=dormant_reason)
+            elif terminal:
+                self.store.mark_capture(ident, terminal[0], terminal[1])
+            return
+        self.store.defer_capture(
+            ident, due=time.time() + min(8, 2 ** (count - 1)),
+            reason=f"{prefix}:{count}", eligible=1,
+        )
+
+    def _defer_partial(self, ident):
+        """An unfinished tail is not an empty capture. Automatic waits are finite."""
+        reason = self.store.continuation_reason(ident) or ""
+        if reason == "incomplete-tail":
+            self.store.dormant_capture(ident, reason="incomplete-tail")
+            return
+        self._defer_counted(
+            ident, "partial-tail", _PARTIAL_LIMIT, dormant_reason="incomplete-tail",
+        )
+
+    def _defer_eof(self, ident):
+        """A clean EOF may still be unflushed. Recheck a few times, with no model."""
+        self._defer_counted(
+            ident, "eof-settle", _EOF_SETTLE_LIMIT,
+            terminal=("no-new-material", "eof settled; no new material"),
+        )
+
+    def _defer_admission(self, ident):
+        reason = self.store.continuation_reason(ident) or ""
+        if reason == "admission-unreadable":
+            self.store.dormant_capture(ident, reason="admission-unreadable")
+            return
+        self._defer_counted(
+            ident, "admission-unreadable", _PARTIAL_LIMIT,
+            dormant_reason="admission-unreadable",
+        )
+
+    def _defer_reread(self, ident):
+        """Finite wait after a cursor conflict. Not an immediate busy loop."""
+        reason = self.store.continuation_reason(ident) or ""
+        if reason == "cursor-conflict":
+            self.store.dormant_capture(ident, reason="cursor-conflict")
+            return
+        self._defer_counted(
+            ident, "cursor-conflict", _PARTIAL_LIMIT, dormant_reason="cursor-conflict",
+        )
+
+    def _defer_apply(self, ident):
+        """Keep a saved result and wait. Do not poll it again on the next tick."""
+        reason = self.store.continuation_reason(ident) or ""
+        if reason == "apply-pending":
+            count = 0
+        else:
+            try:
+                count = int(reason.split(":", 1)[1]) if reason.startswith("apply-retry:") else 0
+            except ValueError:
+                count = 0
+        count += 1
+        if count > _PARTIAL_LIMIT:
+            self.store.schedule_continuation(
+                ident, due=0, reason="apply-pending", eligible=0,
+            )
+            return
+        self.store.schedule_continuation(
+            ident, due=time.time() + min(8, 2 ** (count - 1)),
+            reason=f"apply-retry:{count}", eligible=1,
+        )
+
+    def _summary_fallback(self, row, note, fail_detail):
+        """Turn captures may use a bounded summary. Notifications never do."""
+        if self._is_notification(row):
+            self.store.mark_capture(row["id"], "failed", fail_detail)
+            return "stop"
+        if row["summary"].strip():
+            return ("", True, [note])
+        return False
+
     def _transcript_increment(self, row, settings, lease, region):
         """Read/filter the authorized increment; reserves regions as it goes.
         Returns (text, summary_only, notes) or None when there is no material."""
         parser = self.transcript
         if parser is None:
-            # Missing parser: honest summary-only, never a format guess.
-            if row["summary"].strip():
-                return ("", True, ["no transcript adapter is configured; summary-only"])
-            self.store.mark_capture(
-                row["id"], "failed",
-                "no transcript adapter is configured and no summary",
+            # Missing parser: a turn may use its summary. A notification may not.
+            fallback = self._summary_fallback(
+                row, "no transcript adapter is configured; summary-only",
+                "no transcript adapter is configured; notification summary is forbidden",
             )
-            return None
+            if fallback == "stop":
+                return None
+            if fallback is False:
+                self.store.mark_capture(
+                    row["id"], "failed",
+                    "no transcript adapter is configured and no summary",
+                )
+                return None
+            return fallback
         boundary = row["boundary"] or settings.enabled_at
         key = str(Path(row["transcript"]).resolve(strict=False))
         cursor = self.store.cursor(key)
+        observed_cursor = None
+        if cursor is not None:
+            observed_cursor = {
+                "identity": cursor.get("identity") or "",
+                "finish": int(cursor["finish"]),
+            }
         identity = parser.identify(row["transcript"])
         idtext = identity.serialize() if identity else ""
 
@@ -293,12 +435,24 @@ class Engine:
             return self.store.reserve_region(
                 capture_id=row["id"], file_identity=key, identity=idtext,
                 start=start, finish=finish, region_digest=rdigest,
-                status=status, detail=detail,
+                status=status, detail=detail, observed_cursor=observed_cursor,
             )
 
         if cursor is None and boundary is None:
             # No reliable authorization boundary: never backfill history.
-            return ("", True, ["no reliable authorization boundary; summary-only"])
+            fallback = self._summary_fallback(
+                row, "no reliable authorization boundary; summary-only",
+                "no reliable authorization boundary; notification summary is forbidden",
+            )
+            if fallback == "stop":
+                return None
+            if fallback is False:
+                self.store.mark_capture(
+                    row["id"], "failed",
+                    "no reliable authorization boundary and no summary",
+                )
+                return None
+            return fallback
         start = cursor["finish"] if cursor else 0
         expected = None
         if cursor:
@@ -324,57 +478,142 @@ class Engine:
             if not inc.get("timestamps_reliable", True):
                 # Filtering by the authorization boundary was unreliable:
                 # never admit possibly preauthorization text; degrade instead.
-                if row["summary"].strip():
-                    return ("", True, ["unreliable record timestamps; summary-only"])
+                fallback = self._summary_fallback(
+                    row, "unreliable record timestamps; summary-only",
+                    "unreliable record timestamps; notification summary is forbidden",
+                )
+                if fallback == "stop":
+                    return None
+                if fallback:
+                    return fallback
                 region_id = reserve(inc["start"], inc["end"], inc["digest"], status="failed")
-                self.store.finish_region(region_id, "failed", "unreliable timestamps and no summary")
-                self.store.mark_capture(row["id"], "failed",
-                                        "unreliable timestamps and no summary")
+                if region_id is None:
+                    self._defer_reread(row["id"])
+                    return None
+                self.store.finish_region(
+                    region_id, "failed", "unreliable timestamps and no summary",
+                )
+                self.store.mark_capture(
+                    row["id"], "failed", "unreliable timestamps and no summary",
+                )
                 return None
             return (inc["text"], False, [])
+        if inc.get("partial") and inc["end"] == start:
+            self._defer_partial(row["id"])
+            return None
+        if status in {"ok", "unchanged"} and inc["end"] == start:
+            # Nothing new was observed. A clean EOF can still precede a flush.
+            if inc.get("more"):
+                self.store.defer_capture(
+                    row["id"], due=time.time() + 1,
+                    reason="no new bytes in this page; more authorized bytes remain",
+                )
+            else:
+                self._defer_eof(row["id"])
+            return None
         if status in {"ok", "unchanged"}:
             if status == "ok" and inc["end"] > inc["start"]:
                 # Consumed bytes held no public material; consume them visibly.
                 region_id = reserve(inc["start"], inc["end"], inc["digest"],
                                     status="succeeded", detail="no public material")
+                if region_id is None:
+                    self._defer_reread(row["id"])
+                    return None
                 self.store.finish_region(region_id, "succeeded")
             if inc.get("more") and inc["end"] > inc["start"]:
                 self.store.defer_capture(row["id"], due=time.time()+1,
                                          reason="noise scanned; more authorized bytes remain")
             else:
-                self.store.mark_capture(row["id"], "no-new-material")
+                self._defer_eof(row["id"])
+            return None
+        established = (
+            cursor is not None
+            or inc.get("session_match") is True
+            or inc.get("format_established") is True
+        )
+        if (
+            status == "unknown-format"
+            and established
+            and inc.get("more")
+            and inc["end"] > inc["start"]
+        ):
+            # Reliable native identity is enough. start==0 and a missing cursor
+            # row do not make this a permanent format failure. A positive
+            # offset by itself is not that evidence.
+            region_id = reserve(
+                inc["start"], inc["end"], inc["digest"], status="succeeded",
+                detail="unrecognized page; more bytes remain",
+            )
+            if region_id is None:
+                self._defer_reread(row["id"])
+                return None
+            self.store.finish_region(region_id, "succeeded")
+            self.store.defer_capture(
+                row["id"], due=time.time()+1,
+                reason="unrecognized page; more authorized bytes remain",
+            )
             return None
         if status == "unknown-format":
-            if row["summary"].strip():
-                # Summary model admission, like normal material, must happen
-                # before consuming the region when a quota defers this work.
-                return ("", True, ["unknown transcript format; summary-only"])
-            region["region_id"] = reserve(inc["start"], inc["end"], inc["digest"])
-            self.store.finish_region(region["region_id"], "failed",
-                                     "unknown transcript format and no summary")
-            self.store.mark_capture(row["id"], "failed",
-                                    "unknown transcript format and no summary")
+            fallback = self._summary_fallback(
+                row, "unknown transcript format; summary-only",
+                "unknown transcript format; notification summary is forbidden",
+            )
+            if fallback == "stop":
+                return None
+            if fallback:
+                return fallback
+            region_id = reserve(inc["start"], inc["end"], inc["digest"])
+            if region_id is None:
+                self._defer_reread(row["id"])
+                return None
+            region["region_id"] = region_id
+            self.store.finish_region(
+                region_id, "failed", "unknown transcript format and no summary",
+            )
+            self.store.mark_capture(
+                row["id"], "failed", "unknown transcript format and no summary",
+            )
             return None
         if status == "replaced":
             size = identity.size if identity else 0
-            region["region_id"] = reserve(
+            region_id = reserve(
                 0, size, "0" * 64, status="failed",
                 detail="transcript replaced or truncated; segment parsing stopped",
             )
+            if region_id is None:
+                self.store.mark_capture(
+                    row["id"], "failed", "transcript replaced; cursor not regressed",
+                )
+                return None
+            region["region_id"] = region_id
+            if self._is_notification(row):
+                self.store.mark_capture(
+                    row["id"], "failed",
+                    "transcript replaced; notification summary is forbidden",
+                )
+                return None
             if row["summary"].strip():
                 return ("", True, ["transcript replaced; summary-only"])
-            self.store.mark_capture(row["id"], "failed",
-                                    "transcript replaced and no summary")
+            self.store.mark_capture(
+                row["id"], "failed", "transcript replaced and no summary",
+            )
             return None
         if status == "wrong-task":
             self.store.mark_capture(row["id"], "failed",
                                     "transcript identity mismatch; not read")
             return None
         # missing/unreadable transcript
-        if row["summary"].strip():
-            return ("", True, ["transcript unreadable; summary-only"])
-        self.store.mark_capture(row["id"], "failed",
-                                "transcript unreadable and no summary")
+        fallback = self._summary_fallback(
+            row, "transcript unreadable; summary-only",
+            "transcript unreadable; notification summary is forbidden",
+        )
+        if fallback == "stop":
+            return None
+        if fallback:
+            return fallback
+        self.store.mark_capture(
+            row["id"], "failed", "transcript unreadable and no summary",
+        )
         return None
 
     @staticmethod
@@ -465,6 +704,147 @@ class Engine:
         except Exception as exc:
             return fail(f"{type(exc).__name__}: {exc}")
 
+    def _scanned_entries(self, result):
+        """Keep only outbound-clean entries and assign stable ids before apply."""
+        kept, notes = [], []
+        for entry in result["entries"]:
+            candidate = canonical({key: entry.get(key) for key in sorted(ORGANIZE_FIELDS)})
+            findings = scan_text(candidate)
+            if findings:
+                rules = ", ".join(sorted({finding.rule for finding in findings}))
+                notes.append(
+                    "entry rejected before storage/publication; outbound scan: " + rules
+                )
+                continue
+            item = {key: entry.get(key) for key in ORGANIZE_FIELDS if key in entry}
+            if not item.get("entry_id"):
+                item["entry_id"] = new_identity()
+                item["new"] = True
+            kept.append(item)
+        return kept, notes
+
+    def _apply_one(self, entry, *, opaque, marker, generation):
+        ident = entry["entry_id"]
+        header = {
+            key: entry[key] for key in ("title", "summary", "conditions") if key in entry
+        }
+        if entry.get("new"):
+            found = self.store._row(ident)
+            if found is not None and found["draft_revision"]:
+                return self.store.ref(ident, found["draft_revision"])
+            doc = self.store.create_draft(
+                kind="experience", title=entry["title"], summary=entry["summary"],
+                content=entry["content"], conditions=entry.get("conditions") or {},
+                owner=opaque, entry_id=ident, generation=generation,
+            )
+            return self.store.ref(doc["entry_id"], doc["revision"])
+        try:
+            doc, _appended = self.store.append_observation(
+                ident, entry["content"], marker=marker, producer=opaque,
+                generation=generation, header=header,
+            )
+        except ValueError as exc:
+            if "no local draft" not in str(exc) or not self._restore_sent_draft(ident, generation):
+                raise
+            doc, _appended = self.store.append_observation(
+                ident, entry["content"], marker=marker, producer=opaque,
+                generation=generation, header=header,
+            )
+        return self.store.ref(doc["entry_id"], doc["revision"])
+
+    def _checkpoint_result(self, attempt_id, result, region, inc, summary_only, notes, row, *, apply=False):
+        """Save the scanned result and the region receipt in one transaction.
+
+        ``apply`` then runs the saved body. A false value leaves apply-pending
+        when there is something to apply, which is the admission-unreadable path.
+        """
+        kept, scan_notes = self._scanned_entries(result)
+        notes = list(notes) + scan_notes
+        more = bool(inc.get("more") and inc.get("end", 0) > inc.get("start", 0))
+        region_id = region.get("region_id")
+        region_status = "summary-only" if summary_only else "succeeded" if region_id else None
+        detail = canonical(dict(refs=[], notes=notes))[:1000]
+        if not kept:
+            self.budget.settle_empty(
+                attempt_id, canonical(dict(refs=[], notes=notes)),
+                capture_id=row["id"], capture_detail=detail,
+                region_id=region_id, region_status=region_status or "succeeded",
+                more=more,
+            )
+            return
+        self.budget.checkpoint(
+            attempt_id, canonical(dict(entries=kept)),
+            canonical(dict(items=[], notes=scan_notes, refs=[], more=more)),
+            capture_id=row["id"], capture_status="apply-pending",
+            capture_detail=detail, region_id=region_id, region_status=region_status,
+        )
+        if apply:
+            self._apply_saved(attempt_id, self.store.capture_row(row["id"]) or row)
+
+    def _apply_saved(self, attempt_id, row):
+        """Apply a checkpointed result once. Never calls the organizer."""
+        record = self.budget.application(attempt_id)
+        if record is None or not record.get("result"):
+            return
+        try:
+            self._revalidate(row)
+        except AdmissionUnreadable:
+            # The body stays. A later due continuation retries the apply.
+            if row and row.get("id"):
+                self._defer_apply(row["id"])
+            return
+        except MaintenanceCancelled as exc:
+            self.budget.release_application(
+                attempt_id, canonical(dict(state="revoked", cause=str(exc)[:200])),
+            )
+            if row and row.get("status") not in {"cancelled", "organized"}:
+                self.store.mark_capture(row["id"], "cancelled", str(exc)[:500])
+            return
+        payload = json.loads(record["result"])
+        receipt = json.loads(record["apply_receipt"] or "{}")
+        if not isinstance(receipt, dict):
+            receipt = {}
+        items = [item for item in receipt.get("items", []) if isinstance(item, dict)]
+        done = {item.get("entry_id") for item in items if item.get("state") == "applied"}
+        refs = [ref for ref in receipt.get("refs", []) if isinstance(ref, str)]
+        notes = [note for note in receipt.get("notes", []) if isinstance(note, str)]
+        marker = attempt_id.split(":", 2)[2]
+        opaque = self.store.opaque_for(row["root_session"])
+        blocked = False
+        for entry in payload.get("entries", []):
+            entry_id = entry.get("entry_id")
+            if entry_id in done:
+                continue
+            try:
+                ref = self._apply_one(
+                    entry, opaque=opaque, marker=marker, generation=row["generation"],
+                )
+                refs.append(ref)
+                items.append(dict(entry_id=entry_id, state="applied"))
+                done.add(entry_id)
+            except DraftFull:
+                blocked = True
+                items.append(dict(entry_id=entry_id, state="blocked", cause="draft-full"))
+                notes.append("draft full")
+            except ValueError as exc:
+                blocked = True
+                items.append(dict(entry_id=entry_id, state="blocked", cause="apply-failed"))
+                notes.append(str(exc)[:200])
+        receipt = dict(items=items, notes=notes, refs=refs, more=bool(receipt.get("more")))
+        detail = canonical(dict(refs=refs, notes=notes))[:1000]
+        if blocked:
+            self.budget.checkpoint(
+                attempt_id, record["result"], canonical(receipt),
+                capture_id=row["id"], capture_status="apply-pending",
+                capture_detail=detail,
+            )
+            self._defer_apply(row["id"])
+            return
+        self.budget.complete_application(
+            attempt_id, canonical(receipt), capture_id=row["id"],
+            capture_detail=detail, more=bool(receipt.get("more")),
+        )
+
     def _apply(self, result, *, opaque, marker, generation):
         """Deterministic metadata update + append; no repair model call."""
         refs, notes = [], []
@@ -516,12 +896,19 @@ class Engine:
             return
         if row["status"] not in {"queued", "pending", "deferred"}:
             return
+        if self.budget.status()["paused"]:
+            self.store.dormant_capture(ident, reason="maintenance-paused")
+            return
         settings = self._settings()
         if not settings.allows_capture():
             self.store.mark_capture(ident, "cancelled", "sharing disabled while queued")
             return
         lease = self.admission.active_lease(row["session"]) if self.admission else None
         if self.admission is not None and lease is None:
+            inspected = self.admission.inspect(row["session"])
+            if inspected.get("status") == "unavailable":
+                self._defer_admission(ident)
+                return
             self.store.mark_capture(ident, "cancelled", "task deactivated while queued")
             return
         if not self.agent_command:
@@ -533,11 +920,20 @@ class Engine:
         try:
             try:
                 self._revalidate(row)
+            except AdmissionUnreadable:
+                self._defer_admission(ident)
+                return
             except MaintenanceCancelled as exc:
                 self.store.mark_capture(ident, "cancelled", str(exc)[:500])
                 return
             if row["transcript"]:
                 outcome = self._transcript_increment(row, settings, lease, region)
+            elif self._is_notification(row):
+                self.store.mark_capture(
+                    ident, "failed",
+                    "notification requires a transcript; summary is forbidden",
+                )
+                return
             elif row["summary"].strip():
                 outcome = ("", True, [])
             else:
@@ -546,6 +942,11 @@ class Engine:
             if outcome is None:
                 return
             text, summary_only, notes = outcome
+            if summary_only and self._is_notification(row):
+                self.store.mark_capture(
+                    ident, "failed", "notification forbids summary fallback",
+                )
+                return
             if summary_only:
                 text = "[summary] " + " ".join(row["summary"].split())[:SUMMARY_FIELD]
             masked, rules = mask_text(text)
@@ -584,16 +985,25 @@ class Engine:
                 payload["existing_drafts"].pop()
             def reserve_input():
                 if inc and not region.get("region_id"):
-                    region["region_id"] = region["reserve"](inc["start"], inc["end"], inc["digest"])
+                    reserved = region["reserve"](inc["start"], inc["end"], inc["digest"])
+                    if reserved is None:
+                        raise CursorConflict("cursor advanced before reservation")
+                    region["region_id"] = reserved
                 self.store.mark_capture(ident, "processing", "input reserved; no retry of this region")
+            attempt_id = f"organize:{ident}:{marker}"
             try:
                 result = self.agent(
-                    payload, attempt_id=f"organize:{ident}:{marker}",
+                    payload, attempt_id=attempt_id,
                     root_hash=row["root_session"],
                     gate=lambda: self._revalidate(row),
                     reserve_region=reserve_input,
                 )
-                self._revalidate(row)  # again before applying any result
+            except AdmissionUnreadable:
+                self._defer_admission(ident)
+                return
+            except CursorConflict:
+                self._defer_reread(ident)
+                return
             except MaintenanceCancelled as exc:
                 if region.get("region_id"):
                     self.store.finish_region(
@@ -601,18 +1011,24 @@ class Engine:
                     )
                 self.store.mark_capture(ident, "cancelled", str(exc)[:500])
                 return
-            refs, applied_notes = self._apply(result, opaque=opaque, marker=marker,
-                                              generation=row["generation"])
-            notes.extend(applied_notes)
-            if region.get("region_id"):
-                self.store.finish_region(
-                    region["region_id"], "summary-only" if summary_only else "succeeded"
+            try:
+                self._revalidate(row)  # again before applying any result
+            except AdmissionUnreadable:
+                self._checkpoint_result(
+                    attempt_id, result, region, inc, summary_only, notes, row,
                 )
-            detail = canonical(dict(refs=refs, notes=notes))[:1000]
-            self.store.mark_capture(ident, "organized", detail)
-            if inc.get("more") and inc["end"] > inc["start"]:
-                self.store.defer_capture(ident, due=time.time()+1,
-                                         reason="organized one bounded increment; continuation pending")
+                return
+            except MaintenanceCancelled as exc:
+                if region.get("region_id"):
+                    self.store.finish_region(
+                        region["region_id"], "cancelled", str(exc)[:500]
+                    )
+                self.store.mark_capture(ident, "cancelled", str(exc)[:500])
+                return
+            self._checkpoint_result(
+                attempt_id, result, region, inc, summary_only, notes, row,
+                apply=True,
+            )
             self.last_activity = time.monotonic()
         except BudgetExceeded as exc:
             if exc.retry_at is not None and not region.get("region_id"):
@@ -623,11 +1039,38 @@ class Engine:
             self._unexpected("knowledge.capture", "process", exc)
             detail = f"{type(exc).__name__}: {exc}"[:1000]
             self._error(detail)
+            current = self.store.capture_row(ident)
+            if current and current["status"] in {"apply-pending", "organized"}:
+                return
             if region.get("region_id"):
                 self.store.finish_region(region["region_id"], "failed", detail)
             self.store.mark_capture(ident, "failed", detail)
 
     # ---------------------------------------------------------------- worker
+
+    def _apply_due(self):
+        """Apply one saved result whose continuation is due. No new model.
+
+        ``begin_work`` is the same admission gate as capture processing.
+        Frozen or stopping does not start. One count covers the whole apply
+        and is released in ``finally``.
+        """
+        attempt_id = self.store.due_application()
+        if not attempt_id or not self.begin_work():
+            return
+        try:
+            capture_id = attempt_id.split(":", 2)[1] if attempt_id.count(":") >= 2 else None
+            row = self.store.capture_row(capture_id) if capture_id else None
+            if row is None:
+                return
+            try:
+                self._apply_saved(attempt_id, row)
+            except Exception as exc:
+                self._unexpected("knowledge.capture", "apply", exc)
+                if row.get("id"):
+                    self._defer_apply(row["id"])
+        finally:
+            self.end_work()
 
     def start(self):
         with self.store.lock, self.store.db:
@@ -639,6 +1082,8 @@ class Engine:
             self.store.db.execute("UPDATE regions SET status='failed', detail='interrupted attempt; no replay' WHERE status='attempted'")
         self.budget.recover_interrupted()
         self.revoke_stale()
+        # Arm only. Applying here can block readiness on a network restore.
+        self.store.arm_apply_continuations()
         self.thread.start()
         self.outbox_thread.start()
 
@@ -670,9 +1115,16 @@ class Engine:
                             self._process(ident)
                         finally:
                             self.end_work()
+                    elif not ident:
+                        self._apply_due()
+                except (MaintenanceCancelled, AdmissionUnreadable, CursorConflict):
+                    continue
                 except Exception as exc:
                     self._unexpected("knowledge.worker", "run", exc)
-                    raise  # Preserve the original terminal path; do not retry it.
+                    # Stop this thread and leave rows durable. Do not count
+                    # errors or start another worker inside the loop.
+                    self._worker_failed = True
+                    return
                 continue
             try:
                 if ident and self.begin_work():
@@ -680,7 +1132,7 @@ class Engine:
                         self._process(ident)
                     finally:
                         self.end_work()
-            except MaintenanceCancelled:
+            except (MaintenanceCancelled, AdmissionUnreadable, CursorConflict):
                 pass
             except Exception as exc:  # never let the worker die silently
                 self._unexpected("knowledge.worker", "run", exc)
@@ -917,4 +1369,7 @@ class Engine:
             errors=self.errors,
             activity=activity,
             admission_frozen=frozen,
+            worker_alive=self.thread.is_alive() and not self._worker_failed,
+            worker_failed=bool(self._worker_failed),
+            outbox_alive=self.outbox_thread.is_alive(),
         )

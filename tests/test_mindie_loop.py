@@ -444,7 +444,8 @@ def test_hook_short_circuits_when_sharing_off(tmp_path):
     )))
     start = time.monotonic()
     capture_hook(engine_config, dict(
-        hook_event_name="Stop", session_id="manual-A", turn_id="t",
+        hook_event_name="Stop", identity_kind="turn",
+        session_id="manual-A", turn_id="t",
         mindie_activation=admission_token(adapter), last_assistant_message="summary",
     ))
     assert time.monotonic() - start < 1

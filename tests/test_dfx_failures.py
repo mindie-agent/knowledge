@@ -142,15 +142,19 @@ def test_capture_hook_records_only_authorized_rpc_internal(reports, tmp_path, mo
     admission = make_admission(tmp_path, project_root=tmp_path)
     config = tmp_path / 'config.json'
     config.write_text(json.dumps({'root': str(tmp_path / 'knowledge'), 'domain': 'fixture', 'community_config': str(sharing), 'admission_path': str(admission)}))
-    calls = []
-    monkeypatch.setattr(cli, 'connect', lambda config: {'url': 'fixture'})
-    def broken(*a, **k):
-        calls.append(True)
-        raise KeyError('private_rpc_sentinel')
-    monkeypatch.setattr(cli, 'rpc', broken)
-    event = {'hook_event_name': 'Stop', 'session_id': 'manual-A', 'turn_id': 'turn', 'mindie_activation': admission_token(admission)}
-    assert cli.capture_hook(config, event) is None
-    assert len(calls) == len(reports) == int(enabled)
+    event = {
+        'hook_event_name': 'Stop', 'identity_kind': 'turn',
+        'session_id': 'manual-A', 'turn_id': 'turn',
+        'mindie_activation': admission_token(admission), 'harness': 'codex',
+        'last_assistant_message': 'summary',
+    }
+    result = cli.capture_hook(config, event)
+    if enabled:
+        assert result['stage'] == 'unavailable'
+        assert result['reason'] == 'store-not-ready'
+    else:
+        assert result['stage'] == 'inert'
+    assert reports == []
 
 
 def test_actual_invalid_utf8_is_recorded_at_decode_owner(reports):
