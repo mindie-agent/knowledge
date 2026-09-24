@@ -40,6 +40,7 @@ Canonical semantics (shared by every adapter):
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import secrets
 import sqlite3
@@ -52,6 +53,17 @@ from .store import session_key
 BASE_COLUMNS = {"session", "token", "enabled", "failures"}
 CAPTURE_COLUMNS = BASE_COLUMNS | {"project_root", "root_session", "activated_at"}
 MAX_FAILURES = 3
+
+
+class AdmissionUnavailable(RuntimeError):
+    """The lease store could not be read. This is not an inactive lease."""
+
+
+def activation_epoch(token):
+    """Irreversible reference to one activation token. Not the token itself."""
+    if not isinstance(token, str) or not token:
+        raise ValueError("activation token required")
+    return hashlib.sha256(b"mindie-activation/1\0" + token.encode("utf-8")).hexdigest()
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS leases(
@@ -301,6 +313,161 @@ class Admission:
                 "and activated_at; the existing lease store predates this schema"
             )
         return lease
+
+    def capture_authorization(self, session, token, *, timeout):
+        """Read one lease for a Stop handoff.
+
+        Returns ``state`` of ``admitted``, ``inactive``, ``paused``, or
+        ``schema``. A locked or unreadable database raises
+        ``AdmissionUnavailable`` instead of looking inactive. The token is
+        not copied into the result.
+        """
+        if (
+            not isinstance(session, str)
+            or not session.strip()
+            or session != session.strip()
+            or len(session) > 256
+            or not isinstance(token, str)
+            or not token
+            or len(token) > 512
+        ):
+            return {"state": "inactive"}
+        if not self.path.is_file():
+            return {"state": "inactive"}
+        timeout = max(0.05, min(float(timeout), 0.25))
+        try:
+            db = sqlite3.connect(
+                self.path.as_uri() + "?mode=ro", uri=True, timeout=timeout
+            )
+        except sqlite3.Error as exc:
+            raise AdmissionUnavailable(type(exc).__name__) from None
+        try:
+            db.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
+            deadline = time.monotonic() + timeout
+            db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+            columns = [row[1] for row in db.execute("PRAGMA table_info(leases)")]
+            if not columns:
+                return {"state": "inactive"}
+            if not BASE_COLUMNS <= set(columns):
+                raise AdmissionUnavailable("schema")
+            if not CAPTURE_COLUMNS <= set(columns):
+                return {"state": "schema"}
+            row = db.execute(
+                "SELECT * FROM leases WHERE session=? LIMIT 1", (session,)
+            ).fetchone()
+            if row is None:
+                return {"state": "inactive"}
+            lease = dict(zip(columns, row))
+            if lease.get("enabled") != 1:
+                return {"state": "inactive"}
+            try:
+                matches = hmac.compare_digest(str(lease.get("token") or ""), token)
+            except (TypeError, ValueError):
+                matches = False
+            if not matches:
+                return {"state": "inactive"}
+            failures = int(lease.get("failures") or 0)
+            if failures >= MAX_FAILURES:
+                return {"state": "paused", "failures": failures}
+            root = lease.get("project_root")
+            if not isinstance(root, str) or not root:
+                return {"state": "schema"}
+            try:
+                scope = str(Path(root).expanduser().resolve(strict=False))
+            except OSError:
+                return {"state": "inactive"}
+            root_session = lease.get("root_session") or session
+            if not isinstance(root_session, str) or not root_session.strip():
+                root_session = session
+            return {
+                "state": "admitted",
+                "scope": scope,
+                "root_session": root_session,
+                "activated_at": lease.get("activated_at"),
+                "epoch": activation_epoch(token),
+                "failures": failures,
+            }
+        except AdmissionUnavailable:
+            raise
+        except sqlite3.Error as exc:
+            raise AdmissionUnavailable(type(exc).__name__) from None
+        finally:
+            db.close()
+
+    def resolve_capture_lease(self, session, *, timeout):
+        """Read one live lease for an internal Stop that did not pass a token.
+
+        The stored token is used only to compute the activation epoch and is
+        not returned. An unreadable or locked database raises
+        ``AdmissionUnavailable``. A missing or disabled lease is inactive.
+        This does not use ``active_lease``, which reports both cases as None.
+        External MCP and RPC callers are unchanged and still require a token.
+        """
+        if (
+            not isinstance(session, str)
+            or not session.strip()
+            or session != session.strip()
+            or len(session) > 256
+        ):
+            return {"state": "inactive"}
+        if not self.path.is_file():
+            return {"state": "inactive"}
+        timeout = max(0.05, min(float(timeout), 0.25))
+        try:
+            db = sqlite3.connect(
+                self.path.as_uri() + "?mode=ro", uri=True, timeout=timeout
+            )
+        except sqlite3.Error as exc:
+            raise AdmissionUnavailable(type(exc).__name__) from None
+        try:
+            db.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
+            deadline = time.monotonic() + timeout
+            db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+            columns = [row[1] for row in db.execute("PRAGMA table_info(leases)")]
+            if not columns:
+                return {"state": "inactive"}
+            if not BASE_COLUMNS <= set(columns):
+                raise AdmissionUnavailable("schema")
+            if not CAPTURE_COLUMNS <= set(columns):
+                return {"state": "schema"}
+            row = db.execute(
+                "SELECT * FROM leases WHERE session=? LIMIT 1", (session,)
+            ).fetchone()
+            if row is None:
+                return {"state": "inactive"}
+            lease = dict(zip(columns, row))
+            if lease.get("enabled") != 1:
+                return {"state": "inactive"}
+            failures = int(lease.get("failures") or 0)
+            if failures >= MAX_FAILURES:
+                return {"state": "paused", "failures": failures}
+            token = lease.get("token")
+            if not isinstance(token, str) or not token or len(token) > 512:
+                return {"state": "schema"}
+            root = lease.get("project_root")
+            if not isinstance(root, str) or not root:
+                return {"state": "schema"}
+            try:
+                scope = str(Path(root).expanduser().resolve(strict=False))
+            except OSError:
+                return {"state": "inactive"}
+            root_session = lease.get("root_session") or session
+            if not isinstance(root_session, str) or not root_session.strip():
+                root_session = session
+            return {
+                "state": "admitted",
+                "scope": scope,
+                "root_session": root_session,
+                "activated_at": lease.get("activated_at"),
+                "epoch": activation_epoch(token),
+                "failures": failures,
+            }
+        except AdmissionUnavailable:
+            raise
+        except sqlite3.Error as exc:
+            raise AdmissionUnavailable(type(exc).__name__) from None
+        finally:
+            db.close()
 
     def resolve(self, token):
         """Resolve an ACTIVATION token to its owning valid lease (or None)."""

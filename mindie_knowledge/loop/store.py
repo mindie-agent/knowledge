@@ -110,6 +110,148 @@ def new_identity():
     return secrets.token_hex(32)
 
 
+_HARNESS_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}\Z")
+_UNPROCESSED_CAPTURE = frozenset({"queued", "pending", "deferred"})
+_IDENTITY_KINDS = frozenset({"turn", "notification"})
+_REARM_REASONS = (
+    "reason='incomplete-tail' OR reason='admission-unreadable' "
+    "OR reason='cursor-conflict' OR reason LIKE 'cursor-conflict:%' "
+    "OR reason LIKE 'eof-settle:%' OR reason LIKE 'admission-unreadable:%'"
+)
+
+
+def capture_identity(namespace, session, kind, key):
+    """Stable id for one session plus a turn id or a notification event id."""
+    if kind not in _IDENTITY_KINDS:
+        raise ValueError("invalid identity kind")
+    return digest(["capture", kind, namespace or "", session, key.strip()])
+
+
+def legacy_session_capture_identity(namespace, session, turn):
+    """Previous handoff id: harness, session, and native turn. Turn kind only."""
+    return digest(["capture", namespace or "", session, turn.strip()])
+
+
+def legacy_capture_identity(root_hash, turn):
+    """Pre-handoff id. Ownership hash plus turn; not safe across sibling sessions."""
+    return digest(["capture", root_hash, turn.strip()])
+
+
+def _capture_identity_row(db, ident):
+    return db.execute(
+        "SELECT id, status, session, generation, activation_epoch "
+        "FROM captures WHERE id=?",
+        (ident,),
+    ).fetchone()
+
+
+def _upsert_continuation(db, ident, due, reason, eligible):
+    db.execute(
+        "INSERT INTO continuations(capture_id, due, reason, eligible) VALUES(?,?,?,?) "
+        "ON CONFLICT(capture_id) DO UPDATE SET due=excluded.due, "
+        "reason=excluded.reason, eligible=excluded.eligible",
+        (ident, due, reason, 1 if eligible else 0),
+    )
+
+
+def _hold_capture(db, ident):
+    """Park a paused capture without a fictitious future due time."""
+    db.execute(
+        "UPDATE captures SET status='pending', detail=? WHERE id=?",
+        ("maintenance-paused", ident),
+    )
+    _upsert_continuation(db, ident, 0, "maintenance-paused", False)
+
+
+def commit_capture(
+    db, *, namespace, root_session, session, turn, transcript, summary,
+    generation, boundary, scope, activation_epoch, hold=None,
+    kind="turn", event_key=None,
+):
+    """Insert or adopt one capture. The caller holds the write transaction.
+
+    A repeat of the same kind and key returns the existing row. Turn identity
+    still adopts this session's older id formulas. An unprocessed row whose
+    activation epoch or sharing generation no longer matches is cancelled in
+    place; the id stays so the event is not captured again. ``processing``
+    and terminal rows are not rewritten. A repeat makes a dormant tail or
+    admission wait eligible again. It does not clear a maintenance pause.
+    """
+    if kind not in _IDENTITY_KINDS:
+        raise ValueError("invalid identity kind")
+    if kind == "notification":
+        key = (event_key or "").strip()
+        turn_value = ""
+        stored_event = key
+    else:
+        kind = "turn"
+        key = turn.strip()
+        turn_value = key
+        stored_event = None
+    ident = capture_identity(namespace, session, kind, key)
+    row = _capture_identity_row(db, ident)
+    if row is None and kind == "turn":
+        for candidate in (
+            legacy_session_capture_identity(namespace, session, key),
+            legacy_capture_identity(root_session, key),
+        ):
+            if candidate == ident:
+                continue
+            found = _capture_identity_row(db, candidate)
+            if found is not None and found["session"] == session:
+                row = found
+                ident = found["id"]
+                break
+    if row is not None:
+        status = row["status"]
+        epoch_changed = bool(activation_epoch) and row["activation_epoch"] != activation_epoch
+        generation_changed = (
+            bool(generation) and bool(row["generation"]) and row["generation"] != generation
+        )
+        if status in _UNPROCESSED_CAPTURE and (epoch_changed or generation_changed):
+            detail = (
+                "activation epoch changed before processing"
+                if epoch_changed
+                else "settings generation changed before processing"
+            )
+            db.execute(
+                "UPDATE captures SET status='cancelled', detail=?, transcript=NULL, "
+                "summary='' WHERE id=?",
+                (detail, ident),
+            )
+            db.execute("DELETE FROM continuations WHERE capture_id=?", (ident,))
+            return dict(
+                id=ident, status="cancelled", duplicate=True,
+                revoked="activation-revoked" if epoch_changed else "generation-revoked",
+            )
+        if hold == "maintenance-paused" and status == "queued":
+            _hold_capture(db, ident)
+            return dict(id=ident, status="pending", duplicate=True, revoked=None)
+        if status in _UNPROCESSED_CAPTURE:
+            db.execute(
+                "UPDATE continuations SET due=?, eligible=1 "
+                f"WHERE capture_id=? AND ({_REARM_REASONS})",
+                (time.time(), ident),
+            )
+        return dict(id=ident, status=status, duplicate=True, revoked=None)
+    db.execute(
+        """INSERT INTO captures(
+            id, root_session, session, turn, transcript, summary, status,
+            detail, created, generation, boundary, scope, activation_epoch,
+            identity_kind, event_key
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            ident, root_session, session, turn_value, transcript, summary, "queued", "",
+            time.time(), generation, boundary, scope, activation_epoch,
+            kind, stored_event,
+        ),
+    )
+    if hold == "maintenance-paused":
+        _hold_capture(db, ident)
+        return dict(id=ident, status="pending", duplicate=False, revoked=None)
+    return dict(id=ident, status="queued", duplicate=False, revoked=None)
+
+
 class Store:
     def __init__(self, root, domain):
         if not isinstance(domain, str) or not documents.DOMAIN_RE.fullmatch(domain):
@@ -138,7 +280,8 @@ class Store:
                 root_session TEXT NOT NULL, session TEXT NOT NULL, turn TEXT NOT NULL,
                 transcript TEXT, summary TEXT NOT NULL, status TEXT NOT NULL,
                 detail TEXT NOT NULL, created REAL NOT NULL,
-                generation TEXT, boundary REAL, scope TEXT);
+                generation TEXT, boundary REAL, scope TEXT,
+                activation_epoch TEXT, identity_kind TEXT, event_key TEXT);
             CREATE TABLE IF NOT EXISTS regions(id TEXT PRIMARY KEY,
                 capture_id TEXT NOT NULL, file_identity TEXT NOT NULL,
                 start INTEGER NOT NULL, finish INTEGER NOT NULL, digest TEXT NOT NULL,
@@ -164,7 +307,8 @@ class Store:
             CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY,
                 value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS continuations(capture_id TEXT PRIMARY KEY,
-                due REAL NOT NULL, reason TEXT NOT NULL);
+                due REAL NOT NULL, reason TEXT NOT NULL,
+                eligible INTEGER NOT NULL DEFAULT 1);
             CREATE TABLE IF NOT EXISTS grants(kind TEXT NOT NULL,
                 identity TEXT NOT NULL, revision TEXT NOT NULL,
                 generation TEXT NOT NULL, created REAL NOT NULL,
@@ -183,6 +327,22 @@ class Store:
                 batch_id TEXT,
                 updated REAL NOT NULL);
         """)
+        capture_columns = {
+            row[1] for row in self.db.execute("PRAGMA table_info(captures)")
+        }
+        if capture_columns and "activation_epoch" not in capture_columns:
+            self.db.execute("ALTER TABLE captures ADD COLUMN activation_epoch TEXT")
+        if capture_columns and "identity_kind" not in capture_columns:
+            self.db.execute("ALTER TABLE captures ADD COLUMN identity_kind TEXT")
+        if capture_columns and "event_key" not in capture_columns:
+            self.db.execute("ALTER TABLE captures ADD COLUMN event_key TEXT")
+        continuation_columns = {
+            row[1] for row in self.db.execute("PRAGMA table_info(continuations)")
+        }
+        if continuation_columns and "eligible" not in continuation_columns:
+            self.db.execute(
+                "ALTER TABLE continuations ADD COLUMN eligible INTEGER NOT NULL DEFAULT 1"
+            )
         self.db.execute(
             "INSERT OR REPLACE INTO meta VALUES('schema', ?)", (SCHEMA,)
         )
@@ -1219,25 +1379,39 @@ class Store:
     # --------------------------------------------------------------- capture
 
     def add_capture(self, *, root_session, session, turn, transcript, summary,
-                    generation=None, boundary=None, scope=None):
-        if not isinstance(turn, str) or not turn.strip() or len(turn) > 256:
+                    generation=None, boundary=None, scope=None, namespace="",
+                    activation_epoch=None, hold=None, kind="turn", event_key=None):
+        if kind not in _IDENTITY_KINDS:
+            raise ValueError("invalid identity kind")
+        if kind == "notification":
+            if turn not in (None, ""):
+                raise ValueError("notification identity is not a turn_id")
+            if not isinstance(event_key, str) or not event_key.strip() or len(event_key) > 256:
+                raise ValueError("event_id must be nonempty text of at most 256 characters")
+            if event_key != event_key.strip() or "\x00" in event_key:
+                raise ValueError("event_id must be nonempty text of at most 256 characters")
+            turn = ""
+        elif not isinstance(turn, str) or not turn.strip() or len(turn) > 256:
             raise ValueError("turn_id must be nonempty text of at most 256 characters")
+        elif event_key:
+            raise ValueError("turn identity does not take an event_id")
         if not isinstance(summary, str) or len(summary) > 32768:
             raise ValueError("summary exceeds the bounded envelope")
-        ident = digest(["capture", root_session, turn.strip()])
+        if namespace and not _HARNESS_RE.fullmatch(namespace):
+            raise ValueError("invalid capture namespace")
+        if hold not in {None, "maintenance-paused"}:
+            raise ValueError("invalid capture hold")
         with self._write_txn():
-            old = self.db.execute(
-                "SELECT status FROM captures WHERE id=?", (ident,)
-            ).fetchone()
-            if old:
-                return dict(id=ident, status=old[0], duplicate=True)
-            self.db.execute(
-                "INSERT INTO captures VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                (ident, root_session, session, turn.strip(), transcript,
-                 summary.strip(), "queued", "", time.time(),
-                 generation, boundary, scope),
+            result = commit_capture(
+                self.db, namespace=namespace, root_session=root_session,
+                session=session, turn=turn, transcript=transcript,
+                summary=summary.strip(), generation=generation, boundary=boundary,
+                scope=scope, activation_epoch=activation_epoch, hold=hold,
+                kind=kind, event_key=event_key,
             )
-        return dict(id=ident, status="queued", duplicate=False)
+        if result.get("revoked") is None:
+            result.pop("revoked", None)
+        return result
 
     def capture_row(self, ident):
         with self.lock:
@@ -1248,25 +1422,48 @@ class Store:
 
     def mark_capture(self, ident, status, detail=""):
         with self._write_txn():
-            self.db.execute(
-                "UPDATE captures SET status=?, detail=? WHERE id=?",
-                (status, str(detail)[:1000], ident),
-            )
+            if status in {"cancelled", "discarded"}:
+                self.db.execute(
+                    "UPDATE captures SET status=?, detail=?, transcript=NULL, "
+                    "summary='' WHERE id=?",
+                    (status, str(detail)[:1000], ident),
+                )
+            else:
+                self.db.execute(
+                    "UPDATE captures SET status=?, detail=? WHERE id=?",
+                    (status, str(detail)[:1000], ident),
+                )
             if status not in {"queued", "pending", "deferred"}:
                 self.db.execute("DELETE FROM continuations WHERE capture_id=?", (ident,))
 
-    def defer_capture(self, ident, *, due, reason):
+    def continuation_reason(self, ident):
+        with self.lock:
+            row = self.db.execute(
+                "SELECT reason FROM continuations WHERE capture_id=?", (ident,)
+            ).fetchone()
+        return row[0] if row else None
+
+    def defer_capture(self, ident, *, due, reason, eligible=1):
         with self._write_txn():
             self.db.execute("UPDATE captures SET status='pending', detail=? WHERE id=?",
                             (reason[:1000], ident))
-            self.db.execute("INSERT OR REPLACE INTO continuations VALUES(?,?,?)",
-                            (ident, due, reason[:1000]))
+            _upsert_continuation(self.db, ident, due, reason[:1000], eligible)
+
+    def dormant_capture(self, ident, *, reason):
+        """Ineligible until a later event or explicit resume. Due is not a year."""
+        with self._write_txn():
+            self.db.execute(
+                "UPDATE captures SET status='pending', detail=? WHERE id=?",
+                (reason[:1000], ident),
+            )
+            _upsert_continuation(self.db, ident, 0, reason[:1000], False)
 
     def due_capture(self):
         with self.lock:
             row = self.db.execute(
                 "SELECT c.id FROM captures c LEFT JOIN continuations q ON q.capture_id=c.id "
                 "WHERE c.status IN ('queued','pending','deferred') "
+                "AND COALESCE(q.eligible, 1) != 0 "
                 "AND COALESCE(q.due,0)<=? ORDER BY COALESCE(q.due,0), c.created LIMIT 1",
                 (time.time(),),
             ).fetchone()
@@ -1280,16 +1477,46 @@ class Store:
         return dict(row) if row else None
 
     def reserve_region(self, *, capture_id, file_identity, identity, start, finish,
-                       region_digest, status="attempted", detail=""):
-        """Durably reserve ``(file identity, start, finish, digest)`` BEFORE any
-        model call. Every outcome — success, failure, crash, cancellation —
-        consumes the region; the attempted boundary moves forward and failed
-        regions remain visible as coverage gaps, never silent rereads."""
+                       region_digest, observed_cursor, status="attempted", detail=""):
+        """Reserve one region and advance the shared cursor, or write nothing.
+
+        ``observed_cursor`` is the row the caller saw before this read: None
+        if that read saw no cursor, otherwise its ``identity`` and ``finish``.
+        ``identity`` is the new file identity to store after the compare
+        succeeds. A short file may grow its anchor; that new identity is not
+        the compare value. A conflicting reader gets None. Nothing is written
+        and the cursor is not moved backward.
+        """
         ident = digest(["region", capture_id, file_identity, start, finish, region_digest])
         now = time.time()
+        start = int(start)
+        finish = int(finish)
         with self._write_txn():
+            cursor = self.db.execute(
+                "SELECT identity, finish FROM cursors WHERE file_identity=?",
+                (file_identity,),
+            ).fetchone()
+            if observed_cursor is None:
+                if cursor is not None or start != 0:
+                    return None
+            else:
+                if cursor is None or not isinstance(observed_cursor, dict):
+                    return None
+                expected_finish = int(observed_cursor["finish"])
+                expected_identity = observed_cursor.get("identity") or ""
+                if int(cursor["finish"]) != expected_finish:
+                    return None
+                if (cursor["identity"] or "") != expected_identity:
+                    return None
+                if start != expected_finish:
+                    return None
+            already = self.db.execute(
+                "SELECT id FROM regions WHERE id=?", (ident,)
+            ).fetchone()
+            if already is not None:
+                return None
             self.db.execute(
-                "INSERT OR REPLACE INTO regions VALUES(?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO regions VALUES(?,?,?,?,?,?,?,?,?)",
                 (ident, capture_id, file_identity, start, finish, region_digest,
                  status, str(detail)[:1000], now),
             )
@@ -1298,9 +1525,58 @@ class Store:
                 "ON CONFLICT(file_identity) DO UPDATE SET "
                 "identity=excluded.identity, finish=excluded.finish, "
                 "digest=excluded.digest, updated=excluded.updated",
-                (file_identity, identity, finish, region_digest, now),
+                (file_identity, identity or "", finish, region_digest, now),
             )
         return ident
+
+    def schedule_continuation(self, ident, *, due, reason, eligible=1):
+        """Update one continuation without changing capture status."""
+        with self._write_txn():
+            _upsert_continuation(self.db, ident, due, reason[:1000], eligible)
+
+    def arm_apply_continuations(self):
+        """Give a saved apply-pending result a due row if it has none.
+
+        This does not apply the result and does not touch the network.
+        """
+        now = time.time()
+        with self._write_txn():
+            rows = self.db.execute(
+                "SELECT id FROM maintenance_attempts WHERE status='apply' "
+                "AND result IS NOT NULL"
+            ).fetchall()
+            for (attempt_id,) in rows:
+                parts = str(attempt_id).split(":")
+                if len(parts) < 3 or parts[0] != "organize":
+                    continue
+                capture_id = parts[1]
+                found = self.db.execute(
+                    "SELECT 1 FROM continuations WHERE capture_id=?",
+                    (capture_id,),
+                ).fetchone()
+                if found is None:
+                    _upsert_continuation(
+                        self.db, capture_id, now, "apply-pending", True,
+                    )
+
+    def due_application(self):
+        """One saved apply whose continuation is eligible and due."""
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT m.id, q.capture_id FROM maintenance_attempts m "
+                "JOIN continuations q ON m.id LIKE ('organize:' || q.capture_id || ':%') "
+                "JOIN captures c ON c.id = q.capture_id "
+                "WHERE m.status='apply' AND m.result IS NOT NULL "
+                "AND c.status='apply-pending' "
+                "AND COALESCE(q.eligible, 1) != 0 AND COALESCE(q.due, 0) <= ? "
+                "ORDER BY q.due, m.started LIMIT 5",
+                (time.time(),),
+            ).fetchall()
+        for attempt_id, capture_id in rows:
+            prefix = f"organize:{capture_id}:"
+            if attempt_id.startswith(prefix) and len(attempt_id) > len(prefix):
+                return attempt_id
+        return None
 
     def finish_region(self, ident, status, detail=""):
         ok = status in {"succeeded", "summary-only"}

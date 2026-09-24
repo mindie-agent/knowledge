@@ -111,6 +111,28 @@ STARTUP_TIMEOUT = 5.0
 MAX_STARTUP_PROBES = 3
 
 
+def _existing_service(config_path, config, timeout):
+    """Return a live connection, None when the process is absent, or raise.
+
+    Timeout and any other ambiguous probe must not lead to a second service.
+    A missing connection file or a refused connection is absent.
+    """
+    from .handoff import _probe
+
+    state = _probe(config, timeout)
+    if state == "unknown":
+        raise RuntimeError(
+            "knowledge service probe was ambiguous; not starting a second service"
+        )
+    if state == "absent":
+        return None
+    if state == "ready":
+        from .diagnostics import clear_startup_failure
+
+        clear_startup_failure(config_path, config)
+    return connect(config)
+
+
 def ensure_service(config_path):
     """One start attempt, at most three readiness probes, absolute startup budget."""
     config = config_at(config_path)
@@ -120,17 +142,18 @@ def ensure_service(config_path):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise RuntimeError("knowledge startup deadline exceeded")
-        connection = connect(config)
-        rpc(connection, "status", timeout=min(0.5, remaining))
-        from .diagnostics import clear_startup_failure
-
-        clear_startup_failure(config_path, config)
-        return connection
+        found = _existing_service(config_path, config, min(0.5, remaining))
+        if found is None:
+            raise FileNotFoundError("knowledge service is absent")
+        return found
 
     try:
         return probe()
-    except (OSError, ValueError):
+    except FileNotFoundError:
         pass
+    from .handoff import prepare_schema
+
+    prepare_schema(config_path)
     from .locks import StartInProgress, StartLock
 
     lock = StartLock(connection_path(config).with_name("start.lock"))
@@ -146,7 +169,7 @@ def ensure_service(config_path):
         if acquired:
             try:
                 return probe()
-            except (OSError, ValueError):
+            except FileNotFoundError:
                 pass
             spawn = dict(
                 stdin=subprocess.DEVNULL,
@@ -177,10 +200,18 @@ def ensure_service(config_path):
                 raise RuntimeError("knowledge service exited during startup; no retry")
             try:
                 connection = probe()
-                ready = True
-                return connection
+            except FileNotFoundError:
+                continue
+            except RuntimeError as exc:
+                # The process we just started may not answer yet. That timeout
+                # is not a second service, and it is not a reason to spawn again.
+                if "ambiguous" not in str(exc) and "deadline" not in str(exc):
+                    raise
+                continue
             except (OSError, ValueError):
-                pass
+                continue
+            ready = True
+            return connection
         raise RuntimeError(
             "knowledge service unavailable after bounded readiness probes; no restart"
         )
@@ -199,76 +230,14 @@ def ensure_service(config_path):
 
 
 def capture_hook(config_path, event):
-    """Bounded Stop bridge. Fail open for the user's task: no service start,
-    no transcript access, no offline queue. Sharing off short-circuits before
-    any capture state exists; read-only config/lease inspection is allowed."""
-    rpc_started = False
-    try:
-        if (
-            not isinstance(event, dict)
-            or event.get("hook_event_name") != "Stop"
-            or event.get("stop_hook_active", False) is not False
-        ):
-            return
-        fields = {}
-        for key, limit in (
-            ("session_id", 256),
-            ("turn_id", 256),
-            ("mindie_activation", 512),
-            ("last_assistant_message", 32768),
-            ("transcript_path", 4096),
-            ("cwd", 4096),
-        ):
-            value = event.get(key)
-            if value is None:
-                continue
-            if not isinstance(value, str) or len(value) > limit:
-                return
-            fields[key] = value
-        if "session_id" not in fields or "turn_id" not in fields:
-            return
-        config = config_at(config_path)
-        settings = settings_mod.from_engine_config(config)
-        if not settings.allows_capture():
-            return  # community off: no capture row, cursor, draft, worker, model
-        activation = fields.get("mindie_activation")
-        if not activation or not config.get("admission_path"):
-            return
-        from .activation import Admission
+    """Adapter-facing Stop handoff. The returned dict is the stage contract.
 
-        admission = Admission(config["admission_path"])
-        try:
-            lease = admission.capture_lease(fields["session_id"], activation)
-        except ValueError:
-            return
-        scope = admission.scope_root(fields["session_id"])
-        if not scope or not settings.in_scope(scope):
-            return
-        connection = connect(config)
-        rpc_started = True
-        rpc(
-            connection,
-            "capture",
-            dict(
-                session_id=fields["session_id"],
-                turn_id=fields["turn_id"],
-                transcript_path=fields.get("transcript_path"),
-                summary=fields.get("last_assistant_message", ""),
-                cwd=fields.get("cwd"),
-                _session_id=fields["session_id"],
-                _activation=activation,
-            ),
-            timeout=0.8,
-        )
-    except (OSError, RequestRejected, ValueError):
-        pass
-    except (KeyError, TypeError) as exc:
-        if rpc_started:
-            failure("knowledge.capture", stage="rpc", category="internal_exception", exception=exc)
-    except RuntimeError as exc:
-        if rpc_started:
-            failure("knowledge.capture", stage="rpc", category="internal_exception", exception=exc)
-        raise  # Preserve the original propagation; never restart the hook.
+    Hook stdout stays ``{}``. This function commits one capture row when the
+    gates allow it, then requests at most one detached service wake.
+    """
+    from .handoff import accept_stop
+
+    return accept_stop(config_path, event)
 
 
 def contribution_recovery(config, operation, batch_id):
@@ -392,10 +361,20 @@ def _open_existing_store(config):
 
 
 def _serve(config_path, config):
-    """Record only failures before this owned service publishes readiness."""
+    """Record only failures before this owned service publishes readiness.
+
+    ``consumer.lock`` is the store's lifetime ownership. ``start.lock`` stays
+    the startup handshake and is not held across serve.
+    """
     from .activation import Admission
     from .diagnostics import record_startup_failure
+    from .locks import StartInProgress, StartLock
 
+    consumer = StartLock(connection_path(config).with_name("consumer.lock"))
+    try:
+        consumer.acquire()
+    except StartInProgress:
+        return 0
     stage = "store"
     store = service = engine = None
     try:
@@ -445,6 +424,7 @@ def _serve(config_path, config):
             service.http.server_close()
         if store is not None:
             store.close()
+        consumer.release()
 
 
 def main(argv=None):
@@ -454,6 +434,7 @@ def main(argv=None):
         choices=[
             "serve",
             "hook",
+            "wake",
             "status",
             "diagnostic-status",
             "stop",
@@ -467,6 +448,7 @@ def main(argv=None):
         ],
     )
     parser.add_argument("--config", required=True)
+    parser.add_argument("--event", help="Internal wake correlation hash; not an authorization")
     parser.add_argument("--session", help="Local diagnostic identity; never grants authorization")
     parser.add_argument("--batch",
                         help="Contribution batch id (contribution-* operations only)")
@@ -479,6 +461,10 @@ def main(argv=None):
         parser.error("--resume applies only to sync")
     if args.batch and not args.operation.startswith("contribution-"):
         parser.error("--batch applies only to contribution-* operations")
+    if args.operation == "wake":
+        from .handoff import run_wake
+
+        return run_wake(args.config, args.event)
     if args.operation == "hook":
         try:
             raw = sys.stdin.buffer.read(128 * 1024 + 1)

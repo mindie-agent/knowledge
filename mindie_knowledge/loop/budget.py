@@ -2,6 +2,12 @@
 
 import time
 
+from .store import _upsert_continuation
+
+# The model may return 32 KiB. Saving that result also stores at most three
+# assigned entry ids and new flags. Those local fields are not a second gate.
+MAX_CHECKPOINT_RESULT = 32 * 1024 + 3 * 128
+
 
 class BudgetExceeded(RuntimeError):
     def __init__(self, message, *, retry_at=None):
@@ -21,8 +27,19 @@ class MaintenanceBudget:
             store.db.execute(
                 "CREATE TABLE IF NOT EXISTS maintenance_attempts("
                 "id TEXT PRIMARY KEY, session TEXT NOT NULL, role TEXT NOT NULL, "
-                "started REAL NOT NULL, status TEXT NOT NULL)"
+                "started REAL NOT NULL, status TEXT NOT NULL, "
+                "result TEXT, apply_receipt TEXT)"
             )
+            columns = {
+                row[1]
+                for row in store.db.execute("PRAGMA table_info(maintenance_attempts)")
+            }
+            if "result" not in columns:
+                store.db.execute("ALTER TABLE maintenance_attempts ADD COLUMN result TEXT")
+            if "apply_receipt" not in columns:
+                store.db.execute(
+                    "ALTER TABLE maintenance_attempts ADD COLUMN apply_receipt TEXT"
+                )
 
     def reserve(self, ident, session, role):
         now = time.time()
@@ -70,8 +87,19 @@ class MaintenanceBudget:
             ).fetchone():
                 raise BudgetExceeded("another maintenance call is in progress", retry_at=now + 135)
             db.execute(
-                "INSERT INTO maintenance_attempts VALUES(?,?,?,?,?)",
+                "INSERT INTO maintenance_attempts"
+                "(id, session, role, started, status) VALUES(?,?,?,?,?)",
                 (ident, session, role, now, "running"),
+            )
+
+    def _record_circuit(self, db):
+        last = db.execute(
+            "SELECT status FROM maintenance_attempts ORDER BY started DESC, rowid DESC LIMIT ?",
+            (self.FAILURE_LIMIT,),
+        ).fetchall()
+        if len(last) == self.FAILURE_LIMIT and all(row[0] == "failed" for row in last):
+            db.execute(
+                "INSERT OR REPLACE INTO state VALUES('maintenance_paused', 'consecutive failures')"
             )
 
     def finish(self, ident, succeeded):
@@ -87,30 +115,172 @@ class MaintenanceBudget:
                 "UPDATE maintenance_attempts SET status=? WHERE id=?",
                 (status, ident),
             )
-            last = db.execute(
-                "SELECT status FROM maintenance_attempts ORDER BY started DESC, rowid DESC LIMIT ?",
-                (self.FAILURE_LIMIT,),
-            ).fetchall()
-            if len(last) == self.FAILURE_LIMIT and all(
-                row[0] == "failed" for row in last
-            ):
-                db.execute(
-                    "INSERT OR REPLACE INTO state VALUES('maintenance_paused', 'consecutive failures')"
-                )
+            self._record_circuit(db)
+
+    def abandon_unstarted(self, ident):
+        """Drop a reserved attempt whose model process never started.
+
+        A crash after the model starts still leaves the running row, and
+        service start consumes it. This delete is only for an attempt that
+        has no saved result and did not spawn.
+        """
+        with self.store._write_txn():
+            self.store.db.execute(
+                "DELETE FROM maintenance_attempts WHERE id=? AND status='running' "
+                "AND result IS NULL",
+                (ident,),
+            )
 
     def recover_interrupted(self):
-        """On service start, consume crashes as failures before new admission."""
+        """On service start, consume model crashes that saved no result.
+
+        A row already checkpointed for application stays runnable. It is not
+        a failed model attempt and it is not run again.
+        """
         with self.store.lock:
             interrupted = self.store.db.execute(
-                "SELECT id FROM maintenance_attempts WHERE status='running' ORDER BY started"
+                "SELECT id FROM maintenance_attempts WHERE status='running' "
+                "AND result IS NULL ORDER BY started"
             ).fetchall()
             for row in interrupted:
                 self.finish(row[0], False)
 
+    def checkpoint(self, ident, result_text, receipt_text, *, capture_id=None,
+                   capture_status=None, capture_detail="", region_id=None,
+                   region_status=None, region_detail=""):
+        """Persist one scanned result together with its capture and region state.
+
+        Result text, apply-pending (or the given capture status), and the
+        region receipt commit in the one store transaction. A crash rolls
+        all of them back, so a success receipt cannot exist without the result.
+        """
+        if (
+            not isinstance(result_text, str)
+            or len(result_text.encode("utf-8")) > MAX_CHECKPOINT_RESULT
+        ):
+            raise ValueError("checkpoint result exceeds the saved-result limit")
+        with self.store._write_txn():
+            db = self.store.db
+            updated = db.execute(
+                "UPDATE maintenance_attempts SET status='apply', result=?, "
+                "apply_receipt=? WHERE id=? AND status IN ('running', 'apply')",
+                (result_text, receipt_text, ident),
+            )
+            if updated.rowcount != 1:
+                raise ValueError("maintenance attempt is not checkpointable")
+            if capture_id and capture_status:
+                db.execute(
+                    "UPDATE captures SET status=?, detail=? WHERE id=?",
+                    (capture_status, str(capture_detail)[:1000], capture_id),
+                )
+                if capture_status == "apply-pending":
+                    existing = db.execute(
+                        "SELECT 1 FROM continuations WHERE capture_id=?",
+                        (capture_id,),
+                    ).fetchone()
+                    if existing is None:
+                        _upsert_continuation(
+                            db, capture_id, time.time(), "apply-pending", True,
+                        )
+                elif capture_status not in {"queued", "pending", "deferred"}:
+                    db.execute(
+                        "DELETE FROM continuations WHERE capture_id=?", (capture_id,)
+                    )
+            if region_id and region_status:
+                self.store.finish_region(region_id, region_status, region_detail)
+
+    def application(self, ident):
+        with self.store.lock:
+            row = self.store.db.execute(
+                "SELECT id, status, result, apply_receipt FROM maintenance_attempts WHERE id=?",
+                (ident,),
+            ).fetchone()
+        if row is None:
+            return None
+        return dict(id=row[0], status=row[1], result=row[2], apply_receipt=row[3])
+
+    def pending_applications(self):
+        with self.store.lock:
+            rows = self.store.db.execute(
+                "SELECT id FROM maintenance_attempts WHERE status='apply' "
+                "AND result IS NOT NULL ORDER BY started"
+            ).fetchall()
+        return [row[0] for row in rows]
+
+    def _finish_capture_locked(self, capture_id, detail, more):
+        if not capture_id:
+            return
+        db = self.store.db
+        if more:
+            reason = "organized one bounded increment; continuation pending"
+            db.execute(
+                "UPDATE captures SET status='pending', detail=? WHERE id=?",
+                (reason, capture_id),
+            )
+            _upsert_continuation(db, capture_id, time.time() + 1, reason, True)
+            return
+        db.execute(
+            "UPDATE captures SET status='organized', detail=? WHERE id=?",
+            (str(detail)[:1000], capture_id),
+        )
+        db.execute("DELETE FROM continuations WHERE capture_id=?", (capture_id,))
+
+    def settle_empty(self, ident, receipt_text, *, capture_id, capture_detail="",
+                     region_id=None, region_status="succeeded", more=False):
+        """No scanned entry to apply. Success, cleanup, and the region commit once."""
+        with self.store._write_txn():
+            db = self.store.db
+            updated = db.execute(
+                "UPDATE maintenance_attempts SET status='succeeded', result=NULL, "
+                "apply_receipt=? WHERE id=? AND status='running' AND result IS NULL",
+                (receipt_text, ident),
+            )
+            if updated.rowcount != 1:
+                raise ValueError("maintenance attempt is not settleable")
+            self._finish_capture_locked(capture_id, capture_detail, more)
+            if region_id and region_status:
+                self.store.finish_region(region_id, region_status, "")
+            self._record_circuit(db)
+
+    def complete_application(self, ident, receipt_text, *, capture_id=None,
+                             capture_detail="", more=False):
+        """Model succeeded and every scanned entry was applied. Drop the body.
+
+        Success status, result cleanup, and the capture completion are one
+        commit. An interruption cannot leave status=apply with result NULL.
+        """
+        with self.store._write_txn():
+            db = self.store.db
+            updated = db.execute(
+                "UPDATE maintenance_attempts SET status='succeeded', result=NULL, "
+                "apply_receipt=? WHERE id=? AND status='apply' AND result IS NOT NULL",
+                (receipt_text, ident),
+            )
+            if updated.rowcount != 1:
+                raise ValueError("application is not completable")
+            self._finish_capture_locked(capture_id, capture_detail, more)
+            self._record_circuit(db)
+
+    def release_application(self, ident, receipt_text):
+        """Authorization changed. Drop the body and do not count a model failure."""
+        with self.store.lock, self.store.db:
+            self.store.db.execute(
+                "UPDATE maintenance_attempts SET status='cancelled', result=NULL, "
+                "apply_receipt=? WHERE id=?",
+                (receipt_text, ident),
+            )
+
     def resume(self):
         # Keep attempts and quotas: explicit resume does not replay failed work.
-        with self.store.lock, self.store.db:
+        # Captures held only because the circuit was paused become due again.
+        now = time.time()
+        with self.store._write_txn():
             self.store.db.execute("DELETE FROM state WHERE key='maintenance_paused'")
+            self.store.db.execute(
+                "UPDATE continuations SET due=?, eligible=1 "
+                "WHERE eligible=0 OR reason='maintenance-paused'",
+                (now,),
+            )
         return self.status()
 
     def status(self):

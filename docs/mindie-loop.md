@@ -24,12 +24,16 @@ disabled period.
 
 ## Capture and bounded increments
 
-The Stop Hook (`hook --config`) validates the bounded envelope, re-checks the
-gate read-only and forwards whitelist fields to the already-running loopback
-service; it never opens the transcript, starts a service, or retries. A valid
-event carries `session_id` and `turn_id`; `transcript_path` and
-`last_assistant_message` are both optional — a transcript without a final
-summary is still accepted.
+The Stop hook (`capture_hook`, also `hook --config`) validates the bounded
+envelope and, when sharing and the current activation allow it, commits one
+capture row before it returns. That commit is local acceptance. The hook does
+not open the transcript. If the store is missing, locked, or not migrated, it
+returns unavailable and does not insert. A live worker is a separate stage:
+`worker_alive` on the status RPC, not a `processing` row. When the row is
+still unprocessed and the service process is absent, the hook requests one
+coalesced model-free wake. Hook stdout stays `{}`. Query startup remains
+`ensure_service`, which also prepares the store schema. Codex and Claude Code
+do not add a SessionStart hook for this.
 
 The worker reads only the new byte region of the admitted task's own
 transcript through the configured `transcript_adapter` module (an absolute
