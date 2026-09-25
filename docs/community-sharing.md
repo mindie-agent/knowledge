@@ -35,13 +35,28 @@ or configures that bot, and no model is ever called here.
   recorded masked.
 - Idempotence keys on the content revision, not the event id. A failed or
   unresolved revision is never automatically resent; explicit retry
-  (`batch["explicit_retry"] = true`) resumes from already-pushed commits.
-  Unknown outcomes resolve through bounded read-only reconciliation, durably
-  capped per revision.
+  (`batch["explicit_retry"] = true`) resumes from already-pushed commits. A
+  transient environment failure (`unavailable`) is resubmitted by the caller
+  with persisted backoff. Unknown outcomes resolve through one bounded
+  read-only reconciliation per scheduler opportunity, spaced by a persisted
+  backoff with no permanent exhaustion cap: confirmation requires the exact
+  expected head or Git ancestry proof that the expected commit reached our
+  PR; unavailable evidence stays `unknown`, never a confirmed failure.
 - Our own open PR is updated in place (fast-forward only, never forced). A
   merged prior PR plus a genuine delta opens a follow-up PR on a fresh
-  branch. Remote content that moved away from the declared base parks the
-  batch as `needs_review`; nothing is overwritten.
+  branch. Remote content that moved away from the declared base receives only
+  the not-yet-confirmed observation delta onto the current body (the remote
+  body and header stay authoritative); when the delta cannot be proven from
+  confirmed marker identities the batch parks as `needs_review` — nothing is
+  overwritten. A closed-unmerged PR is a proven `rejected` verdict: the
+  contributor side quarantines exactly that content instead of resurrecting
+  it with a new PR.
+- The upstream repository is the content authority; a fork is only the
+  contributor's write destination. An open PR is read from its upstream PR
+  ref after that commit is checked against the API head. A merged PR,
+  including a squash or rebase merge, continues from current upstream main.
+  Removed content is not restored from a retained contribution branch or
+  local published cache. An unreadable lookup is not an empty lookup.
 - Pure vote batches publish without entries; votes merge by
   `(root_id, entry_id, revision)` — replacement updates, never double counts;
   a revision change is a distinct vote. Reasons are stored untrusted.
@@ -58,8 +73,12 @@ python -m mindie_knowledge.community reconcile \
 ```
 
 Both print one JSON receipt (`status` in submitted/updated/unchanged/unknown/
-failed/disabled/needs_review, plus `batch_id`, `revision`, `pr_url`,
-`head_sha`, bounded `detail`).
+unavailable/failed/rejected/disabled/needs_review, plus `batch_id`,
+`revision`, `pr_url`, `head_sha`, bounded `detail`; confirmed submissions
+also carry the actual committed per-file identities in `files`).
+An optional finite Unix-epoch `retry_at` carries server retry guidance. The
+existing outbox persists the later of that value and its backoff time;
+an uncertain write still receives only read-only reconciliation.
 
 ## Skill package validation helpers
 

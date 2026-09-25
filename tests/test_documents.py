@@ -111,9 +111,22 @@ def test_append_observation_is_idempotent_and_bounded():
     again, appended = append_observation(updated, "Later observation Y changed Z.", marker="f" * 32)
     assert not appended and again == updated
     assert doc["content"] in updated["content"]
-    big = "x" * (64 * 1024)
+
+
+def test_cumulative_body_past_64kib_continues_to_the_file_envelope():
+    # There is no 64 KiB business cap on accumulated experience; a long entry
+    # keeps growing and is bounded only by the per-file publication envelope
+    # (the rendered canonical file, header included).
+    doc = entry()
+    chunk = "x" * (32 * 1024)
+    for index in range(3):
+        doc, appended = append_observation(doc, chunk, marker=f"{index:064x}")
+        assert appended
+    assert len(doc["content"].encode()) > 64 * 1024
+    parse_entry(render_entry(doc))  # the accumulated body stays canonical
+    over = entry()
     with pytest.raises(DraftFull):
-        append_observation(updated, big, marker="e" * 32)
+        append_observation(over, "y" * documents.MAX_FILE_BYTES, marker="e" * 32)
 
 
 def test_malformed_files_fail_loudly():
@@ -124,3 +137,22 @@ def test_malformed_files_fail_loudly():
         parse_entry(render_entry(doc).replace("\n", "\r\n"))
     with pytest.raises(ValueError, match="frontmatter"):
         parse_entry("# no frontmatter\n")
+
+
+def test_frontmatter_metadata_envelope_is_utf8_bytes_everywhere():
+    # A header under 64 Ki CHARACTERS but over 64 KiB in UTF-8 (non-BMP) is
+    # refused at parse, create AND render — one byte envelope, all surfaces.
+    padded = "é" * (64 * 1024)  # 2 bytes per char: 128 KiB of bytes
+    raw = (
+        "---\nconditions: {}\ndomain: vllm-ascend\nentry_id: " + "b" * 64
+        + "\nkind: experience\nsummary: s\ntitle: " + padded + "\n---\n\nbody\n"
+    )
+    with pytest.raises(ValueError, match="metadata byte limit"):
+        parse_entry(raw)
+    # Over the byte envelope even in pure ASCII: create/render refuse what
+    # parse would refuse (the old 75 KB ASCII gap).
+    big_conditions = {f"key_{i:04d}": "v" * 500 for i in range(140)}
+    with pytest.raises(ValueError, match="metadata byte limit"):
+        entry(conditions=big_conditions)
+    # A normal header stays well within the envelope.
+    assert parse_entry(render_entry(entry())) == entry()

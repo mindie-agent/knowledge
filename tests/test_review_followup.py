@@ -190,6 +190,58 @@ def test_recovery_text_does_not_ask_for_a_stop_replay():
     assert "replay this stop" in blob
 
 
+def test_apply_transient_failure_resumes_without_terminal_dormancy(tmp_path):
+    """A saved organizer result blocked by a transient local failure keeps its
+    persisted backoff and stays eligible — no terminal attempt count parks it
+    and no model is replayed."""
+    _config, _admission, _project, settings = _ready(tmp_path)
+    store = Store(tmp_path / "root", "test")
+    try:
+        captured = store.add_capture(
+            root_session="root", session="manual-A", turn="t", transcript=None,
+            summary="kept", namespace="codex",
+        )
+        store.mark_capture(captured["id"], "apply-pending", "saved")
+        engine = Engine(store, agent_command=["false"], settings_path=str(settings))
+        attempt = f"organize:{captured['id']}:marker"
+        engine.budget.reserve(attempt, "root", "organize")
+        payload = json.dumps({"entries": [dict(
+            entry_id="e" * 64, title="Transient case", summary="s",
+            content="kept body", conditions={}, new=True,
+        )]})
+        engine.budget.checkpoint(attempt, payload, "{}")
+
+        from mindie_knowledge.loop.store import Store as _Store
+
+        calls = []
+        real_create = _Store.create_draft
+
+        def busy_create(*args, **kwargs):
+            calls.append(1)
+            raise OSError("disk busy")
+
+        store.create_draft = busy_create
+        row = store.capture_row(captured["id"])
+        engine._apply_saved(attempt, row)
+        assert store.continuation_reason(captured["id"]) == "apply-transient:1"
+        cont = store.db.execute(
+            "SELECT due, eligible FROM continuations WHERE capture_id=?",
+            (captured["id"],),
+        ).fetchone()
+        assert cont["eligible"] == 1 and cont["due"] > time.time()
+        # Still apply-pending with the saved result intact; repeated transient
+        # faults grow the backoff but never park the valid result.
+        engine._apply_saved(attempt, store.capture_row(captured["id"]))
+        assert store.continuation_reason(captured["id"]) == "apply-transient:2"
+        assert engine.budget.application(attempt)["result"] == payload
+        store.create_draft = real_create.__get__(store, _Store)
+        engine._apply_saved(attempt, store.capture_row(captured["id"]))
+        assert store.capture_row(captured["id"])["status"] == "organized"
+        assert engine.budget.application(attempt)["result"] is None  # settled
+    finally:
+        store.close()
+
+
 def test_apply_due_counts_activity_and_does_not_start_when_frozen(tmp_path):
     store = Store(tmp_path, "vllm-ascend")
     try:

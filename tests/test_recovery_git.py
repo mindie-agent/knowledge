@@ -98,13 +98,13 @@ def test_inspect_confirms_exhausted_row_only_at_exact_expected_head(tmp_path):
                             transport=StubTransport([]))
     assert receipt["status"] == "unknown"
 
-    # A closed unmerged PR is a proven failure.
+    # A closed unmerged PR is a proven content-level rejection.
     _ledger_row(tmp_path / "s4", status="unknown", head_sha="b" * 40)
     closed = dict(pr, state="closed", merged=False,
                   head={"ref": "mindie/test/batch-x", "sha": "b" * 40})
     receipt = inspect_batch("batch-x", cfg, tmp_path / "s4",
                             transport=StubTransport([closed]))
-    assert receipt["status"] == "failed"
+    assert receipt["status"] == "rejected"
 
     # Historical cap-failed with no evidence becomes unknown, not kept failed.
     _ledger_row(tmp_path / "s5", status="failed", head_sha="b" * 40)
@@ -216,6 +216,29 @@ def _bare_remote(tmp_path):
     return bare, head, body, path, doc
 
 
+def _seed_merged_pr(store, bare, head):
+    """The receipt's PR is merged. Main, not the deleted branch, is the body."""
+    from mindie_knowledge.community.transport import FileTransport
+
+    FileTransport(store.root / "outbox" / "dev-github.json", {REPO: str(bare)}).seed(
+        REPO,
+        pulls={
+            "9": {
+                "number": 9,
+                "state": "closed",
+                "merged": True,
+                "html_url": "https://x/pull/9",
+                "head": {
+                    "ref": "mindie/test/batch-z",
+                    "sha": head,
+                    "repo": {"full_name": REPO},
+                },
+                "base": {"ref": "main", "repo": {"full_name": REPO}},
+            }
+        },
+    )
+
+
 def _restore_diagnostics(engine, entry_id):
     """Expose the real Git error for platform-specific receipt failures."""
     from mindie_knowledge.community import gitops
@@ -234,11 +257,11 @@ def _restore_diagnostics(engine, entry_id):
             "git_error": result.err_text[:1200], "work_path_length": len(str(work))}
 
 
-def test_restore_uses_exact_receipt_head_after_branch_deletion(tmp_path):
+def test_restore_uses_current_remote_body_after_branch_deletion(tmp_path):
     bare, head, body, path, doc = _bare_remote(tmp_path)
     settings = write_settings(
         tmp_path / "community.json", enabled=True, roots=[tmp_path],
-        repository=REPO, dev_remotes={REPO: str(bare)},
+        repository=REPO, dev_remotes={REPO: str(bare)}, transport="file",
     )
     store = Store(tmp_path / "store", "test")
     local = store.create_draft(kind="experience", title="Sent case", summary="s",
@@ -265,13 +288,16 @@ def test_restore_uses_exact_receipt_head_after_branch_deletion(tmp_path):
         )
     store.compact_confirmed(batch_id)
     assert store._row(doc["entry_id"])["draft_revision"] is None
+    _seed_merged_pr(store, bare, head)
 
     engine = Engine(store, settings_path=tmp_path / "community.json")
     assert engine._restore_sent_draft(doc["entry_id"], settings.generation), _restore_diagnostics(engine, doc["entry_id"])
     row = store._row(doc["entry_id"])
     assert row["draft_revision"] == doc["revision"]
     restored = store.get(store.ref(doc["entry_id"]))
-    assert restored["content"] == "the sent body"  # exact prior remote body
+    # The current remote body (merged main) is the append base, not an old
+    # confirmed-head draft.
+    assert restored["content"] == "the sent body"
     updated, appended = store.append_observation(
         doc["entry_id"], "second observation", marker="ef" * 32,
         producer=PRODUCER, generation=settings.generation,
@@ -279,13 +305,15 @@ def test_restore_uses_exact_receipt_head_after_branch_deletion(tmp_path):
     assert appended and "the sent body" in updated["content"]
     assert "second observation" in updated["content"]
 
-    # A tampered receipt hash never seeds a base.
+    # A tampered receipt path never seeds a base from mismatched content:
+    # restore reads the CURRENT remote body and requires the entry identity.
     store2 = Store(tmp_path / "store2", "test")
     store2.create_draft(kind="experience", title="Sent case", summary="s",
                         content="the sent body", owner=PRODUCER,
                         entry_id=doc["entry_id"],
                         generation=settings.generation)
-    bad = dict(receipt, files=[{"path": path, "sha256": "0" * 64}])
+    bad = dict(receipt, files=[{"path": "cases/" + "0" * 64 + ".md",
+                                "sha256": hashlib.sha256(body.encode()).hexdigest()}])
     with store2._write_txn():
         store2.db.execute(
             "INSERT INTO outbox VALUES(?,?,?,?,?,?,?,1.0,NULL,1.0,0,NULL,?)",
@@ -294,8 +322,9 @@ def test_restore_uses_exact_receipt_head_after_branch_deletion(tmp_path):
         )
     store2.compact_confirmed(batch_id)
     engine2 = Engine(store2, settings_path=tmp_path / "community.json")
+    # The wrong path means no receipt was ever recorded for this entry.
     assert not engine2._restore_sent_draft(doc["entry_id"], settings.generation), engine2.errors
-    assert any("hash mismatch" in err for err in engine2.errors), engine2.errors
+    assert any("no matching receipt" in err for err in engine2.errors), engine2.errors
     store.close()
     store2.close()
 
@@ -310,7 +339,7 @@ def test_aba_continuation_after_lineage_replace_and_branch_removal(tmp_path):
     bare, head, body, path, doc = _bare_remote(tmp_path)
     settings = write_settings(
         tmp_path / "community.json", enabled=True, roots=[tmp_path],
-        repository=REPO, dev_remotes={REPO: str(bare)},
+        repository=REPO, dev_remotes={REPO: str(bare)}, transport="file",
     )
     store = Store(tmp_path / "store", "test")
     local = store.create_draft(kind="experience", title="Sent case", summary="s",
@@ -353,6 +382,7 @@ def test_aba_continuation_after_lineage_replace_and_branch_removal(tmp_path):
     assert store._revision_doc(doc["entry_id"], doc["revision"]) is None
     assert any("b-only later batch" in json.loads(row[0]).get("content", "")
                for row in store.db.execute("SELECT doc FROM revisions"))
+    _seed_merged_pr(store, bare, head)
 
     engine = Engine(store, settings_path=tmp_path / "community.json")
     assert engine._restore_sent_draft(doc["entry_id"], settings.generation), _restore_diagnostics(engine, doc["entry_id"])

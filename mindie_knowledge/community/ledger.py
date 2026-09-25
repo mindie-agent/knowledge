@@ -8,6 +8,7 @@ replays a failed or unknown revision of the same candidate digest.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import time
@@ -18,7 +19,8 @@ from .common import MAX_DETAIL, canonical
 
 LEDGER_NAME = "community-ledger.sqlite3"
 
-PUBLISH_FINAL = ("submitted", "updated", "unchanged", "failed", "needs_review", "disabled")
+PUBLISH_FINAL = ("submitted", "updated", "unchanged", "failed", "rejected",
+                 "needs_review", "disabled")
 PUBLISH_UNRESOLVED = ("intent", "unknown")
 
 
@@ -60,6 +62,11 @@ class Ledger:
             CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             """
         )
+        columns = {
+            row[1] for row in self.db.execute("PRAGMA table_info(publication)")
+        }
+        if columns and "actual_files" not in columns:
+            self.db.execute("ALTER TABLE publication ADD COLUMN actual_files TEXT")
         self.db.commit()
 
     def close(self) -> None:
@@ -140,6 +147,42 @@ class Ledger:
                 (batch_id, revision, step, detail[:MAX_DETAIL], time.time()),
             )
 
+    def record_actual_files(
+        self, batch_id: str, revision: str, files: list[dict[str, Any]]
+    ) -> None:
+        """Persist the actual per-file committed identities (path/sha256/
+        revision) BEFORE the uncertain external step they belong to.
+
+        Small identities only — never bodies — so a lost response can still
+        recover exactly what the worktree held at commit time, without a
+        second body store."""
+        packed = canonical([
+            {k: f.get(k) for k in ("path", "sha256", "revision")} for f in files
+        ])
+        with self.lock, self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            self.db.execute(
+                "UPDATE publication SET actual_files=? WHERE batch_id=? AND revision=?",
+                (packed, batch_id, revision),
+            )
+
+    @staticmethod
+    def parse_actual_files(row: Mapping[str, Any]) -> list[dict[str, Any]] | None:
+        raw = row.get("actual_files")
+        if not raw:
+            return None
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            return None
+        if not isinstance(value, list):
+            return None
+        out = []
+        for item in value:
+            if isinstance(item, dict) and isinstance(item.get("path"), str):
+                out.append(item)
+        return out
+
     def steps_for(self, batch_id: str, revision: str) -> list[dict[str, Any]]:
         with self.lock:
             rows = self.db.execute(
@@ -185,4 +228,5 @@ class Ledger:
             "pr_url": row.get("pr_url"),
             "head_sha": row.get("head_sha"),
             "detail": row.get("detail") or "",
+            "files": self.parse_actual_files(row),
         }

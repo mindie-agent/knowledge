@@ -180,6 +180,8 @@ def test_conflict_divergence_parks_needs_review(settings, state_dir, transport, 
     git(["-c", "user.name=maintainer", "-c", "user.email=m@example.invalid",
          "commit", "-m", "maintainer edit"], cwd=work)
     git(["push", "origin", "HEAD"], cwd=work)
+    # The PR head ref moves with the branch. It is not left on the old tip.
+    git(["push", "origin", "HEAD:refs/pull/1/head"], cwd=work)
     # Our next revision, based on OUR last content, must not overwrite that edit.
     doc2 = make_entry(content="Updated observation from the contributor.")
     batch2 = make_batch("batch-i", [dict(entry_file(doc2), base_sha256=entry_file(doc)["sha256"])])
@@ -242,6 +244,24 @@ def _deadline():
     return Deadline(120, 60)
 
 
+def test_network_shaped_git_failures_are_transient_but_auth_is_not():
+    from mindie_knowledge.community.gitops import _is_transient_git_error
+
+    # Observed isolated evidence: proxy/DNS/connection failures are the
+    # environment, never the content or the authorization.
+    assert _is_transient_git_error(
+        "fatal: unable to access 'https://example.invalid/x.git/': "
+        "Proxy CONNECT aborted"
+    )
+    assert _is_transient_git_error("fatal: Could not resolve host: github.com")
+    assert _is_transient_git_error("fatal: connection timed out")
+    assert _is_transient_git_error("error: HTTP 503: Service Unavailable")
+    assert not _is_transient_git_error("fatal: Authentication failed")
+    assert not _is_transient_git_error("HTTP 403: token lacks authority")
+    assert not _is_transient_git_error("fatal: repository not found")
+    assert not _is_transient_git_error("")
+
+
 def test_deleted_entry_is_not_restored_by_a_pending_correction(settings, state_dir, transport, remote_url):
     doc = make_entry()
     first = submit_batch(make_batch('batch-delete', [entry_file(doc)]), settings,
@@ -254,6 +274,7 @@ def test_deleted_entry_is_not_restored_by_a_pending_correction(settings, state_d
     git(['-c', 'user.name=maintainer', '-c', 'user.email=m@example.invalid',
          'commit', '-m', 'Withdraw incorrect entry'], cwd=work)
     git(['push', 'origin', 'HEAD'], cwd=work)
+    git(['push', 'origin', 'HEAD:refs/pull/1/head'], cwd=work)
     before = git(['rev-parse', 'HEAD'], cwd=work)
     correction = make_entry(content='Later observation retained privately.')
     batch = make_batch('batch-delete', [dict(entry_file(correction),

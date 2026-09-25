@@ -15,10 +15,13 @@ GitHub acceptance evidence.
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 import tempfile
 import threading
 import time
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -26,6 +29,7 @@ from .common import (
     DEFAULT_API_OP_SECONDS,
     CommunityError,
     Deadline,
+    TransientError,
     UnknownOutcome,
     check_repository,
     run_argv,
@@ -45,7 +49,9 @@ def _brief(payload: Any) -> str:
 class Transport:
     """Narrow GitHub surface used by contributor publication."""
 
-    def find_pull_requests(self, repo: str, *, head_branch: str, deadline: Deadline) -> list[dict]:
+    def find_pull_requests(
+        self, repo: str, *, head_branch: str, deadline: Deadline, head_owner: str | None = None
+    ) -> list[dict]:
         raise NotImplementedError
 
 
@@ -78,6 +84,7 @@ class GhTransport(Transport):
     """Bounded ``gh api`` argv calls. The token stays in gh's own env var."""
 
     def __init__(self, settings: Mapping[str, Any]):
+        self.settings = settings
         self.token_env = settings.get("token_env", "GH_TOKEN")
         self.op_seconds = min(DEFAULT_API_OP_SECONDS, settings.get("transaction_seconds", 120))
 
@@ -85,7 +92,7 @@ class GhTransport(Transport):
         self, method: str, path: str, deadline: Deadline, body: Mapping[str, Any] | None = None
     ) -> Any:
         remaining = deadline.step(f"gh {method} {path.split('?')[0]}")
-        argv = ["gh", "api", "--method", method, "-H", "Accept: application/vnd.github+json"]
+        argv = ["gh", "api", "--include", "--method", method, "-H", "Accept: application/vnd.github+json"]
         tmp = None
         try:
             if body is not None:
@@ -112,28 +119,59 @@ class GhTransport(Transport):
                     os.unlink(tmp.name)
                 except OSError:
                     pass
-        if result.timed_out:
-            raise UnknownOutcome(f"gh api {method} {path} timed out; outcome unknown")
-        text = result.out_text.strip()
+        header, body_text = _split_included(result.out_text)
         payload: Any = None
-        if text:
+        if body_text.strip():
             try:
-                payload = json.loads(text)
+                payload = json.loads(body_text)
             except json.JSONDecodeError:
                 payload = None
+        evidence = "\n".join((header, result.err_text))
+        status = _http_status(evidence)
+        if result.timed_out:
+            _read_or_unknown(
+                method == "GET",
+                f"gh api {method} {path} timed out",
+                unknown_detail=f"gh api {method} {path} timed out; outcome unknown",
+            )
         if result.code != 0:
             message = ""
             if isinstance(payload, Mapping):
                 message = str(payload.get("message") or "")
             if not message:
                 # gh prints HTTP failures to stderr; keep detail bounded and
-                # never include argv, headers or environment.
+                # never include argv or the token.
                 message = result.err_text.strip().splitlines()[0] if result.err_text.strip() else "gh api failed"
-            status = _http_status(result.err_text)
+            rate = _rate_limited(status, message, result.err_text)
+            retry_at = _retry_epoch(header) if rate or (status is not None and status >= 500) else None
+            if rate:
+                detail = (
+                    f"GitHub rate limit on {method} {path}: {message}"
+                    + (f" (HTTP {status})" if status else "")
+                )
+                # A rate-limited write may have landed. Stay unknown and only
+                # delay the next read-only reconciliation.
+                _read_or_unknown(
+                    method == "GET",
+                    detail,
+                    unknown_detail=f"gh api {method} {path}: rate limited; outcome unknown",
+                    retry_at=retry_at,
+                )
             if status in (401, 403, 404):
                 raise CommunityError(f"GitHub refused {method} {path}: {message} (HTTP {status})")
             if status is None:
-                raise UnknownOutcome(f"gh api {method} {path}: no HTTP response; outcome unknown")
+                _read_or_unknown(
+                    method == "GET",
+                    f"GitHub unreachable on {method} {path}: {message}",
+                    unknown_detail=f"gh api {method} {path}: no HTTP response; outcome unknown",
+                )
+            if status >= 500:
+                _read_or_unknown(
+                    method == "GET",
+                    f"GitHub temporarily unavailable on {method} {path}: {message} (HTTP {status})",
+                    unknown_detail=f"gh api {method} {path}: HTTP {status}; outcome unknown",
+                    retry_at=retry_at,
+                )
             raise CommunityError(f"GitHub error on {method} {path}: {message} (HTTP {status})")
         return payload
 
@@ -143,20 +181,27 @@ class GhTransport(Transport):
 
         return path + "?" + "&".join(f"{k}={quote(v, safe='')}" for k, v in params.items())
 
-    def find_pull_requests(self, repo: str, *, head_branch: str, deadline: Deadline) -> list[dict]:
+    def find_pull_requests(
+        self, repo: str, *, head_branch: str, deadline: Deadline, head_owner: str | None = None
+    ) -> list[dict]:
         check_repository(repo)
-        owner = repo.split("/", 1)[0]
+        owner = head_owner or _configured_head_owner(self.settings, repo)
         payload = self._api(
             "GET", self._query(f"/repos/{repo}/pulls", head=f"{owner}:{head_branch}", state="all"), deadline
         )
-        return list(payload) if isinstance(payload, list) else []
+        # A completed lookup is a list of selectable PRs. An unreadable 2xx
+        # body is an unavailable read — not "no PR" and not a content rejection.
+        # Only a valid empty list proves absence.
+        if not isinstance(payload, list):
+            raise TransientError("PR lookup returned an unreadable list")
+        return [_normalize_pr(item) for item in payload]
 
 
     def get_pull_request(self, repo: str, number: int, deadline: Deadline) -> dict:
         payload = self._api("GET", f"/repos/{repo}/pulls/{int(number)}", deadline)
         if not isinstance(payload, Mapping):
-            raise CommunityError("unexpected PR payload")
-        return dict(payload)
+            raise TransientError("PR lookup returned an unreadable PR")
+        return _normalize_pr(payload, number=int(number))
 
     def create_pull_request(self, repo, *, title, body, head, base, deadline) -> dict:
         payload = self._api(
@@ -182,14 +227,132 @@ class GhTransport(Transport):
 
 
 
-def _http_status(stderr_text: str) -> int | None:
-    for token in stderr_text.split():
-        if token.startswith("HTTP"):
-            try:
-                return int(token.removeprefix("HTTP").strip(": "))
-            except ValueError:
-                return None
-    return None
+_HTTP_STATUS = re.compile(
+    r"(?:\bHTTP/\d+(?:\.\d+)?|\bHTTP|\(\s*HTTP)\s+(\d{3})\b",
+    re.IGNORECASE,
+)
+_RETRY_AFTER = re.compile(r"(?im)^retry-after:\s*(.+?)\s*$")
+
+
+def _http_status(text: str) -> int | None:
+    """Parse gh's ``(HTTP 403)`` and a real status line. Not every token."""
+    match = _HTTP_STATUS.search(text or "")
+    if not match:
+        return None
+    try:
+        code = int(match.group(1))
+    except ValueError:
+        return None
+    return code if 100 <= code <= 599 else None
+
+
+def _split_included(text: str) -> tuple[str, str]:
+    """Split ``gh api --include`` headers from the body. Bare JSON stays a body.
+
+    Real responses use LF or CRLF. The blank line is the separator; a payload
+    that does not start with a status line is left intact.
+    """
+    raw = text or ""
+    if not raw.lstrip().startswith("HTTP/"):
+        return "", raw.strip()
+    normalized = raw.replace("\r\n", "\n").replace("\r", "\n")
+    header, sep, body = normalized.partition("\n\n")
+    if not sep:
+        return "", raw.strip()
+    return header, body.strip()
+
+
+def _rate_limited(status: int | None, *parts: str) -> bool:
+    if status == 429:
+        return True
+    blob = "\n".join(parts).lower()
+    return "rate limit" in blob
+
+
+def _retry_epoch(header: str) -> float | None:
+    """Retry-After as a finite Unix epoch. Relative seconds or an HTTP date."""
+    match = _RETRY_AFTER.search(header or "")
+    if not match:
+        return None
+    raw = match.group(1).strip().strip('"')
+    if raw.lower() in {"nan", "inf", "+inf", "-inf", "infinity", "+infinity", "-infinity", "true", "false"}:
+        return None
+    try:
+        seconds = float(raw)
+    except ValueError:
+        seconds = None
+    else:
+        if not math.isfinite(seconds) or seconds < 0:
+            return None
+        return time.time() + seconds
+    try:
+        parsed = parsedate_to_datetime(raw)
+    except (TypeError, ValueError, OverflowError, IndexError):
+        return None
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        from datetime import timezone
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    epoch = parsed.timestamp()
+    if not math.isfinite(epoch):
+        return None
+    return epoch
+
+
+def _read_or_unknown(is_read: bool, read_detail: str, *, unknown_detail: str, retry_at: float | None = None) -> None:
+    if is_read:
+        raise TransientError(read_detail, retry_at=retry_at)
+    raise UnknownOutcome(unknown_detail, retry_at=retry_at)
+
+
+def _selectable_pr(item: Any) -> bool:
+    """Number, head ref, and state open/closed. Not a GitHub schema."""
+    if not isinstance(item, Mapping):
+        return False
+    number = item.get("number")
+    if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
+        return False
+    if item.get("state") not in ("open", "closed"):
+        return False
+    head = item.get("head")
+    if not isinstance(head, Mapping):
+        return False
+    ref = head.get("ref")
+    return isinstance(ref, str) and bool(ref)
+
+
+def _merged_flag(item: Mapping) -> bool:
+    """List omits ``merged``. A nonempty ``merged_at`` is the merge.
+
+    An explicit boolean wins. ``null`` or a missing key is not a boolean,
+    so the timestamp is used. No timestamp means not merged.
+    """
+    merged = item.get("merged")
+    if isinstance(merged, bool):
+        return merged
+    merged_at = item.get("merged_at")
+    return isinstance(merged_at, str) and bool(merged_at.strip())
+
+
+def _normalize_pr(item: Mapping, *, number: int | None = None) -> dict:
+    """Copy one REST PR into the dict downstream already reads.
+
+    ``number`` is the detail request. A body for a different PR is unread.
+    """
+    if not _selectable_pr(item) or (number is not None and item.get("number") != number):
+        raise TransientError("PR lookup returned an unreadable PR")
+    out = dict(item)
+    out["merged"] = _merged_flag(item)
+    return out
+
+
+def _configured_head_owner(settings: Mapping[str, Any], repo: str) -> str:
+    """PR head owner is the fork account when publication pushes to a fork."""
+    fork = settings.get("fork")
+    if isinstance(fork, str) and "/" in fork:
+        return fork.split("/", 1)[0]
+    return repo.split("/", 1)[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -259,15 +422,20 @@ class FileTransport(Transport):
 
     # -- transport surface --------------------------------------------------- #
 
-    def find_pull_requests(self, repo, *, head_branch, deadline) -> list[dict]:
+    def find_pull_requests(self, repo, *, head_branch, deadline, head_owner=None) -> list[dict]:
         deadline.step("find pull requests")
         with self.lock:
             repo_state = self._repo(self._read(), repo)
-            return [
-                dict(pr)
-                for pr in repo_state["pulls"].values()
-                if pr.get("head", {}).get("ref") == head_branch
-            ]
+            found = []
+            for pr in repo_state["pulls"].values():
+                head = pr.get("head") or {}
+                if head.get("ref") != head_branch:
+                    continue
+                owner = ((head.get("repo") or {}).get("full_name") or "").split("/", 1)[0]
+                if head_owner and owner and owner != head_owner:
+                    continue
+                found.append(_normalize_pr(pr) if _selectable_pr(pr) else dict(pr))
+            return found
 
     def list_open_pull_requests(self, repo, *, deadline) -> list[dict]:
         deadline.step("list open pull requests")
@@ -291,6 +459,10 @@ class FileTransport(Transport):
         tip = self._tip(repo, pr.get("head", {}).get("ref", ""), deadline)
         if tip and pr.get("state") == "open":
             pr.setdefault("head", {})["sha"] = tip
+        if _selectable_pr(pr):
+            pr = _normalize_pr(pr)
+        elif not isinstance(pr.get("merged"), bool):
+            pr["merged"] = _merged_flag(pr)
         return pr
 
     def create_pull_request(self, repo, *, title, body, head, base, deadline) -> dict:
@@ -300,26 +472,52 @@ class FileTransport(Transport):
             repo_state = self._repo(data, repo)
             if not repo_state.get("permissions", True):
                 raise CommunityError("token lacks authority to create pull requests (HTTP 403)")
+            offered = head.split(":", 1)[1] if isinstance(head, str) and ":" in head else head
             for pr in repo_state["pulls"].values():
-                if pr.get("head", {}).get("ref") == head and pr.get("state") == "open":
+                existing = (pr.get("head") or {}).get("ref")
+                if pr.get("state") == "open" and existing in {head, offered}:
                     raise CommunityError("an open PR already exists for this branch (HTTP 422)")
             number = repo_state["next_pr"]
             repo_state["next_pr"] = number + 1
-            sha = self._tip(repo, head, deadline)
+            ref = head
+            full_name = repo
+            if isinstance(head, str) and ":" in head:
+                owner, ref = head.split(":", 1)
+                repo_name = repo.split("/", 1)[1] if "/" in str(repo) else ""
+                full_name = f"{owner}/{repo_name}" if repo_name else str(repo)
+            sha = self._tip(repo, ref, deadline) or ""
             pr = {
                 "number": number,
                 "title": title,
                 "body": body,
                 "state": "open",
                 "merged": False,
-                "head": {"ref": head, "sha": sha or ""},
-                "base": {"ref": base},
+                "head": {"ref": ref, "sha": sha, "repo": {"full_name": full_name}},
+                "base": {"ref": base, "repo": {"full_name": repo}},
                 "user": {"login": "dev-transport"},
                 "html_url": f"https://example.invalid/{repo}/pull/{number}",
             }
             repo_state["pulls"][str(number)] = pr
             self._write(data)
-            return dict(pr)
+        if sha:
+            url = self.remotes.get(repo)
+            if url:
+                # The object is already on the dev remote (the branch push).
+                # Record the same commit as refs/pull/N/head, which is what
+                # GitHub exposes for that PR. No second host and no force.
+                remaining = deadline.step("record PR head ref")
+                result = run_argv(
+                    ["git", "--git-dir", url, "update-ref", f"refs/pull/{number}/head", sha],
+                    timeout=min(30, remaining),
+                    max_output=64 * 1024,
+                )
+                if result.timed_out:
+                    raise TransientError("recording the PR head ref timed out")
+                if result.code != 0:
+                    raise CommunityError(
+                        f"cannot record PR head ref: {result.err_text.strip()[:200]}"
+                    )
+        return dict(pr)
 
     def update_pull_request(self, repo, number, *, title, body, deadline) -> dict:
         deadline.step("update pull request")

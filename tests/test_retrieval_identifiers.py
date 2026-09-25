@@ -2,7 +2,7 @@
 from pathlib import Path
 
 from mindie_knowledge.markdown import Document
-from mindie_knowledge.retrieval import lexical_search, tokens
+from mindie_knowledge.retrieval import lexical_search, lexical_search_streaming, tokens
 
 
 def test_operator_components_find_qualified_api_without_substring_matching():
@@ -27,3 +27,19 @@ def test_versions_stay_whole_and_chinese_remains_searchable():
     assert "2.10.0+cpu" in result
     assert not {"2", "10", "0"}.intersection(result)
     assert {"显存", "存泄", "泄漏"}.issubset(result)
+
+
+def test_streaming_lexical_search_matches_the_loaded_variant():
+    docs = [
+        Document(layer="experience", title=f"Case {i}",
+                 content=f"Body {i} about npu_rms_norm and device mapping.",
+                 slug=str(i), path=Path(f"{i}.md"), uri=str(i))
+        for i in range(50)
+    ]
+    for query in ("rms_norm", "device mapping", "nothing here"):
+        loaded = [(h.uri, h.score) for h in lexical_search(query, docs, limit=7)]
+        streamed = [
+            (h.uri, h.score)
+            for h in lexical_search_streaming(query, lambda: iter(docs), limit=7)
+        ]
+        assert streamed == loaded

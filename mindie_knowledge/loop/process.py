@@ -50,7 +50,13 @@ def _failure_detail(category, started):
 
 
 def annotated_error(exc, category, started, exit_code=None, stage="run"):
-    """Attach diagnostics and return the same exception object."""
+    """Attach diagnostics and return the same exception object.
+
+    The trusted category also travels on the exception object so the budget
+    layer can tell a per-item content failure (invalid result, output limit)
+    apart from a shared configuration/runtime failure without parsing text.
+    """
+    exc.mindie_category = category
     failure(
         "organizer.process",
         stage=stage,

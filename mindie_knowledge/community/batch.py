@@ -9,6 +9,7 @@ text templates (zero model involvement).
 from __future__ import annotations
 
 import json
+import re
 from pathlib import PurePosixPath
 from typing import Any, Iterable, Mapping
 
@@ -16,7 +17,6 @@ from mindie_knowledge.redact import Allowlist, scan_text
 
 from .common import (
     MAX_BATCH_BYTES,
-    MAX_BATCH_FILES,
     MAX_DETAIL,
     MAX_FILE_BYTES,
     MAX_TITLE,
@@ -32,6 +32,7 @@ from .common import (
 
 ALLOWED_PREFIXES = {"cases": ".md", "topics": ".md", "feedback": ".json"}
 RATINGS = ("up", "down")
+_MARKER_RE = re.compile(r"[0-9a-f]{16,64}")
 
 
 def check_path(path: Any) -> str:
@@ -172,15 +173,13 @@ def validate_batch(batch: Any) -> dict[str, Any]:
     if base_commit is not None:
         base_commit = bounded_text(base_commit, "base_commit", 64)
     entry_refs = batch.get("entry_refs", [])
-    if not isinstance(entry_refs, list) or len(entry_refs) > MAX_BATCH_FILES:
+    if not isinstance(entry_refs, list):
         raise CommunityError("entry_refs must be a bounded list")
     entry_refs = [bounded_text(ref, "entry_refs[]", 256) for ref in entry_refs]
     summary = bounded_text(batch.get("summary"), "summary", MAX_TITLE)
     files = batch.get("files")
     if not isinstance(files, list) or not files:
         raise CommunityError("batch files must be a nonempty list")
-    if len(files) > MAX_BATCH_FILES:
-        raise CommunityError(f"batch holds more than {MAX_BATCH_FILES} files")
 
     total = 0
     seen_paths: set[str] = set()
@@ -188,7 +187,7 @@ def validate_batch(batch: Any) -> dict[str, Any]:
     for index, item in enumerate(files):
         if not isinstance(item, Mapping):
             raise CommunityError(f"files[{index}] must be an object")
-        unknown = set(item) - {"path", "content", "sha256", "base_sha256"}
+        unknown = set(item) - {"path", "content", "sha256", "base_sha256", "sent_markers"}
         if unknown:
             raise CommunityError(f"files[{index}] has unknown fields: {sorted(unknown)}")
         path = check_path(item.get("path"))
@@ -200,20 +199,48 @@ def validate_batch(batch: Any) -> dict[str, Any]:
             raise CommunityError(f"{path}: content must be a UTF-8 string")
         raw = content.encode("utf-8")
         if len(raw) > MAX_FILE_BYTES:
-            raise CommunityError(f"{path}: exceeds the {MAX_FILE_BYTES}-byte file limit")
+            raise CommunityError(f"{path}: exceeds the per-file platform envelope")
         total += len(raw)
         if total > MAX_BATCH_BYTES:
-            raise CommunityError("batch exceeds the total byte limit")
+            # Soft multi-record grouping budget: an over-budget batch is valid
+            # only when exactly one platform-legal entry document accounts for
+            # the excess (JSON overhead included by construction). Anything
+            # else must have been chunked by the contributor side.
+            entry_files = [
+                *checked_files, {"path": path, "content": content},
+            ]
+            entry_files = [f for f in entry_files
+                           if f["path"].startswith(("cases/", "topics/"))]
+            if not (
+                len(entry_files) == 1
+                and total - len(entry_files[0]["content"].encode("utf-8")) <= MAX_BATCH_BYTES
+            ):
+                raise CommunityError("batch exceeds the per-flush grouping budget")
         sha = item.get("sha256")
         if not isinstance(sha, str) or sha != sha256_text(content):
             raise CommunityError(f"{path}: sha256 does not match content")
         base_sha = item.get("base_sha256")
         if base_sha is not None and (not isinstance(base_sha, str) or len(base_sha) != 64):
             raise CommunityError(f"{path}: base_sha256 must be null or a sha256 digest")
+        markers = item.get("sent_markers")
+        if markers is not None:
+            # Confirmed observation identities (sending history), used to
+            # apply only still-unsent additions onto the actual remote body.
+            if (
+                not isinstance(markers, list)
+                or len(markers) > 65536
+                or any(not isinstance(marker, str) or not _MARKER_RE.fullmatch(marker)
+                       for marker in markers)
+            ):
+                raise CommunityError(
+                    f"{path}: sent_markers must be a bounded list of hex observation identities"
+                )
         if path.startswith("feedback/"):
             validate_feedback(content, path)
+            markers = None  # feedback files carry no observation identity
         checked_files.append(
-            {"path": path, "content": content, "sha256": sha, "base_sha256": base_sha}
+            {"path": path, "content": content, "sha256": sha,
+             "base_sha256": base_sha, "sent_markers": markers}
         )
 
     revision = batch.get("revision")

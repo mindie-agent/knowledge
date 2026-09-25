@@ -27,6 +27,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import math
 import re
 import secrets
 import sqlite3
@@ -40,14 +41,16 @@ from . import documents
 from .documents import DraftFull
 
 SCHEMA = "mindie-store/3"
-MAX_ENTRIES = 10000
 MAX_VOTE_REASON = 1000
 RATINGS = ("up", "down")
-REPLACEABLE_BATCH = frozenset({"submitted", "updated", "unchanged", "needs_review", "failed"})
+# A rejected lineage row may be replaced by a NEW batch of other material:
+# the rejection quarantines the rejected entries, never the whole domain.
+REPLACEABLE_BATCH = frozenset({"submitted", "updated", "unchanged", "needs_review",
+                               "failed", "rejected"})
 
 # Batch receipts that must never automatically write again.
 TERMINAL_BATCH = ("submitted", "updated", "unchanged", "needs_review", "failed",
-                  "unknown", "disabled", "unavailable")
+                  "rejected", "unknown", "disabled", "unavailable")
 
 
 def canonical(value):
@@ -56,6 +59,12 @@ def canonical(value):
 
 def digest(value):
     return hashlib.sha256(canonical(value).encode()).hexdigest()
+
+
+def _backoff_seconds(base, cap, attempt):
+    """Exponential backoff; the exponent is clamped before computing so a
+    long-failing persisted counter can never overflow to an error."""
+    return min(cap, base * (2.0 ** min(max(0, attempt - 1), 20)))
 
 
 def session_key(value):
@@ -161,6 +170,17 @@ def _hold_capture(db, ident):
         ("maintenance-paused", ident),
     )
     _upsert_continuation(db, ident, 0, "maintenance-paused", False)
+
+
+def _valid_retry_at(value):
+    """A Retry-After hint is a finite Unix-epoch number — never a bool, NaN
+    or infinity (anything else is ignored, never honored)."""
+    return (
+        value is not None
+        and not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+    )
 
 
 def commit_capture(
@@ -304,6 +324,9 @@ class Store:
                 next_attempt REAL, generation TEXT);
             CREATE TABLE IF NOT EXISTS feed_state(key TEXT PRIMARY KEY,
                 value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS feed_staging(feed TEXT NOT NULL,
+                git_commit TEXT NOT NULL, path TEXT NOT NULL, entry_id TEXT NOT NULL,
+                doc TEXT NOT NULL, PRIMARY KEY(feed, path));
             CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY,
                 value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS continuations(capture_id TEXT PRIMARY KEY,
@@ -326,6 +349,11 @@ class Store:
                 pr_url TEXT,
                 batch_id TEXT,
                 updated REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS entry_quarantine(
+                entry_id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                created REAL NOT NULL);
         """)
         capture_columns = {
             row[1] for row in self.db.execute("PRAGMA table_info(captures)")
@@ -343,6 +371,13 @@ class Store:
             self.db.execute(
                 "ALTER TABLE continuations ADD COLUMN eligible INTEGER NOT NULL DEFAULT 1"
             )
+        receipt_columns = {
+            row[1] for row in self.db.execute("PRAGMA table_info(sent_receipts)")
+        }
+        if receipt_columns and "markers" not in receipt_columns:
+            self.db.execute("ALTER TABLE sent_receipts ADD COLUMN markers TEXT")
+        if receipt_columns and "batch_revision" not in receipt_columns:
+            self.db.execute("ALTER TABLE sent_receipts ADD COLUMN batch_revision TEXT")
         self.db.execute(
             "INSERT OR REPLACE INTO meta VALUES('schema', ?)", (SCHEMA,)
         )
@@ -520,17 +555,37 @@ class Store:
                 return dict(doc, withdrawn=True, note=self.WITHDRAWN_NOTE)
             return dict(doc, withdrawn=False)
 
+    # One-call response protection for the native wire (the MCP wrappers
+    # duplicate the body as content.text plus structuredContent, so 32 Ki
+    # non-BMP characters already cost 256 KiB before JSON overhead): a long
+    # body is paginated with the explicit continuation shape
+    # (content_offset/content_length/next_offset) instead of failing at
+    # transport serialization or being silently truncated. This is a
+    # per-call budget, not a document cap. Short bodies return whole.
+    EXPLAIN_PAGE_CHARS = 8 * 1024
+    EXPLAIN_MAX_LIMIT = 32 * 1024
+
     def explain(self, ref, *, offset=0, limit=None):
         doc = self.get(ref)
         if type(offset) is not int or offset < 0:
             raise ValueError("offset must be a nonnegative integer")
-        if limit is not None and (type(limit) is not int or not 1 <= limit <= 65536):
-            raise ValueError("limit must be between 1 and 65536 characters")
+        if limit is not None and (
+            type(limit) is not int or not 1 <= limit <= self.EXPLAIN_MAX_LIMIT
+        ):
+            raise ValueError(
+                f"limit must be between 1 and {self.EXPLAIN_MAX_LIMIT} characters"
+            )
         body = doc["content"]
         total = len(body)
+        if limit is None and total - offset > self.EXPLAIN_PAGE_CHARS:
+            limit = self.EXPLAIN_PAGE_CHARS
         sliced = body[offset : offset + limit if limit is not None else None]
-        return dict(doc, content=sliced, content_offset=offset,
-                    content_length=total, ref=self.ref(doc["entry_id"], doc["revision"]))
+        next_offset = offset + len(sliced)
+        return dict(
+            doc, content=sliced, content_offset=offset, content_length=total,
+            next_offset=next_offset if next_offset < total else None,
+            ref=self.ref(doc["entry_id"], doc["revision"]),
+        )
 
     # ---------------------------------------------------------------- drafts
 
@@ -662,6 +717,13 @@ class Store:
     _NOT_WITHDRAWN = (
         "NOT (entries.published_revision IS NOT NULL AND entries.feed_active=0)"
     )
+    # Quarantined entries (final-scan content rejection or a proven
+    # closed-unmerged PR) stay local and readable but never re-enter an
+    # automatic batch; unrelated material in the same domain is unaffected.
+    _NOT_QUARANTINED = (
+        "NOT EXISTS (SELECT 1 FROM entry_quarantine "
+        "WHERE entry_quarantine.entry_id=entries.entry_id)"
+    )
 
     def drafts_changed(self, *, generation=None):
         """Draft revision bodies not yet included in any outbox batch.
@@ -673,7 +735,8 @@ class Store:
         to that sharing generation is selected — anything else stays local
         and inert, never backfilled. Without it, this is the local
         bookkeeping view across generations. A draft whose entry the feed no
-        longer carries is never a new publication."""
+        longer carries is never a new publication; a quarantined entry stays
+        out of automatic batches."""
         with self.lock:
             if generation is not None:
                 rows = self.db.execute(
@@ -684,7 +747,7 @@ class Store:
                     "AND grants.generation=? "
                     "WHERE entries.draft_revision IS NOT NULL "
                     "AND entries.draft_revision != COALESCE(entries.batched_revision, '') "
-                    f"AND {self._NOT_WITHDRAWN}",
+                    f"AND {self._NOT_WITHDRAWN} AND {self._NOT_QUARANTINED}",
                     (generation,),
                 ).fetchall()
             else:
@@ -692,6 +755,8 @@ class Store:
                     "SELECT entry_id, draft_revision FROM entries "
                     "WHERE draft_revision IS NOT NULL "
                     "AND draft_revision != COALESCE(batched_revision, '') "
+                    "AND NOT EXISTS (SELECT 1 FROM entry_quarantine "
+                    "WHERE entry_quarantine.entry_id=entries.entry_id) "
                     f"AND {self._NOT_WITHDRAWN.replace('entries.', '')}"
                 ).fetchall()
             return [self._revision_doc(r["entry_id"], r["draft_revision"])
@@ -775,9 +840,11 @@ class Store:
     def query(self, query, limit=5, conditions=None):
         """BM25 over visible entries: published versions win;
         withdrawn-from-feed entries stay explainable but leave the results.
-        Draft overlays on published entries are labeled, never a second hit."""
+        Draft overlays on published entries are labeled, never a second hit.
+        The corpus is walked lazily (one body at a time), so domain growth is
+        bounded by per-document work, never rejected at a whole-domain cap."""
         from mindie_knowledge.markdown import Document
-        from mindie_knowledge.retrieval import lexical_search
+        from mindie_knowledge.retrieval import lexical_search_streaming
 
         if not isinstance(query, str) or not query.strip() or len(query) > 2000:
             raise ValueError("query must be nonempty text of at most 2000 characters")
@@ -785,18 +852,17 @@ class Store:
             raise ValueError("limit must be between 1 and 20")
         if conditions is not None and not isinstance(conditions, dict):
             raise ValueError("conditions must be an object")
-        with self.lock:
-            rows = self.db.execute(
+
+        def make_documents():
+            # Two lazy passes over the catalogue: at most one entry body is
+            # in memory at a time, so a growing domain never materializes the
+            # whole library to answer a query and no domain-size cap rejects
+            # it wholesale.
+            cursor = self.db.execute(
                 "SELECT * FROM entries WHERE (feed_active=1 "
-                "OR (draft_revision IS NOT NULL AND published_revision IS NULL)) "
-                "LIMIT ?", (MAX_ENTRIES + 1,),
-            ).fetchall()
-            if len(rows) > MAX_ENTRIES:
-                raise ValueError(
-                    "domain exceeds the initial lexical capacity; split it or configure a larger index"
-                )
-            selected, docs = {}, []
-            for row in rows:
+                "OR (draft_revision IS NOT NULL AND published_revision IS NULL))"
+            )
+            for row in cursor:
                 doc = json.loads(row["doc"])
                 if (
                     doc["kind"] == "knowledge"
@@ -807,20 +873,34 @@ class Store:
                     )
                 ):
                     continue
-                supplemental = bool(
-                    row["feed_active"]
-                    and row["draft_revision"]
-                    and row["draft_revision"] != row["published_revision"]
-                )
-                selected[doc["entry_id"]] = (doc, row, supplemental)
-                docs.append(Document(
+                yield Document(
                     layer=doc["kind"], title=doc["title"],
                     content=doc["summary"] + "\n" + doc["content"],
                     slug=doc["entry_id"],
                     path=self.root / "drafts" / f"{doc['entry_id']}.md",
                     uri=doc["entry_id"],
+                )
+
+        with self.lock:
+            hits = lexical_search_streaming(query, make_documents, limit=limit)
+            if not hits:
+                return dict(
+                    domain=self.domain, retrieval="bm25", results=[],
+                    note="Reference material. Scores indicate retrieval usefulness, not factual confidence.",
+                )
+            marks = ",".join("?" for _ in hits)
+            rows = self.db.execute(
+                f"SELECT * FROM entries WHERE entry_id IN ({marks})",
+                tuple(hit.uri for hit in hits),
+            ).fetchall()
+            selected = {}
+            for row in rows:
+                doc = json.loads(row["doc"])
+                selected[doc["entry_id"]] = (doc, row, bool(
+                    row["feed_active"]
+                    and row["draft_revision"]
+                    and row["draft_revision"] != row["published_revision"]
                 ))
-            hits = lexical_search(query, docs, limit=len(docs))
             output = []
             for hit in hits:
                 doc, row, supplemental = selected[hit.uri]
@@ -855,17 +935,81 @@ class Store:
                 (key, canonical(value)),
             )
 
+    # ------------------------------------------------- feed staging (per commit)
+
+    def feed_staging_prune(self, feed, commit):
+        """Drop staged verification progress for any other commit of this feed."""
+        with self._write_txn():
+            self.db.execute(
+                "DELETE FROM feed_staging WHERE feed=? AND git_commit != ?",
+                (feed, commit),
+            )
+
+    def feed_stage_doc(self, feed, commit, path, entry_id, doc):
+        """Persist one validated blob as verified progress for this commit.
+
+        Each row lands in its own short transaction — no long SQLite write
+        transaction is ever held across Git subprocess reads, and a crashed
+        attempt resumes after the last staged blob instead of item zero.
+        """
+        with self._write_txn():
+            self.db.execute(
+                "INSERT OR REPLACE INTO feed_staging VALUES(?,?,?,?,?)",
+                (feed, commit, path, entry_id, canonical(doc)),
+            )
+
+    def feed_staging_state(self, feed, commit):
+        """(paths, entry_ids) already verified for exactly this commit."""
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT path, entry_id FROM feed_staging WHERE feed=? AND git_commit=?",
+                (feed, commit),
+            ).fetchall()
+        return {row[0] for row in rows}, {row[1] for row in rows}
+
+    def feed_staging_count(self, feed, commit):
+        with self.lock:
+            return self.db.execute(
+                "SELECT count(*) FROM feed_staging WHERE feed=? AND git_commit=?",
+                (feed, commit),
+            ).fetchone()[0]
+
+    def feed_staged_docs(self, feed, commit):
+        """Lazily yield the staged documents in path order (one at a time)."""
+        cursor = self.db.execute(
+            "SELECT doc FROM feed_staging WHERE feed=? AND git_commit=? ORDER BY path",
+            (feed, commit),
+        )
+        for (doc_json,) in cursor:
+            yield json.loads(doc_json)
+
+    def feed_staging_clear(self, feed):
+        with self._write_txn():
+            self.db.execute("DELETE FROM feed_staging WHERE feed=?", (feed,))
+
     def install_feed(self, docs, *, feed_ident):
         """Atomically switch published membership to one validated Git tree.
 
+        ``docs`` may be a lazy iterable (the feed streams validated blobs one
+        at a time instead of holding every body in memory): it is consumed
+        inside this single write transaction, so a mid-iteration parse or IO
+        failure rolls the whole candidate back and keeps the old cache.
         Every revision body is retained; entries the tree no longer carries
-        leave ordinary search but stay readable by reference. Local drafts are
-        untouched; a published revision of the same entry folds over its draft
-        in search while the draft remains a labeled private supplement.
+        leave ordinary search but stay readable by reference. A published
+        revision of the same entry folds over its draft in search; the local
+        draft is then re-seated onto the new authoritative body, keeping only
+        not-yet-sent observation additions (see ``rebase_draft_on_published``)
+        — the feed switch never destroys unsubmitted local work.
         """
         now = time.time()
         seen = set()
         with self._write_txn():
+            # Membership is authoritative for every entry, however it first
+            # appeared locally. Clear then re-mark inside the same
+            # transaction: no giant NOT IN variable list (SQLite has a
+            # variable-count ceiling), and a mid-iteration failure rolls the
+            # whole candidate back so the old cache stays.
+            self.db.execute("UPDATE entries SET feed_active=0 WHERE feed_active=1")
             for doc in docs:
                 if doc["entry_id"] in seen:
                     raise ValueError("duplicate entry identity in feed")
@@ -892,23 +1036,44 @@ class Store:
                         (doc["kind"], doc["title"], doc["revision"],
                          canonical(doc), now, doc["entry_id"]),
                     )
-            # Membership is authoritative for every entry, however it first
-            # appeared locally. Once an entry has a published revision its
-            # visibility is governed by the feed alone: leaving the tree (or a
-            # valid empty tree) removes it from search, and its stale draft
-            # copy is never resurrected. All bodies stay readable by pinned
-            # reference.
-            if seen:
-                self.db.execute(
-                    "UPDATE entries SET feed_active=0 WHERE feed_active=1 "
-                    f"AND entry_id NOT IN ({','.join('?' for _ in seen)})",
-                    tuple(seen),
-                )
-            else:
-                self.db.execute("UPDATE entries SET feed_active=0 WHERE feed_active=1")
-            return dict(entries=len(docs))
+                self.rebase_draft_on_published(doc["entry_id"])
+            # Once an entry has a published revision its visibility is
+            # governed by the feed alone: leaving the tree (or a valid empty
+            # tree) removes it from search, and its stale draft copy is never
+            # resurrected. All bodies stay readable by pinned reference.
+            return dict(entries=len(seen))
 
-    # ----------------------------------------------------------------- votes
+    # ------------------------------------------------------- entry quarantine
+
+    def quarantine_entry(self, entry_id, *, kind, detail):
+        """Keep one entry's material out of every future automatic batch.
+
+        Quarantine is per-entry and automatic: a final-scan content rejection
+        or a proven closed-unmerged PR retires exactly that content (the local
+        draft stays readable and searchable) while unrelated material keeps
+        flowing. Append-only bodies cannot erase rejected text, so there is no
+        automatic un-quarantine; genuinely new content lives under a new
+        entry identity, and an explicit operator retry of the stored batch
+        remains available for a proven failure.
+        """
+        if kind not in {"content-scan", "pr-rejected", "platform-envelope"}:
+            raise ValueError("invalid quarantine kind")
+        with self._write_txn():
+            self.db.execute(
+                "INSERT OR REPLACE INTO entry_quarantine VALUES(?,?,?,?)",
+                (entry_id, kind, str(detail)[:500], time.time()),
+            )
+
+    def quarantined_entries(self):
+        with self.lock:
+            return {
+                row[0]: row[1]
+                for row in self.db.execute(
+                    "SELECT entry_id, kind FROM entry_quarantine"
+                )
+            }
+
+    # ------------------------------------------------------------------ votes
 
     def opaque_for(self, root_hash):
         """Stable opaque public identity for one local root; the raw native
@@ -929,11 +1094,23 @@ class Store:
     def record_vote(self, *, root_hash, ref, rating, reason, publishable,
                     generation=None):
         """One current vote per opaque root and entry; a new vote on the same
-        entry replaces it (including its revision and reason)."""
+        entry replaces it (including its revision and reason). A publishable
+        vote's free-text reason is privacy-scanned at admission, so a single
+        unsafe reason can never block unrelated material at batch time; local
+        (non-publishable) votes are never scanned and never leave the store."""
         if rating not in RATINGS:
             raise ValueError("rating must be up or down")
         if not isinstance(reason, str) or len(reason) > MAX_VOTE_REASON:
             raise ValueError("reason must be text of at most 1000 characters")
+        if publishable:
+            from mindie_knowledge.redact import scan_text
+
+            findings = scan_text(reason)
+            if findings:
+                rules = ", ".join(sorted({f.rule for f in findings}))
+                raise ValueError(
+                    f"publishable vote reason fails the privacy scan: {rules}"
+                )
         with self._write_txn():
             entry_id, pinned = self._parse_ref(ref)
             row = self._row(entry_id)
@@ -963,10 +1140,15 @@ class Store:
     def unbatched_votes(self, *, generation=None):
         """Publishable unbatched votes. With ``generation`` (the outbound
         path), only votes explicitly granted to that sharing generation.
-        Votes on an entry the feed no longer carries stay local."""
+        Votes on an entry the feed no longer carries — or whose material was
+        quarantined — stay local."""
         withdrawn = (
             "NOT EXISTS (SELECT 1 FROM entries e WHERE e.entry_id=votes.entry_id "
             "AND e.published_revision IS NOT NULL AND e.feed_active=0)"
+        )
+        quarantined = (
+            "NOT EXISTS (SELECT 1 FROM entry_quarantine q "
+            "WHERE q.entry_id=votes.entry_id)"
         )
         with self.lock:
             if generation is not None:
@@ -977,7 +1159,7 @@ class Store:
                         "AND grants.identity=votes.root_opaque||':'||votes.entry_id "
                         "AND grants.revision=votes.revision AND grants.generation=? "
                         "WHERE votes.publishable=1 AND votes.batch_id IS NULL "
-                        f"AND {withdrawn}",
+                        f"AND {withdrawn} AND {quarantined}",
                         (generation,),
                     )
                 ]
@@ -985,30 +1167,126 @@ class Store:
                 dict(r)
                 for r in self.db.execute(
                     "SELECT * FROM votes WHERE publishable=1 AND batch_id IS NULL "
-                    f"AND {withdrawn}"
+                    f"AND {withdrawn} AND {quarantined}"
                 )
             ]
 
     # ---------------------------------------------------------------- outbox
 
+    EXPORT_BACKOFF_BASE = 60.0
+    EXPORT_BACKOFF_CAP = 3600.0
+
+    @classmethod
+    def _export_backoff(cls, attempts):
+        return _backoff_seconds(
+            cls.EXPORT_BACKOFF_BASE, cls.EXPORT_BACKOFF_CAP, attempts
+        )
+
     def reserve_export(self, fingerprint):
         """Consume this material revision before final scanning/staging.
 
-        A scan failure or interrupted build must not be repeated every idle
-        tick. New draft content or an explicit new vote gets a new fingerprint.
-        """
-        with self._write_txn():
-            return self.db.execute(
-                "INSERT OR IGNORE INTO state VALUES(?,?)",
-                ("export:" + fingerprint, canonical({"status": "attempted"})),
-            ).rowcount == 1
+        True means this process may build now; False means do not build:
 
-    def finish_export(self, fingerprint, status, detail=""):
+        - ``staged`` — the batch was already recorded (the pending outbox row
+          owns it);
+        - ``failed`` with class ``content`` — deterministic content rejection,
+          quarantined to exactly this fingerprint and never retried;
+        - ``next_check`` in the future — a transient failure (or an
+          interrupted attempt) is backing off.
+
+        An interrupted attempt (crash between reserve and finish) leaves an
+        ``attempted`` record with a persisted ``next_check``: no remote write
+        or outbox batch can exist for it, so once the backoff is due the
+        local deterministic build resumes automatically — without organizer
+        replay, cursor resets or redaction bypass. Every reservation persists
+        the next backoff time up front, so a crash cannot spin a failing
+        build every idle tick.
+        """
+        now = time.time()
         with self._write_txn():
+            row = self.db.execute(
+                "SELECT value FROM state WHERE key=?", ("export:" + fingerprint,)
+            ).fetchone()
+            if row is None:
+                self.db.execute(
+                    "INSERT INTO state VALUES(?,?)",
+                    (
+                        "export:" + fingerprint,
+                        canonical({
+                            "status": "attempted", "attempts": 1, "detail": "",
+                            "class": None,
+                            # The backoff is persisted up front, so a crash in
+                            # the build window also resumes after a delay
+                            # instead of spinning every idle tick.
+                            "next_check": now + self._export_backoff(1),
+                            "updated": now,
+                        }),
+                    ),
+                )
+                return True
+            try:
+                record = json.loads(row[0])
+            except ValueError:
+                record = {"status": "attempted"}
+            status = record.get("status")
+            if status == "staged":
+                return False
+            if status == "failed" and record.get("class") == "content":
+                return False
+            next_check = record.get("next_check") or 0
+            if next_check and now < next_check:
+                return False
+            attempts = int(record.get("attempts") or 0) + 1
             self.db.execute(
                 "UPDATE state SET value=? WHERE key=?",
-                (canonical({"status": status, "detail": str(detail)[:500]}),
-                 "export:" + fingerprint),
+                (
+                    canonical({
+                        "status": "attempted", "attempts": attempts,
+                        "detail": str(record.get("detail", ""))[:500],
+                        "class": record.get("class"),
+                        "next_check": now + self._export_backoff(attempts),
+                        "updated": now,
+                    }),
+                    "export:" + fingerprint,
+                ),
+            )
+            return True
+
+    def finish_export(self, fingerprint, status, detail="", *, classification=None):
+        """Record the build outcome with its failure class and next check.
+
+        ``classification='content'`` quarantines the fingerprint permanently
+        (a redaction/validation rejection is never resolved by retrying);
+        anything else is transient: the record keeps the reason and the
+        persisted ``next_check`` so background scheduling resumes it with
+        backoff after the local problem is fixed."""
+        now = time.time()
+        with self._write_txn():
+            row = self.db.execute(
+                "SELECT value FROM state WHERE key=?", ("export:" + fingerprint,)
+            ).fetchone()
+            record = {}
+            if row is not None:
+                try:
+                    record = json.loads(row[0])
+                except ValueError:
+                    record = {}
+            attempts = int(record.get("attempts") or 0)
+            next_check = None
+            if status == "failed":
+                classification = classification or "transient"
+                if classification != "content":
+                    next_check = now + self._export_backoff(max(1, attempts))
+            self.db.execute(
+                "UPDATE state SET value=? WHERE key=?",
+                (
+                    canonical({
+                        "status": status, "attempts": attempts,
+                        "detail": str(detail)[:500], "class": classification,
+                        "next_check": next_check, "updated": now,
+                    }),
+                    "export:" + fingerprint,
+                ),
             )
 
     def create_batch(self, *, batch_id, revision, batch, entry_ids, vote_keys,
@@ -1016,11 +1294,26 @@ class Store:
         """Record one built batch as pending and bind its material.
 
         Material bound to a batch is never silently re-batched: only a newer
-        draft revision or a replacement vote becomes new work. Batches are
-        bounded in size by construction (draft bodies are 64 KiB capped).
+        draft revision or a replacement vote becomes new work. The batch row
+        is one durable payload, bounded by the same per-flush envelope the
+        exporter chunks to; the envelope is a soft grouping budget, so a batch
+        holding exactly one platform-legal entry document always fits.
         """
-        if len(canonical(batch).encode("utf-8")) > 4 * 1024 * 1024:
-            raise ValueError("batch exceeds the storage envelope")
+        from mindie_knowledge.community.common import MAX_BATCH_BYTES, MAX_FILE_BYTES
+
+        if len(canonical(batch).encode("utf-8")) > MAX_BATCH_BYTES:
+            entry_files = [
+                f for f in batch.get("files", [])
+                if isinstance(f, dict)
+                and str(f.get("path", "")).startswith(("cases/", "topics/"))
+            ]
+            single_ok = (
+                len(entry_files) == 1
+                and isinstance(entry_files[0].get("content"), str)
+                and len(entry_files[0]["content"].encode("utf-8")) <= MAX_FILE_BYTES
+            )
+            if not single_ok:
+                raise ValueError("batch exceeds the per-flush storage envelope")
         now = time.time()
         with self._write_txn():
             existing = self.db.execute(
@@ -1055,10 +1348,25 @@ class Store:
                 )
 
     def mark_batch(self, batch_id, status, *, detail="", pr_url=None, head_sha=None,
-                   attempted=False):
+                   attempted=False, actual_files=None, retry_at=None):
+        """Record one batch receipt.
+
+        ``actual_files`` is the publisher's report of the entry files as
+        actually committed (post-merge content identities), so the per-entry
+        receipts reflect what the remote holds rather than the candidate
+        payload. A valid ``retry_at`` (Retry-After receipt hint) raises the
+        persisted next-attempt floor in this same transaction — never
+        shortening it. Entering ``unknown``/``unavailable`` from a different
+        status resets the operation attempt counter so the first
+        reconciliation is not skipped by an inherited count, but never erases
+        an already reserved next-attempt floor: the reserved time is kept and
+        the receipt hint can only raise it."""
         if status not in {"pending", *TERMINAL_BATCH}:
             raise ValueError("invalid batch status")
         with self._write_txn():
+            previous = self.db.execute(
+                "SELECT status FROM outbox WHERE batch_id=?", (batch_id,)
+            ).fetchone()
             self.db.execute(
                 "UPDATE outbox SET status=?, detail=?, pr_url=COALESCE(?, pr_url), "
                 "head_sha=COALESCE(?, head_sha), attempted=COALESCE(?, attempted), "
@@ -1066,6 +1374,23 @@ class Store:
                 (status, str(detail)[:1000], pr_url, head_sha,
                  time.time() if attempted else None, time.time(), batch_id),
             )
+            if (
+                previous is not None
+                and previous["status"] != status
+                and status in ("unknown", "unavailable")
+            ):
+                # Reset only the attempt COUNT. A later reserved floor
+                # (next_attempt) survives the transition untouched.
+                self.db.execute(
+                    "UPDATE outbox SET reconciliations=0 WHERE batch_id=?",
+                    (batch_id,),
+                )
+            if _valid_retry_at(retry_at):
+                self.db.execute(
+                    "UPDATE outbox SET next_attempt=MAX(COALESCE(next_attempt, 0), ?) "
+                    "WHERE batch_id=?",
+                    (float(retry_at), batch_id),
+                )
             if status in self.CONFIRMED_BATCH:
                 row = self.db.execute(
                     "SELECT * FROM outbox WHERE batch_id=?", (batch_id,)
@@ -1075,7 +1400,28 @@ class Store:
                         batch = json.loads(row["batch"])
                     except ValueError:
                         batch = {}
-                    self._record_sent_receipts(row, batch)
+                    self._record_sent_receipts(row, batch, actual_files=actual_files)
+            if status == "rejected":
+                # A proven closed-unmerged PR retires exactly this batch's
+                # entry material from automatic publication; the lineage row
+                # itself stays replaceable so unrelated material flows.
+                row = self.db.execute(
+                    "SELECT batch FROM outbox WHERE batch_id=?", (batch_id,)
+                ).fetchone()
+                try:
+                    refs = json.loads(row[0]).get("entry_refs", []) if row else []
+                except ValueError:
+                    refs = []
+                for ref in refs:
+                    parsed = _exact_revision_ref(ref)
+                    if parsed is None:
+                        continue
+                    self.db.execute(
+                        "INSERT OR IGNORE INTO entry_quarantine VALUES(?,?,?,?)",
+                        (parsed[0], "pr-rejected",
+                         str(detail)[:500] or "contribution PR closed unmerged",
+                         time.time()),
+                    )
 
     def batch(self, batch_id):
         with self.lock:
@@ -1106,17 +1452,22 @@ class Store:
                 )
             ]
 
-    def reconcile_due(self, batch_id, *, limit=5):
-        """Durable finite reconciliation: bounded count and exponential
-        backoff persisted across restarts. True when another bounded read-only
-        reconciliation is allowed now."""
+    def _operation_due(self, batch_id):
+        """Persisted exponential backoff gate for one bounded outbox operation.
+
+        Shared by read-only reconciliation (``unknown``) and resubmission
+        (``unavailable``): one bounded operation per scheduler opportunity,
+        interval growing to one hour, durable across restarts — and no
+        permanent exhaustion latch. An unknown outcome stays unknown until
+        remote evidence proves it; a transient send failure resumes after the
+        environment recovers. True when the operation may run now."""
         now = time.time()
         with self._write_txn():
             row = self.db.execute(
                 "SELECT reconciliations, next_attempt FROM outbox WHERE batch_id=?",
                 (batch_id,),
             ).fetchone()
-            if row is None or row["reconciliations"] >= limit:
+            if row is None:
                 return False
             if row["next_attempt"] is not None and now < row["next_attempt"]:
                 return False
@@ -1124,9 +1475,39 @@ class Store:
             self.db.execute(
                 "UPDATE outbox SET reconciliations=?, next_attempt=? "
                 "WHERE batch_id=?",
-                (count, now + min(60.0, 2.0 ** count), batch_id),
+                (count, now + _backoff_seconds(60.0, 3600.0, count), batch_id),
             )
             return True
+
+    def reconcile_due(self, batch_id):
+        """True when one bounded read-only reconciliation may run now.
+
+        There is no attempt cap: exhaustion is never proof of failure and
+        never permission to resend; the persisted backoff merely spaces the
+        checks out to at most one per hour."""
+        return self._operation_due(batch_id)
+
+    def retry_due(self, batch_id):
+        """True when one bounded resubmission of an unavailable batch may run."""
+        return self._operation_due(batch_id)
+
+    def defer_operation_until(self, batch_id, retry_at):
+        """Raise the persisted next-attempt floor to a valid ``retry_at``.
+
+        ``retry_at`` is a Retry-After receipt hint (finite Unix-epoch
+        seconds). Only a valid non-bool finite number is applied; a past or
+        smaller value never shortens the existing persisted backoff (the
+        floor is the maximum of both). Returns True when the hint was valid.
+        """
+        if not _valid_retry_at(retry_at):
+            return False
+        with self._write_txn():
+            self.db.execute(
+                "UPDATE outbox SET next_attempt=MAX(COALESCE(next_attempt, 0), ?) "
+                "WHERE batch_id=?",
+                (float(retry_at), batch_id),
+            )
+        return True
 
     def outbox_unresolved(self):
         """Attempted but outcome-unknown batches needing bounded reconciliation."""
@@ -1136,6 +1517,21 @@ class Store:
                 for r in self.db.execute(
                     "SELECT * FROM outbox WHERE (status='unknown' "
                     "OR (status='pending' AND attempted IS NOT NULL))"
+                )
+            ]
+
+    def outbox_unavailable(self):
+        """Batches whose last send hit a transient environment failure.
+
+        The stored payload is intact (nothing confirmed, nothing compacted);
+        resubmission retries the exact same operation with persisted backoff.
+        """
+        with self.lock:
+            return [
+                dict(r)
+                for r in self.db.execute(
+                    "SELECT * FROM outbox WHERE status='unavailable' "
+                    "AND attempted IS NOT NULL ORDER BY created"
                 )
             ]
 
@@ -1291,18 +1687,31 @@ class Store:
                 cleared += 1
         return cleared
 
-    def _record_sent_receipts(self, row, batch):
+    def _record_sent_receipts(self, row, batch, *, actual_files=None):
         """Tiny per-entry last-confirmed receipt, independent of the newest
-        lineage outbox row. No body/history."""
+        lineage outbox row. No body/history.
+
+        A confirmed receipt is sending history, never publication proof to
+        write from: it records the content identity actually committed (when
+        the publisher reports post-merge file identities) and the cumulative
+        confirmed observation-marker set — enough to prove which additions are
+        still unsent — plus path/PR linkage. The actual remote state is
+        re-read wherever it is used (publication merge, draft restore)."""
         head = row["head_sha"] if isinstance(row, sqlite3.Row) else row.get("head_sha")
         if not isinstance(head, str) or not head:
             return
         generation = row["generation"] if isinstance(row, sqlite3.Row) else row.get("generation")
         pr_url = row["pr_url"] if isinstance(row, sqlite3.Row) else row.get("pr_url")
         batch_id = row["batch_id"] if isinstance(row, sqlite3.Row) else row.get("batch_id")
+        batch_revision = row["revision"] if isinstance(row, sqlite3.Row) else row.get("revision")
         files = {
             f.get("path"): f
             for f in batch.get("files", [])
+            if isinstance(f, dict) and isinstance(f.get("path"), str)
+        }
+        actual = {
+            f.get("path"): f
+            for f in (actual_files or [])
             if isinstance(f, dict) and isinstance(f.get("path"), str)
         }
         now = time.time()
@@ -1312,20 +1721,67 @@ class Store:
                 continue
             entry_id, sent_revision = parsed
             path = next(
-                (p for p in (f"cases/{entry_id}.md", f"topics/{entry_id}.md") if p in files),
+                (p for p in (f"cases/{entry_id}.md", f"topics/{entry_id}.md")
+                 if p in files or p in actual),
                 None,
             )
             if not entry_id or not sent_revision or not path:
                 continue
-            sha = files[path].get("sha256")
+            existing = self.db.execute(
+                "SELECT sha256, sent_revision, markers FROM sent_receipts "
+                "WHERE entry_id=? AND batch_revision=?",
+                (entry_id, batch_revision),
+            ).fetchone()
+            payload_file = files.get(path) or {}
+            actual_file = actual.get(path) or {}
+            if actual_file.get("sha256") and actual_file.get("revision"):
+                # What the remote actually committed (post-merge content).
+                sha = actual_file["sha256"]
+                revision = actual_file["revision"]
+            elif existing is not None:
+                # A later re-record of the same confirmed batch (e.g. payload
+                # compaction) must not downgrade actual identities to the
+                # pre-merge candidate values.
+                sha = existing["sha256"]
+                revision = existing["sent_revision"]
+            else:
+                # Legacy rows only: batches confirmed before actual-file
+                # recording existed have no committed identity to recover;
+                # the candidate identity is their best available record.
+                sha = payload_file.get("sha256")
+                revision = sent_revision
             if not isinstance(sha, str) or not sha:
                 continue
+            if not isinstance(revision, str) or not revision:
+                continue
+            content = payload_file.get("content")
+            payload_markers = (
+                documents.observation_markers(content)
+                if isinstance(content, str) else None
+            )
+            prior_row = self.db.execute(
+                "SELECT markers FROM sent_receipts WHERE entry_id=?", (entry_id,)
+            ).fetchone()
+            prior = []
+            if prior_row is not None and prior_row[0]:
+                try:
+                    parsed_markers = json.loads(prior_row[0])
+                except ValueError:
+                    parsed_markers = []
+                if isinstance(parsed_markers, list):
+                    prior = [m for m in parsed_markers if isinstance(m, str)]
+            if payload_markers is None and prior_row is None:
+                markers_value = None
+            else:
+                markers_value = canonical(sorted({*prior, *(payload_markers or [])}))
             self.db.execute(
-                "INSERT OR REPLACE INTO sent_receipts "
-                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO sent_receipts"
+                "(entry_id, generation, sent_revision, path, sha256, head_sha,"
+                " repository, pr_url, batch_id, updated, markers, batch_revision)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
-                    entry_id, generation, sent_revision, path, sha, head,
-                    None, pr_url, batch_id, now,
+                    entry_id, generation, revision, path, sha, head,
+                    None, pr_url, batch_id, now, markers_value, batch_revision,
                 ),
             )
 
@@ -1342,6 +1798,117 @@ class Store:
         per-entry confirmed receipt (survives later lineage-row replacement)."""
         receipt = self.sent_receipt(entry_id)
         return receipt["sha256"] if receipt else None
+
+    def sent_markers(self, entry_id):
+        """Observation markers present in the last confirmed sent body.
+
+        A set proves which additions are still unsent; None means unknown
+        (no receipt, or a receipt written before markers were recorded), in
+        which case no delta may be inferred and publication reconciles the
+        current remote head instead of guessing."""
+        receipt = self.sent_receipt(entry_id)
+        if not receipt:
+            return None
+        raw = receipt.get("markers")
+        if not raw:
+            return None
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            return None
+        if not isinstance(value, list) or not all(
+            isinstance(marker, str) for marker in value
+        ):
+            return None
+        return set(value)
+
+    def rebase_draft_on_published(self, entry_id):
+        """Re-seat a local draft onto the authoritative published body.
+
+        Submitted content obeys the remote: when the feed-installed body has
+        moved away from the last confirmed send (bot/maintainer edits), the
+        local draft is rebuilt as the published body plus only the
+        not-yet-sent observation blocks (markers absent from the confirmed
+        receipt and from the published body). Blocks the upstream removed are
+        never brought back, and a remote header wins over a local one. When
+        nothing remains unsent the redundant local draft is dropped. Returns
+        the resulting draft doc, or None when there is nothing to rebase (or
+        no draft remains). Never resurrects a withdrawn entry; a legacy
+        receipt without marker knowledge cannot prove the delta and is left
+        for the publication-time head reconciliation instead of guessing."""
+        now = time.time()
+        with self._write_txn():
+            row = self._row(entry_id)
+            if (
+                row is None
+                or not row["draft_revision"]
+                or not row["published_revision"]
+                or not row["feed_active"]
+            ):
+                return None
+            sent_markers = self.sent_markers(entry_id)
+            if sent_markers is None:
+                return None
+            receipt_hash = self.sent_file_hash(entry_id)
+            published = self._revision_doc(entry_id, row["published_revision"])
+            draft = self._revision_doc(entry_id, row["draft_revision"])
+            if published is None or draft is None:
+                return None
+            published_sha = hashlib.sha256(
+                documents.render_entry(published).encode("utf-8")
+            ).hexdigest()
+            if published_sha == receipt_hash:
+                return None  # remote did not move; the draft base stands
+            split = documents.split_observations(draft["content"])
+            if split is None:
+                return None  # opaque tail: publication reconciles, never guess
+            _base, blocks = split
+            published_markers = set(documents.observation_markers(published["content"]))
+            unsent = [
+                (marker, addition)
+                for marker, addition in blocks
+                if marker not in sent_markers and marker not in published_markers
+            ]
+            if not unsent and not blocks:
+                # The draft predates any observation structure; if it differs
+                # from the published body the divergence is not in transferable
+                # observation form, so it is left for publication-time
+                # reconciliation rather than silently dropped.
+                if draft["content"] != published["content"]:
+                    return None
+            rebuilt = published
+            for marker, addition in unsent:
+                rebuilt, _appended = documents.append_observation(
+                    rebuilt, addition, marker=marker
+                )
+            if rebuilt["revision"] == draft["revision"]:
+                return None  # already seated on the published body
+            if rebuilt["revision"] == published["revision"]:
+                # Nothing unsent: the local copy converges to the remote body.
+                self.db.execute(
+                    "UPDATE entries SET draft_revision=NULL, title=?, updated=? "
+                    "WHERE entry_id=?",
+                    (published["title"], now, entry_id),
+                )
+                try:
+                    (self.root / "drafts" / f"{entry_id}.md").unlink()
+                except OSError:
+                    pass
+                return None
+            self._insert_revision(rebuilt, row["origin"], now)
+            self.db.execute(
+                "INSERT OR REPLACE INTO grants "
+                "SELECT 'draft', identity, ?, generation, ? FROM grants "
+                "WHERE kind='draft' AND identity=? AND revision=?",
+                (rebuilt["revision"], now, entry_id, row["draft_revision"]),
+            )
+            self.db.execute(
+                "UPDATE entries SET draft_revision=?, title=?, updated=? "
+                "WHERE entry_id=?",
+                (rebuilt["revision"], published["title"], now, entry_id),
+            )
+            self._write_draft_file(rebuilt)
+            return rebuilt
 
     def restore_draft(self, entry_id, doc, *, generation=None):
         """Re-seed a compacted append-base from the exact confirmed remote
@@ -1646,6 +2213,13 @@ class Store:
                 ],
                 coverage_gaps=len(self.coverage_gaps()),
                 votes=self.db.execute("SELECT count(*) FROM votes").fetchone()[0],
+                quarantined_entries=[
+                    dict(r)
+                    for r in self.db.execute(
+                        "SELECT entry_id, kind, detail FROM entry_quarantine "
+                        "ORDER BY created DESC LIMIT 20"
+                    )
+                ],
                 export_attempts=[json.loads(r[0]) for r in self.db.execute(
                     "SELECT value FROM state WHERE key LIKE 'export:%' "
                     "ORDER BY rowid DESC LIMIT 20"

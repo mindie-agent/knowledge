@@ -75,3 +75,40 @@ def lexical_search(text: str, documents: Sequence[Document], *, limit: int) -> l
         if score:
             hits.append(Hit(document.uri, score, document.title, layer=document.layer))
     return sorted(hits, key=lambda hit: (-hit.score, hit.uri))[:limit]
+
+
+def lexical_search_streaming(text: str, make_documents, *, limit: int) -> list[Hit]:
+    """BM25 over a lazily-iterated corpus: at most one body in memory.
+
+    ``make_documents()`` must return a fresh iterator of Documents on each
+    call. The corpus is walked twice — once for document frequencies and
+    lengths, once for scoring — so growing knowledge never requires loading
+    every body at once, and no whole-domain size cap is needed. Scores are
+    identical to ``lexical_search`` over the same corpus.
+    """
+    terms = set(tokens(text))
+    if not terms:
+        return []
+    frequencies = {term: 0 for term in terms}
+    lengths: dict[str, int] = {}
+    for document in make_documents():
+        count = Counter(tokens(document.title + "\n" + document.content))
+        lengths[document.uri] = sum(count.values())
+        for term in terms:
+            if term in count:
+                frequencies[term] += 1
+    total = len(lengths)
+    average = sum(lengths.values()) / max(total, 1) or 1
+    hits: list[Hit] = []
+    for document in make_documents():
+        length = lengths[document.uri]
+        count = Counter(tokens(document.title + "\n" + document.content))
+        score = 0.0
+        for term in terms:
+            frequency = count[term]
+            if frequency:
+                inverse = math.log(1 + (total - frequencies[term] + .5) / (frequencies[term] + .5))
+                score += inverse * frequency * 2.2 / (frequency + 1.2 * (.25 + .75 * length / average))
+        if score:
+            hits.append(Hit(document.uri, score, document.title, layer=document.layer))
+    return sorted(hits, key=lambda hit: (-hit.score, hit.uri))[:limit]

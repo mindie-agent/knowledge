@@ -28,18 +28,22 @@ def _load_settings(args) -> dict:
 
 
 def _read_json_arg(value: str):
+    # One invocation reads one batch document: bounded by the per-flush
+    # envelope the exporter chunks to (plus framing headroom), so a
+    # platform-legal batch always fits; never unbounded.
+    limit = 132 * 1024 * 1024
     if value == "-":
-        raw = sys.stdin.buffer.read(8 * 1024 * 1024 + 1)
-        if len(raw) > 8 * 1024 * 1024:
-            raise ToolError("stdin JSON exceeds the 8 MiB limit")
+        raw = sys.stdin.buffer.read(limit + 1)
+        if len(raw) > limit:
+            raise ToolError("stdin JSON exceeds the per-batch envelope")
     else:
         path = Path(value)
         try:
             raw = path.read_bytes()
         except OSError as exc:
             raise ToolError(f"{path}: cannot read: {exc.strerror}") from None
-        if len(raw) > 8 * 1024 * 1024:
-            raise ToolError(f"{path}: exceeds the 8 MiB limit")
+        if len(raw) > limit:
+            raise ToolError(f"{path}: exceeds the per-batch envelope")
     try:
         return json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:

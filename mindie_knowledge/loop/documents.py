@@ -30,10 +30,18 @@ import yaml
 SCHEMA = "mindie-entry/2"
 KINDS = ("knowledge", "experience")
 
-MAX_FILE_BYTES = 128 * 1024
+# The per-file envelope is the real external platform rejection point, not a
+# business cap and not GitHub's 50 MiB warning: GitHub actually rejects
+# ordinary Git files exceeding 100 MiB
+# (https://docs.github.com/en/repositories/working-with-files/managing-large-files/about-large-files-on-github).
+# Canonical entry files stay plain text; no LFS. A single record is processed
+# whole (normalized doc interface); what must never happen is materializing
+# the whole LIBRARY or rejecting its growth.
+MAX_FILE_BYTES = 100 * 1024 * 1024
+# Frontmatter is small structured metadata; an oversized header is malformed.
+MAX_HEADER_BYTES = 64 * 1024
 MAX_TITLE = 240
 MAX_SUMMARY_BYTES = 2048
-MAX_BODY_BYTES = 64 * 1024
 MAX_CONDITION_KEY = 128
 MAX_CONDITION_VALUE = 512
 
@@ -68,7 +76,13 @@ _OBSERVATION_HEADING = "## Later observations"
 
 
 class DraftFull(ValueError):
-    """The merged draft reached the 64 KiB storage envelope; stop expanding."""
+    """One entry reached the per-file platform envelope (MAX_FILE_BYTES).
+
+    This is GitHub's real file-size boundary applied to one canonical
+    Markdown file, not a business cap on accumulated experience: appends keep
+    working up to the platform envelope, and there is no separate smaller
+    total body limit. The rejected addition stays in the checkpointed local
+    result; nothing is silently dropped."""
 
 
 def canonical(value) -> str:
@@ -99,6 +113,17 @@ def _bytes(value, name, limit):
     if len(value.encode("utf-8")) > limit:
         raise ValueError(f"{name} exceeds {limit} UTF-8 bytes")
     return value
+
+
+def _header_bytes(doc: dict) -> int:
+    """UTF-8 byte size of the canonical rendered frontmatter."""
+    header = {key: doc[key] for key in PUBLIC_HEADER_FIELDS if key != "conditions"}
+    if doc["conditions"]:
+        header["conditions"] = dict(doc["conditions"])
+    return len(
+        yaml.safe_dump(header, sort_keys=True, allow_unicode=True, width=10**6)
+        .encode("utf-8")
+    )
 
 
 def validate(doc: dict) -> dict:
@@ -142,7 +167,13 @@ def validate(doc: dict) -> dict:
         raise ValueError("content must be nonempty text")
     if doc["content"] != doc["content"].strip():
         raise ValueError("content must be canonical (no surrounding whitespace)")
-    _bytes(doc["content"], "content", MAX_BODY_BYTES)
+    # The only size bound on a body is the real per-file platform envelope
+    # the canonical Markdown file must fit; there is no cumulative cap.
+    if len(doc["content"].encode("utf-8")) > MAX_FILE_BYTES:
+        raise DraftFull("content exceeds the per-file platform envelope")
+    # Structured metadata stays byte-bounded at create/render/parse alike.
+    if _header_bytes(doc) > MAX_HEADER_BYTES:
+        raise ValueError("entry frontmatter exceeds the metadata byte limit")
     if revision_of(doc) != doc["revision"]:
         raise ValueError("revision does not match the canonical fields")
     return doc
@@ -220,6 +251,10 @@ def parse_entry(markdown) -> dict:
     end = text.find("\n---\n", 4)
     if end == -1:
         raise ValueError("unterminated YAML frontmatter block")
+    if len(text[4:end].encode("utf-8")) > MAX_HEADER_BYTES:
+        # The frontmatter is bounded structured metadata; an oversized header
+        # is malformed, never handed to the YAML loader.
+        raise ValueError("entry frontmatter exceeds the metadata byte limit")
     try:
         header = yaml.load(text[4:end], Loader=_UniqueKeyLoader)
     except (yaml.YAMLError, TypeError):
@@ -246,11 +281,59 @@ def parse_entry(markdown) -> dict:
     return validate(doc)
 
 
+_OBSERVATION_RE = re.compile(r"<!-- observation:([0-9a-f]{16,64}) -->")
+
+
+def observation_markers(content):
+    """Ordered marker identities carried by one body (empty when none)."""
+    return _OBSERVATION_RE.findall(content or "")
+
+
+def append_observation_text(content, addition, marker):
+    """Canonical string-level append of one marked observation block."""
+    block = f"<!-- observation:{marker} -->\n\n{addition}"
+    if _OBSERVATION_HEADING in content:
+        return content.rstrip() + "\n\n" + block
+    return content.rstrip() + f"\n\n{_OBSERVATION_HEADING}\n\n" + block
+
+
+def split_observations(content):
+    """Split a body into ``(base_text, [(marker, addition), ...])``.
+
+    ``base_text`` is everything before the ``## Later observations`` heading
+    (or the whole body when absent). Additions exclude the marker comment;
+    re-appending them with ``_append_observation_text`` reproduces the exact
+    canonical bytes. A ``## Later observations`` tail that is not purely
+    observation blocks returns None: the body is then opaque and callers must
+    not treat any part of it as a transferable delta.
+    """
+    content = (content or "").rstrip()
+    base, sep, tail = content.partition(_OBSERVATION_HEADING)
+    if not sep:
+        return content, []
+    matches = list(_OBSERVATION_RE.finditer(tail))
+    if not matches:
+        return (base.rstrip(), []) if not tail.strip() else None
+    blocks = []
+    pos = 0
+    for index, match in enumerate(matches):
+        if tail[pos : match.start()].strip():
+            return None
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(tail)
+        addition = tail[match.end() : end].strip()
+        if not addition:
+            return None
+        blocks.append((match.group(1), addition))
+        pos = end
+    return base.rstrip(), blocks
+
+
 def append_observation(doc: dict, addition: str, *, marker: str) -> tuple[dict, bool]:
-    """Append one self-contained observation/correction under the bounded
+    """Append one self-contained observation/correction under the
     ``## Later observations`` section. Idempotent on ``marker``: an already
     appended increment returns ``(doc, False)``. Never rewrites or deletes
-    earlier body. Raises :class:`DraftFull` at the 64 KiB envelope."""
+    earlier body. Raises :class:`DraftFull` only at the per-file publication
+    envelope; accumulation of ordinary observations is not capped."""
     if not re.fullmatch(r"[0-9a-f]{16,64}", marker or ""):
         raise ValueError("observation marker must be a hex increment identity")
     addition = (addition or "").strip()
@@ -258,13 +341,11 @@ def append_observation(doc: dict, addition: str, *, marker: str) -> tuple[dict, 
         raise ValueError("observation must be nonempty")
     if f"<!-- observation:{marker} -->" in doc["content"]:
         return doc, False
-    block = f"<!-- observation:{marker} -->\n\n{addition}"
-    if _OBSERVATION_HEADING in doc["content"]:
-        content = doc["content"].rstrip() + "\n\n" + block
-    else:
-        content = doc["content"].rstrip() + f"\n\n{_OBSERVATION_HEADING}\n\n" + block
-    if len(content.encode("utf-8")) > MAX_BODY_BYTES:
-        raise DraftFull("draft full: the 64 KiB body envelope is reached")
+    content = append_observation_text(doc["content"], addition, marker)
     updated = dict(doc, content=content)
     updated["revision"] = revision_of(updated)
+    # The bound is the rendered canonical FILE against the real per-file
+    # platform envelope (what Git hosting accepts), not a business total.
+    if len(render_entry(updated).encode("utf-8")) > MAX_FILE_BYTES:
+        raise DraftFull("draft full: the per-file platform envelope is reached")
     return validate(updated), True
