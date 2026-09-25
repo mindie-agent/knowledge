@@ -30,25 +30,32 @@ _READ_CHUNK = 1024 * 1024
 
 
 def with_windows_longpaths(env):
-    """Copy ``env`` and, on Windows, add command-local ``core.longpaths``.
+    """Copy ``env`` and, on Windows, require command-local ``core.longpaths``.
 
     ``GIT_CONFIG_*`` is process configuration, so it applies to ``clone``
-    before the target repository exists. Existing slots, including
-    hooksPath and credential helpers, stay. Other platforms are unchanged.
-    No git config file is written.
+    before the target repository exists. An existing slot is set to true,
+    including a later false that would otherwise win. The input map is not
+    modified. A malformed or negative ``GIT_CONFIG_COUNT`` is refused.
+    Other platforms are unchanged. No git config file is written.
     """
     out = {str(key): str(value) for key, value in env.items()}
     if os.name != "nt":
         return out
+    raw_count = out.get("GIT_CONFIG_COUNT", "0")
     try:
-        count = int(out.get("GIT_CONFIG_COUNT", "0"))
+        count = int(raw_count)
     except ValueError:
-        count = 0
+        raise ValueError(f"GIT_CONFIG_COUNT is not an integer: {raw_count}") from None
     if count < 0:
-        count = 0
+        raise ValueError(f"GIT_CONFIG_COUNT must not be negative: {raw_count}")
+    found = False
     for index in range(count):
-        if out.get(f"GIT_CONFIG_KEY_{index}") == "core.longpaths":
-            return out
+        key = out.get(f"GIT_CONFIG_KEY_{index}")
+        if isinstance(key, str) and key.lower() == "core.longpaths":
+            out[f"GIT_CONFIG_VALUE_{index}"] = "true"
+            found = True
+    if found:
+        return out
     out["GIT_CONFIG_COUNT"] = str(count + 1)
     out[f"GIT_CONFIG_KEY_{count}"] = "core.longpaths"
     out[f"GIT_CONFIG_VALUE_{count}"] = "true"

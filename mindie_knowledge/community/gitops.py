@@ -75,8 +75,12 @@ GIT_ENV = _GIT_BASE
 
 
 def _resolve_git_env(env: Mapping[str, str] | None) -> dict[str, str]:
-    """Env for one Git subprocess. Windows long paths are command-local."""
-    return with_windows_longpaths(env if env is not None else _GIT_BASE)
+    """Env for one Git subprocess. An empty map keeps the default Git config.
+
+    Windows long paths are command-local. ``{}`` matches the old
+    ``env or GIT_ENV`` fallback, so credential helpers and hooksPath stay.
+    """
+    return with_windows_longpaths(env or _GIT_BASE)
 
 
 def git_env(settings: Mapping[str, Any] | None = None, token_env: str | None = None) -> dict[str, str]:
