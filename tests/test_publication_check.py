@@ -2,7 +2,6 @@ from pathlib import Path
 import json
 import re
 import subprocess
-import time
 import pytest
 from mindie_knowledge.publication_check import validate
 from mindie_knowledge.loop.documents import make_entry,render_entry
@@ -244,9 +243,14 @@ def test_validate_does_not_leak_descriptors(tmp_path):
 
 
 def test_validate_auto_advances_bounded_slices_in_one_call(tmp_path, monkeypatch):
-    """A normal caller does not manage checkpoints or rerun: one validate()
-    call advances in bounded slices and finishes a tree that no single slice
-    could hold."""
+    """One validate() call continues after a controlled blob boundary.
+
+    Not a timer and not a model run. After five successful real blob reads
+    on one reader, the next read raises TimeoutError before Git is called.
+    The product treats that as the end of the slice, opens a new reader, and
+    finishes the tree in the same call. The checkpoint file is the one
+    validate() writes.
+    """
     import mindie_knowledge.publication_check as pc
     files={}
     for i in range(30):
@@ -255,23 +259,49 @@ def test_validate_auto_advances_bounded_slices_in_one_call(tmp_path, monkeypatch
                        content=f'Body of sliced case {i}.')
         files[f'cases/{i:04x}.md']=render_entry(doc)
     repo,sha=publish(tmp_path,files)
-    monkeypatch.setattr(pc,'SLICE_SECONDS',0.2)
-    # Force every blob read to consume the slice, so validation spans many
-    # automatically continued slices within this single call.
+    state=tmp_path/'validator-state.json'
+    boundary=5
+    monkeypatch.setattr(pc,'_CHECKPOINT_EVERY',boundary)
     from mindie_knowledge import gitread
     real_read=gitread.CatFileBatch.read
-    slices=[]
-    def counting_read(self,rev,**kwargs):
-        time.sleep(0.05)
-        return real_read(self,rev,**kwargs)
-    monkeypatch.setattr(gitread.CatFileBatch,'read',counting_read)
     real_ctor=pc.CatFileBatch
+    reads=[]
+    slices=[]
+    counts={}
+    boundary_sizes=[]
+    def bounded_read(self,rev,**kwargs):
+        done=counts.get(id(self),0)
+        if done>=boundary:
+            if not boundary_sizes and state.is_file():
+                saved=json.loads(state.read_text(encoding='utf-8'))
+                verified=saved.get('verified')
+                boundary_sizes.append(len(verified) if isinstance(verified,dict) else -1)
+            raise TimeoutError('controlled fixture: blob boundary before this read')
+        blob=real_read(self,rev,**kwargs)
+        counts[id(self)]=done+1
+        reads.append(rev)
+        return blob
     class CountingCtor:
         def __new__(cls,*args,**kwargs):
             batch=real_ctor(*args,**kwargs)
             slices.append(batch)
             return batch
+    monkeypatch.setattr(gitread.CatFileBatch,'read',bounded_read)
     monkeypatch.setattr(pc,'CatFileBatch',CountingCtor)
-    result=pc.validate(repo,sha,'vllm-ascend')
+    result=pc.validate(repo,sha,'vllm-ascend',state=state)
     assert result['entries']==30
-    assert len(slices)>1  # multiple bounded slices advanced automatically
+    assert len(slices)>1
+    assert len(reads)==30 and len(set(reads))==30
+    assert boundary_sizes==[boundary]
+    saved=json.loads(state.read_text(encoding='utf-8'))
+    assert saved['commit']==sha and len(saved['verified'])==30
+    monkeypatch.setattr(gitread.CatFileBatch,'read',real_read)
+    monkeypatch.setattr(pc,'CatFileBatch',real_ctor)
+    monkeypatch.setattr(pc,'_CHECKPOINT_EVERY',64)
+    again_reads=[]
+    def tracking(self,rev,**kwargs):
+        again_reads.append(rev)
+        return real_read(self,rev,**kwargs)
+    monkeypatch.setattr(gitread.CatFileBatch,'read',tracking)
+    again=pc.validate(repo,sha,'vllm-ascend',state=state)
+    assert again['entries']==30 and again_reads==[]
