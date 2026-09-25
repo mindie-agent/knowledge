@@ -40,6 +40,7 @@ from __future__ import annotations
 import re
 import os
 import time
+import hashlib
 from pathlib import Path
 
 from . import documents
@@ -233,9 +234,12 @@ class Feed:
         ``git cat-file --batch`` process — never a per-blob spawn and never a
         whole-library materialization. Raises ValueError for incompatible
         content (quarantined, no retry) and OSError/TimeoutError for
-        transient failures (backoff, progress kept).
+        transient failures (backoff, progress kept). The derived retrieval
+        token stream is precomputed per blob here, off the switch, so the
+        atomic visibility switch never retokenizes under a write transaction.
         """
         from mindie_knowledge.gitread import CatFileBatch
+        from mindie_knowledge.retrieval import index_text
 
         staged_paths, seen_ids = self.store.feed_staging_state(self.ident, commit)
         reader = None
@@ -260,7 +264,12 @@ class Feed:
                 if doc["entry_id"] in seen_ids:
                     raise ValueError("duplicate entry identity in feed")
                 seen_ids.add(doc["entry_id"])
-                self.store.feed_stage_doc(self.ident, commit, path, doc["entry_id"], doc)
+                text = doc["title"] + "\n" + doc["summary"] + "\n" + doc["content"]
+                self.store.feed_stage_doc(
+                    self.ident, commit, path, doc["entry_id"], doc,
+                    tokens=index_text(text),
+                    text_digest=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                )
                 staged += 1
         finally:
             if reader is not None:

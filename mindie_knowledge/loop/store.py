@@ -67,6 +67,16 @@ def _backoff_seconds(base, cap, attempt):
     return min(cap, base * (2.0 ** min(max(0, attempt - 1), 20)))
 
 
+class IndexNotReady(ValueError):
+    """The derived search index is being built or rebuilt.
+
+    A brief honest readiness state (existing read-rejection shape): never a
+    fake empty result and never a failure of the queried content. Callers
+    that merely wanted OPTIONAL retrieval context (the organizer payload)
+    must catch exactly this type and continue without it; anything else still
+    propagates."""
+
+
 def session_key(value):
     """Local hash of a native session id; never exported."""
     if not isinstance(value, str) or not value.strip() or len(value) > 256:
@@ -292,7 +302,8 @@ class Store:
                 kind TEXT NOT NULL, title TEXT NOT NULL,
                 origin TEXT NOT NULL, draft_revision TEXT, published_revision TEXT,
                 feed_active INTEGER NOT NULL DEFAULT 0, batched_revision TEXT,
-                doc TEXT NOT NULL, updated REAL NOT NULL);
+                doc TEXT NOT NULL, updated REAL NOT NULL,
+                conditions TEXT NOT NULL DEFAULT '{}');
             CREATE TABLE IF NOT EXISTS revisions(entry_id TEXT NOT NULL,
                 revision TEXT NOT NULL, doc TEXT NOT NULL, source TEXT NOT NULL,
                 created REAL NOT NULL, PRIMARY KEY(entry_id, revision));
@@ -378,6 +389,22 @@ class Store:
             self.db.execute("ALTER TABLE sent_receipts ADD COLUMN markers TEXT")
         if receipt_columns and "batch_revision" not in receipt_columns:
             self.db.execute("ALTER TABLE sent_receipts ADD COLUMN batch_revision TEXT")
+        staging_columns = {
+            row[1] for row in self.db.execute("PRAGMA table_info(feed_staging)")
+        }
+        if staging_columns and "tokens" not in staging_columns:
+            self.db.execute("ALTER TABLE feed_staging ADD COLUMN tokens TEXT")
+            self.db.execute("ALTER TABLE feed_staging ADD COLUMN text_digest TEXT")
+        entry_columns = {
+            row[1] for row in self.db.execute("PRAGMA table_info(entries)")
+        }
+        if entry_columns and "conditions" not in entry_columns:
+            # Small authoritative metadata for pre-LIMIT filtering; the
+            # search backfill populates it for pre-existing rows.
+            self.db.execute(
+                "ALTER TABLE entries ADD COLUMN conditions TEXT NOT NULL DEFAULT '{}'"
+            )
+        self._init_search_index()
         self.db.execute(
             "INSERT OR REPLACE INTO meta VALUES('schema', ?)", (SCHEMA,)
         )
@@ -407,6 +434,350 @@ class Store:
 
     def close(self):
         self.db.close()
+
+    # ------------------------------------------------- derived search index
+    #
+    # The store keeps a REBUILDABLE contentless FTS5 index of derived token
+    # streams; `entries` remains the only authority. The index stores only
+    # the inverted term index (content='', contentless_delete=1) — no body
+    # and no token-stream text copy — plus the entry_id ↔ rowid map with a
+    # text fingerprint, so a state-only change never retokenizes. Tokenizer
+    # semantics are exactly `retrieval.tokens()` (qualified identifiers,
+    # aliases, CJK bigrams); FTS tokenchars keep `./+:-_` inside tokens.
+    # A query is one SQL join: index MATCH → entry map → current visibility +
+    # conditions filters → rank → LIMIT; only hit headers are read.
+    #
+    # Tokenization always happens off the write transaction/store lock:
+    # create/restore compute from the known document before the write txn;
+    # append computes from an off-lock base and re-verifies the base revision
+    # at apply (a raced draft recomputes, bounded); feed staging precomputes
+    # per blob and the atomic switch applies them; compaction/withdrawal
+    # remove the row in the same transaction. An old store (or a
+    # version/corruption reset) backfills in bounded resumable slices driven
+    # by the existing outbox worker, with apply-time verification that the
+    # staged tokens still match the entry's current visible revision — a
+    # raced entry is requeued, never overwritten with a stale snapshot and
+    # never skipped at completion.
+
+    SEARCH_INDEX_VERSION = "fts5-t2"
+    SEARCH_BACKFILL_SLICE = 128
+
+    _VISIBLE_SQL = (
+        "feed_active=1 OR (draft_revision IS NOT NULL AND published_revision IS NULL)"
+    )
+
+    def _init_search_index(self):
+        version_row = self.db.execute(
+            "SELECT value FROM meta WHERE key='search_index_version'"
+        ).fetchone()
+        current = version_row[0] if version_row else None
+        if current is not None and current != self.SEARCH_INDEX_VERSION:
+            # Index-semantics change: drop only derived tables and rebuild.
+            self.db.execute("DROP TABLE IF EXISTS search_index")
+            self.db.execute("DROP TABLE IF EXISTS search_map")
+        try:
+            self.db.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS search_index "
+                "USING fts5(tokens, content='', contentless_delete=1, "
+                "tokenize=\"unicode61 tokenchars './+:-_'\")"
+            )
+        except sqlite3.OperationalError:
+            raise ValueError(
+                "knowledge search requires SQLite FTS5 support; this SQLite "
+                "build does not provide it"
+            ) from None
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS search_map("
+            "entry_id TEXT PRIMARY KEY, docid INTEGER NOT NULL UNIQUE, "
+            "text_digest TEXT NOT NULL)"
+        )
+        if current != self.SEARCH_INDEX_VERSION:
+            self.db.execute(
+                "INSERT OR REPLACE INTO meta VALUES('search_index_version', ?)",
+                (self.SEARCH_INDEX_VERSION,),
+            )
+            self.db.execute("DELETE FROM meta WHERE key='search_backfill'")
+            self.db.execute("DELETE FROM meta WHERE key='search_requeue'")
+
+    def _search_backfill_state(self):
+        row = self.db.execute(
+            "SELECT value FROM meta WHERE key='search_backfill'"
+        ).fetchone()
+        if row is None:
+            return {"next_rowid": 0, "complete": False}
+        try:
+            value = json.loads(row[0])
+        except ValueError:
+            return {"next_rowid": 0, "complete": False}
+        return value if isinstance(value, dict) else {"next_rowid": 0, "complete": False}
+
+    def _search_requeue_read(self):
+        row = self.db.execute(
+            "SELECT value FROM meta WHERE key='search_requeue'"
+        ).fetchone()
+        if row is None:
+            return []
+        try:
+            value = json.loads(row[0])
+        except ValueError:
+            return []
+        if not isinstance(value, list):
+            return []
+        return [item for item in value if isinstance(item, str)][:256]
+
+    @staticmethod
+    def _doc_source_text(doc):
+        return doc["title"] + "\n" + doc["summary"] + "\n" + doc["content"]
+
+    def _index_upsert_doc(self, entry_id, doc):
+        """Tokenize and index one entry's visible document. Only used where
+        the caller is already on a short local path (fallback when no staged
+        token stream exists); the feed production path precomputes per blob.
+        """
+        from mindie_knowledge.retrieval import index_text
+
+        text = self._doc_source_text(doc)
+        self._index_upsert_tokens(
+            entry_id, index_text(text),
+            hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        )
+
+    def _index_upsert_tokens(self, entry_id, tokens_text, text_digest):
+        """Write one entry's precomputed token row (caller holds the txn;
+        consistency with the current revision is the caller's verified
+        precondition)."""
+        row = self.db.execute(
+            "SELECT docid, text_digest FROM search_map WHERE entry_id=?",
+            (entry_id,),
+        ).fetchone()
+        if row is not None and row["text_digest"] == text_digest:
+            return  # state-only change: never retokenize
+        if row is not None:
+            self.db.execute(
+                "UPDATE search_index SET tokens=? WHERE rowid=?",
+                (tokens_text, row["docid"]),
+            )
+            self.db.execute(
+                "UPDATE search_map SET text_digest=? WHERE entry_id=?",
+                (text_digest, entry_id),
+            )
+        else:
+            cursor = self.db.execute(
+                "INSERT INTO search_index(rowid, tokens) VALUES(NULL, ?)",
+                (tokens_text,),
+            )
+            self.db.execute(
+                "INSERT INTO search_map VALUES(?,?,?)",
+                (entry_id, cursor.lastrowid, text_digest),
+            )
+
+    def _index_remove(self, entry_id):
+        row = self.db.execute(
+            "SELECT docid FROM search_map WHERE entry_id=?", (entry_id,)
+        ).fetchone()
+        if row is None:
+            return
+        self.db.execute("DELETE FROM search_index WHERE rowid=?", (row["docid"],))
+        self.db.execute("DELETE FROM search_map WHERE entry_id=?", (entry_id,))
+
+    def _index_sweep_invisible(self):
+        """Drop index rows for entries gone or no longer visible (same txn)."""
+        stale = self.db.execute(
+            "SELECT m.entry_id, m.docid FROM search_map m WHERE m.entry_id "
+            "NOT IN (SELECT entry_id FROM entries WHERE " + self._VISIBLE_SQL + ")"
+        ).fetchall()
+        for entry_id, docid in stale:
+            self.db.execute("DELETE FROM search_index WHERE rowid=?", (docid,))
+            self.db.execute("DELETE FROM search_map WHERE entry_id=?", (entry_id,))
+
+    def _search_reset(self):
+        """Corruption: drop only derived data and restart the backfill."""
+        with self._write_txn():
+            self.db.execute("DROP TABLE IF EXISTS search_index")
+            self.db.execute("DROP TABLE IF EXISTS search_map")
+            self._init_search_index()
+            self.db.execute("DELETE FROM meta WHERE key='search_backfill'")
+            self.db.execute("DELETE FROM meta WHERE key='search_requeue'")
+
+    def search_index_status(self):
+        with self.lock:
+            state = self._search_backfill_state()
+            return dict(
+                version=self.SEARCH_INDEX_VERSION,
+                complete=bool(state.get("complete")),
+                indexed=self.db.execute(
+                    "SELECT count(*) FROM search_map"
+                ).fetchone()[0],
+                visible=self.db.execute(
+                    "SELECT count(*) FROM entries WHERE " + self._VISIBLE_SQL
+                ).fetchone()[0],
+                next_rowid=state.get("next_rowid", 0),
+                requeued=len(self._search_requeue_read()),
+            )
+
+    def _search_mark_complete_if_covered(self):
+        """Persist completeness when the visible set is fully covered.
+
+        The write-path hooks keep coverage current directly, so a store that
+        never needed a backfill becomes ready without slicing; a store with
+        genuine gaps keeps its persisted cursor untouched."""
+        missing = self.db.execute(
+            "SELECT count(*) FROM entries WHERE (" + self._VISIBLE_SQL + ") "
+            "AND entry_id NOT IN (SELECT entry_id FROM search_map)"
+        ).fetchone()[0]
+        stale = self.db.execute(
+            "SELECT count(*) FROM search_map WHERE entry_id NOT IN "
+            "(SELECT entry_id FROM entries WHERE " + self._VISIBLE_SQL + ")"
+        ).fetchone()[0]
+        if missing or stale or self._search_requeue_read():
+            return False
+        with self._write_txn():
+            top = self.db.execute("SELECT MAX(rowid) FROM entries").fetchone()[0] or 0
+            self.db.execute(
+                "INSERT OR REPLACE INTO meta VALUES('search_backfill', ?)",
+                (canonical({"next_rowid": top, "complete": True}),),
+            )
+        return True
+
+    def advance_search_index(self, *, max_entries=None, budget_seconds=0.5):
+        """Advance the derived search index by one bounded, resumable slice.
+
+        Tokenization runs off the store lock; one short write transaction per
+        slice; the persisted cursor resumes after interruption. At apply time
+        each staged result must still match the entry's current visible text
+        (digest proof); a raced entry is requeued for the next slice instead
+        of being overwritten with a stale snapshot or skipped at completion.
+        Returns True when the index covers every currently visible entry.
+        Purely local read-only maintenance: no capture, no model, no
+        publication.
+        """
+        max_entries = max_entries or self.SEARCH_BACKFILL_SLICE
+        deadline = time.monotonic() + budget_seconds
+        with self.lock:
+            state = self._search_backfill_state()
+            requeue = self._search_requeue_read()
+            if state.get("complete") and not requeue:
+                return True
+            cursor = int(state.get("next_rowid") or 0)
+            rows = []
+            for entry_id in requeue:
+                found = self.db.execute(
+                    "SELECT rowid, entry_id, doc, feed_active, "
+                    "draft_revision, published_revision FROM entries "
+                    "WHERE entry_id=?",
+                    (entry_id,),
+                ).fetchone()
+                if found is not None:
+                    rows.append(found)
+            remaining = max_entries - len(rows)
+            slice_rows = []
+            if remaining > 0 and not state.get("complete"):
+                slice_rows = self.db.execute(
+                    "SELECT rowid, entry_id, doc, feed_active, draft_revision, "
+                    "published_revision FROM entries "
+                    "WHERE rowid > ? ORDER BY rowid LIMIT ?",
+                    (cursor, remaining),
+                ).fetchall()
+                rows.extend(slice_rows)
+            existing = (
+                {
+                    r[0]: r[1]
+                    for r in self.db.execute(
+                        "SELECT entry_id, text_digest FROM search_map "
+                        f"WHERE entry_id IN ({','.join('?' for _ in rows)})",
+                        tuple(r["entry_id"] for r in rows),
+                    )
+                }
+                if rows
+                else {}
+            )
+        from mindie_knowledge.retrieval import index_text
+
+        prepared = []
+        last_rowid = cursor
+        exhausted = False
+        for row in rows:
+            if time.monotonic() > deadline:
+                exhausted = True
+                break
+            visible = bool(
+                row["feed_active"]
+                or (row["draft_revision"] and not row["published_revision"])
+            )
+            if row["rowid"] > cursor:
+                last_rowid = row["rowid"]
+            if not visible:
+                prepared.append((row["entry_id"], None))
+                continue
+            doc = json.loads(row["doc"])
+            text = self._doc_source_text(doc)
+            digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            if existing.get(row["entry_id"]) == digest:
+                continue  # already current: no retokenization, no write
+            prepared.append(
+                (row["entry_id"],
+                 (index_text(text), digest, canonical(doc["conditions"])))
+            )
+        still_racing = []
+        with self._write_txn():
+            for entry_id, payload in prepared:
+                if payload is None:
+                    self._index_remove(entry_id)
+                    continue
+                tokens_text, digest, conditions_json = payload
+                # Verify against the CURRENT authoritative row before
+                # applying an off-lock derived snapshot.
+                current = self.db.execute(
+                    "SELECT doc, feed_active, draft_revision, "
+                    "published_revision FROM entries WHERE entry_id=?",
+                    (entry_id,),
+                ).fetchone()
+                if current is None:
+                    self._index_remove(entry_id)
+                    continue
+                current_visible = bool(
+                    current["feed_active"]
+                    or (current["draft_revision"]
+                        and not current["published_revision"])
+                )
+                if not current_visible:
+                    self._index_remove(entry_id)
+                    continue
+                current_doc = json.loads(current["doc"])
+                current_digest = hashlib.sha256(
+                    self._doc_source_text(current_doc).encode("utf-8")
+                ).hexdigest()
+                if current_digest != digest:
+                    # The entry moved while we tokenized: discard the stale
+                    # derived result; the next slice re-reads the current
+                    # version. Never overwrite with it, never skip it.
+                    still_racing.append(entry_id)
+                    continue
+                self.db.execute(
+                    "UPDATE entries SET conditions=? WHERE entry_id=?",
+                    (conditions_json, entry_id),
+                )
+                self._index_upsert_tokens(entry_id, tokens_text, digest)
+            self.db.execute("DELETE FROM meta WHERE key='search_requeue'")
+            if still_racing:
+                self.db.execute(
+                    "INSERT INTO meta VALUES('search_requeue', ?)",
+                    (canonical(still_racing),),
+                )
+            # The cursor slice completed when it read past the last row; a
+            # complete index also requires no entry still racing.
+            slice_finished = (not exhausted) and len(slice_rows) < (
+                max_entries - len(requeue)
+            )
+            complete = slice_finished and not still_racing
+            if complete:
+                self._index_sweep_invisible()
+            self.db.execute(
+                "INSERT OR REPLACE INTO meta VALUES('search_backfill', ?)",
+                (canonical({"next_rowid": last_rowid, "complete": complete}),),
+            )
+        return complete
+
 
     # ------------------------------------------------- material authorization
 
@@ -629,15 +1000,26 @@ class Store:
             entry_id=entry_id, domain=self.domain, kind=kind, title=title,
             summary=summary, content=content, conditions=conditions,
         )
+        # Derived tokenization happens off the write transaction; the applied
+        # row is exactly this content, so no verify is needed for a creation.
+        from mindie_knowledge.retrieval import index_text
+
+        source_text = self._doc_source_text(doc)
+        tokens_text = index_text(source_text)
+        text_digest = hashlib.sha256(source_text.encode("utf-8")).hexdigest()
         now = time.time()
         with self._write_txn():
             if self._row(entry_id) is not None:
                 raise ValueError("entry identity already exists")
             self._insert_revision(doc, origin, now)
             self.db.execute(
-                "INSERT INTO entries VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO entries(entry_id, kind, title, origin, "
+                "draft_revision, published_revision, feed_active, "
+                "batched_revision, doc, updated, conditions) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (entry_id, kind, doc["title"], origin, doc["revision"],
-                 None, 0, None, canonical(doc), now),
+                 None, 0, None, canonical(doc), now,
+                 canonical(doc["conditions"])),
             )
             if owner is not None:
                 self.db.execute(
@@ -649,6 +1031,7 @@ class Store:
                     ("draft", entry_id, doc["revision"], generation, now),
                 )
             self._write_draft_file(doc)
+            self._index_upsert_tokens(entry_id, tokens_text, text_digest)
         return doc
 
     def append_observation(self, entry_id, addition, *, marker, producer=None,
@@ -664,24 +1047,28 @@ class Store:
         smuggle an old-generation private body into a new publication.
         Without it the new revision is local-only. Returns
         ``(doc, appended)``.
+
+        The derived tokenization is computed off the write lock from an
+        off-lock base snapshot; the apply transaction re-verifies the base
+        revision and recomputes (bounded) if the draft raced ahead, so no
+        long body is ever tokenized under the write transaction and no stale
+        derived row can overwrite a newer draft.
         """
-        now = time.time()
-        with self._write_txn():
-            row = self._row(entry_id)
-            if row is None:
-                raise ValueError("unknown draft in this domain")
-            if not row["draft_revision"]:
-                raise ValueError("entry has no local draft to update")
-            if generation is not None and not self.granted(
-                "draft", entry_id, row["draft_revision"], generation
-            ):
-                raise ValueError(
-                    "draft material belongs to another sharing generation; "
-                    "it stays local instead of being republished"
-                )
-            base = self._revision_doc(entry_id, row["draft_revision"])
-            if producer is not None and producer != self._owner_of(entry_id):
+        from mindie_knowledge.retrieval import index_text
+
+        for _attempt in range(3):
+            with self.lock:
+                row = self._row(entry_id)
+                if row is None:
+                    raise ValueError("unknown draft in this domain")
+                if not row["draft_revision"]:
+                    raise ValueError("entry has no local draft to update")
+                base = self._revision_doc(entry_id, row["draft_revision"])
+                owner = self._owner_of(entry_id)
+            if producer is not None and producer != owner:
                 raise ValueError("only the owning task may append its draft")
+            # Off the write lock: the deterministic document and its derived
+            # token stream.
             doc, appended = documents.append_observation(base, addition, marker=marker)
             if not appended:
                 return doc, False
@@ -698,21 +1085,45 @@ class Store:
                     doc["conditions"] = dict(header["conditions"])
                 doc["revision"] = documents.revision_of(doc)
                 documents.validate(doc)
-            self._insert_revision(doc, row["origin"], now)
-            if generation is not None:
+            source_text = self._doc_source_text(doc)
+            tokens_text = index_text(source_text)
+            text_digest = hashlib.sha256(source_text.encode("utf-8")).hexdigest()
+            now = time.time()
+            with self._write_txn():
+                current = self._row(entry_id)
+                if current is None or current["draft_revision"] != base["revision"]:
+                    continue  # the draft raced ahead; recompute from its base
+                if generation is not None and not self.granted(
+                    "draft", entry_id, base["revision"], generation
+                ):
+                    raise ValueError(
+                        "draft material belongs to another sharing generation; "
+                        "it stays local instead of being republished"
+                    )
+                self._insert_revision(doc, current["origin"], now)
+                if generation is not None:
+                    self.db.execute(
+                        "INSERT OR REPLACE INTO grants VALUES(?,?,?,?,?)",
+                        ("draft", entry_id, doc["revision"], generation, now),
+                    )
+                visible = not current["feed_active"]
                 self.db.execute(
-                    "INSERT OR REPLACE INTO grants VALUES(?,?,?,?,?)",
-                    ("draft", entry_id, doc["revision"], generation, now),
+                    "UPDATE entries SET draft_revision=?, title=?, doc=?, "
+                    "updated=?, conditions=? WHERE entry_id=?",
+                    (doc["revision"], doc["title"],
+                     canonical(doc) if visible else current["doc"], now,
+                     canonical(doc["conditions"]) if visible
+                     else current["conditions"], entry_id),
                 )
-            visible = not row["feed_active"]
-            self.db.execute(
-                "UPDATE entries SET draft_revision=?, title=?, doc=?, updated=? "
-                "WHERE entry_id=?",
-                (doc["revision"], doc["title"],
-                 canonical(doc) if visible else row["doc"], now, entry_id),
-            )
-            self._write_draft_file(doc)
-            return doc, True
+                self._write_draft_file(doc)
+                if visible:
+                    # Only a genuinely visible document enters the index; for
+                    # a feed-active entry the published body keeps the row.
+                    self._index_upsert_tokens(entry_id, tokens_text, text_digest)
+                return doc, True
+        raise ValueError(
+            "draft kept changing across bounded retries; append not applied"
+        )
 
     _NOT_WITHDRAWN = (
         "NOT (entries.published_revision IS NOT NULL AND entries.feed_active=0)"
@@ -838,78 +1249,96 @@ class Store:
     # ---------------------------------------------------------------- search
 
     def query(self, query, limit=5, conditions=None):
-        """BM25 over visible entries: published versions win;
-        withdrawn-from-feed entries stay explainable but leave the results.
-        Draft overlays on published entries are labeled, never a second hit.
-        The corpus is walked lazily (one body at a time), so domain growth is
-        bounded by per-document work, never rejected at a whole-domain cap."""
-        from mindie_knowledge.markdown import Document
-        from mindie_knowledge.retrieval import lexical_search_streaming
-
+        """BM25 over visible entries via the derived contentless FTS5 index:
+        published versions win; withdrawn-from-feed entries stay explainable
+        but leave the results. Draft overlays on published entries are
+        labeled, never a second hit. One SQL join does index MATCH → entry
+        map → current visibility/conditions filtering → rank → LIMIT; only
+        hit headers are read, and no query ever walks, re-sorts or
+        retokenizes the library. While the derived index is being built (old
+        store, version reset, corruption), the call honestly rejects with
+        :class:`IndexNotReady` — a brief transient read-rejection, never a
+        fake/partial result set; the outbox worker completes the build.
+        """
         if not isinstance(query, str) or not query.strip() or len(query) > 2000:
             raise ValueError("query must be nonempty text of at most 2000 characters")
         if type(limit) is not int or not 1 <= limit <= 20:
             raise ValueError("limit must be between 1 and 20")
         if conditions is not None and not isinstance(conditions, dict):
             raise ValueError("conditions must be an object")
+        from mindie_knowledge.retrieval import tokens
 
-        def make_documents():
-            # Two lazy passes over the catalogue: at most one entry body is
-            # in memory at a time, so a growing domain never materializes the
-            # whole library to answer a query and no domain-size cap rejects
-            # it wholesale.
-            cursor = self.db.execute(
-                "SELECT * FROM entries WHERE (feed_active=1 "
-                "OR (draft_revision IS NOT NULL AND published_revision IS NULL))"
+        terms = list(dict.fromkeys(tokens(query)))
+        if not terms:
+            return dict(
+                domain=self.domain, retrieval="bm25", results=[],
+                note="Reference material. Scores indicate retrieval usefulness, not factual confidence.",
             )
-            for row in cursor:
-                doc = json.loads(row["doc"])
-                if (
-                    doc["kind"] == "knowledge"
-                    and conditions
-                    and any(
-                        key in doc["conditions"] and doc["conditions"][key] != value
-                        for key, value in conditions.items()
-                    )
-                ):
-                    continue
-                yield Document(
-                    layer=doc["kind"], title=doc["title"],
-                    content=doc["summary"] + "\n" + doc["content"],
-                    slug=doc["entry_id"],
-                    path=self.root / "drafts" / f"{doc['entry_id']}.md",
-                    uri=doc["entry_id"],
+        match = " OR ".join('"' + term.replace('"', '""') + '"' for term in terms)
+        condition_sql = ""
+        condition_args = []
+        if conditions:
+            for key, value in conditions.items():
+                # A knowledge entry carrying a conflicting value is excluded;
+                # entries without the key (or non-knowledge kinds) pass. The
+                # JSON path is a bound parameter, never interpolated SQL.
+                path = '$."' + str(key).replace('"', '""') + '"'
+                condition_sql += (
+                    " AND NOT (e.kind='knowledge' "
+                    "AND json_extract(e.conditions, ?) IS NOT NULL "
+                    "AND json_extract(e.conditions, ?) != ?)"
                 )
-
+                condition_args.extend([path, path, str(value)])
+        sql = (
+            "SELECT e.entry_id, e.kind, e.origin, e.feed_active, "
+            "e.draft_revision, e.published_revision, e.conditions, e.doc, "
+            "bm25(search_index) AS rank FROM search_index "
+            "JOIN search_map m ON m.docid = search_index.rowid "
+            "JOIN entries e ON e.entry_id = m.entry_id "
+            "WHERE search_index MATCH ? AND (" + self._VISIBLE_SQL + ")"
+            + condition_sql + " ORDER BY rank LIMIT ?"
+        )
         with self.lock:
-            hits = lexical_search_streaming(query, make_documents, limit=limit)
-            if not hits:
-                return dict(
-                    domain=self.domain, retrieval="bm25", results=[],
-                    note="Reference material. Scores indicate retrieval usefulness, not factual confidence.",
+            if not self._search_backfill_state().get("complete"):
+                # Hooks may have kept full coverage without any backfill
+                # slice; check coverage once per readiness episode. There is
+                # deliberately no inline slice work here: a query never
+                # builds or tokenizes content.
+                self._search_mark_complete_if_covered()
+            if not self._search_backfill_state().get("complete"):
+                status = self.search_index_status()
+                raise IndexNotReady(
+                    "knowledge search index is being rebuilt "
+                    f"({status['indexed']}/{status['visible']} entries); "
+                    "this is a brief readiness state, not an empty result"
                 )
-            marks = ",".join("?" for _ in hits)
-            rows = self.db.execute(
-                f"SELECT * FROM entries WHERE entry_id IN ({marks})",
-                tuple(hit.uri for hit in hits),
-            ).fetchall()
-            selected = {}
+            try:
+                rows = self.db.execute(
+                    sql, (match, *condition_args, limit),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                # Derived-index corruption: drop only derived data and let
+                # the background worker rebuild; authoritative tables
+                # untouched.
+                self._search_reset()
+                raise IndexNotReady(
+                    "knowledge search index was reset after a read error and "
+                    "is being rebuilt; retry shortly"
+                ) from None
+            output = []
             for row in rows:
                 doc = json.loads(row["doc"])
-                selected[doc["entry_id"]] = (doc, row, bool(
+                supplemental = bool(
                     row["feed_active"]
                     and row["draft_revision"]
                     and row["draft_revision"] != row["published_revision"]
-                ))
-            output = []
-            for hit in hits:
-                doc, row, supplemental = selected[hit.uri]
+                )
                 output.append(dict(
                     ref=self._short_ref(doc["entry_id"], doc["revision"]),
-                    kind=doc["kind"], title=doc["title"], summary=doc["summary"],
-                    conditions=doc["conditions"],
+                    kind=doc["kind"], title=doc["title"],
+                    summary=doc["summary"], conditions=doc["conditions"],
                     origin=row["origin"], supplemental=supplemental,
-                    score=round(hit.score, 8),
+                    score=round(-row["rank"], 8),
                 ))
             output.sort(key=lambda item: (-item["score"], item["ref"]))
             return dict(
@@ -945,8 +1374,10 @@ class Store:
                 (feed, commit),
             )
 
-    def feed_stage_doc(self, feed, commit, path, entry_id, doc):
-        """Persist one validated blob as verified progress for this commit.
+    def feed_stage_doc(self, feed, commit, path, entry_id, doc,
+                       tokens=None, text_digest=None):
+        """Persist one validated blob as verified progress for this commit,
+        with its derived retrieval token stream precomputed off the switch.
 
         Each row lands in its own short transaction — no long SQLite write
         transaction is ever held across Git subprocess reads, and a crashed
@@ -954,8 +1385,9 @@ class Store:
         """
         with self._write_txn():
             self.db.execute(
-                "INSERT OR REPLACE INTO feed_staging VALUES(?,?,?,?,?)",
-                (feed, commit, path, entry_id, canonical(doc)),
+                "INSERT OR REPLACE INTO feed_staging VALUES(?,?,?,?,?,?,?)",
+                (feed, commit, path, entry_id, canonical(doc), tokens,
+                 text_digest),
             )
 
     def feed_staging_state(self, feed, commit):
@@ -975,13 +1407,16 @@ class Store:
             ).fetchone()[0]
 
     def feed_staged_docs(self, feed, commit):
-        """Lazily yield the staged documents in path order (one at a time)."""
+        """Lazily yield staged (doc, tokens, text_digest) tuples in path
+        order (one at a time); rows written before the tokens column existed
+        yield None tokens and the switch recomputes them."""
         cursor = self.db.execute(
-            "SELECT doc FROM feed_staging WHERE feed=? AND git_commit=? ORDER BY path",
+            "SELECT doc, tokens, text_digest FROM feed_staging "
+            "WHERE feed=? AND git_commit=? ORDER BY path",
             (feed, commit),
         )
-        for (doc_json,) in cursor:
-            yield json.loads(doc_json)
+        for doc_json, tokens, text_digest in cursor:
+            yield json.loads(doc_json), tokens, text_digest
 
     def feed_staging_clear(self, feed):
         with self._write_txn():
@@ -1010,7 +1445,13 @@ class Store:
             # variable-count ceiling), and a mid-iteration failure rolls the
             # whole candidate back so the old cache stays.
             self.db.execute("UPDATE entries SET feed_active=0 WHERE feed_active=1")
-            for doc in docs:
+            for item in docs:
+                if isinstance(item, tuple):
+                    # The feed staged the derived token stream per blob
+                    # (off the switch); the atomic switch only applies it.
+                    doc, tokens_text, text_digest = item
+                else:
+                    doc, tokens_text, text_digest = item, None, None
                 if doc["entry_id"] in seen:
                     raise ValueError("duplicate entry identity in feed")
                 seen.add(doc["entry_id"])
@@ -1023,24 +1464,37 @@ class Store:
                     self._insert_revision(doc, "feed", now)
                 if row is None:
                     self.db.execute(
-                        "INSERT INTO entries VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        "INSERT INTO entries(entry_id, kind, title, origin, "
+                        "draft_revision, published_revision, feed_active, "
+                        "batched_revision, doc, updated, conditions) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                         (doc["entry_id"], doc["kind"], doc["title"],
                          "feed", None, doc["revision"], 1, None,
-                         canonical(doc), now),
+                         canonical(doc), now, canonical(doc["conditions"])),
                     )
                 else:
                     self.db.execute(
                         "UPDATE entries SET kind=?, title=?, "
-                        "published_revision=?, feed_active=1, doc=?, updated=? "
-                        "WHERE entry_id=?",
+                        "published_revision=?, feed_active=1, doc=?, updated=?, "
+                        "conditions=? WHERE entry_id=?",
                         (doc["kind"], doc["title"], doc["revision"],
-                         canonical(doc), now, doc["entry_id"]),
+                         canonical(doc), now, canonical(doc["conditions"]),
+                         doc["entry_id"]),
                     )
+                # The visible document is the published body; index exactly
+                # it, with the feed-staged token stream when present.
+                if tokens_text is None:
+                    self._index_upsert_doc(doc["entry_id"], doc)
+                else:
+                    self._index_upsert_tokens(doc["entry_id"], tokens_text,
+                                              text_digest)
                 self.rebase_draft_on_published(doc["entry_id"])
             # Once an entry has a published revision its visibility is
             # governed by the feed alone: leaving the tree (or a valid empty
             # tree) removes it from search, and its stale draft copy is never
-            # resurrected. All bodies stay readable by pinned reference.
+            # resurrected. All bodies stay readable by pinned reference. The
+            # derived index rows leave in the same transaction.
+            self._index_sweep_invisible()
             return dict(entries=len(seen))
 
     # ------------------------------------------------------- entry quarantine
@@ -1633,11 +2087,16 @@ class Store:
                         **json.loads(entry["doc"]), "content": ""
                     }
                     self.db.execute(
-                        "UPDATE entries SET draft_revision=NULL, doc=?, updated=? "
-                        "WHERE entry_id=?",
-                        (canonical(header), time.time(), entry_id),
+                        "UPDATE entries SET draft_revision=NULL, doc=?, "
+                        "updated=?, conditions=? WHERE entry_id=?",
+                        (canonical(header), time.time(),
+                         canonical(header["conditions"]), entry_id),
                     )
                     removed["entries"] += 1
+                    if not entry["feed_active"]:
+                        # A compacted, never-published draft leaves search
+                        # entirely; the derived row goes with it.
+                        self._index_remove(entry_id)
                     try:
                         (self.root / "drafts" / f"{entry_id}.md").unlink()
                     except OSError:
@@ -1915,6 +2374,14 @@ class Store:
         body (fetched boundedly by the caller). Never overwrites an existing
         local draft, never resurrects a withdrawn entry and never fabricates
         a base from only the new paragraph."""
+        documents.validate(doc)
+        # Derived tokenization is computed off the write transaction from the
+        # caller-provided document; the apply writes exactly that content.
+        from mindie_knowledge.retrieval import index_text
+
+        source_text = self._doc_source_text(doc)
+        tokens_text = index_text(source_text)
+        text_digest = hashlib.sha256(source_text.encode("utf-8")).hexdigest()
         now = time.time()
         with self._write_txn():
             row = self._row(entry_id)
@@ -1926,7 +2393,6 @@ class Store:
                 raise ValueError("entry was withdrawn upstream; not restored")
             if not isinstance(doc, dict) or doc.get("entry_id") != entry_id:
                 raise ValueError("fetched body does not match the entry identity")
-            documents.validate(doc)
             self._insert_revision(doc, "draft", now)
             if generation is not None:
                 self.db.execute(
@@ -1935,12 +2401,16 @@ class Store:
                 )
             visible = not row["feed_active"]
             self.db.execute(
-                "UPDATE entries SET draft_revision=?, title=?, doc=?, updated=? "
-                "WHERE entry_id=?",
+                "UPDATE entries SET draft_revision=?, title=?, doc=?, "
+                "updated=?, conditions=? WHERE entry_id=?",
                 (doc["revision"], doc["title"],
-                 canonical(doc) if visible else row["doc"], now, entry_id),
+                 canonical(doc) if visible else row["doc"], now,
+                 canonical(doc["conditions"]) if visible else row["conditions"],
+                 entry_id),
             )
             self._write_draft_file(doc)
+            if visible:
+                self._index_upsert_tokens(entry_id, tokens_text, text_digest)
             return doc
 
     # --------------------------------------------------------------- capture

@@ -4,7 +4,9 @@ Design inherits all nine [VAWS / MindIE Agent principles](https://github.com/min
 
 Local domain knowledge and experience loop for MindIE Agent: bounded capture from admitted tasks, optional community sharing through Git, and read-only retrieval from the canonical Git publication.
 
-Use `mindie-knowledge` from the `mindie-knowledge` Python package (Python 3.11+). The module namespace is `mindie_knowledge`.
+Use `mindie-knowledge` from the `mindie-knowledge` Python package (Python 3.11+).
+The interpreter's SQLite must be 3.43.0 or newer with FTS5 and
+`contentless_delete` support. The module namespace is `mindie_knowledge`.
 
 ```sh
 python -m pip install -e .

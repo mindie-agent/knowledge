@@ -52,6 +52,17 @@ def tokens(text: str) -> list[str]:
     return result
 
 
+def index_text(text: str) -> str:
+    """The derived retrieval token stream for one document's source text.
+
+    This is the single tokenization of the document — qualified identifiers,
+    their underscore/namespace aliases and CJK bigrams — stored in the FTS
+    index at content-change time, so a query tokenizes only the query itself.
+    Tokenizer semantics are identical to ``tokens()`` by construction.
+    """
+    return " ".join(tokens(text))
+
+
 def lexical_search(text: str, documents: Sequence[Document], *, limit: int) -> list[Hit]:
     """BM25 over already loaded Markdown; exact names survive vector misses."""
     terms = set(tokens(text))

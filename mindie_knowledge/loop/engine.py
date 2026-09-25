@@ -963,6 +963,25 @@ class Engine:
                 notes.append(str(exc)[:200])
         return refs, notes
 
+    def _optional_refs(self, masked, notes):
+        """Optional retrieval context for the organizer payload.
+
+        Only an explicit index-not-ready state skips the refs: the authorized
+        increment is still organized normally. Any other query error still
+        propagates to the failure path — nothing is silently swallowed and no
+        material is consumed by a missing index.
+        """
+        from .store import IndexNotReady
+
+        try:
+            return [
+                hit["ref"]
+                for hit in self.store.query(masked[:2000], limit=5)["results"]
+            ]
+        except IndexNotReady:
+            notes.append("retrieval index not ready; organized without optional refs")
+            return []
+
     def _process(self, ident):
         row = self.store.capture_row(ident)
         if row is None:
@@ -1047,10 +1066,7 @@ class Engine:
                 ),
                 existing_drafts=self.store.draft_headers(
                     owner=opaque, generation=row["generation"], query=masked),
-                retrieved_refs=[
-                    hit["ref"]
-                    for hit in self.store.query(masked[:2000], limit=5)["results"]
-                ],
+                retrieved_refs=self._optional_refs(masked, notes),
             )
             # Keep the new evidence intact; older optional context yields first
             # when UTF-8 headers would exceed the worker envelope.
@@ -1331,6 +1347,16 @@ class Engine:
                         )
                         self._cancel.clear()
                 self._generation = generation
+                # Local read-only index maintenance: runs even with community
+                # contribution off (no capture/model/publication), in bounded
+                # resumable slices, off the query path.
+                if not self._is_frozen() and self.begin_work():
+                    try:
+                        self.store.advance_search_index()
+                    except Exception as exc:
+                        self._unexpected("knowledge.index", "tick", exc)
+                    finally:
+                        self.end_work()
                 if generation is not None and not self._is_frozen():
                     for row in self.store.outbox_unresolved()[:2]:
                         if self._is_frozen():

@@ -133,6 +133,30 @@ entry/revision prefixes (`mindie://<domain>/<entry>@<revision>`, full hashes
 only on the rare collision) and always read the exact historical body;
 ambiguous prefixes fail instead of guessing.
 
+### Local retrieval index
+
+The existing `store-v3.sqlite3` contains a derived FTS5 index. Entries and
+their revisions remain authoritative; the index does not store a second
+copy of the body. Tokenization retains qualified identifiers, their aliases
+and Chinese bigrams. Search uses the index, filters current visibility and
+knowledge conditions before limiting results, then reads the matching
+entries. Scores rank retrieval usefulness and do not measure factual
+confidence.
+
+Content changes update the derived index. An older cache builds its index in
+resumable slices through the existing background worker, including when
+community contribution is off. This local work does not capture a task,
+call a model or submit a contribution. While a complete index is unavailable,
+queries return an explicit readiness rejection instead of an empty or
+partially searched corpus. The background work continues without a user
+command or repeated queries; optional retrieval context must not prevent
+an otherwise valid capture from being processed. The existing RPC deadline
+remains unchanged.
+
+The runtime requires SQLite 3.43.0 or newer with FTS5 and
+`contentless_delete` support. The SQLite library used by the selected Python
+interpreter determines this capability; a Python version alone does not.
+
 ## Optional feedback
 
 `knowledge_feedback(ref, rating, reason?)` records one current `up`/`down`
