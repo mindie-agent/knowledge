@@ -459,7 +459,7 @@ class Store:
     # raced entry is requeued, never overwritten with a stale snapshot and
     # never skipped at completion.
 
-    SEARCH_INDEX_VERSION = "fts5-t2"
+    SEARCH_INDEX_VERSION = "fts5-t3"
     SEARCH_BACKFILL_SLICE = 128
 
     _VISIBLE_SQL = (
@@ -481,10 +481,11 @@ class Store:
                 "USING fts5(tokens, content='', contentless_delete=1, "
                 "tokenize=\"unicode61 tokenchars './+:-_'\")"
             )
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as exc:
             raise ValueError(
-                "knowledge search requires SQLite FTS5 support; this SQLite "
-                "build does not provide it"
+                "knowledge search requires SQLite FTS5 with contentless "
+                "delete support (SQLite >= 3.43.0); this runtime provides "
+                f"SQLite {sqlite3.sqlite_version} ({exc})"
             ) from None
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS search_map("
@@ -529,6 +530,18 @@ class Store:
     def _doc_source_text(doc):
         return doc["title"] + "\n" + doc["summary"] + "\n" + doc["content"]
 
+    @classmethod
+    def _doc_state_digest(cls, doc):
+        """Fingerprint of everything the derived rows carry: the indexed
+        text AND the small authoritative conditions metadata.
+
+        A conditions-only upstream change must invalidate a staged snapshot
+        exactly like a body change."""
+        return digest([
+            cls._doc_source_text(doc),
+            canonical(doc["conditions"]),
+        ])
+
     def _index_upsert_doc(self, entry_id, doc):
         """Tokenize and index one entry's visible document. Only used where
         the caller is already on a short local path (fallback when no staged
@@ -539,7 +552,7 @@ class Store:
         text = self._doc_source_text(doc)
         self._index_upsert_tokens(
             entry_id, index_text(text),
-            hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            self._doc_state_digest(doc),
         )
 
     def _index_upsert_tokens(self, entry_id, tokens_text, text_digest):
@@ -710,8 +723,8 @@ class Store:
                 prepared.append((row["entry_id"], None))
                 continue
             doc = json.loads(row["doc"])
+            digest = self._doc_state_digest(doc)
             text = self._doc_source_text(doc)
-            digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
             if existing.get(row["entry_id"]) == digest:
                 continue  # already current: no retokenization, no write
             prepared.append(
@@ -721,12 +734,10 @@ class Store:
         still_racing = []
         with self._write_txn():
             for entry_id, payload in prepared:
-                if payload is None:
-                    self._index_remove(entry_id)
-                    continue
-                tokens_text, digest, conditions_json = payload
-                # Verify against the CURRENT authoritative row before
-                # applying an off-lock derived snapshot.
+                # Both branches verify the snapshot against the CURRENT
+                # authoritative row inside this short transaction: a stale
+                # snapshot never deletes a newer index row and never writes
+                # superseded conditions/metadata.
                 current = self.db.execute(
                     "SELECT doc, feed_active, draft_revision, "
                     "published_revision FROM entries WHERE entry_id=?",
@@ -740,13 +751,33 @@ class Store:
                     or (current["draft_revision"]
                         and not current["published_revision"])
                 )
+                current_doc = json.loads(current["doc"])
+                current_digest = (
+                    self._doc_state_digest(current_doc) if current_visible
+                    else None
+                )
+                have = self.db.execute(
+                    "SELECT text_digest FROM search_map WHERE entry_id=?",
+                    (entry_id,),
+                ).fetchone()
+                if payload is None:
+                    # The snapshot saw it invisible.
+                    if not current_visible:
+                        self._index_remove(entry_id)  # snapshot agrees
+                        continue
+                    if have is not None and have[0] == current_digest:
+                        continue  # the write path already indexed it
+                    # It became visible meanwhile (e.g. a feed switch
+                    # republished it): never let the stale snapshot delete
+                    # anything; the next slice re-reads the current version.
+                    still_racing.append(entry_id)
+                    continue
+                tokens_text, digest, conditions_json = payload
                 if not current_visible:
+                    # It left the visible set meanwhile: a state change, no
+                    # tokenization; the row goes.
                     self._index_remove(entry_id)
                     continue
-                current_doc = json.loads(current["doc"])
-                current_digest = hashlib.sha256(
-                    self._doc_source_text(current_doc).encode("utf-8")
-                ).hexdigest()
                 if current_digest != digest:
                     # The entry moved while we tokenized: discard the stale
                     # derived result; the next slice re-reads the current
@@ -1006,7 +1037,7 @@ class Store:
 
         source_text = self._doc_source_text(doc)
         tokens_text = index_text(source_text)
-        text_digest = hashlib.sha256(source_text.encode("utf-8")).hexdigest()
+        text_digest = self._doc_state_digest(doc)
         now = time.time()
         with self._write_txn():
             if self._row(entry_id) is not None:
@@ -1087,7 +1118,7 @@ class Store:
                 documents.validate(doc)
             source_text = self._doc_source_text(doc)
             tokens_text = index_text(source_text)
-            text_digest = hashlib.sha256(source_text.encode("utf-8")).hexdigest()
+            text_digest = self._doc_state_digest(doc)
             now = time.time()
             with self._write_txn():
                 current = self._row(entry_id)
@@ -1113,7 +1144,8 @@ class Store:
                     (doc["revision"], doc["title"],
                      canonical(doc) if visible else current["doc"], now,
                      canonical(doc["conditions"]) if visible
-                     else current["conditions"], entry_id),
+                     else current["conditions"],
+                     entry_id),
                 )
                 self._write_draft_file(doc)
                 if visible:
@@ -1121,8 +1153,9 @@ class Store:
                     # a feed-active entry the published body keeps the row.
                     self._index_upsert_tokens(entry_id, tokens_text, text_digest)
                 return doc, True
-        raise ValueError(
-            "draft kept changing across bounded retries; append not applied"
+        raise BlockingIOError(
+            "draft kept changing across bounded retries; append not applied "
+            "now (transient contention, resumed by the existing scheduler)"
         )
 
     _NOT_WITHDRAWN = (
@@ -1253,12 +1286,16 @@ class Store:
         published versions win; withdrawn-from-feed entries stay explainable
         but leave the results. Draft overlays on published entries are
         labeled, never a second hit. One SQL join does index MATCH → entry
-        map → current visibility/conditions filtering → rank → LIMIT; only
-        hit headers are read, and no query ever walks, re-sorts or
-        retokenizes the library. While the derived index is being built (old
-        store, version reset, corruption), the call honestly rejects with
+        map → current visibility/conditions filtering → rank → LIMIT, and
+        the response header (title/summary/conditions) is parsed only from
+        the ≤LIMIT hit rows' own visible documents in that same statement —
+        one consistent snapshot, so the header always matches the revision
+        the ref points at. No query ever walks, re-sorts or retokenizes the
+        library. While the derived index is being built (old store, version
+        reset, corruption), the call honestly rejects with
         :class:`IndexNotReady` — a brief transient read-rejection, never a
         fake/partial result set; the outbox worker completes the build.
+        Unrelated SQL errors keep their own class.
         """
         if not isinstance(query, str) or not query.strip() or len(query) > 2000:
             raise ValueError("query must be nonempty text of at most 2000 characters")
@@ -1280,18 +1317,18 @@ class Store:
         if conditions:
             for key, value in conditions.items():
                 # A knowledge entry carrying a conflicting value is excluded;
-                # entries without the key (or non-knowledge kinds) pass. The
-                # JSON path is a bound parameter, never interpolated SQL.
-                path = '$."' + str(key).replace('"', '""') + '"'
+                # entries without the key (or non-knowledge kinds) pass.
+                # Exact key comparison via json_each with bound parameters —
+                # quotes/backslashes in a legal key are data, never escaping.
                 condition_sql += (
-                    " AND NOT (e.kind='knowledge' "
-                    "AND json_extract(e.conditions, ?) IS NOT NULL "
-                    "AND json_extract(e.conditions, ?) != ?)"
+                    " AND NOT (e.kind='knowledge' AND EXISTS ("
+                    "SELECT 1 FROM json_each(e.conditions) AS j "
+                    "WHERE j.key=? AND j.value != ?))"
                 )
-                condition_args.extend([path, path, str(value)])
+                condition_args.extend([key, str(value)])
         sql = (
             "SELECT e.entry_id, e.kind, e.origin, e.feed_active, "
-            "e.draft_revision, e.published_revision, e.conditions, e.doc, "
+            "e.draft_revision, e.published_revision, e.doc, "
             "bm25(search_index) AS rank FROM search_index "
             "JOIN search_map m ON m.docid = search_index.rowid "
             "JOIN entries e ON e.entry_id = m.entry_id "
@@ -1316,10 +1353,26 @@ class Store:
                 rows = self.db.execute(
                     sql, (match, *condition_args, limit),
                 ).fetchall()
-            except sqlite3.OperationalError:
-                # Derived-index corruption: drop only derived data and let
-                # the background worker rebuild; authoritative tables
-                # untouched.
+            except sqlite3.DatabaseError as exc:
+                code = getattr(exc, "sqlite_errorcode", None)
+                detail = str(exc).lower()
+                derived_missing = (
+                    code == sqlite3.SQLITE_ERROR
+                    and "no such table" in detail
+                    and ("search_index" in detail or "search_map" in detail)
+                )
+                if not (
+                    derived_missing or code == sqlite3.SQLITE_CORRUPT_VTAB
+                ):
+                    # Unrelated SQL/runtime/authorization/JSON errors keep
+                    # their real diagnostic classification; they never
+                    # rebuild derived data and never masquerade as readiness.
+                    # (SQLITE_CORRUPT_VTAB surfaces as DatabaseError, not
+                    # OperationalError, in the Python sqlite3 mapping.)
+                    raise
+                # Derived-index structure missing/damaged: drop only derived
+                # data and let the background worker rebuild; authoritative
+                # tables untouched.
                 self._search_reset()
                 raise IndexNotReady(
                     "knowledge search index was reset after a read error and "
@@ -1327,6 +1380,10 @@ class Store:
                 ) from None
             output = []
             for row in rows:
+                # The header comes from the same row's own visible document
+                # in this one statement — a consistent snapshot, no second
+                # read window; a feed-active hit answers with its published
+                # header, not an overlay draft's.
                 doc = json.loads(row["doc"])
                 supplemental = bool(
                     row["feed_active"]
@@ -1334,9 +1391,14 @@ class Store:
                     and row["draft_revision"] != row["published_revision"]
                 )
                 output.append(dict(
-                    ref=self._short_ref(doc["entry_id"], doc["revision"]),
-                    kind=doc["kind"], title=doc["title"],
-                    summary=doc["summary"], conditions=doc["conditions"],
+                    ref=self._short_ref(
+                        row["entry_id"],
+                        row["published_revision"]
+                        if row["feed_active"] else row["draft_revision"],
+                    ),
+                    kind=row["kind"], title=doc["title"],
+                    summary=doc["summary"],
+                    conditions=doc["conditions"],
                     origin=row["origin"], supplemental=supplemental,
                     score=round(-row["rank"], 8),
                 ))
@@ -2381,7 +2443,7 @@ class Store:
 
         source_text = self._doc_source_text(doc)
         tokens_text = index_text(source_text)
-        text_digest = hashlib.sha256(source_text.encode("utf-8")).hexdigest()
+        text_digest = self._doc_state_digest(doc)
         now = time.time()
         with self._write_txn():
             row = self._row(entry_id)

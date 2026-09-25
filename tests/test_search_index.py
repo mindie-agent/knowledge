@@ -15,7 +15,7 @@ from mindie_knowledge.loop.engine import Engine
 from mindie_knowledge.loop.store import IndexNotReady, Store
 from mindie_knowledge.loop.transport import Service, rpc
 from mindie_knowledge.markdown import Document
-from mindie_knowledge.retrieval import lexical_search_streaming
+from retrieval_oracle import lexical_search_streaming
 
 from conftest import make_admission, write_settings
 
@@ -429,3 +429,259 @@ def test_capture_proceeds_while_index_migration_is_pending(tmp_path):
                                                       generation=row["generation"])]
     assert "Cold capture" in titles
     store.close()
+
+
+def _controlled_txn(store, worker_name, entered, release):
+    """Deterministic barrier at the backfill apply transaction."""
+    from contextlib import contextmanager
+
+    original_txn = store._write_txn
+
+    @contextmanager
+    def controlled():
+        if threading.current_thread().name == worker_name:
+            entered.set()
+            if not release.wait(10):
+                raise TimeoutError("test apply barrier not released")
+        with original_txn():
+            yield
+
+    return controlled
+
+
+def test_backfill_apply_never_deletes_a_republished_row(tmp_path):
+    """Snapshot invisible → the entry is republished before apply: the stale
+    removal must not delete the freshly built index row."""
+    store = Store(tmp_path / "case", "test")
+    first = make_entry(entry_id="a" * 64, domain="test", kind="knowledge",
+                       title="Race control", summary="s",
+                       content="RACECONTROL body", conditions={})
+    store.install_feed([first], feed_ident="b" * 64)
+    store.install_feed([], feed_ident="b" * 64)  # withdrawn: invisible
+    store._search_reset()
+    entered, release = threading.Event(), threading.Event()
+    store._write_txn = _controlled_txn(store, "apply-barrier", entered, release)
+    worker = threading.Thread(target=store.advance_search_index,
+                              kwargs={"max_entries": 2}, name="apply-barrier")
+    try:
+        worker.start()
+        assert entered.wait(5)
+        store.install_feed([first], feed_ident="b" * 64)  # visible again
+        release.set()
+        worker.join(10)
+        assert not worker.is_alive()
+    finally:
+        release.set()
+        worker.join(10)
+        store._write_txn = Store._write_txn.__get__(store, Store)
+    while not store.advance_search_index():
+        pass
+    status = store.search_index_status()
+    assert status["complete"] and status["indexed"] == 1 and status["visible"] == 1
+    assert store.query("RACECONTROL")["results"]
+    store.close()
+
+
+def test_backfill_apply_never_overwrites_newer_conditions(tmp_path):
+    """Snapshot conditions=1.0, body unchanged → a feed update moves to 2.0
+    before apply: the stale snapshot must not write the old conditions back
+    and must not be skipped at completion."""
+    store = Store(tmp_path / "case", "test")
+    first = make_entry(entry_id="a" * 64, domain="test", kind="knowledge",
+                       title="Race control", summary="s",
+                       content="RACECONTROL body",
+                       conditions={"package_version": "1.0"})
+    current = make_entry(entry_id="a" * 64, domain="test", kind="knowledge",
+                         title="Race control", summary="s",
+                         content="RACECONTROL body",
+                         conditions={"package_version": "2.0"})
+    store.install_feed([first], feed_ident="b" * 64)
+    store._search_reset()
+    entered, release = threading.Event(), threading.Event()
+    store._write_txn = _controlled_txn(store, "apply-barrier", entered, release)
+    worker = threading.Thread(target=store.advance_search_index,
+                              kwargs={"max_entries": 2}, name="apply-barrier")
+    try:
+        worker.start()
+        assert entered.wait(5)
+        store.install_feed([current], feed_ident="b" * 64)  # conditions 2.0
+        release.set()
+        worker.join(10)
+        assert not worker.is_alive()
+    finally:
+        release.set()
+        worker.join(10)
+        store._write_txn = Store._write_txn.__get__(store, Store)
+    while not store.advance_search_index():
+        pass
+    assert store.search_index_status()["complete"]
+    assert store.get(store.ref(first["entry_id"]))["conditions"] == {
+        "package_version": "2.0"
+    }
+    hits = store.query("RACECONTROL", conditions={"package_version": "2.0"})
+    assert len(hits["results"]) == 1
+    assert store.query("RACECONTROL",
+                       conditions={"package_version": "1.0"})["results"] == []
+    store.close()
+
+
+def test_conditions_exact_key_comparison_for_legal_keys(tmp_path):
+    """Quoted/dotted/backslash condition keys are exact data, never escaping
+    bugs: mismatched values filter the entry out for every key shape."""
+    for index, key in enumerate(("lib.version", 'lib"version', "lib\\version")):
+        store = Store(tmp_path / str(index), "test")
+        try:
+            store.create_draft(
+                kind="knowledge", title="Keyed", summary="sharedneedle",
+                content="sharedneedle body", conditions={key: "1.0"},
+                owner=PRODUCER,
+            )
+            assert store.query("sharedneedle", conditions={key: "2.0"})["results"] == []
+            assert store.query("sharedneedle", conditions={key: "1.0"})["results"]
+        finally:
+            store.close()
+
+
+def test_unrelated_sql_errors_are_not_rebuilt_as_readiness(tmp_path):
+    """An authorizer denial of the bm25() call is a real SQL error, never a
+    readiness state, and never wipes the derived index."""
+    store = Store(tmp_path, "test")
+    try:
+        _corpus(store)
+        assert store.query("rms_norm")["results"]
+        indexed = store.search_index_status()["indexed"]
+        complete = store.search_index_status()["complete"]
+
+        def deny_bm25(action, arg1, arg2, _db, _trigger):
+            # SQLITE_FUNCTION reports the function name as arg2.
+            if action == sqlite3.SQLITE_FUNCTION and arg2 == "bm25":
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        store.db.set_authorizer(deny_bm25)
+        with pytest.raises(sqlite3.OperationalError):
+            store.query("rms_norm")
+        store.db.set_authorizer(None)
+        status = store.search_index_status()
+        assert status["indexed"] == indexed and status["complete"] == complete
+        assert store.query("rms_norm")["results"]  # recovered untouched
+    finally:
+        store.close()
+
+
+def test_query_header_describes_the_published_ref_not_the_draft(tmp_path):
+    """A draft overlay renames the local draft of a feed-active entry, but a
+    query hit returns the published ref: the header must come from the same
+    published document the ref resolves to, never the unpublished draft."""
+    store = Store(tmp_path, "test")
+    try:
+        draft = store.create_draft(
+            kind="knowledge", title="Published title", summary="published summary",
+            content="sharedneedle body", conditions={"v": "1.0"}, owner=PRODUCER,
+        )
+        published = store.get(store.ref(draft["entry_id"]))
+        store.install_feed([published], feed_ident="f" * 64)
+        store.append_observation(
+            draft["entry_id"], "later private note", marker="ab" * 16,
+            producer=PRODUCER,
+            header={"title": "Unpublished rename",
+                    "summary": "unpublished summary"},
+        )
+        # The local overlay really took the new header.
+        overlay = store._row(draft["entry_id"])["draft_revision"]
+        assert overlay != published["revision"]
+        assert store.get(store.ref(draft["entry_id"], overlay))["title"] == (
+            "Unpublished rename"
+        )
+        hits = store.query("sharedneedle")["results"]
+        assert len(hits) == 1
+        hit = hits[0]
+        assert hit["supplemental"] is True
+        resolved = store.get(hit["ref"])
+        assert resolved["revision"] == published["revision"]
+        assert hit["title"] == resolved["title"] == "Published title"
+        assert hit["summary"] == resolved["summary"] == "published summary"
+        assert hit["conditions"] == resolved["conditions"] == {"v": "1.0"}
+    finally:
+        store.close()
+
+
+def test_malformed_conditions_json_is_not_an_index_reset(tmp_path):
+    """A damaged derived conditions column makes json_each raise a plain
+    SQLITE_ERROR ('malformed JSON'): the query preserves that real error and
+    never wipes the healthy derived index."""
+    store = Store(tmp_path, "test")
+    try:
+        store.create_draft(
+            kind="knowledge", title="Keyed", summary="sharedneedle",
+            content="sharedneedle body", conditions={"v": "1.0"}, owner=PRODUCER,
+        )
+        assert store.query("sharedneedle", conditions={"v": "1.0"})["results"]
+        before = store.search_index_status()
+        store.db.execute("UPDATE entries SET conditions='{unclosed'")
+        store.db.commit()
+        with pytest.raises(sqlite3.OperationalError, match="malformed JSON"):
+            store.query("sharedneedle", conditions={"v": "1.0"})
+        after = store.search_index_status()
+        assert after["indexed"] == before["indexed"]
+        assert after["complete"] == before["complete"]
+        # Restoring the derived column restores the query, index untouched.
+        store.db.execute("UPDATE entries SET conditions='{\"v\": \"1.0\"}'")
+        store.db.commit()
+        assert store.query("sharedneedle", conditions={"v": "1.0"})["results"]
+    finally:
+        store.close()
+
+
+class _ExplodingDb:
+    """Delegate everything to the real connection except the FTS MATCH read,
+    which fails with the given prebuilt exception (sqlite errorcode set)."""
+
+    def __init__(self, real, exc):
+        self._real = real
+        self._exc = exc
+
+    def execute(self, sql, *args, **kwargs):
+        if "search_index MATCH" in sql:
+            raise self._exc
+        return self._real.execute(sql, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def test_sqlite_corrupt_vtab_resets_but_other_database_errors_propagate(tmp_path):
+    """SQLITE_CORRUPT_VTAB (267) maps to sqlite3.DatabaseError, not
+    OperationalError: it is the one corruption fact that resets derived data.
+    Any other DatabaseError keeps its class and leaves the index alone."""
+    store = Store(tmp_path, "test")
+    try:
+        _corpus(store)
+        assert store.query("rms_norm")["results"]
+        before = store.search_index_status()
+        assert before["complete"] and before["indexed"] > 0
+
+        real = store.db
+        generic = sqlite3.DatabaseError("database is locked")
+        generic.sqlite_errorcode = sqlite3.SQLITE_BUSY
+        store.db = _ExplodingDb(real, generic)
+        with pytest.raises(sqlite3.DatabaseError, match="database is locked"):
+            store.query("rms_norm")
+        after = store.search_index_status()
+        assert after["indexed"] == before["indexed"] and after["complete"]
+
+        corrupt = sqlite3.DatabaseError("database disk image is malformed")
+        corrupt.sqlite_errorcode = sqlite3.SQLITE_CORRUPT_VTAB
+        store.db = _ExplodingDb(real, corrupt)
+        with pytest.raises(IndexNotReady, match="rebuilt"):
+            store.query("rms_norm")
+        store.db = store.db._real
+        status = store.search_index_status()
+        assert status["indexed"] == 0 and not status["complete"]
+        # Derived-only reset: authoritative rows untouched; worker rebuilds.
+        assert store.db.execute("SELECT count(*) FROM revisions").fetchone()[0] > 0
+        while not store.advance_search_index():
+            pass
+        assert store.query("rms_norm")["results"]
+    finally:
+        store.close()

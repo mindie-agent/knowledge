@@ -40,7 +40,6 @@ from __future__ import annotations
 import re
 import os
 import time
-import hashlib
 from pathlib import Path
 
 from . import documents
@@ -268,7 +267,7 @@ class Feed:
                 self.store.feed_stage_doc(
                     self.ident, commit, path, doc["entry_id"], doc,
                     tokens=index_text(text),
-                    text_digest=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                    text_digest=self.store._doc_state_digest(doc),
                 )
                 staged += 1
         finally:

@@ -314,3 +314,95 @@ def test_live_pid_in_wake_json_does_not_coalesce(tmp_path, monkeypatch):
         live.wait(timeout=2)
     assert result["wake"] == "requested"
     assert spawned
+
+
+def _force_cas_races(store, count):
+    """Make the in-transaction base check see a moved draft ``count`` times."""
+    real_row = store._row
+    races = {"left": count}
+
+    def racing_row(entry_id):
+        if store.db.in_transaction and races["left"] > 0:
+            row = real_row(entry_id)
+            if row is not None and row["draft_revision"]:
+                races["left"] -= 1
+                return dict(row, draft_revision="0" * 64)
+            return row
+        return real_row(entry_id)
+
+    store._row = racing_row
+    return races
+
+
+def test_append_cas_exhaustion_is_transient_not_content_failure(tmp_path):
+    """A normal concurrent draft update that keeps winning the compare race
+    is transient contention, classified for scheduler resume — never an
+    invalid-content failure. The single-call bound of three stays."""
+    store = Store(tmp_path, "test")
+    try:
+        doc = store.create_draft(kind="experience", title="Contended case",
+                                 summary="s", content="base body", owner="a" * 64)
+        races = _force_cas_races(store, 3)
+        with pytest.raises(BlockingIOError):  # an OSError: transient class
+            store.append_observation(doc["entry_id"], "contended observation",
+                                     marker="ab" * 32, producer="a" * 64)
+        assert races["left"] == 0  # exactly the bounded three attempts
+        assert not store.get(store.ref(doc["entry_id"]))["content"].count("concurrent")
+        # Contention over: the same append applies normally, once.
+        store._row = store.__class__._row  # restore the real method binding
+        del store._row  # instance attribute gone
+        updated, appended = store.append_observation(
+            doc["entry_id"], "contended observation", marker="ab" * 32,
+            producer="a" * 64)
+        assert appended
+        again, again_appended = store.append_observation(
+            doc["entry_id"], "contended observation", marker="ab" * 32,
+            producer="a" * 64)
+        assert not again_appended and again["revision"] == updated["revision"]
+    finally:
+        store.close()
+
+
+def test_apply_saved_cas_contention_recovers_via_existing_backoff(tmp_path):
+    """A saved organizer result whose append exhausts the CAS bound resumes
+    through the existing persisted apply backoff — never recorded as a
+    content failure, and applied exactly once after contention clears."""
+    _config, _admission, _project, settings = _ready(tmp_path)
+    store = Store(tmp_path / "root", "test")
+    try:
+        captured = store.add_capture(
+            root_session="root", session="manual-A", turn="t", transcript=None,
+            summary="kept", namespace="codex",
+        )
+        store.mark_capture(captured["id"], "apply-pending", "saved")
+        engine = Engine(store, agent_command=["false"], settings_path=str(settings))
+        attempt = f"organize:{captured['id']}:" + "ab" * 32
+        engine.budget.reserve(attempt, "root", "organize")
+        opaque = store.opaque_for("root")
+        base = store.create_draft(kind="experience", title="Contended saved",
+                                  summary="s", content="base body", owner=opaque)
+        payload = json.dumps({"entries": [
+            dict(entry_id=base["entry_id"], title=None, summary="s",
+                 content="observation one", conditions={}),
+        ]})
+        engine.budget.checkpoint(attempt, payload, "{}")
+        races = _force_cas_races(store, 3)
+        engine._apply_saved(attempt, store.capture_row(captured["id"]))
+        assert store.continuation_reason(captured["id"]) == "apply-transient:1"
+        cont = store.db.execute(
+            "SELECT due, eligible FROM continuations WHERE capture_id=?",
+            (captured["id"],),
+        ).fetchone()
+        assert cont["eligible"] == 1 and cont["due"] > time.time()
+        assert engine.budget.application(attempt)["result"] == payload
+        # The saved result is intact; no entry was half-applied.
+        assert "observation one" not in store.get(store.ref(base["entry_id"]))["content"]
+        # Contention cleared: the same saved result applies exactly once.
+        del store._row
+        engine._apply_saved(attempt, store.capture_row(captured["id"]))
+        assert store.capture_row(captured["id"])["status"] == "organized"
+        body = store.get(store.ref(base["entry_id"]))["content"]
+        assert "observation one" in body
+        assert engine.budget.application(attempt)["result"] is None
+    finally:
+        store.close()

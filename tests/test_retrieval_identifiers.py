@@ -2,7 +2,8 @@
 from pathlib import Path
 
 from mindie_knowledge.markdown import Document
-from mindie_knowledge.retrieval import lexical_search, lexical_search_streaming, tokens
+from mindie_knowledge.retrieval import tokens
+from retrieval_oracle import lexical_search, lexical_search_streaming
 
 
 def test_operator_components_find_qualified_api_without_substring_matching():
