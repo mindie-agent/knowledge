@@ -361,7 +361,8 @@ def test_restore_follows_api_pr_state(tmp_path):
     # Open mismatch: API sha is not refs/pull/5/head. Main still has the body,
     # and the PR ref does too. Either read would resurrect it. The branch is
     # removed first so the dev double cannot replace the API sha with the tip.
-    other = git(["commit-tree", kept + "^{tree}", "-m", "different"], cwd=work)
+    other = git(["-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                 "commit-tree", kept + "^{tree}", "-m", "different"], cwd=work)
     git(["push", "origin", ":refs/heads/" + branch], cwd=work)
     git(["--git-dir", str(bare), "update-ref", "refs/pull/5/head", kept])
     attempt("open", 5, other)
