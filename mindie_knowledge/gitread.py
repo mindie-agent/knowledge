@@ -29,6 +29,38 @@ _MAX_HEADER = 4096
 _READ_CHUNK = 1024 * 1024
 
 
+def with_windows_longpaths(env):
+    """Copy ``env`` and, on Windows, add command-local ``core.longpaths``.
+
+    ``GIT_CONFIG_*`` is process configuration, so it applies to ``clone``
+    before the target repository exists. Existing slots, including
+    hooksPath and credential helpers, stay. Other platforms are unchanged.
+    No git config file is written.
+    """
+    out = {str(key): str(value) for key, value in env.items()}
+    if os.name != "nt":
+        return out
+    try:
+        count = int(out.get("GIT_CONFIG_COUNT", "0"))
+    except ValueError:
+        count = 0
+    if count < 0:
+        count = 0
+    for index in range(count):
+        if out.get(f"GIT_CONFIG_KEY_{index}") == "core.longpaths":
+            return out
+    out["GIT_CONFIG_COUNT"] = str(count + 1)
+    out[f"GIT_CONFIG_KEY_{count}"] = "core.longpaths"
+    out[f"GIT_CONFIG_VALUE_{count}"] = "true"
+    return out
+
+
+def _git_command(argv) -> bool:
+    if not argv:
+        return False
+    return os.path.basename(str(argv[0])).lower() in {"git", "git.exe"}
+
+
 def run_stdout_to_file(argv, target, *, timeout, env=None):
     """Run ``argv`` with stdout redirected to ``target`` (no memory cap).
 
@@ -42,6 +74,8 @@ def run_stdout_to_file(argv, target, *, timeout, env=None):
     if env:
         merged_env.update({str(k): str(v) for k, v in env.items()})
     argv = [str(a) for a in argv]
+    if _git_command(argv):
+        merged_env = with_windows_longpaths(merged_env)
     spawn = {}
     if os.name == "nt":
         spawn["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -120,6 +154,7 @@ class CatFileBatch:
         merged_env = dict(os.environ)
         if env:
             merged_env.update({str(k): str(v) for k, v in env.items()})
+        merged_env = with_windows_longpaths(merged_env)
         spawn = {}
         if os.name == "nt":
             spawn["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP

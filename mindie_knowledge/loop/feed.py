@@ -46,6 +46,17 @@ from . import documents
 from .locks import StartInProgress, StartLock
 from .store import _backoff_seconds, digest
 from mindie_knowledge.community.common import CommunityError, run_argv
+from mindie_knowledge.gitread import with_windows_longpaths
+
+
+def _feed_git_env():
+    """hooksPath suppression, plus Windows long paths before clone exists."""
+    return with_windows_longpaths({
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "core.hooksPath",
+        "GIT_CONFIG_VALUE_0": os.devnull,
+    })
 
 ATTEMPT_SECONDS = 30
 # Repeated discovery failure defers ordinary calls for one hour, the
@@ -99,8 +110,7 @@ class Feed:
             completed = run_argv(
             ["git", "-C", str(self.repo), *args],
                 timeout=min(remaining, 25), max_output=maximum, input_bytes=b"",
-                env={"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_COUNT": "1",
-                     "GIT_CONFIG_KEY_0": "core.hooksPath", "GIT_CONFIG_VALUE_0": os.devnull},
+                env=_feed_git_env(),
             )
         except CommunityError as exc:
             raise OSError(f"bounded git {args[0]} failed: {exc}") from exc
@@ -127,8 +137,7 @@ class Feed:
                 ["git", "clone", "--bare", "--quiet", "--depth=1", "--single-branch",
                  "--branch", self.ref, url, str(self.repo)],
                 timeout=min(remaining, 25), max_output=65536, input_bytes=b"",
-                env={"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_COUNT": "1",
-                     "GIT_CONFIG_KEY_0": "core.hooksPath", "GIT_CONFIG_VALUE_0": os.devnull},
+                env=_feed_git_env(),
             )
         except CommunityError as exc:
             raise OSError(f"bounded git clone failed: {exc}") from exc
@@ -164,8 +173,7 @@ class Feed:
              "--", self.prefix or "."],
             listing_path,
             timeout=max(1.0, deadline - time.monotonic()),
-            env={"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_COUNT": "1",
-                 "GIT_CONFIG_KEY_0": "core.hooksPath", "GIT_CONFIG_VALUE_0": os.devnull},
+            env=_feed_git_env(),
         )
         try:
             records = iter_file_records(listing_path, separator=b"\n")
@@ -237,11 +245,7 @@ class Feed:
                 if path in staged_paths:
                     continue
                 if reader is None:
-                    reader = CatFileBatch(self.repo, env={
-                        "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_COUNT": "1",
-                        "GIT_CONFIG_KEY_0": "core.hooksPath",
-                        "GIT_CONFIG_VALUE_0": os.devnull,
-                    })
+                    reader = CatFileBatch(self.repo, env=_feed_git_env())
                 raw = reader.read(
                     f"{commit}:{self.prefix + '/' if self.prefix else ''}{path}",
                     deadline=deadline, max_bytes=documents.MAX_FILE_BYTES,

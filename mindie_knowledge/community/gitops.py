@@ -22,6 +22,7 @@ from .common import (
     lf_bytes,
     run_argv,
 )
+from mindie_knowledge.gitread import with_windows_longpaths
 
 MAX_GIT_OUTPUT = 256 * 1024
 
@@ -59,7 +60,7 @@ def _is_transient_git_error(detail: str) -> bool:
 # Per-command credential wiring (no global config writes): clear any inherited
 # helper, then delegate to the maintainer's authenticated `gh` CLI. The token
 # itself never appears in argv, URLs or logs.
-GIT_ENV = {
+_GIT_BASE = {
     "GIT_TERMINAL_PROMPT": "0",
     "GIT_CONFIG_COUNT": "3",
     "GIT_CONFIG_KEY_0": "credential.helper",
@@ -69,6 +70,13 @@ GIT_ENV = {
     "GIT_CONFIG_KEY_2": "core.hooksPath",
     "GIT_CONFIG_VALUE_2": os.devnull,
 }
+# Same three slots as before. Windows adds core.longpaths at use time.
+GIT_ENV = _GIT_BASE
+
+
+def _resolve_git_env(env: Mapping[str, str] | None) -> dict[str, str]:
+    """Env for one Git subprocess. Windows long paths are command-local."""
+    return with_windows_longpaths(env if env is not None else _GIT_BASE)
 
 
 def git_env(settings: Mapping[str, Any] | None = None, token_env: str | None = None) -> dict[str, str]:
@@ -78,7 +86,7 @@ def git_env(settings: Mapping[str, Any] | None = None, token_env: str | None = N
     account. Plugin-repo mutations pass ``bot.plugin_token_env`` explicitly so
     the separate plugin credential is used for BOTH git and API calls.
     """
-    env = dict(GIT_ENV)
+    env = _resolve_git_env(None)
     name = token_env or (settings or {}).get("token_env")
     token = os.environ.get(name) if name else None
     if token:
@@ -102,7 +110,7 @@ def _git(
         max_output=MAX_GIT_OUTPUT,
         input_bytes=input_bytes,
         cwd=cwd,
-        env=env or GIT_ENV,
+        env=_resolve_git_env(env),
     )
     if result.timed_out:
         if unknown_on_timeout:
@@ -145,7 +153,7 @@ def checkout_existing(work_dir: Path, branch: str, deadline: Deadline, *, env=No
         timeout=min(DEFAULT_GIT_OP_SECONDS, remaining),
         max_output=MAX_GIT_OUTPUT,
         cwd=work_dir,
-        env=env or GIT_ENV,
+        env=_resolve_git_env(env),
     )
     return result.code == 0
 
@@ -213,7 +221,7 @@ def stage_and_commit(
         timeout=min(DEFAULT_GIT_OP_SECONDS, remaining),
         max_output=4096,
         cwd=work_dir,
-        env=env or GIT_ENV,
+        env=_resolve_git_env(env),
     )
     if diff.code == 0:
         return None
@@ -236,7 +244,7 @@ def _commit(work_dir: Path, message: str, deadline: Deadline, *, env=None) -> No
         max_output=MAX_GIT_OUTPUT,
         input_bytes=message.encode("utf-8"),
         cwd=work_dir,
-        env=env or GIT_ENV,
+        env=_resolve_git_env(env),
     )
     if result.code != 0:
         raise CommunityError(f"git commit failed: {result.err_text.strip()[:300]}")
@@ -262,7 +270,7 @@ def fetch_ref(
         timeout=min(DEFAULT_GIT_OP_SECONDS, remaining),
         max_output=MAX_GIT_OUTPUT,
         cwd=work_dir,
-        env=env or GIT_ENV,
+        env=_resolve_git_env(env),
     )
     if result.timed_out:
         raise TransientError(f"git fetch {ref} timed out")
@@ -314,7 +322,7 @@ def show_file(work_dir: Path, commit: str, path: str, deadline: Deadline, *, env
     """
     from .common import MAX_FILE_BYTES, run_argv as _run
 
-    env = env or GIT_ENV
+    env = _resolve_git_env(env)
     remaining = deadline.step("git show")
     present = _run(
         ["git", "cat-file", "-e", f"{commit}^{{commit}}"],
@@ -372,7 +380,7 @@ def fetch_commit(work_dir: Path, sha: str, deadline: Deadline, *, env=None) -> b
         timeout=min(DEFAULT_GIT_OP_SECONDS, remaining),
         max_output=4096,
         cwd=work_dir,
-        env=env or GIT_ENV,
+        env=_resolve_git_env(env),
     )
     if have.code == 0:
         return True
@@ -381,7 +389,7 @@ def fetch_commit(work_dir: Path, sha: str, deadline: Deadline, *, env=None) -> b
         timeout=min(DEFAULT_GIT_OP_SECONDS, deadline.remaining()),
         max_output=MAX_GIT_OUTPUT,
         cwd=work_dir,
-        env=env or GIT_ENV,
+        env=_resolve_git_env(env),
     )
     return result.code == 0
 
@@ -396,7 +404,7 @@ def is_ancestor(work_dir: Path, old: str, new: str, deadline: Deadline, *, env=N
         timeout=min(DEFAULT_GIT_OP_SECONDS, remaining),
         max_output=MAX_GIT_OUTPUT,
         cwd=work_dir,
-        env=env or GIT_ENV,
+        env=_resolve_git_env(env),
     )
     if result.code == 0:
         return True
@@ -415,7 +423,7 @@ def push_branch(work_dir: Path, branch: str, deadline: Deadline, *, env=None, ca
         timeout=min(DEFAULT_GIT_OP_SECONDS, remaining),
         max_output=MAX_GIT_OUTPUT,
         cwd=work_dir,
-        env=env or GIT_ENV,
+        env=_resolve_git_env(env),
         cancel=cancel,
     )
     if result.timed_out:

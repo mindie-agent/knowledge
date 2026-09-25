@@ -7,16 +7,16 @@ import pytest
 from mindie_knowledge.publication_check import validate
 from mindie_knowledge.loop.documents import make_entry,render_entry
 
-def git(repo,*args):
-    return subprocess.check_output(['git','-C',str(repo),*args],text=True,timeout=10).strip()
+def git(repo,*args,timeout=10):
+    return subprocess.check_output(['git','-C',str(repo),*args],text=True,timeout=timeout).strip()
 
-def publish(tmp_path,files):
+def publish(tmp_path,files,*,add_timeout=10):
     repo=tmp_path/'repo';repo.mkdir()
     git(repo,'init','-q','-b','main')
     git(repo,'config','user.name','check');git(repo,'config','user.email','check@example.invalid')
     for name,text in files.items():
         p=repo/name;p.parent.mkdir(parents=True,exist_ok=True);p.write_text(text,encoding='utf-8',newline='\n')
-    git(repo,'add','.');git(repo,'commit','-qm','publication')
+    git(repo,'add','.',timeout=add_timeout);git(repo,'commit','-qm','publication')
     return repo,git(repo,'rev-parse','HEAD')
 
 def test_empty_repository_metadata_is_valid(tmp_path):
@@ -54,7 +54,7 @@ def test_more_than_1024_entries_validate(tmp_path):
                        title=f'Accumulated case {i}',summary=f'Summary {i}.',
                        content=f'Detailed body of case {i}.')
         files[f'cases/{i:04x}.md']=render_entry(doc)
-    repo,sha=publish(tmp_path,files)
+    repo,sha=publish(tmp_path,files,add_timeout=60)
     result=validate(repo,sha,'vllm-ascend')
     assert result['entries']==1027
 
@@ -196,7 +196,7 @@ def test_checkpoint_binds_the_installed_validator_sources(tmp_path, monkeypatch)
     # Edit one trusted implementation body in the copy (a finder body, as in
     # the probe): version, profile, ids and patterns all stay the same.
     redact_copy = copied / 'redact.py'
-    redact_copy.write_text(redact_copy.read_text() + "\n# tightened finder body\n")
+    redact_copy.write_bytes(redact_copy.read_bytes() + b"\n# tightened finder body\n")
     monkeypatch.setattr(pc, '_PACKAGE_ROOT', copied)
     assert pc._validator_context('npu')['sources'] != original['sources']
     # The old checkpoint is not trusted: the blob is read again (fresh run).
@@ -206,7 +206,7 @@ def test_checkpoint_binds_the_installed_validator_sources(tmp_path, monkeypatch)
     # With the tightened rule actually in force (as a further source edit —
     # in reality the tightened finder lives in the changed bytes), the old
     # checkpoint is again not trusted and the fresh scan rejects.
-    redact_copy.write_text(redact_copy.read_text() + "# tighten policy-canary rule\n")
+    redact_copy.write_bytes(redact_copy.read_bytes() + b"# tighten policy-canary rule\n")
     first = redact_mod.RULES[0]
     tightened = type(first)(
         id=first.id, description=first.description, hint=first.hint,

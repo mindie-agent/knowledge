@@ -29,10 +29,14 @@ import argparse,importlib.metadata,json,os,re,tempfile,time
 from pathlib import Path
 from .community.batch import check_path,validate_feedback
 from .community.common import SCHEMA_FEEDBACK,CommunityError,run_argv,sha256_text
-from .gitread import CatFileBatch,iter_file_records,run_stdout_to_file
+from .gitread import CatFileBatch,iter_file_records,run_stdout_to_file,with_windows_longpaths
 from .loop import documents
 from .loop.documents import MAX_FILE_BYTES,parse_entry
 from .redact import scan_text
+
+def _git_env():
+    return with_windows_longpaths({'GIT_TERMINAL_PROMPT':'0','GIT_CONFIG_COUNT':'1',
+        'GIT_CONFIG_KEY_0':'core.hooksPath','GIT_CONFIG_VALUE_0':os.devnull})
 
 # One bounded validation slice; the host (CI job, CLI caller) bounds the
 # total across automatically continued slices.
@@ -140,8 +144,7 @@ def _git(repo,args,maximum,deadline):
     remaining=deadline-time.monotonic()
     if remaining<=0:raise _SliceExhausted()
     result=run_argv(['git','-C',str(repo),*args],timeout=min(25,remaining),max_output=maximum,input_bytes=b'',
-                    env={'GIT_TERMINAL_PROMPT':'0','GIT_CONFIG_COUNT':'1',
-                         'GIT_CONFIG_KEY_0':'core.hooksPath','GIT_CONFIG_VALUE_0':os.devnull})
+                    env=_git_env())
     if result.timed_out:raise _SliceExhausted()
     if result.code:raise ValueError('Cannot read the candidate Git publication')
     return result.out
@@ -162,8 +165,7 @@ def _validate_slice(repo,revision,domain,state_path,context,verified,stats):
         run_stdout_to_file(
             ['git','-C',str(repo),'ls-tree','-r','-z','--long',revision],
             listing_file,timeout=min(25,max(1.0,deadline-time.monotonic())),
-            env={'GIT_TERMINAL_PROMPT':'0','GIT_CONFIG_COUNT':'1',
-                 'GIT_CONFIG_KEY_0':'core.hooksPath','GIT_CONFIG_VALUE_0':os.devnull})
+            env=_git_env())
         reader=None
         pending=0
         try:
@@ -199,9 +201,7 @@ def _validate_slice(repo,revision,domain,state_path,context,verified,stats):
                 if time.monotonic()>=deadline:
                     raise _SliceExhausted()
                 if reader is None:
-                    reader=CatFileBatch(repo,env={'GIT_TERMINAL_PROMPT':'0','GIT_CONFIG_COUNT':'1',
-                                                  'GIT_CONFIG_KEY_0':'core.hooksPath',
-                                                  'GIT_CONFIG_VALUE_0':os.devnull})
+                    reader=CatFileBatch(repo,env=_git_env())
                 try:
                     blob=reader.read(sha,deadline=deadline,max_bytes=MAX_FILE_BYTES)
                 except TimeoutError:
