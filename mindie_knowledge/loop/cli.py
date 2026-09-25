@@ -250,8 +250,8 @@ def contribution_recovery(config, operation, batch_id):
     stays available after the automatic read budget is exhausted, and
     exhaustion or a lookup failure stays ``unknown``, never magically
     confirmed-failed. ``contribution-retry`` resubmits exactly one PROVEN
-    failed stored payload with ``explicit_retry`` (never an unknown,
-    rebuilt or mutated batch).
+    failed or rejected stored payload with ``explicit_retry`` (never an
+    unknown, rebuilt or mutated batch).
     ``contribution-compact`` removes the sent private payload of a confirmed
     batch. None of these reruns the organizer, resets a capture cursor or
     replays failed model attempts.
@@ -314,9 +314,9 @@ def contribution_recovery(config, operation, batch_id):
             # cap-exhausted rows too. Unknown stays unknown.
             receipt = inspect_batch(batch_id, settings.as_dict(), state_dir)
         else:
-            if row["status"] != "failed":
+            if row["status"] not in ("failed", "rejected"):
                 raise ValueError(
-                    "only a proven failed batch is retried explicitly; an "
+                    "only a proven failed or rejected batch is retried explicitly; an "
                     "uncertain (unknown/unresolved) write is inspected with "
                     "contribution-reconcile, never replayed"
                 )
@@ -453,7 +453,8 @@ def main(argv=None):
     parser.add_argument("--batch",
                         help="Contribution batch id (contribution-* operations only)")
     parser.add_argument("--resume", action="store_true",
-                        help="Explicitly resume deferred remote discovery and exhausted candidates (sync only)")
+                        help="Explicitly resume deferred remote discovery and backed-off "
+                             "candidate validation (sync only)")
     args = parser.parse_args(argv)
     if args.session and args.operation != "diagnostic-status":
         parser.error("--session applies only to diagnostic-status")

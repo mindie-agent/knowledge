@@ -9,6 +9,13 @@ from .store import _upsert_continuation
 MAX_CHECKPOINT_RESULT = 32 * 1024 + 3 * 128
 
 
+# Categories that are one item's own content failure: the attempt is consumed
+# (never replayed) but it must not pause the whole domain's maintenance for
+# other tasks. Shared prerequisites (configuration) and systemic runtime
+# failures still count toward the domain pause circuit.
+CONTENT_FAILURE_CATEGORIES = frozenset({"invalid_result", "output_limit"})
+
+
 class BudgetExceeded(RuntimeError):
     def __init__(self, message, *, retry_at=None):
         super().__init__(message)
@@ -102,13 +109,20 @@ class MaintenanceBudget:
                 "INSERT OR REPLACE INTO state VALUES('maintenance_paused', 'consecutive failures')"
             )
 
-    def finish(self, ident, succeeded):
+    def finish(self, ident, succeeded, *, category=None):
         """Record the outcome. ``succeeded=None`` is a cancellation (sharing
         revoked or shutdown): the attempt is consumed but never counted as a
-        failure toward the pause circuit."""
+        failure toward the pause circuit. A failed attempt carrying a
+        per-item content category (invalid model result, output overflow) is
+        recorded as ``invalid``: it stays consumed and visible, but it does
+        not pause unrelated tasks' maintenance — only shared or systemic
+        failures (configuration, deadline, native, unknown) feed the domain
+        circuit."""
         status = "succeeded" if succeeded else "failed"
         if succeeded is None:
             status = "cancelled"
+        elif not succeeded and category in CONTENT_FAILURE_CATEGORIES:
+            status = "invalid"
         with self.store.lock, self.store.db:
             db = self.store.db
             db.execute(

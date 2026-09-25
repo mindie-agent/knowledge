@@ -274,3 +274,44 @@ def test_interrupted_attempts_count_toward_pause_across_restarts(store):
     restarted.resume()
     with pytest.raises(BudgetExceeded, match='already been attempted'):
         restarted.reserve('crash-0', 'session', 'organize')
+
+
+def test_per_item_content_failures_do_not_pause_the_domain(store):
+    """One task's invalid model result is consumed (never replayed) but must
+    not pause other tasks' maintenance; shared configuration/runtime failures
+    still feed the circuit."""
+    budget = MaintenanceBudget(store)
+    for i in range(3):
+        budget.reserve(f"bad-{i}", f"s{i}", "organize")
+        budget.finish(f"bad-{i}", False, category="invalid_result")
+    assert not budget.status()["paused"]
+    row = store.db.execute(
+        "SELECT status FROM maintenance_attempts WHERE id='bad-0'"
+    ).fetchone()
+    assert row[0] == "invalid"  # consumed and visible, not a circuit failure
+    budget.reserve("good", "sg", "organize")  # other work admitted normally
+    budget.finish("good", True)
+    for i in range(3):
+        budget.reserve(f"cfg-{i}", f"sc{i}", "organize")
+        budget.finish(f"cfg-{i}", False, category="configuration")
+    assert budget.status()["paused"]
+    # An uncategorized failure keeps the conservative shared semantics.
+    assert not MaintenanceBudget(store).resume()["paused"]
+
+
+def test_runner_exit_category_drives_circuit_scope(store, tmp_path):
+    from conftest import write_settings
+
+    settings_path = tmp_path / "community.json"
+    write_settings(settings_path, enabled=True, roots=[tmp_path])
+    command = [sys.executable, "-c", "import sys; sys.exit(65)"]
+    engine = Engine(store, agent_command=command, settings_path=settings_path)
+    for i in range(3):
+        with pytest.raises(RuntimeError, match="category=invalid_result"):
+            engine.agent(dict(role="organize"), attempt_id=f"bad-{i}", root_hash="s")
+    assert not engine.budget.status()["paused"]
+    engine.agent_command = [sys.executable, "-c", "import sys; sys.exit(78)"]
+    for i in range(3):
+        with pytest.raises(RuntimeError, match="category=configuration"):
+            engine.agent(dict(role="organize"), attempt_id=f"cfg-{i}", root_hash="sc")
+    assert engine.budget.status()["paused"]

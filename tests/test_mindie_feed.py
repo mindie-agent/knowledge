@@ -147,24 +147,39 @@ def test_knowledge_needs_no_header_sources_and_versions_can_be_empty(env):
     assert store.query("Grounded")["results"][0]["conditions"] == {}
 
 
-def test_attempts_persist_across_sync_restarts(env, monkeypatch):
+def test_transient_candidate_failure_backs_off_and_recovers(env, monkeypatch):
     git, repo, store, feed = env
     commit_docs(git, repo, [entry_doc("5" * 64, "Flaky candidate")])
-    original = feed._validate_tree
-    monkeypatch.setattr(feed, "_validate_tree",
+    clock = [10000.0]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    original = feed._validate_listing
+    monkeypatch.setattr(feed, "_validate_listing",
                         lambda *a, **k: (_ for _ in ()).throw(OSError("network down")))
-    for expected in (1, 2, 3):
-        assert feed.sync()["status"] == "unavailable"
-        assert store.feed_get(f"feed-candidate:{feed.ident}")["attempts"] == expected
-    # Ordinary scheduled calls never reset the per-candidate attempt budget.
-    assert feed.sync()["status"] == "exhausted"
-    assert feed.sync()["status"] == "exhausted"
-    # An explicit resume grants the transiently exhausted candidate one fresh
-    # bounded round, which ordinary calls then keep consuming.
+    # Attempts are persisted across restarts, and each failure backs the same
+    # candidate off exponentially instead of exhausting permanently.
+    assert feed.sync()["status"] == "unavailable"
+    candidate = store.feed_get(f"feed-candidate:{feed.ident}")
+    assert candidate["attempts"] == 1 and candidate["next_check"] > clock[0]
+    clock[0] += 61
+    assert feed.sync()["status"] == "unavailable"
+    candidate = store.feed_get(f"feed-candidate:{feed.ident}")
+    assert candidate["attempts"] == 2
+    assert candidate["next_check"] >= clock[0] + 119  # backoff grows
+    # While the backoff is due nothing revalidates; this is a deferral with a
+    # persisted next check, never a permanent exhaustion.
+    assert feed.sync()["status"] == "deferred"
+    assert store.feed_get(f"feed-candidate:{feed.ident}")["attempts"] == 2
+    assert feed.sync()["status"] == "deferred"
+    # An explicit resume rechecks immediately, even mid-backoff.
     assert feed.sync(force=True)["status"] == "unavailable"
-    assert store.feed_get(f"feed-candidate:{feed.ident}")["attempts"] == 1
-    monkeypatch.setattr(feed, "_validate_tree", original)
+    assert store.feed_get(f"feed-candidate:{feed.ident}")["attempts"] == 3
+    # Once due, an ordinary sync retries the same candidate and recovers.
+    monkeypatch.setattr(feed, "_validate_listing", original)
+    clock[0] += 241
     assert feed.sync()["status"] == "synced"
+    candidate = store.feed_get(f"feed-candidate:{feed.ident}")
+    assert candidate["status"] == "ok" and candidate["attempts"] == 0
+    assert store.query("Flaky candidate")["results"]
 
 
 def test_invalid_candidate_stays_quarantined_under_resume(env):
@@ -266,3 +281,52 @@ def test_same_commit_refresh_drops_stale_unavailable_recovery_fields(env):
     assert "retained_commit" not in receipt
     hits = store.query("Recovered same commit")["results"]
     assert hits and "Recovered same commit" in store.get(hits[0]["ref"])["title"]
+
+
+def test_interrupted_candidate_resumes_from_staged_progress(env, monkeypatch):
+    """A mid-candidate failure keeps verified per-blob progress: the next
+    attempt continues after the last staged blob, never from item zero."""
+    git, repo, store, feed = env
+    docs = [entry_doc(f"{i:04x}" + "0" * 60, f"Staged case {i}") for i in range(6)]
+    commit = commit_docs(git, repo, docs)
+    from mindie_knowledge import gitread
+
+    reads = []
+    real_read = gitread.CatFileBatch.read
+    fail = {"armed": True}
+
+    def counting_read(self, rev, **kwargs):
+        if fail["armed"] and len(reads) == 3:
+            fail["armed"] = False
+            reads.append(rev)
+            raise OSError("network down mid-candidate")
+        reads.append(rev)
+        return real_read(self, rev, **kwargs)
+
+    monkeypatch.setattr(gitread.CatFileBatch, "read", counting_read)
+    assert feed.sync()["status"] == "unavailable"
+    assert store.feed_staging_count(feed.ident, commit) == 3
+    first_attempt = len(reads)
+    receipt = feed.sync(force=True)  # explicit resume skips the backoff
+    assert receipt["status"] == "synced" and receipt["entries"] == 6
+    # The second attempt read only the three still-unverified blobs: verified
+    # progress was kept, no restart at item zero.
+    assert first_attempt == 4  # three staged, the fourth hit the fault
+    assert len(reads) - first_attempt == 3
+    assert store.feed_staging_count(feed.ident, commit) == 0
+    assert store.query("Staged case 4")["results"]
+
+
+def test_feed_grows_past_1024_entries(env):
+    """No whole-feed count or byte total rejects a growing knowledge base."""
+    git, repo, store, feed = env
+    # Distinct leading hex so the entry-id-derived filenames do not collide.
+    docs = [entry_doc(f"{i:04x}" + "0" * 60, f"Accumulated case {i}") for i in range(1026)]
+    commit_docs(git, repo, docs)
+    receipt = feed.sync()
+    assert receipt["status"] == "synced", receipt.get("detail")
+    assert receipt["entries"] == 1026
+    assert store.query("Accumulated case 1000")["results"]
+    assert store.get(store.ref(f"{1025:04x}" + "0" * 60))["title"] == "Accumulated case 1025"
+    # And the same corpus revalidates as unchanged without restaging.
+    assert feed.sync()["status"] == "unchanged"

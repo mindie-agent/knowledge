@@ -4,7 +4,9 @@ Design inherits all nine [VAWS / MindIE Agent principles](https://github.com/min
 
 Local domain knowledge and experience loop for MindIE Agent: bounded capture from admitted tasks, optional community sharing through Git, and read-only retrieval from the canonical Git publication.
 
-Use `mindie-knowledge` from the `mindie-knowledge` Python package (Python 3.11+). The module namespace is `mindie_knowledge`.
+Use `mindie-knowledge` from the `mindie-knowledge` Python package (Python 3.11+).
+The interpreter's SQLite must be 3.43.0 or newer with FTS5 and
+`contentless_delete` support. The module namespace is `mindie_knowledge`.
 
 ```sh
 python -m pip install -e .
@@ -15,8 +17,12 @@ mindie-knowledge sync --config domain.json
 
 See [the runtime contract](docs/mindie-loop.md) for configuration, the capture
 gate, bounded transcript increments, drafts and revisions, optional feedback,
-contribution batches and feed sync. A Harness provides the model runner; the
-[Codex plugin](https://github.com/mindie-agent/mindie-agent-codex) and independent [Kimi plugin](https://github.com/mindie-agent/mindie-agent-kimi) own native identity, record parsing and MCP dispatch. Kimi lifecycle acceptance is still in progress.
+automatic contribution delivery and feed sync. A Harness provides the model
+runner; the [Codex plugin](https://github.com/mindie-agent/mindie-agent-codex),
+[Kimi plugin](https://github.com/mindie-agent/mindie-agent-kimi) and
+[Claude Code plugin](https://github.com/mindie-agent/mindie-agent-cc) own native
+identity, record parsing and MCP dispatch. Component checks and native
+end-to-end acceptance are reported separately in each adapter repository.
 
 ## Boundaries
 
@@ -24,6 +30,7 @@ contribution batches and feed sync. A Harness provides the model runner; the
 - Entries have stable opaque IDs and internally computed content revisions. Upstream deletion withdraws an entry; cached pinned reads explicitly identify historical material. Local drafts update by append-only observations and never restore withdrawn content.
 - Harness adapters expose `knowledge_query`, `knowledge_explain` and optional `knowledge_feedback`; each adapter verifies native task identity and the core rechecks its shared admission grant. Feedback is fully optional up/down with an optional one-line reason; there is no judge and no voting weight.
 - Raw task records stay with the user's Harness. Only redaction-scanned canonical entry Markdown and vote files ever reach the contribution staging directory.
+- Temporary publication or sync failures recover through the existing background worker with persisted backoff. Packaging and submission do not call a model, and recovery never replays an organizer attempt. Confirmed submissions retain minimal receipts; the current remote PR or upstream main provides the published body.
 - The core uses the shared `mindie-diagnostics` component directly for bounded local failure logs and incident references; automatic fault reporting has its own explicit consent, separate from community contribution.
 
 ## Development

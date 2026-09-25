@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import queue
 import re
@@ -26,9 +27,18 @@ SCHEMA_CONFIG = "mindie-community-config/1"
 SCHEMA_ENTRY = "mindie-entry/2"
 
 MAX_DETAIL = 800
-MAX_BATCH_FILES = 200
-MAX_FILE_BYTES = 128 * 1024
-MAX_BATCH_BYTES = 2 * 1024 * 1024
+# The per-file envelope is the real external platform rejection point, not a
+# business cap and not GitHub's 50 MiB warning: GitHub actually rejects
+# ordinary Git files exceeding 100 MiB. Canonical content files stay plain
+# text; no LFS.
+MAX_FILE_BYTES = 100 * 1024 * 1024
+# One batch is a bounded in-memory publish operation. This is a SOFT
+# multi-record grouping budget: a flush packs as many pending records as fit
+# and the rest wait for the next automatic batch — but a single
+# platform-legal document with its required JSON overhead always goes
+# through, even when it alone exceeds this budget. The envelope chunks
+# groups; it never rejects one supported file.
+MAX_BATCH_BYTES = 128 * 1024 * 1024
 MAX_TITLE = 240
 MAX_VOTE_REASON = 1000
 
@@ -38,19 +48,50 @@ DEFAULT_GIT_OP_SECONDS = 60
 DEFAULT_API_OP_SECONDS = 30
 
 
+def finite_epoch(value: Any) -> float | None:
+    """Unix seconds, or None. Bool, NaN and infinity are not a delay."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value):
+        return None
+    return float(value)
+
+
 class CommunityError(Exception):
     """A deterministic, user-visible failure. Detail must stay secret-free."""
 
-    def __init__(self, detail: str, *, status: str = "failed"):
+    def __init__(self, detail: str, *, status: str = "failed", retry_at: float | None = None):
         super().__init__(detail[:MAX_DETAIL])
         self.status = status
+        self.retry_at = finite_epoch(retry_at)
+
+
+class TransientError(CommunityError):
+    """An environment failure before the outcome was uncertain.
+
+    Raised for timeouts (outside the uncertain-write window) and network-shaped
+    refusals: nothing was durably changed by this attempt, so the publication
+    records ``unavailable`` — not ``failed`` — and the caller retries the same
+    stored operation with persisted backoff once the environment recovers.
+    Authentication/authorization refusals and content rejections are never
+    transient: they stay terminal and visible instead of being retried.
+    ``retry_at`` is an optional absolute epoch; persistence takes the later of
+    this and any due time it already stored.
+    """
+
+    def __init__(self, detail: str, *, retry_at: float | None = None):
+        super().__init__(detail, status="unavailable", retry_at=retry_at)
 
 
 class UnknownOutcome(CommunityError):
-    """A remote write was attempted but its result cannot be confirmed."""
+    """A remote write was attempted but its result cannot be confirmed.
 
-    def __init__(self, detail: str):
-        super().__init__(detail, status="unknown")
+    ``retry_at`` only delays the next read-only reconciliation. It is not
+    permission to repeat the write.
+    """
+
+    def __init__(self, detail: str, *, retry_at: float | None = None):
+        super().__init__(detail, status="unknown", retry_at=retry_at)
 
 
 def canonical(value: Any) -> str:

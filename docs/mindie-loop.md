@@ -15,9 +15,10 @@ config indirection is rejected, not aliased.
 canonical project_root inside the configured scope`. The shared settings file
 is re-read before transcript reading, before every model spawn and before any
 outbound write. When community contribution is off — the default — there is no
-automatic capture, extraction or sanitization at all: the Hook short-circuits,
-no capture row/cursor/draft/worker/model exists, and only read-only retrieval,
-plugin updates and knowledge sync keep working. Disabling mid-task cancels
+automatic capture, extraction or sanitization at all: the Hook short-circuits
+and creates no capture, cursor, draft or organizer call. Read-only retrieval,
+plugin updates and knowledge sync keep working; an existing service or local
+retrieval cache does not imply capture is enabled. Disabling mid-task cancels
 queued and running maintenance, the idle batch timer and unsent batches; it
 never deletes drafts or published data, and re-enabling never backfills the
 disabled period.
@@ -83,8 +84,13 @@ self-contained observation to that draft, deduplicated by the increment
 marker. Corrections append to the body and update the current retrieval header;
 previous pinned revisions remain unchanged. Context selection includes recent
 correction tails and matches task-owned headers to the current material.
-Bodies are capped at 64 KiB (`draft full` stops expansion — no
-auto-condense or extra model).
+A saved organizer result that hits a transient local/remote read failure is
+applied later with persisted backoff (no model replay, no terminal attempt
+count); only deterministic content failures park dormant. Bodies grow by
+accumulated observations with no cumulative business cap; the only size bound
+is the real per-file platform envelope (GitHub rejects ordinary files beyond
+100 MiB), which parks just that entry's append as `draft full` while keeping
+the checkpointed material.
 
 For explicit local historical experiments, `python -m
 mindie_knowledge.loop.history plan --source FILE --session-id ID --output DIR`
@@ -127,6 +133,30 @@ entry/revision prefixes (`mindie://<domain>/<entry>@<revision>`, full hashes
 only on the rare collision) and always read the exact historical body;
 ambiguous prefixes fail instead of guessing.
 
+### Local retrieval index
+
+The existing `store-v3.sqlite3` contains a derived FTS5 index. Entries and
+their revisions remain authoritative; the index does not store a second
+copy of the body. Tokenization retains qualified identifiers, their aliases
+and Chinese bigrams. Search uses the index, filters current visibility and
+knowledge conditions before limiting results, then reads the matching
+entries. Scores rank retrieval usefulness and do not measure factual
+confidence.
+
+Content changes update the derived index. An older cache builds its index in
+resumable slices through the existing background worker, including when
+community contribution is off. This local work does not capture a task,
+call a model or submit a contribution. While a complete index is unavailable,
+queries return an explicit readiness rejection instead of an empty or
+partially searched corpus. The background work continues without a user
+command or repeated queries; optional retrieval context must not prevent
+an otherwise valid capture from being processed. The existing RPC deadline
+remains unchanged.
+
+The runtime requires SQLite 3.43.0 or newer with FTS5 and
+`contentless_delete` support. The SQLite library used by the selected Python
+interpreter determines this capability; a Python version alone does not.
+
 ## Optional feedback
 
 `knowledge_feedback(ref, rating, reason?)` records one current `up`/`down`
@@ -137,33 +167,62 @@ opaque root ID. Votes recorded while sharing is off stay local
 (`publishable=0`) and are never backfilled; a vote while off also never wakes
 capture or the outbox.
 
-## Contribution batches
+## Automatic contribution delivery
 
 One coalescing outbox per domain: the idle timer (default 300 s from the
 settings file; task deactivation flushes early) packs every changed draft
 revision and unbatched publishable vote into a single `mindie-contribution/1`
 batch — canonical entry Markdown under `cases/`/`topics/`, one
 `feedback/*.json` — staged as already-scanned bytes in a private staging
-directory. Core calls `mindie_knowledge.community.submit_batch` /
+directory. A batch is an internal delivery record, not a user-managed unit or
+an extra approval step. One flush is one bounded in-memory operation (per-flush envelope);
+material beyond it waits for the next automatic batch after this one
+resolves, never dropped and never user-managed. A final per-entry outbound
+scan quarantines exactly an unsafe entry instead of blocking the batch.
+Local packaging failures are classified: content rejections stay quarantined
+per entry; transient local failures (disk, interrupted process) persist a
+backoff `next_check` and resume automatically once due — a crash can never
+permanently consume unbatched material.
+
+Core calls `mindie_knowledge.community.submit_batch` /
 `reconcile_batch` and records the receipt; when the community package is not
-installed while sharing is enabled, batches fail loudly as `unavailable`
-(a dependency failure, never a fake success). Failed/unknown batch revisions
-are never automatically rewritten; unknown outcomes get bounded read-only
-reconciliation before any new work. The model is never involved in batching,
+installed while sharing is enabled, batches are marked `unavailable`
+(a dependency failure, never a fake success) and resubmitted by the outbox
+worker once the install recovers. Unknown outcomes get one bounded read-only
+reconciliation per scheduler opportunity with a persisted backoff — no
+permanent exhaustion latch; confirmation requires the exact expected head or
+Git ancestry proof that the expected commit reached our PR (the head may
+have advanced after a lost response). A proven closed-unmerged PR is
+`rejected`: exactly that batch's entries are quarantined out of future
+automatic batches (their local drafts stay readable), never resurrected by a
+new PR, while unrelated material keeps flowing on a fresh branch. Failed
+revisions are never automatically resent; `unavailable` (transient
+environment) revisions are resubmitted with persisted backoff. An update's
+expected base comes only from confirmed per-entry send receipts, and a
+remote body that moved (bot/maintainer edits) receives only the
+not-yet-confirmed observation blocks — the current remote body, header
+included, stays authoritative. The model is never involved in batching,
 commit messages or PR text.
 
 ## Knowledge sync
 
-`sync --config` is standalone and model-free (30 s per attempt, 3 attempts
-per candidate persisted across restarts): it follows the configured content
-repository branch as an immutable Git commit, validates the complete
-candidate tree (canonical layout under `cases/`+`topics/`, sizes, UTF-8/LF,
-schema, revisions, domain) and switches
-atomically. A valid empty tree empties ordinary search (withdrawal is
-upstream deletion); an
+`sync --config` is standalone and model-free (30 s per attempt): it follows
+the configured content repository branch as an immutable Git commit,
+validates the candidate tree (canonical layout under `cases/`+`topics/`,
+per-file platform envelope, UTF-8/LF, schema, revisions, domain) and switches
+atomically. There is no whole-feed entry-count or total-byte cap: blobs are
+read one at a time through a bounded persistent `git cat-file --batch`
+process, and each verified blob is checkpointed against the exact candidate
+commit, so an attempt that hits the deadline resumes after the last staged
+blob — never restarting at item zero — and the visible feed switches in one
+short local transaction only after the candidate completes. Transient
+failures persist a backoff `next_check` and are retried automatically once
+due; a structurally incompatible candidate stays quarantined against its
+immutable commit; a bad candidate always keeps the old cache. A valid empty
+tree empties ordinary search (withdrawal is upstream deletion); an
 unsupported old layout (e.g. `corpus/`) fails loudly instead of looking like
-an empty feed; a bad candidate always keeps the old cache. Sync works with
-community contribution off and never starts the maintenance service.
+an empty feed. Sync works with community contribution off and never starts
+the maintenance service.
 
 ## MCP surface
 
@@ -171,7 +230,11 @@ Native MCP dispatch belongs to the harness adapters; the former core MCP host
 shim (bound to Codex-only turn metadata) is retired. Core keeps the
 authenticated loopback RPC the adapters forward to (`query`, `explain`,
 `feedback`, `capture`), each still bound to a verified per-call identity and
-re-checked against the admission store.
+re-checked against the admission store. Bodies are no longer size-capped by a
+business limit, so `explain` paginates long content by default (8 Ki
+characters per page, explicit `limit` up to 32 Ki characters) using the
+existing `offset`/`limit` shape with `content_offset`, `content_length` and
+`next_offset` continuations — a per-call wire budget, not a document cap.
 
 ## Commands
 
@@ -191,9 +254,10 @@ mindie-knowledge contribution-compact --config domain.json --batch ID
 
 The contribution operations are deterministic and model-free: inspect is
 read-only (loop outbox + community ledger); reconcile runs the bounded
-read-only remote inspection and updates both stores (available even after the
-automatic read budget is exhausted); retry resubmits exactly one confirmed
-failed stored payload with `explicit_retry` (unknown outcomes are refused); compact removes the
+read-only remote inspection and updates both stores (always available;
+automatic checks are spaced by persisted backoff, never exhausted); retry
+resubmits exactly one confirmed failed or rejected stored payload with
+`explicit_retry` (unknown outcomes are refused); compact removes the
 sent private payload (draft bodies/history, raw capture summaries, staging)
 of a confirmed batch while keeping IDs, hashes, the retrieval header and
 PR/head receipts. None of them reruns the organizer, resets a capture cursor
@@ -218,15 +282,24 @@ due, an ordinary sync discovers again, and a successful discovery clears
 the transient failure count. State persisted before this deferral existed
 carries no due time and is retried immediately. An operator may run
 `mindie-knowledge sync --config CONFIG --resume` to skip the deferral and
-to grant a transiently exhausted candidate one fresh bounded round. This
+to recheck a backed-off candidate now. This
 does not replay failed model work or revalidate an invalid candidate:
 incompatible content stays quarantined against its immutable commit.
 
 Content CI invokes the pinned installed package with
 `python -I -m mindie_knowledge.publication_check --repo CHECKOUT --revision SHA`.
-The validator reads immutable Git blobs, accepts an empty publication, and
-checks canonical documents, feedback, file modes, sizes and private-data
-findings. Candidate repository Python is never imported or executed.
+The validator reads immutable Git blobs through one bounded persistent
+`git cat-file --batch` process, accepts an empty publication, and checks
+canonical documents, feedback, file modes, the real per-file platform
+envelope and private-data findings — with no whole-publication file-count or
+total-byte cap and no fixed whole-tree metadata cap (the listing streams
+through a scratch file). Verified results checkpoint per path, bound to the
+exact commit and the exact validation context (domain, pinned validator
+version, privacy-rule set, schemas); a normal call advances in bounded slices
+and auto-continues within the invocation, never restarting a large fixed
+commit at item zero and never asking the caller to rerun. `--state FILE`
+overrides the default scratch checkpoint in the candidate repo's Git dir.
+Candidate repository Python is never imported or executed.
 
 ### Pre-release format boundary
 
@@ -243,18 +316,28 @@ non-replayable within this format.
 
 ## Confirmed payload cleanup and idle updates
 
-Confirmation requires a matching remote PR head. Exhausted read-only
-reconciliation leaves an uncertain write `unknown`, preserving inspection
-material and preventing blind replay. Automatic cleanup removes exactly the
-sent draft payload and staging. Capture summaries are cleared only when all
-recorded entry-and-revision references are covered by that confirmed batch;
-newer unsent and ambiguous observations remain available.
+Confirmation requires a matching remote PR head or Git ancestry proof that
+the expected commit reached our PR. Uncertain writes stay `unknown`,
+preserving inspection material and preventing blind replay; persisted backoff
+spaces the read-only checks without ever latching. Automatic cleanup removes
+exactly the sent draft payload and staging. Capture summaries are cleared only
+when all recorded entry-and-revision references are covered by that confirmed
+batch; newer unsent and ambiguous observations remain available.
 
-Tiny per-entry receipts retain the confirmed head, path, hash, revision,
-PR and contribution generation independently of the latest coalescing batch.
+Tiny per-entry receipts are sending history: the content identity actually
+committed (as reported by the publisher, which can differ from the candidate
+payload after a bot/maintainer merge edit), the cumulative confirmed
+observation-marker set, the confirmed head, path, revision, PR and
+contribution generation — kept independently of the latest coalescing batch.
 After A is sent and compacted, a later B-only batch does not erase A's
-receipt. A future A update retrieves the exact prior remote body once before
-appending. Normal organizer context includes the compacted entry's retained
+receipt. A future A update checks the linked PR's actual state and re-reads
+the current upstream main body after a merge, or the verified upstream PR
+head while it is open, and appends only there. Squash and rebase merges use
+the same rule. Closed-unmerged PRs are not restored. A cached published body
+or retained contribution branch cannot prove that a remote entry still
+exists; an old confirmed head is never reseeded over a remote correction, and
+confirmed marker identities prevent re-attaching a submitted observation the
+remote removed. Normal organizer context includes the compacted entry's
 title, summary and sent revision with an empty excerpt, restricted to the same
 task and contribution generation. Reading this header neither fetches the
 body nor makes it a pending draft; restoration happens only when the organizer

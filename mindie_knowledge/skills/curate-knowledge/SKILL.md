@@ -10,7 +10,7 @@ Experience is a detailed observation or method from a task. Neither is an
 execution instruction or a permission grant.
 
 The optional `conditions` header contains only observed software versions or
-source commit IDs; leave it empty when unknown. Hardware, topology,
+source commit IDs; omit it when no such facts were recorded. Hardware, topology,
 configuration, shape, seed, epsilon, device mapping, tolerances and validation
 limits belong in the detailed body. Preserve those details without duplicating
 them as header fields or inventing missing versions.
@@ -24,7 +24,7 @@ anymore; do not invent them.
 | Surface | Who | Live entry | Not this |
 | --- | --- | --- | --- |
 | Ordinary query / explain / feedback | The current admitted task | MCP `knowledge_query`, `knowledge_explain`, `knowledge_feedback` | Maintenance APIs, publication |
-| Background organization | The domain service after Stop | Already-running loop service; bounded queue and budget | A second user-facing model turn |
+| Background organization | The domain service after an admitted Stop | Durable notification and authorized worker wake; bounded increments | A second user-facing model turn |
 | Maintenance (status, gaps, resume) | An explicit maintenance task | `status`, `sharing-status`, `maintenance-resume` CLI | Scanning unrelated tasks or transcripts |
 
 Discovery, install, or reading this file does not activate the plugin, start
@@ -33,7 +33,7 @@ the knowledge service, or authorize a public contribution.
 ## Ordinary use (not this skill)
 
 - `knowledge_query(query, limit?, conditions?)` — search visible entries. Published revisions win; `supplemental: true` marks a private draft overlay.
-- `knowledge_explain(ref, offset?, limit?)` — exact body for one `mindie://<domain>/<id>[@<revision>]` reference, including an explicit historical/withdrawn flag for entries removed from the feed.
+- `knowledge_explain(ref, offset?, limit?)` — a body page for one `mindie://<domain>/<id>[@<revision>]` reference, with a historical/withdrawn flag for removed entries. Use `next_offset` for more content when needed; `null` means the body is complete. The default page is 8,192 characters, with an explicit limit up to 32,768.
 - `knowledge_feedback(ref, rating, reason?)` — optional up/down with an optional one-line reason. Never required; silence is not a signal; there is no follow-up form.
 
 Calls are bound to the host's per-call task metadata; a host that does not
@@ -53,9 +53,11 @@ python -m mindie_knowledge sync --config domain.json
 
 Statuses to read precisely: sharing `disabled`/unconfigured; `coverage gap`
 (failed transcript regions are consumed and skipped, never silently reread);
-`draft full` (64 KiB body envelope reached; expansion stops, no auto-condense);
-`unknown`/`unavailable` outbox receipts (publication outcome unresolved or the
-community package missing — reconcile, never blindly resend); `pending scope`
+`draft full` (the ordinary-file publication platform limit was reached;
+checkpointed material remains, with no automatic condensing or model replay);
+`unknown` (the existing worker queries remote state before any further write);
+`unavailable` (a temporary environment failure, retried automatically with
+persisted backoff and no organizer replay); `pending scope`
 when a lease's project root is outside the configured roots.
 
 The pause circuit (three consecutive model failures) lifts only through

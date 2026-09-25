@@ -17,7 +17,6 @@ and never backfills the disabled period after re-enable.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import queue
 import threading
@@ -30,7 +29,7 @@ from . import settings as settings_mod
 from .activation import activation_epoch
 from .budget import BudgetExceeded, MaintenanceBudget
 from .dfx import failure
-from .documents import DraftFull
+from .documents import MAX_FILE_BYTES, DraftFull
 from .process import MaintenanceCancelled, bounded_run
 from .store import Store, canonical, digest, new_identity, session_key
 
@@ -50,6 +49,14 @@ class AdmissionUnreadable(Exception):
 
 class CursorConflict(Exception):
     """The shared cursor moved. Do not call the model or count a failure."""
+
+
+class RestoreUnavailable(OSError):
+    """The current remote body could not be read (network/IO environment).
+
+    A saved apply resumes it with persisted backoff — it is never a
+    deterministic content refusal (those return False) and never a reason to
+    replay the organizer."""
 
 
 def mask_text(text):
@@ -242,6 +249,7 @@ class Engine:
         self.budget.reserve(attempt_id, root_hash, payload.get("role", "organize"))
         outcome = False
         started = False
+        category = None
         try:
             self._gate_live()
             if gate is not None:
@@ -261,6 +269,9 @@ class Engine:
                     raise ValueError("structured result exceeds the 32 KiB limit")
                 self._validate_organize(result)
             except (ValueError, UnicodeError, TypeError) as exc:
+                # A malformed result is this item's content failure, not a
+                # shared maintenance problem.
+                category = "invalid_result"
                 failure(
                     "organizer.result",
                     stage="validate",
@@ -278,12 +289,18 @@ class Engine:
                 self.budget.abandon_unstarted(attempt_id)
                 outcome = "abandoned"
             raise
+        except (RuntimeError, TimeoutError, ValueError, OSError) as exc:
+            if category is None:
+                category = getattr(exc, "mindie_category", None)
+            raise
         finally:
             # A validated result stays 'running' until the caller checkpoints
             # it. Finishing success here would drop the output on an apply crash.
             # An unstarted admission or cursor conflict is abandoned, not failed.
+            # A per-item content failure stays consumed but does not feed the
+            # domain pause circuit.
             if outcome is not True and outcome != "abandoned":
-                self.budget.finish(attempt_id, outcome)
+                self.budget.finish(attempt_id, outcome, category=category)
 
     @staticmethod
     def _validate_organize(result):
@@ -370,9 +387,32 @@ class Engine:
             ident, "cursor-conflict", _PARTIAL_LIMIT, dormant_reason="cursor-conflict",
         )
 
-    def _defer_apply(self, ident):
-        """Keep a saved result and wait. Do not poll it again on the next tick."""
+    def _defer_apply(self, ident, *, transient=False):
+        """Keep a saved result and wait. Never calls the organizer.
+
+        A transient environment failure (local IO, remote read) resumes with
+        persisted exponential backoff and no terminal attempt count — a saved
+        valid result is not abandoned because the environment was down.
+        A deterministic content failure is checked finitely, then parks
+        dormant: it cannot heal without new content, and it is never a
+        network probe."""
         reason = self.store.continuation_reason(ident) or ""
+        if transient:
+            try:
+                count = (
+                    int(reason.split(":", 1)[1])
+                    if reason.startswith("apply-transient:")
+                    else 0
+                )
+            except ValueError:
+                count = 0
+            count += 1
+            self.store.schedule_continuation(
+                ident,
+                due=time.time() + min(3600.0, 60.0 * 2.0 ** min(count - 1, 6)),
+                reason=f"apply-transient:{count}", eligible=1,
+            )
+            return
         if reason == "apply-pending":
             count = 0
         else:
@@ -628,79 +668,103 @@ class Engine:
         observation appends to/updates the prior body instead of replacing it
         with only the new paragraph.
 
-        Addressed by the per-entry last-confirmed receipt (independent of the
-        newest lineage outbox row): exact confirmed head, path, hash and sent
-        revision. The fetched body must match the retained hash AND parse
-        back to the same entry identity and sent revision. Any mismatch or
-        failure simply keeps the update refused — no base is ever fabricated,
-        a withdrawn entry is never resurrected and a maintainer correction is
-        never overwritten (the retained hash stays the honest expected base).
+        Submitted content obeys the linked PR's actual state. A merged PR,
+        including one accepted by squash or rebase, is read from upstream
+        main only. An open PR is read only from the upstream PR ref whose
+        fetched SHA is the API head. A closed unmerged PR is not restored.
+        The synced feed is a local cache of an earlier read; it does not
+        prove the current remote body and cannot override a withdrawal.
+        A deterministic refusal keeps the update refused (False); an
+        environment or linkage read failure raises :class:`RestoreUnavailable`
+        so the saved apply resumes with persisted backoff. No base is ever
+        fabricated, a withdrawn entry is never resurrected and a maintainer
+        correction is never overwritten.
         """
         def fail(reason):
             self._error(f"restore: {reason}"[:240])
             return False
 
-        if self.community is None or not generation:
+        if not generation:
             return fail("community unavailable")
         receipt = self.store.sent_receipt(entry_id)
         if not receipt or receipt.get("generation") not in (generation, None):
             return fail("no matching receipt")
-        head_sha = receipt.get("head_sha")
+        if self.community is None:
+            return fail("community unavailable")
         path = receipt.get("path")
-        expected_hash = receipt.get("sha256")
-        expected_revision = receipt.get("sent_revision")
-        if not head_sha or not path or not expected_revision:
+        if not path:
             return fail("incomplete receipt")
         settings = self._settings()
         if not settings.allows_capture() or not settings.repository:
             return fail("capture disabled")
-        last = None
+        from mindie_knowledge.community.common import CommunityError
+
         try:
             from mindie_knowledge.community import gitops
             from mindie_knowledge.community.common import Deadline
-            from mindie_knowledge.community.publish import _remote_url
+            from mindie_knowledge.community.publish import (
+                _contribution_head, _remote_url, _valid_sha,
+            )
+            from mindie_knowledge.community.transport import transport_from_settings
 
             from .documents import parse_entry
 
             cfg = settings.as_dict()
-            write_repo = cfg.get("fork") or settings.repository
+            read_repo = settings.repository
+            number = self._pr_number(receipt.get("pr_url"))
+            if number is None:
+                return fail("incomplete receipt")
             deadline = Deadline(cfg.get("transaction_seconds", 120), 30,
                                 cancel=self._cancel)
             env = gitops.git_env(cfg)
+            pr = transport_from_settings(cfg, self.state_dir).get_pull_request(
+                read_repo, number, deadline
+            )
+            if not _contribution_head(pr, cfg):
+                return fail("PR head is not the configured contribution")
+            if pr.get("state") == "closed" and not pr.get("merged"):
+                return fail("closed unmerged PR is not restored")
+            if pr.get("state") != "open" and not pr.get("merged"):
+                raise CommunityError("PR state is unreadable")
+            # Upstream is the content remote. The fork is only a push target.
             work_dir = gitops.ensure_clone(
-                _remote_url(cfg, write_repo),
-                self.state_dir / "git" / write_repo.replace("/", "_"),
+                _remote_url(cfg, read_repo),
+                self.state_dir / "git" / read_repo.replace("/", "_"),
                 deadline, env=env,
             )
-            if not gitops.fetch_commit(work_dir, head_sha, deadline, env=env):
-                last = "commit fetch refused"
-                number = self._pr_number(receipt.get("pr_url"))
-                if number is None:
-                    last = "commit fetch refused and no PR"
-                else:
-                    try:
-                        fetched = gitops.fetch_pr_head(
-                            work_dir, number, "", deadline, env=env
-                        )
-                        if fetched != head_sha:
-                            last = "pr head mismatch"
-                    except Exception as exc:
-                        last = f"{type(exc).__name__}: {exc}"
-            # Clone of main may already hold the receipt head even when a
-            # SHA fetch is refused; show the exact commit either way.
-            raw = gitops.show_file(work_dir, head_sha, path, deadline, env=env)
+            if pr.get("merged"):
+                source = f"origin/{settings.branch}"
+            else:
+                api_sha = (pr.get("head") or {}).get("sha")
+                if not _valid_sha(api_sha):
+                    raise CommunityError("open PR has no valid head SHA")
+                fetched = gitops.fetch_pr_head(
+                    work_dir, number, "", deadline, env=env,
+                    remote_url=_remote_url(cfg, read_repo),
+                )
+                if fetched.lower() != str(api_sha).lower():
+                    raise CommunityError("upstream PR ref does not match the API head")
+                source = fetched
+            raw = gitops.show_file(work_dir, source, path, deadline, env=env)
             if raw is None:
-                return fail(last or "missing blob at receipt head")
+                return fail(f"no blob at {source}")
             normalized = raw.encode("utf-8").replace(b"\r\n", b"\n").replace(b"\r", b"\n")
-            if len(normalized) > 128 * 1024:
-                return fail("blob exceeds limit")
-            if expected_hash and hashlib.sha256(normalized).hexdigest() != expected_hash:
-                return fail("hash mismatch")
-            doc = parse_entry(normalized)
-            if doc["entry_id"] != entry_id or doc["revision"] != expected_revision:
-                return fail("entry or revision mismatch")
+            if len(normalized) > MAX_FILE_BYTES:
+                return fail("blob exceeds the per-file platform envelope")
+            try:
+                doc = parse_entry(normalized)
+            except ValueError:
+                return fail(f"blob at {source} is not a canonical entry")
+            if doc["entry_id"] != entry_id:
+                return fail(f"blob at {source} is a different entry")
             self.store.restore_draft(entry_id, doc, generation=generation)
             return True
+        except RestoreUnavailable:
+            raise
+        except (OSError, TimeoutError, CommunityError) as exc:
+            raise RestoreUnavailable(
+                f"current remote body unreadable: {type(exc).__name__}: {exc}"
+            ) from exc
         except Exception as exc:
             return fail(f"{type(exc).__name__}: {exc}")
 
@@ -791,7 +855,7 @@ class Engine:
         except AdmissionUnreadable:
             # The body stays. A later due continuation retries the apply.
             if row and row.get("id"):
-                self._defer_apply(row["id"])
+                self._defer_apply(row["id"], transient=True)
             return
         except MaintenanceCancelled as exc:
             self.budget.release_application(
@@ -811,6 +875,7 @@ class Engine:
         marker = attempt_id.split(":", 2)[2]
         opaque = self.store.opaque_for(row["root_session"])
         blocked = False
+        transient = False
         for entry in payload.get("entries", []):
             entry_id = entry.get("entry_id")
             if entry_id in done:
@@ -825,8 +890,16 @@ class Engine:
             except DraftFull:
                 blocked = True
                 items.append(dict(entry_id=entry_id, state="blocked", cause="draft-full"))
-                notes.append("draft full")
+                notes.append("draft full: the per-file platform envelope is reached")
+            except OSError as exc:
+                # Environment failure (local IO, remote body read): resume
+                # with persisted backoff; never counted as a content failure.
+                blocked = True
+                transient = True
+                items.append(dict(entry_id=entry_id, state="blocked", cause="apply-transient"))
+                notes.append(str(exc)[:200])
             except ValueError as exc:
+                # Deterministic content failure: parked after finite checks.
                 blocked = True
                 items.append(dict(entry_id=entry_id, state="blocked", cause="apply-failed"))
                 notes.append(str(exc)[:200])
@@ -838,7 +911,7 @@ class Engine:
                 capture_id=row["id"], capture_status="apply-pending",
                 capture_detail=detail,
             )
-            self._defer_apply(row["id"])
+            self._defer_apply(row["id"], transient=transient)
             return
         self.budget.complete_application(
             attempt_id, canonical(receipt), capture_id=row["id"],
@@ -889,6 +962,25 @@ class Engine:
             except ValueError as exc:
                 notes.append(str(exc)[:200])
         return refs, notes
+
+    def _optional_refs(self, masked, notes):
+        """Optional retrieval context for the organizer payload.
+
+        Only an explicit index-not-ready state skips the refs: the authorized
+        increment is still organized normally. Any other query error still
+        propagates to the failure path — nothing is silently swallowed and no
+        material is consumed by a missing index.
+        """
+        from .store import IndexNotReady
+
+        try:
+            return [
+                hit["ref"]
+                for hit in self.store.query(masked[:2000], limit=5)["results"]
+            ]
+        except IndexNotReady:
+            notes.append("retrieval index not ready; organized without optional refs")
+            return []
 
     def _process(self, ident):
         row = self.store.capture_row(ident)
@@ -974,10 +1066,7 @@ class Engine:
                 ),
                 existing_drafts=self.store.draft_headers(
                     owner=opaque, generation=row["generation"], query=masked),
-                retrieved_refs=[
-                    hit["ref"]
-                    for hit in self.store.query(masked[:2000], limit=5)["results"]
-                ],
+                retrieved_refs=self._optional_refs(masked, notes),
             )
             # Keep the new evidence intact; older optional context yields first
             # when UTF-8 headers would exceed the worker envelope.
@@ -1068,7 +1157,7 @@ class Engine:
             except Exception as exc:
                 self._unexpected("knowledge.capture", "apply", exc)
                 if row.get("id"):
-                    self._defer_apply(row["id"])
+                    self._defer_apply(row["id"], transient=True)
         finally:
             self.end_work()
 
@@ -1202,6 +1291,7 @@ class Engine:
             batch_row["batch_id"], receipt.get("status", "unknown"),
             attempted=True, detail=receipt.get("detail", ""),
             pr_url=receipt.get("pr_url"), head_sha=receipt.get("head_sha"),
+            actual_files=receipt.get("files"), retry_at=receipt.get("retry_at"),
         )
         if receipt.get("status") in Store_confirmed:
             # The GitHub branch is now the durable body source: drop the sent
@@ -1222,6 +1312,7 @@ class Engine:
             batch_row["batch_id"], receipt.get("status", "unknown"),
             detail=receipt.get("detail", ""), pr_url=receipt.get("pr_url"),
             head_sha=receipt.get("head_sha"),
+            actual_files=receipt.get("files"), retry_at=receipt.get("retry_at"),
         )
         if receipt.get("status") in Store_confirmed:
             self.store.compact_confirmed(batch_row["batch_id"])
@@ -1256,6 +1347,16 @@ class Engine:
                         )
                         self._cancel.clear()
                 self._generation = generation
+                # Local read-only index maintenance: runs even with community
+                # contribution off (no capture/model/publication), in bounded
+                # resumable slices, off the query path.
+                if not self._is_frozen() and self.begin_work():
+                    try:
+                        self.store.advance_search_index()
+                    except Exception as exc:
+                        self._unexpected("knowledge.index", "tick", exc)
+                    finally:
+                        self.end_work()
                 if generation is not None and not self._is_frozen():
                     for row in self.store.outbox_unresolved()[:2]:
                         if self._is_frozen():
@@ -1263,6 +1364,17 @@ class Engine:
                         if self.store.reconcile_due(row["batch_id"]) and self.begin_work():
                             try:
                                 self._reconcile(row)
+                            finally:
+                                self.end_work()
+                    # Transient send failures resume automatically with
+                    # persisted backoff: the stored batch payload is retried,
+                    # never rebuilt from scratch and never silently dropped.
+                    for row in self.store.outbox_unavailable()[:2]:
+                        if self._is_frozen():
+                            break
+                        if self.store.retry_due(row["batch_id"]) and self.begin_work():
+                            try:
+                                self._submit(row)
                             finally:
                                 self.end_work()
                     for row in self.store.outbox_pending()[:2]:
