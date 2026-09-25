@@ -15,9 +15,10 @@ config indirection is rejected, not aliased.
 canonical project_root inside the configured scope`. The shared settings file
 is re-read before transcript reading, before every model spawn and before any
 outbound write. When community contribution is off — the default — there is no
-automatic capture, extraction or sanitization at all: the Hook short-circuits,
-no capture row/cursor/draft/worker/model exists, and only read-only retrieval,
-plugin updates and knowledge sync keep working. Disabling mid-task cancels
+automatic capture, extraction or sanitization at all: the Hook short-circuits
+and creates no capture, cursor, draft or organizer call. Read-only retrieval,
+plugin updates and knowledge sync keep working; an existing service or local
+retrieval cache does not imply capture is enabled. Disabling mid-task cancels
 queued and running maintenance, the idle batch timer and unsent batches; it
 never deletes drafts or published data, and re-enabling never backfills the
 disabled period.
@@ -142,14 +143,15 @@ opaque root ID. Votes recorded while sharing is off stay local
 (`publishable=0`) and are never backfilled; a vote while off also never wakes
 capture or the outbox.
 
-## Contribution batches
+## Automatic contribution delivery
 
 One coalescing outbox per domain: the idle timer (default 300 s from the
 settings file; task deactivation flushes early) packs every changed draft
 revision and unbatched publishable vote into a single `mindie-contribution/1`
 batch — canonical entry Markdown under `cases/`/`topics/`, one
 `feedback/*.json` — staged as already-scanned bytes in a private staging
-directory. One flush is one bounded in-memory operation (per-flush envelope);
+directory. A batch is an internal delivery record, not a user-managed unit or
+an extra approval step. One flush is one bounded in-memory operation (per-flush envelope);
 material beyond it waits for the next automatic batch after this one
 resolves, never dropped and never user-managed. A final per-entry outbound
 scan quarantines exactly an unsafe entry instead of blocking the batch.
