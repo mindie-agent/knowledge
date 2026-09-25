@@ -29,15 +29,20 @@ POSIX_CHILD = pytest.mark.skipif(
 
 
 def test_show_file_preserves_legal_body_above_256kib(tmp_path):
+    import hashlib
     git(["init", "-q"], cwd=tmp_path)
     body = "Local fixture body.\n" * 20000
-    assert len(body.encode()) > 256 * 1024
-    (tmp_path / "large.md").write_text(body)
+    raw = body.encode("utf-8")
+    assert len(raw) > 256 * 1024
+    (tmp_path / "large.md").write_bytes(raw)
     git(["add", "large.md"], cwd=tmp_path)
     git(["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
          "commit", "-q", "-m", "Local legal blob"], cwd=tmp_path)
     head = git(["rev-parse", "HEAD"], cwd=tmp_path)
-    assert gitops.show_file(tmp_path, head, "large.md", Deadline(30, 10)) == body
+    shown = gitops.show_file(tmp_path, head, "large.md", Deadline(30, 10))
+    assert type(shown) is str
+    assert len(shown) == len(body)
+    assert hashlib.sha256(shown.encode("utf-8")).hexdigest() == hashlib.sha256(raw).hexdigest()
     assert gitops.show_file(tmp_path, head, "missing.md", Deadline(30, 10)) is None
     assert gitops.show_file(tmp_path, "b" * 40, "large.md", Deadline(30, 10)) is None
 
