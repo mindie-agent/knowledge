@@ -243,7 +243,6 @@ mindie-knowledge serve --config domain.json      # foreground service
 mindie-knowledge status --config domain.json     # live or local read-only status
 mindie-knowledge sharing-status --config domain.json
 mindie-knowledge sync --config domain.json       # one bounded knowledge sync
-mindie-knowledge maintenance-resume --config domain.json
 mindie-knowledge stop --config domain.json
 mindie-knowledge hook --config domain.json       # Stop envelope on stdin
 mindie-knowledge contribution-inspect --config domain.json --batch ID

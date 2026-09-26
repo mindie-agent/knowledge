@@ -93,7 +93,7 @@ def test_authorization_has_no_wallclock_expiry(tmp_path):
     assert Admission(path).active_lease("manual-A")
 
 
-def test_claim_consumes_exactly_once_and_finish_drives_circuit(tmp_path):
+def test_claim_consumes_exactly_once_and_finish_is_diagnostic_only(tmp_path):
     path = make_admission(tmp_path, project_root=tmp_path)
     gate = Admission(path)
     token = admission_token(path)
@@ -105,20 +105,18 @@ def test_claim_consumes_exactly_once_and_finish_drives_circuit(tmp_path):
         gate.claim("manual-A", "hook", "x", token="forged")
     gate.finish("manual-A", token, False)
     gate.finish("manual-A", token, False)
-    gate.finish("manual-A", token, True)  # valid success resets while healthy
+    gate.finish("manual-A", token, True)  # a valid success resets the counter
     assert gate.active_lease("manual-A")["failures"] == 0
-    for _ in range(3):
+    for _ in range(5):
         gate.finish("manual-A", token, False)
-    assert gate.active_lease("manual-A") is None  # circuit paused
-    # Success never unpauses at >=3, and activate is not a bypass either.
-    gate.finish("manual-A", token, True)
-    paused = gate.activate("manual-A", project_root=str(tmp_path))
-    assert paused["enabled"] is False and paused["paused"] is True
-    assert paused["failures"] >= 3
-    assert gate.active_lease("manual-A") is None
-    with pytest.raises(ValueError):
-        gate.claim("manual-A", "hook", "y", token=token)  # resolve fails closed
-    # Explicit recovery: revoke, then a fresh activation.
+    # Failure counts never pause or revoke the binding: claims and capture
+    # authorization keep working and a repeat activate preserves the token.
+    assert gate.active_lease("manual-A")["failures"] == 5
+    assert gate.claim("manual-A", "hook", "update:0.9.0", token=token) is True
+    again = gate.activate("manual-A", project_root=str(tmp_path))
+    assert again["token"] == token and again["enabled"] is True
+    assert gate.capture_authorization("manual-A", token, timeout=0.1)["state"] == "admitted"
+    # Explicit revoke still rotates the token on the next fresh activation.
     gate.deactivate("manual-A")
     fresh = gate.activate("manual-A", project_root=str(tmp_path))
     assert gate.active_lease("manual-A")["failures"] == 0

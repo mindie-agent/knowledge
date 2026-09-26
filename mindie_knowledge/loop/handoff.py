@@ -141,7 +141,7 @@ def _required_schema(db):
 
 
 def _accept_row(db, *, namespace, root_hash, session, turn, transcript, summary,
-                generation, boundary, scope, epoch, paused, kind, event_key):
+                generation, boundary, scope, epoch, kind, event_key):
     _required_schema(db)
     floor = float(db.execute(
         "SELECT value FROM meta WHERE key='capture_floor'"
@@ -149,27 +149,17 @@ def _accept_row(db, *, namespace, root_hash, session, turn, transcript, summary,
     boundary = max(boundary, floor)
     db.execute("BEGIN IMMEDIATE")
     try:
-        held = "maintenance-paused" if paused else None
         result = commit_capture(
             db, namespace=namespace, root_session=root_hash, session=session,
             turn=turn, transcript=transcript, summary=summary,
             generation=generation, boundary=boundary, scope=scope,
-            activation_epoch=epoch, hold=held, kind=kind, event_key=event_key,
+            activation_epoch=epoch, kind=kind, event_key=event_key,
         )
         db.commit()
         return result
     except Exception:
         db.rollback()
         raise
-
-
-def _paused(db):
-    try:
-        return db.execute(
-            "SELECT 1 FROM state WHERE key='maintenance_paused'"
-        ).fetchone() is not None
-    except sqlite3.Error as exc:
-        raise SchemaNotReady() from exc
 
 
 def _probe(config, timeout):
@@ -486,9 +476,6 @@ def accept_stop(config_path, event):
         )
     if auth["state"] == "inactive":
         return _result(stage="inert", reason="not-activated", summary_dropped=dropped)
-    if auth["state"] == "paused":
-        return _result(stage="rejected", reason="admission-paused", summary_dropped=dropped,
-                       recovery="Task admission is paused. Diagnose it, then deactivate and activate. This Stop was not captured.")
     if auth["state"] == "schema":
         return _result(stage="rejected", reason="admission-schema", summary_dropped=dropped)
     if not settings.in_scope(auth["scope"]):
@@ -511,7 +498,6 @@ def accept_stop(config_path, event):
     db.row_factory = sqlite3.Row
     try:
         try:
-            paused = _paused(db)
             activated = auth.get("activated_at")
             boundary = max(
                 settings.enabled_at or 0,
@@ -521,7 +507,7 @@ def accept_stop(config_path, event):
                 db, namespace=harness, root_hash=session_key(auth["root_session"]),
                 session=session, turn=turn, transcript=transcript, summary=summary,
                 generation=settings.generation, boundary=boundary, scope=auth["scope"],
-                epoch=auth["epoch"], paused=paused, kind=kind, event_key=event_key,
+                epoch=auth["epoch"], kind=kind, event_key=event_key,
             )
         except SchemaNotReady:
             _record(config, stage="accept", cause="schema-not-ready", event=event_id)
@@ -570,15 +556,6 @@ def accept_stop(config_path, event):
         stage_name = "accepted-local"
     else:
         stage_name = "accepted-local"
-    if paused:
-        return _result(
-            stage="accepted-local", capture_id=capture_id, duplicate=duplicate,
-            wake="not-requested", reason="maintenance-paused", summary_dropped=dropped,
-            recovery=(
-                "Shared maintenance is paused. Run maintenance-resume. This "
-                "capture was recorded and the model was not called."
-            ),
-        )
     state = "unknown"
     if time.monotonic() < deadline:
         state = _probe(config, min(0.15, max(0.05, deadline - time.monotonic())))

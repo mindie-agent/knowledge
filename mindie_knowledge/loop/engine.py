@@ -7,7 +7,16 @@ later content is appended as a marker-deduplicated, self-contained
 observation. The input region is durably reserved BEFORE the model spawns,
 so every outcome — failure, crash, cancellation — consumes it; attempted and
 successful cursors are separate and failed regions stay visible as coverage
-gaps. Nothing here replays failed work.
+gaps.
+
+A region that failed with an explicit deadline and has no saved result gets
+exactly one delayed background recovery (at most two model attempts per
+region in total, the counter persisted across restarts). The recovery
+re-reads the SAME source range with the SAME transcript identity and
+verifies the recorded end offset and content digest before any model call;
+an unverifiable or again-failing recovery keeps a locatable, non-complete
+gap while other captures and new material continue. Successful regions are
+never re-organized and saved results are never re-applied.
 
 Sharing revocation is live: the outbox/idle thread rereads the shared
 settings file about once a second; disabling (or replacing) the configuration
@@ -41,6 +50,9 @@ MAX_INPUT = 64 * 1024
 SUMMARY_FIELD = 4096
 _EOF_SETTLE_LIMIT = 3
 _PARTIAL_LIMIT = 4
+# One delayed recovery attempt for a deadline-failed region; the persisted
+# per-region counter, not wall time, bounds the total model attempts to two.
+GAP_RECOVERY_DELAY = 300.0
 
 
 class AdmissionUnreadable(Exception):
@@ -151,10 +163,8 @@ class Engine:
                 cwd=None, harness=""):
         """Admit one Stop event into the capture table.
 
-        Community off short-circuits before any row. A paused maintenance
-        circuit still records the turn and holds it until explicit resume;
-        it does not drop the event. The Stop hook commits through the same
-        identity before it talks to this process.
+        Community off short-circuits before any row. The Stop hook commits
+        through the same identity before it talks to this process.
         """
         settings = self._settings()
         if not settings.allows_capture():
@@ -165,7 +175,7 @@ class Engine:
                         reason="no adapter admission is configured; identity unknown")
         lease = self.admission.active_lease(session_id)
         if lease is None:
-            return dict(status="skipped", reason="session is not manually active")
+            return dict(status="skipped", reason="session is not bound; invoke the entry once")
         if not lease.get("capture_schema"):
             return dict(status="skipped",
                         reason="adapter lease store predates the capture schema")
@@ -173,7 +183,6 @@ class Engine:
         if not scope or not settings.in_scope(scope):
             return dict(status="skipped",
                         reason="the lease's project root is outside the authorized scope")
-        paused = self.budget.status()["paused"]
         root_session = lease.get("root_session") or session_id
         root_hash = session_key(root_session)
         activated_at = lease.get("activated_at")
@@ -192,9 +201,8 @@ class Engine:
             generation=settings.generation, boundary=boundary, scope=scope,
             namespace=namespace,
             activation_epoch=activation_epoch(lease["token"]),
-            hold="maintenance-paused" if paused else None,
         )
-        if captured.get("revoked") or paused:
+        if captured.get("revoked"):
             return captured
         if captured["status"] in {"queued", "pending", "deferred"}:
             try:
@@ -982,14 +990,155 @@ class Engine:
             notes.append("retrieval index not ready; organized without optional refs")
             return []
 
+    def _recover_gap(self, row, region_id):
+        """The one permitted delayed recovery of a deadline-failed region.
+
+        Re-reads exactly the failed source range with the recorded transcript
+        identity and verifies the persisted end offset and content digest
+        before any model call — never the live cursor and never new material.
+        A second failure (or an unverifiable source) leaves a locatable,
+        non-complete gap; other captures continue.
+        """
+        ident = row["id"]
+        region = self.store.gap_region(region_id)
+        if region is None:
+            self.store.mark_capture(
+                ident, "failed", "gap recovery region is missing; gap retained"
+            )
+            return
+        if region["status"] != "failed":
+            # Already resolved (or cancelled) elsewhere: resume normal flow.
+            self.store.defer_capture(
+                ident, due=time.time(), reason="gap already resolved; continuing",
+            )
+            return
+
+        def keep_gap(detail):
+            detail = f"{detail}; gap retained at [{region['start']},{region['finish']})"
+            self.store.finish_region(region_id, "failed", detail[:1000])
+            self.store.mark_capture(ident, "failed", detail[:1000])
+
+        try:
+            self._revalidate(row)
+        except AdmissionUnreadable:
+            self.store.schedule_continuation(
+                ident, due=time.time() + 60,
+                reason=f"gap-recovery:{region_id}", eligible=1,
+            )
+            return
+        except MaintenanceCancelled as exc:
+            self.store.mark_capture(ident, "cancelled", str(exc)[:500])
+            return
+        parser = self.transcript
+        if parser is None or not row["transcript"]:
+            keep_gap("gap recovery requires the original transcript")
+            return
+        key = str(Path(row["transcript"]).resolve(strict=False))
+        if key != region["file_identity"]:
+            keep_gap("gap recovery source path changed")
+            return
+        expected = None
+        if region.get("identity"):
+            expected = parser.FileIdentity.unserialize(region["identity"], key)
+            if expected is None:
+                keep_gap("persisted transcript identity is unusable")
+                return
+        scan = int(region["finish"]) - int(region["start"])
+        budgets = {}
+        if scan >= 1024:
+            budgets["max_scan_bytes"] = min(scan, 64 * 1024 * 1024)
+        inc = parser.read_material(
+            row["transcript"], int(region["start"]),
+            session_id=row["session"], not_before=row["boundary"],
+            expected=expected, **budgets,
+        )
+        if (
+            inc.get("status") != "ok"
+            or inc.get("end") != region["finish"]
+            or inc.get("digest") != region["digest"]
+            or not str(inc.get("text") or "").strip()
+        ):
+            keep_gap("gap recovery could not verify the same source range")
+            return
+        masked, rules = mask_text(inc["text"])
+        notes = ["bounded deadline-gap recovery"]
+        if rules:
+            notes.append("pre-model redaction: " + ", ".join(rules))
+        if not masked.strip():
+            keep_gap("recovery increment fully redacted")
+            return
+        opaque = self.store.opaque_for(row["root_session"])
+        marker = (inc.get("digest") or region["digest"])[:64]
+        payload = dict(
+            role="organize", domain=self.store.domain, increment=masked,
+            coverage=dict(
+                summary_only=False, notes=notes,
+                gaps=len(self.store.coverage_gaps(key)),
+                ranges=inc.get("coverage", []),
+                start=inc.get("start"), end=inc.get("end"),
+                more=inc.get("more", False),
+            ),
+            existing_drafts=self.store.draft_headers(
+                owner=opaque, generation=row["generation"], query=masked),
+            retrieved_refs=self._optional_refs(masked, notes),
+        )
+        while payload["existing_drafts"] and len(canonical(payload).encode()) > MAX_INPUT:
+            payload["existing_drafts"].pop()
+        attempt_id = f"organize:{ident}:{marker}:recover"
+        try:
+            result = self.agent(
+                payload, attempt_id=attempt_id,
+                root_hash=row["root_session"],
+                gate=lambda: self._revalidate(row),
+            )
+        except BudgetExceeded as exc:
+            if exc.retry_at is not None:
+                self.store.schedule_continuation(
+                    ident, due=exc.retry_at,
+                    reason=f"gap-recovery:{region_id}", eligible=1,
+                )
+                return
+            keep_gap(f"gap recovery exhausted ({exc})")
+            return
+        except AdmissionUnreadable:
+            self.store.schedule_continuation(
+                ident, due=time.time() + 60,
+                reason=f"gap-recovery:{region_id}", eligible=1,
+            )
+            return
+        except CursorConflict:
+            self.store.schedule_continuation(
+                ident, due=time.time() + 8,
+                reason=f"gap-recovery:{region_id}", eligible=1,
+            )
+            return
+        except MaintenanceCancelled as exc:
+            self.store.mark_capture(ident, "cancelled", str(exc)[:500])
+            return
+        except (RuntimeError, TimeoutError, ValueError, OSError) as exc:
+            keep_gap(f"gap recovery failed again ({type(exc).__name__})")
+            return
+        try:
+            self._revalidate(row)  # again before applying any result
+        except AdmissionUnreadable:
+            self._checkpoint_result(
+                attempt_id, result, {"region_id": region_id}, inc, False, notes, row,
+            )
+            return
+        except MaintenanceCancelled as exc:
+            self.store.mark_capture(ident, "cancelled", str(exc)[:500])
+            return
+        self._checkpoint_result(
+            attempt_id, result, {"region_id": region_id}, inc, False, notes, row,
+            apply=True,
+        )
+        self.last_activity = time.monotonic()
+
     def _process(self, ident):
         row = self.store.capture_row(ident)
         if row is None:
             return
         if row["status"] not in {"queued", "pending", "deferred"}:
-            return
-        if self.budget.status()["paused"]:
-            self.store.dormant_capture(ident, reason="maintenance-paused")
             return
         settings = self._settings()
         if not settings.allows_capture():
@@ -1007,6 +1156,10 @@ class Engine:
             self.store.mark_capture(
                 ident, "discarded", "no maintenance runner is configured"
             )
+            return
+        reason = self.store.continuation_reason(ident) or ""
+        if reason.startswith("gap-recovery:"):
+            self._recover_gap(row, reason.split(":", 1)[1].strip())
             return
         region = {}
         try:
@@ -1133,6 +1286,17 @@ class Engine:
                 return
             if region.get("region_id"):
                 self.store.finish_region(region["region_id"], "failed", detail)
+                if (
+                    getattr(exc, "mindie_category", None) == "deadline"
+                    and row.get("transcript")
+                    and self.store.schedule_gap_recovery(
+                        region["region_id"], due=time.time() + GAP_RECOVERY_DELAY
+                    )
+                    is not None
+                ):
+                    # The gap keeps one delayed recovery: the capture stays
+                    # pending on its gap-recovery continuation, not failed.
+                    return
             self.store.mark_capture(ident, "failed", detail)
 
     # ---------------------------------------------------------------- worker

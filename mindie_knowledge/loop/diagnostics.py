@@ -88,9 +88,9 @@ _DELIVERY_RECOVERY = {
     ),
     "worker-unavailable": (
         "The service process is up but its worker is not consuming. Do not "
-        "start a second service. Pending rows remain. Run maintenance-resume "
-        "only for a paused maintenance circuit. A healthy query does not "
-        "apply or republish the pending row."
+        "start a second service. Pending rows remain and resume through the "
+        "normal service start. A healthy query does not apply or republish "
+        "the pending row."
     ),
     "wake-failed": (
         "The capture row is durable. Inspect startup status. The next real "
@@ -345,10 +345,9 @@ def _store(config, session, result):
     try:
         db = _ro(path)
         tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        paused = bool(db.execute("SELECT 1 FROM state WHERE key='maintenance_paused'").fetchone())
         counts = {table: db.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
                   for table in ("captures", "outbox")}
-        result["maintenance"] = dict(status="paused" if paused else "ok", scope="shared", paused=paused, counts=counts)
+        result["maintenance"] = dict(status="ok", scope="shared", counts=counts)
         if "maintenance_attempts" in tables:
             result["maintenance"]["calls_last_hour"] = db.execute(
                 "SELECT count(*) FROM maintenance_attempts WHERE started>?", (time.time() - 3600,)
@@ -436,10 +435,11 @@ def snapshot(config_path, *, session=None):
         result["delivery"] = dict(status="unavailable", error_class=error_class(exc))
     if result["delivery"].get("status") == "unresolved" and result["delivery"].get("recovery"):
         result["hints"].append(result["delivery"]["recovery"])
-    if result["admission"].get("status") == "paused":
-        result["hints"].append("Task admission is paused. Diagnose and fix its cause before explicit deactivate/reactivate; consumed attempts are not replayed.")
-    if result["maintenance"].get("paused"):
-        result["hints"].append("Shared maintenance is paused. Diagnose and fix its cause before explicit maintenance-resume; failed input is not replayed.")
+    if result["admission"].get("failures"):
+        result["hints"].append(
+            "This task recorded consecutive failures. They are diagnostic only: "
+            "the binding stays valid and the existing background paths keep recovering."
+        )
     if result["contributions"]:
         result["hints"].append("Use this task's contributions batch_id for recover inspect; reconcile unknown writes before any explicit retry.")
     if result["startup"].get("status") == "failed":

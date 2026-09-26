@@ -6,6 +6,14 @@ model and before any outbound write — so flipping ``enabled`` or bumping
 ``generation`` takes effect without restarting anything. Missing, malformed or
 unconfigured state fails **closed** for capture and contribution, but never
 blocks read-only retrieval, plugin updates or knowledge sync.
+
+This file is the one persistent installation-level choice. A saved explicit
+value (enabled or disabled) never expires: not on restart, upgrade, fork,
+network failure or failure counts. Its honest state is reported distinctly —
+``unconfigured``, ``missing``, ``unreadable``, ``corrupt``, ``disabled`` or
+``enabled`` — so a damaged file is never treated as a never-configured
+installation (no fresh onboarding) and a missing one is never treated as an
+explicit opt-out.
 """
 
 from __future__ import annotations
@@ -99,13 +107,19 @@ def normalize(data):
 class CommunitySettings:
     """One read of the shared settings file. Treat instances as ephemeral."""
 
-    def __init__(self, path, data, error=None):
+    def __init__(self, path, data, error=None, state=None):
         self.path = Path(path) if path else None
         self.raw = data if isinstance(data, dict) else {}
         self.error = error
         self.schema_ok = error is None and self.raw.get("schema") == SCHEMA
         enabled = self.schema_ok and self.raw.get("enabled") is True
         self.enabled = bool(enabled)
+        if state is not None:
+            self.state = state
+        elif not self.schema_ok:
+            self.state = "corrupt"
+        else:
+            self.state = "enabled" if self.enabled else "disabled"
         generation = self.raw.get("generation")
         # The generation is a nonempty opaque string shared by all components.
         self.generation = generation if isinstance(generation, str) and generation else None
@@ -197,6 +211,7 @@ class CommunitySettings:
         """Secret-free operational status."""
         return dict(
             configured=self.schema_ok,
+            state=self.state,
             enabled=self.enabled,
             generation_set=self.generation is not None,
             repository=self.repository,
@@ -209,23 +224,45 @@ class CommunitySettings:
 
 
 def load(path) -> CommunitySettings:
-    """Read the settings file once. Never raises; failures mean disabled."""
+    """Read the settings file once. Never raises; failures mean disabled.
+
+    The reported ``state`` keeps a missing file, an unreadable one, a damaged
+    one and an explicit saved choice strictly apart."""
     if not path:
-        return CommunitySettings(None, {}, error="community_config is not configured")
+        return CommunitySettings(
+            None, {}, error="community_config is not configured",
+            state="unconfigured",
+        )
     try:
         raw = Path(path).read_bytes()
+    except FileNotFoundError:
+        return CommunitySettings(
+            path, {}, error="settings file does not exist", state="missing",
+        )
     except OSError:
-        return CommunitySettings(path, {}, error="settings file is unreadable")
+        return CommunitySettings(
+            path, {}, error="settings file is unreadable", state="unreadable",
+        )
     if len(raw) > 64 * 1024:
-        return CommunitySettings(path, {}, error="settings file exceeds the byte limit")
+        return CommunitySettings(
+            path, {}, error="settings file exceeds the byte limit",
+            state="corrupt",
+        )
     try:
         data = json.loads(raw)
     except ValueError:
-        return CommunitySettings(path, {}, error="settings file is not valid JSON")
+        return CommunitySettings(
+            path, {}, error="settings file is not valid JSON", state="corrupt",
+        )
     if not isinstance(data, dict):
-        return CommunitySettings(path, {}, error="settings file must hold one object")
+        return CommunitySettings(
+            path, {}, error="settings file must hold one object",
+            state="corrupt",
+        )
     if data.get("schema") != SCHEMA:
-        return CommunitySettings(path, data, error="unsupported settings schema")
+        return CommunitySettings(
+            path, data, error="unsupported settings schema", state="corrupt",
+        )
     return CommunitySettings(path, data)
 
 

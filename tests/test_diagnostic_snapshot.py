@@ -100,7 +100,7 @@ def test_malformed_startup_projection_is_bounded(tmp_path, field, value):
     assert "private exception" not in json.dumps(result)
 
 
-def test_scoped_records_batches_pause_and_readonly(tmp_path):
+def test_scoped_records_and_failure_counts_are_diagnostic_only(tmp_path):
     path, data = config(tmp_path)
     admission = Admission(data["admission_path"])
     lease = admission.activate("task-A", project_root=str(tmp_path), root_session="root-A")
@@ -121,6 +121,7 @@ def test_scoped_records_batches_pause_and_readonly(tmp_path):
         store.create_batch(batch_id="vote-only", revision="r", batch={"entry_refs": []}, entry_ids=[], vote_keys=[])
         with store.db:
             store.db.execute("INSERT INTO votes VALUES(?,?,?,?,?,?,?,?)", (opaque, "not-owned", "r", "down", "private body", 1, "vote-only", time.time()))
+            # Legacy retired latch residue: never reported, never pausing.
             store.db.execute("INSERT OR REPLACE INTO state VALUES('maintenance_paused','private pause reason')")
     finally:
         store.close()
@@ -136,11 +137,13 @@ def test_scoped_records_batches_pause_and_readonly(tmp_path):
     assert len(result["contributions"]) == 5
     assert "vote-only" in {row["batch_id"] for row in result["contributions"]}
     assert "foreign" not in {row["batch_id"] for row in result["contributions"]}
-    assert result["admission"]["status"] == "paused" and result["admission"]["failures"] == 3
-    assert result["maintenance"]["paused"] is True
+    # Failure counts are observability only: the binding stays active and the
+    # retired maintenance latch is neither reported nor honored.
+    assert result["admission"]["status"] == "active" and result["admission"]["failures"] == 3
+    assert "paused" not in result["maintenance"]
     raw = json.dumps(result)
     assert all(secret not in raw for secret in ("private body", "private exception", "private pause reason", lease["token"], other["token"], "task-B", ref))
-    assert not admission.active_lease("task-A")
+    assert admission.active_lease("task-A")["failures"] == 3
     assert diagnostics.snapshot(path)["captures"] == diagnostics.snapshot(path)["contributions"] == []
 
 

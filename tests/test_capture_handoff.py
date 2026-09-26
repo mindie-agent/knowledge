@@ -55,6 +55,30 @@ def _event(admission, **extra):
     return event
 
 
+def test_failure_counts_never_reject_a_stop(tmp_path):
+    """A3: consecutive task failures are diagnostic only — the persistent
+    choice and the task binding survive, and the next Stop is still admitted
+    with no deactivate/reactivate cycle."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    config, admission = _ready(tmp_path, project)
+    from tests.conftest import admission_token
+
+    gate = Admission(admission)
+    token = admission_token(admission)
+    for _ in range(5):
+        gate.finish("manual-A", token, False)
+    assert gate.inspect("manual-A")["failures"] == 5
+    result = capture_hook(config, _event(admission))
+    assert result["stage"] in {"accepted-local", "accepted-runtime"}, result
+    assert result["capture_id"]
+    store = Store(tmp_path / "root", "test")
+    try:
+        assert store.capture_row(result["capture_id"]) is not None
+    finally:
+        store.close()
+
+
 def test_same_turn_is_one_row_and_sibling_sessions_are_not(tmp_path):
     project = tmp_path / "proj"
     project.mkdir()
