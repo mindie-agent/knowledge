@@ -412,6 +412,17 @@ class Store:
         self.capture_floor = float(self.db.execute(
             "SELECT value FROM meta WHERE key='capture_floor'"
         ).fetchone()[0])
+        # Legacy one-time migration at the single atomic storage boundary:
+        # the retired maintenance pause latch left captures parked with
+        # reason='maintenance-paused', eligible=0. Clear the latch and re-due
+        # exactly those rows; every other dormant/revoked/cancelled state is
+        # untouched. Idempotent — once migrated, no rows match.
+        self.db.execute("DELETE FROM state WHERE key='maintenance_paused'")
+        self.db.execute(
+            "UPDATE continuations SET due=?, eligible=1 "
+            "WHERE reason='maintenance-paused' AND eligible=0",
+            (time.time(),),
+        )
         self.db.commit()
 
     @contextlib.contextmanager

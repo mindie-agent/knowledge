@@ -46,9 +46,6 @@ class MaintenanceBudget:
                 store.db.execute(
                     "ALTER TABLE maintenance_attempts ADD COLUMN apply_receipt TEXT"
                 )
-            # Legacy migration: the retired failure-circuit latch is cleared so
-            # an old paused installation resumes through the normal paths.
-            store.db.execute("DELETE FROM state WHERE key='maintenance_paused'")
 
     def reserve(self, ident, session, role):
         now = time.time()

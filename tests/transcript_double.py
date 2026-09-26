@@ -138,9 +138,14 @@ def _extract(record):
 
 
 def read_material(path, start, *, session_id=None, not_before=None, expected=None,
-                  max_scan_bytes=16777216, max_seconds=2.0, max_text_bytes=49152):
+                  max_scan_bytes=16777216, max_seconds=2.0, max_text_bytes=49152,
+                  scan_until=None):
     if type(start) is not int or start < 0:
         raise ValueError("start must be a nonnegative offset")
+    if scan_until is not None and (
+        type(scan_until) is not int or scan_until < start
+    ):
+        raise ValueError("scan_until must be an exact byte boundary at or after start")
     result = dict(status="ok", start=start, end=start,
                   digest=hashlib.sha256(b"").hexdigest(), text="", records=0,
                   skipped_records=0, oversize_records=0, partial=False,
@@ -196,6 +201,8 @@ def read_material(path, start, *, session_id=None, not_before=None, expected=Non
             middle = start > 0 and stream.read(1) != b"\n"
             stream.seek(start)
             end_limit = min(stat.st_size, start + max_scan_bytes)
+            if scan_until is not None:
+                end_limit = min(end_limit, scan_until)
             while stream.tell() < end_limit and time.monotonic() - begun < max_seconds:
                 offset = stream.tell()
                 raw = stream.readline(min(RECORD_LIMIT + 1, end_limit - offset))

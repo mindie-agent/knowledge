@@ -69,22 +69,119 @@ def test_failures_never_pause_and_attempts_stay_consumed(store):
     assert "paused" not in budget.status()
 
 
-def test_legacy_pause_latch_is_cleared_on_open(store):
+def test_legacy_pause_latch_and_backlog_migrate_on_store_open(store):
+    parked = store.add_capture(
+        root_session="r", session="s", turn="t", transcript=None,
+        summary="legacy parked work",
+    )
+    with store._write_txn():
+        store.db.execute(
+            "INSERT OR REPLACE INTO state VALUES('maintenance_paused', 'legacy')"
+        )
+    store.dormant_capture(parked["id"], reason="maintenance-paused")
+    with store._write_txn():
+        store.db.execute(
+            "INSERT INTO continuations VALUES('cap-2', 0, 'incomplete-tail', 0)"
+        )
+    root = store.root
+    store.close()
+    # Reopening the store migrates exactly the paused backlog; other dormant
+    # reasons are untouched, and the migration is idempotent.
+    migrated = Store(root.parent, root.name)
+    try:
+        with migrated.lock:
+            assert migrated.db.execute(
+                "SELECT 1 FROM state WHERE key='maintenance_paused'"
+            ).fetchone() is None
+            rows = dict(
+                migrated.db.execute(
+                    "SELECT capture_id, eligible FROM continuations"
+                ).fetchall()
+            )
+        assert rows == {parked["id"]: 1, "cap-2": 0}
+        due = migrated.due_capture()
+        assert due == parked["id"]
+    finally:
+        migrated.close()
+    again = Store(root.parent, root.name)
+    try:
+        with again.lock:
+            assert again.db.execute(
+                "SELECT 1 FROM state WHERE key='maintenance_paused'"
+            ).fetchone() is None
+    finally:
+        again.close()
+    store = Store(root.parent, root.name)
+    try:
+        budget = MaintenanceBudget(store)
+        budget.reserve("after-migration", "s", "organize")
+        budget.finish("after-migration", True)
+    finally:
+        store.close()
+
+
+def test_legacy_paused_capture_completes_through_the_worker(store, tmp_path):
+    """F4: a capture parked ONLY by the retired latch is consumed after the
+    store-open migration and finishes through the normal worker path."""
+    import sys
+
+    from conftest import write_settings
+
+    from mindie_knowledge.loop.activation import Admission
+    from mindie_knowledge.loop.engine import Engine
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    settings_path = tmp_path / "community.json"
+    write_settings(settings_path, enabled=True, roots=[project])
+    admission = Admission(tmp_path / "admission.sqlite3")
+    admission.activate("manual-A", project_root=str(project))
+    runner = tmp_path / "runner.py"
+    runner.write_text("print('{\"entries\": []}')")
+    engine = Engine(
+        store,
+        agent_command=[sys.executable, str(runner)],
+        settings_path=settings_path,
+        admission=admission,
+    )
+    captured = engine.capture(
+        session_id="manual-A", turn_id="t1", summary="pending legacy work"
+    )
+    assert captured["status"] == "queued"
+    # Simulate the retired latch exactly: parked ineligible, state row present.
     with store._write_txn():
         store.db.execute(
             "INSERT OR REPLACE INTO state VALUES('maintenance_paused', 'legacy')"
         )
         store.db.execute(
-            "INSERT INTO continuations VALUES('cap-1', 0, 'maintenance-paused', 0)"
+            "UPDATE continuations SET due=0, eligible=1 WHERE capture_id=?",
+            (captured["id"],),
         )
-    MaintenanceBudget(store)
-    with store.lock:
-        assert store.db.execute(
-            "SELECT 1 FROM state WHERE key='maintenance_paused'"
-        ).fetchone() is None
-    budget = MaintenanceBudget(store)
-    budget.reserve("after-migration", "s", "organize")
-    budget.finish("after-migration", True)
+    store.dormant_capture(captured["id"], reason="maintenance-paused")
+    assert store.due_capture() is None
+    root = store.root
+    store.close()
+    # Upgrade/restart: reopening migrates the backlog; the worker then
+    # consumes it through the normal path and the content converges.
+    reopened = Store(root.parent, root.name)
+    try:
+        assert reopened.due_capture() == captured["id"]
+        engine = Engine(
+            reopened,
+            agent_command=[sys.executable, str(runner)],
+            settings_path=settings_path,
+            admission=admission,
+        )
+        engine._process(captured["id"])
+        row = reopened.capture_row(captured["id"])
+        assert row["status"] == "organized", row["detail"]
+        assert reopened.due_capture() is None
+        with reopened.lock:
+            assert reopened.db.execute(
+                "SELECT count(*) FROM continuations"
+            ).fetchone()[0] == 0
+    finally:
+        reopened.close()
 
 
 def test_concurrent_duplicate_reserves_only_one_call(store):

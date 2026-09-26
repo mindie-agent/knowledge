@@ -1043,14 +1043,21 @@ class Engine:
             if expected is None:
                 keep_gap("persisted transcript identity is unusable")
                 return
-        scan = int(region["finish"]) - int(region["start"])
-        budgets = {}
-        if scan >= 1024:
-            budgets["max_scan_bytes"] = min(scan, 64 * 1024 * 1024)
+        import inspect
+
+        try:
+            exact_range = "scan_until" in inspect.signature(
+                parser.read_material
+            ).parameters
+        except (TypeError, ValueError):
+            exact_range = False
+        if not exact_range:
+            keep_gap("transcript parser lacks exact-range recovery support")
+            return
         inc = parser.read_material(
             row["transcript"], int(region["start"]),
             session_id=row["session"], not_before=row["boundary"],
-            expected=expected, **budgets,
+            expected=expected, scan_until=int(region["finish"]),
         )
         if (
             inc.get("status") != "ok"

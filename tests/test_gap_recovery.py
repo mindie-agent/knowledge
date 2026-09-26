@@ -62,22 +62,22 @@ def gated(tmp_path):
     adapter = make_admission(tmp_path, project_root=project)
     runner = tmp_path / "runner.py"
     runner.write_text(SUCCESS_RUNNER)
-    spawns = tmp_path / "spawns"
     store = Store(tmp_path / "store", "test")
+    box = dict(store=store, runner=runner, tmp_path=tmp_path,
+               settings=settings, adapter=adapter, project=project)
 
     def engine():
         return Engine(
-            store,
+            box["store"],
             agent_command=[sys.executable, str(runner)],
             settings_path=tmp_path / "community.json",
             admission=Admission(adapter),
             transcript_adapter=transcript_mod,
         )
 
-    yield dict(store=store, engine=engine, runner=runner, spawns=spawns,
-               tmp_path=tmp_path, settings=settings, adapter=adapter,
-               project=project)
-    store.close()
+    box["engine"] = engine
+    yield box
+    box["store"].close()
 
 
 def _counting_runner(gated, body):
@@ -293,6 +293,77 @@ def test_sequence_restart_duplicate_event_and_recovery_converges(gated):
                               transcript_path=str(rollout), summary="")
     assert again["duplicate"] is True
     assert marker.read_text().count("x") == 3
+
+
+def _reopen_store(gated):
+    """Actually close and reopen the SQLite store (not a wrapper)."""
+    gated["store"].close()
+    store = Store(gated["tmp_path"] / "store", "test")
+    gated["store"] = store
+    return store
+
+
+def test_small_region_recovers_after_log_growth(gated):
+    """F3: a <1024B failed region stays exactly recoverable after the
+    transcript keeps growing — the original range is re-read and verified,
+    the recovery runs once, and the new material then processes normally."""
+    store, engine = gated["store"], gated["engine"]()
+    marker = _counting_runner(gated, DEADLINE_RUNNER)
+    rollout = gated["tmp_path"] / "rollout.jsonl"
+    _write_transcript(rollout, "manual-A", ["NPU mapping observed x210"])
+    capture = engine.capture(session_id="manual-A", turn_id="t1",
+                             transcript_path=str(rollout), summary="")
+    engine._process(capture["id"])
+    assert store.capture_row(capture["id"])["status"] == "pending"
+    region = [r for r in _regions(store) if r["status"] == "failed"][0]
+    assert region["finish"] - region["start"] < 1024
+    # The log keeps growing normally after the failure.
+    _append_transcript(rollout, ["later user turn with fresh work"])
+    # Real close/reopen of the SQLite store before the recovery fires.
+    store = _reopen_store(gated)
+    engine = gated["engine"]()
+    _counting_runner(gated, SUCCESS_RUNNER)
+    _fire_due(store, capture["id"])
+    engine._process(capture["id"])
+    row = store.capture_row(capture["id"])
+    assert row["status"] in {"organized", "pending"}, row["detail"]
+    assert marker.read_text().count("x") == 2  # initial + the single recovery
+    hits = store.query("NPU mapping")["results"]
+    assert hits and "NPU mapping observed" in store.get(hits[0]["ref"])["content"]
+    # The appended material is then processed through the normal path.
+    if row["status"] == "pending":
+        _fire_due(store, capture["id"])
+        engine._process(capture["id"])
+        row = store.capture_row(capture["id"])
+    assert row["status"] == "organized", row["detail"]
+    assert marker.read_text().count("x") == 3  # recovery + normal increment
+    assert store.coverage_gaps() == []
+
+
+def test_small_region_with_half_line_and_utf8_append(gated):
+    """Half-written tail lines and multibyte UTF-8 after the failure do not
+    break exact-range verification."""
+    store, engine = gated["store"], gated["engine"]()
+    marker = _counting_runner(gated, DEADLINE_RUNNER)
+    rollout = gated["tmp_path"] / "rollout.jsonl"
+    _write_transcript(rollout, "manual-A", ["device reset 设备映射 observed"])
+    capture = engine.capture(session_id="manual-A", turn_id="t1",
+                             transcript_path=str(rollout), summary="")
+    engine._process(capture["id"])
+    assert store.capture_row(capture["id"])["status"] == "pending"
+    # A half-written line, then a completed multibyte record.
+    with open(rollout, "ab") as f:
+        f.write(b'{"type":"response_item","payload":{"type":"message","role":"u')
+    _append_transcript(rollout, ["后续 turn 中文内容 完成记录"])
+    store = _reopen_store(gated)
+    engine = gated["engine"]()
+    _counting_runner(gated, SUCCESS_RUNNER)
+    _fire_due(store, capture["id"])
+    engine._process(capture["id"])
+    row = store.capture_row(capture["id"])
+    assert row["status"] in {"organized", "pending"}, row["detail"]
+    assert marker.read_text().count("x") == 2
+    assert "设备映射" in store.get(store.query("设备映射")["results"][0]["ref"])["content"]
 
 
 def test_non_deadline_failures_do_not_schedule_recovery(gated):
