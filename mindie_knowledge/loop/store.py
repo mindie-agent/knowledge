@@ -2765,6 +2765,44 @@ class Store:
             ).fetchone()
         return dict(row) if row else None
 
+    def finish_gap_if_unresolved(self, region_id, capture_id, detail):
+        """Record a failed recovery ONLY when no concurrent recovery won.
+
+        Both failure writes are guarded in one transaction: the region must
+        still be ``failed`` (a winner's checkpoint already flipped it to
+        ``succeeded`` atomically with its saved result) and the capture is
+        only flipped while still in the unprocessed family — never over an
+        ``apply-pending`` saved result or an ``organized`` outcome. Returns
+        True when this call landed the failure. A late loser must not
+        downgrade an already recovered success: the OS can preempt it
+        between its failed reservation and these writes.
+        """
+        detail = str(detail)[:1000]
+        with self._write_txn():
+            region = self.db.execute(
+                "SELECT status FROM regions WHERE id=?", (region_id,)
+            ).fetchone()
+            if region is None or region["status"] != "failed":
+                return False
+            self.db.execute(
+                "UPDATE regions SET status='failed', detail=? WHERE id=?",
+                (detail, region_id),
+            )
+            capture = self.db.execute(
+                "SELECT status FROM captures WHERE id=?", (capture_id,)
+            ).fetchone()
+            if capture is not None and capture["status"] in (
+                "queued", "pending", "deferred"
+            ):
+                self.db.execute(
+                    "UPDATE captures SET status='failed', detail=? WHERE id=?",
+                    (detail, capture_id),
+                )
+                self.db.execute(
+                    "DELETE FROM continuations WHERE capture_id=?", (capture_id,)
+                )
+            return True
+
     # ---------------------------------------------------------------- legacy
 
     # Legacy public migration was cancelled by explicit user steering (the

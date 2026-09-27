@@ -21,7 +21,13 @@ never re-organized and saved results are never re-applied.
 Sharing revocation is live: the outbox/idle thread rereads the shared
 settings file about once a second; disabling (or replacing) the configuration
 cancels in-flight model work, pending batch timers and unsent contributions,
-and never backfills the disabled period after re-enable.
+and never backfills the disabled period after re-enable. An *unknown*
+authority state — the settings file or the named consent document missing,
+unreadable, corrupt or malformed — is a fault, not a revocation (GateFault):
+no new read/model/outbound-write happens, but already-received captures,
+pending gap recoveries and saved apply results are parked with a persisted
+bounded backoff and resume once the authority is restored and revalidates;
+unsent batches are held, not cancelled.
 """
 
 from __future__ import annotations
@@ -57,6 +63,14 @@ GAP_RECOVERY_DELAY = 300.0
 
 class AdmissionUnreadable(Exception):
     """Admission storage could not be read. This is not a revocation."""
+
+
+class GateFault(Exception):
+    """The settings/consent authority is in an unknown state (missing,
+    unreadable, corrupt or malformed). This is not a revocation: no new
+    read/model/write happens, and durably received work or saved results are
+    parked with a bounded backoff — never cancelled, never dropped — until
+    the authority is restored and revalidation passes again."""
 
 
 class CursorConflict(Exception):
@@ -142,9 +156,10 @@ class Engine:
 
     def _unexpected(self, operation, stage, exc):
         """Report an unhandled internal error. Expected cancellation, budget,
-        config/caller, and community business errors are not incidents."""
+        config/caller, authority-fault, and community business errors are not
+        incidents."""
         if isinstance(exc, (MaintenanceCancelled, AdmissionUnreadable, CursorConflict,
-                            BudgetExceeded, OSError, ValueError, TypeError)):
+                            GateFault, BudgetExceeded, OSError, ValueError, TypeError)):
             return
         try:
             from mindie_knowledge.community.common import CommunityError
@@ -220,15 +235,23 @@ class Engine:
     def _gate_live(self):
         if self.stop.is_set():
             raise MaintenanceCancelled("service is stopping")
-        if not self._settings().allows_capture():
+        block = self._settings().capture_block_kind()
+        if block == "fault":
+            raise GateFault("consent/settings authority is unavailable")
+        if block == "revoked":
             raise MaintenanceCancelled("sharing disabled before model spawn")
 
     def _revalidate(self, row):
         """The capture's persisted authorization must still hold exactly:
         same settings generation, live lease, unchanged authorized scope.
-        Anything else is a revocation — the material never reaches a child."""
+        Anything else is a revocation — the material never reaches a child.
+        An unknown authority state is a GateFault, not a revocation: the
+        material stays parked and the saved result is never dropped."""
         settings = self._settings()
-        if not settings.allows_capture():
+        block = settings.capture_block_kind()
+        if block == "fault":
+            raise GateFault("consent/settings authority is unavailable")
+        if block == "revoked":
             raise MaintenanceCancelled("sharing disabled")
         if row["generation"] is not None and settings.generation != row["generation"]:
             raise MaintenanceCancelled("settings generation changed since admission")
@@ -292,7 +315,7 @@ class Engine:
         except MaintenanceCancelled:
             outcome = None
             raise
-        except (AdmissionUnreadable, CursorConflict):
+        except (AdmissionUnreadable, CursorConflict, GateFault):
             if not started:
                 self.budget.abandon_unstarted(attempt_id)
                 outcome = "abandoned"
@@ -304,7 +327,8 @@ class Engine:
         finally:
             # A validated result stays 'running' until the caller checkpoints
             # it. Finishing success here would drop the output on an apply crash.
-            # An unstarted admission or cursor conflict is abandoned, not failed.
+            # An unstarted admission, cursor conflict or gate fault is
+            # abandoned, not failed.
             # A per-item content failure stays consumed but does not feed the
             # domain pause circuit.
             if outcome is not True and outcome != "abandoned":
@@ -383,6 +407,34 @@ class Engine:
         self._defer_counted(
             ident, "admission-unreadable", _PARTIAL_LIMIT,
             dormant_reason="admission-unreadable",
+        )
+
+    def _defer_gate_fault(self, ident):
+        """Park durably received work while the settings/consent authority is
+        in an unknown state. Nothing is cancelled and no saved result is
+        dropped: the capture stays pending with a persisted, capped backoff
+        and resumes once the authority is restored and revalidation passes.
+        A pending gap recovery keeps its routing reason (the region is still
+        owed its one bounded recovery) and just waits out the fault."""
+        reason = self.store.continuation_reason(ident) or ""
+        if reason.startswith("gap-recovery:"):
+            self.store.schedule_continuation(
+                ident, due=time.time() + 60, reason=reason, eligible=1,
+            )
+            return
+        try:
+            count = (
+                int(reason.split(":", 1)[1])
+                if reason.startswith("gate-fault:")
+                else 0
+            )
+        except ValueError:
+            count = 0
+        count += 1
+        self.store.defer_capture(
+            ident,
+            due=time.time() + min(3600.0, 30.0 * 2.0 ** min(count - 1, 6)),
+            reason=f"gate-fault:{count}", eligible=1,
         )
 
     def _defer_reread(self, ident):
@@ -860,7 +912,7 @@ class Engine:
             return
         try:
             self._revalidate(row)
-        except AdmissionUnreadable:
+        except (AdmissionUnreadable, GateFault):
             # The body stays. A later due continuation retries the apply.
             if row and row.get("id"):
                 self._defer_apply(row["id"], transient=True)
@@ -1015,12 +1067,20 @@ class Engine:
 
         def keep_gap(detail):
             detail = f"{detail}; gap retained at [{region['start']},{region['finish']})"
-            self.store.finish_region(region_id, "failed", detail[:1000])
-            self.store.mark_capture(ident, "failed", detail[:1000])
+            # Guarded: a concurrent winner's recovered success is never
+            # downgraded by this loser's late failure write.
+            self.store.finish_gap_if_unresolved(region_id, ident, detail)
 
         try:
             self._revalidate(row)
         except AdmissionUnreadable:
+            self.store.schedule_continuation(
+                ident, due=time.time() + 60,
+                reason=f"gap-recovery:{region_id}", eligible=1,
+            )
+            return
+        except GateFault:
+            # Wait out the authority fault; the region keeps its one recovery.
             self.store.schedule_continuation(
                 ident, due=time.time() + 60,
                 reason=f"gap-recovery:{region_id}", eligible=1,
@@ -1119,6 +1179,12 @@ class Engine:
                 reason=f"gap-recovery:{region_id}", eligible=1,
             )
             return
+        except GateFault:
+            self.store.schedule_continuation(
+                ident, due=time.time() + 60,
+                reason=f"gap-recovery:{region_id}", eligible=1,
+            )
+            return
         except MaintenanceCancelled as exc:
             self.store.mark_capture(ident, "cancelled", str(exc)[:500])
             return
@@ -1128,6 +1194,12 @@ class Engine:
         try:
             self._revalidate(row)  # again before applying any result
         except AdmissionUnreadable:
+            self._checkpoint_result(
+                attempt_id, result, {"region_id": region_id}, inc, False, notes, row,
+            )
+            return
+        except GateFault:
+            # Save the recovered result; the apply waits out the fault.
             self._checkpoint_result(
                 attempt_id, result, {"region_id": region_id}, inc, False, notes, row,
             )
@@ -1148,7 +1220,14 @@ class Engine:
         if row["status"] not in {"queued", "pending", "deferred"}:
             return
         settings = self._settings()
-        if not settings.allows_capture():
+        block = settings.capture_block_kind()
+        if block == "fault":
+            # An unknown authority state is not a revocation: park the
+            # received work with a bounded backoff; it resumes unchanged
+            # after the authority is restored.
+            self._defer_gate_fault(ident)
+            return
+        if block == "revoked":
             self.store.mark_capture(ident, "cancelled", "sharing disabled while queued")
             return
         lease = self.admission.active_lease(row["session"]) if self.admission else None
@@ -1174,6 +1253,9 @@ class Engine:
                 self._revalidate(row)
             except AdmissionUnreadable:
                 self._defer_admission(ident)
+                return
+            except GateFault:
+                self._defer_gate_fault(ident)
                 return
             except MaintenanceCancelled as exc:
                 self.store.mark_capture(ident, "cancelled", str(exc)[:500])
@@ -1253,6 +1335,11 @@ class Engine:
             except CursorConflict:
                 self._defer_reread(ident)
                 return
+            except GateFault:
+                # Pre-spawn authority fault: the attempt was abandoned before
+                # any region reservation; park the capture unchanged.
+                self._defer_gate_fault(ident)
+                return
             except MaintenanceCancelled as exc:
                 if region.get("region_id"):
                     self.store.finish_region(
@@ -1263,6 +1350,14 @@ class Engine:
             try:
                 self._revalidate(row)  # again before applying any result
             except AdmissionUnreadable:
+                self._checkpoint_result(
+                    attempt_id, result, region, inc, summary_only, notes, row,
+                )
+                return
+            except GateFault:
+                # The model result is durably saved; only the apply waits out
+                # the authority fault (apply-pending continuation, backoff in
+                # _apply_saved). Nothing is cancelled, nothing is re-run.
                 self._checkpoint_result(
                     attempt_id, result, region, inc, summary_only, notes, row,
                 )
@@ -1284,6 +1379,9 @@ class Engine:
                 self.store.defer_capture(ident, due=exc.retry_at, reason=str(exc))
             else:
                 self.store.mark_capture(ident, "discarded", str(exc))
+        except GateFault:
+            # Safety net for any gate site above: park, never drop.
+            self._defer_gate_fault(ident)
         except Exception as exc:
             self._unexpected("knowledge.capture", "process", exc)
             detail = f"{type(exc).__name__}: {exc}"[:1000]
@@ -1367,11 +1465,13 @@ class Engine:
         """Restart/poll-edge safety net: when sharing is enabled, pending
         batches of any other generation become disabled; when it is disabled,
         every unsent batch and publishable vote is cancelled. Old material is
-        never backfilled into a new generation."""
+        never backfilled into a new generation. An unknown authority state
+        (fault) is not a revocation: unsent work is held, not cancelled."""
         settings = self._settings()
-        if settings.allows_capture():
+        block = settings.capture_block_kind()
+        if block is None:
             self.store.disable_foreign_pending(settings.generation)
-        else:
+        elif block == "revoked":
             self._cancel_unsent("sharing disabled; unsent work cancelled")
 
     def run(self):
@@ -1393,7 +1493,8 @@ class Engine:
                             self.end_work()
                     elif not ident:
                         self._apply_due()
-                except (MaintenanceCancelled, AdmissionUnreadable, CursorConflict):
+                except (MaintenanceCancelled, AdmissionUnreadable, CursorConflict,
+                        GateFault):
                     continue
                 except Exception as exc:
                     self._unexpected("knowledge.worker", "run", exc)
@@ -1408,7 +1509,8 @@ class Engine:
                         self._process(ident)
                     finally:
                         self.end_work()
-            except (MaintenanceCancelled, AdmissionUnreadable, CursorConflict):
+            except (MaintenanceCancelled, AdmissionUnreadable, CursorConflict,
+                    GateFault):
                 pass
             except Exception as exc:  # never let the worker die silently
                 self._unexpected("knowledge.worker", "run", exc)
@@ -1524,8 +1626,16 @@ class Engine:
         while not self.stop.is_set():
             try:
                 settings = self._settings()
-                generation = settings.generation if settings.allows_capture() else None
-                if self._generation is not None and generation != self._generation:
+                block = settings.capture_block_kind()
+                generation = settings.generation if block is None else None
+                if block == "fault":
+                    # Unknown authority state: hold unsent/pending work in
+                    # place — no cancel edge, no send, no flush. Work resumes
+                    # unchanged once the authority is restored; a generation
+                    # that genuinely changed is still caught on the next
+                    # non-fault tick by the edge below.
+                    pass
+                elif self._generation is not None and generation != self._generation:
                     if generation is None:
                         self._cancel_unsent("sharing disabled; unsent work cancelled")
                     else:
@@ -1533,7 +1643,8 @@ class Engine:
                             "settings generation changed; unsent work cancelled"
                         )
                         self._cancel.clear()
-                self._generation = generation
+                if block != "fault":
+                    self._generation = generation
                 # Local read-only index maintenance: runs even with community
                 # contribution off (no capture/model/publication), in bounded
                 # resumable slices, off the query path.

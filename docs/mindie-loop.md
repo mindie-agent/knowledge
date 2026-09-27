@@ -29,7 +29,14 @@ call. Read-only retrieval, plugin updates and knowledge sync keep working; an
 existing service or local retrieval cache does not imply capture is enabled.
 Disabling mid-task cancels queued and running maintenance, the idle batch
 timer and unsent batches; it never deletes drafts or published data, and
-re-enabling never backfills the disabled period.
+re-enabling never backfills the disabled period. An *unknown* authority state
+— the settings file or the named consent document missing, unreadable,
+corrupt or malformed — is a fault, not a revocation: no new read, model call
+or outbound write happens, but already-received captures, pending gap
+recoveries and saved apply results are parked with a persisted bounded
+backoff and unsent batches are held, all resuming once the authority is
+restored and revalidates. Repairing a damaged file is the user's explicit
+action and is never re-onboarding.
 
 ## Capture and bounded increments
 

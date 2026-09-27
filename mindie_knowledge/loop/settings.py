@@ -236,6 +236,32 @@ class CommunitySettings:
             return f"the saved consent authority is {state}; contribution is stopped"
         return "the saved consent choice does not allow contribution"
 
+    def capture_block_kind(self):
+        """None when the gate is open, else ``"revoked"`` or ``"fault"``.
+
+        ``revoked`` is an explicit saved off: a valid config with
+        ``enabled=false``, or a valid consent document whose saved choice is
+        ``read-only``/``later``/``disabled``. Already-received work keeps the
+        revocation semantics (cancelled, unsent cancelled, never backfilled).
+
+        ``fault`` is an unknown authority state: the settings file or the
+        named consent document is missing, unreadable, corrupt or malformed
+        (including an invalid ``consent_config`` value and an ``enabled`` but
+        otherwise malformed config). A fault is not a user revocation:
+        already-received work and saved results must be kept locatable and
+        resumed after the authority is restored and revalidates.
+        """
+        if self.allows_capture():
+            return None
+        if self._base_allows_capture():
+            # The sharing config itself is open; only the consent gate blocks.
+            return (
+                "revoked"
+                if (self.consent or {}).get("state") == "ok"
+                else "fault"
+            )
+        return "revoked" if self.state == "disabled" else "fault"
+
     def in_scope(self, candidate):
         """Canonical containment check against the configured project roots.
 
@@ -347,6 +373,23 @@ def from_engine_config(config: dict) -> CommunitySettings:
     return load((config or {}).get("community_config"))
 
 
+_MANAGED_KEYS = frozenset({
+    "schema", "enabled", "generation", "enabled_at", "repository",
+    "branch", "project_roots", "idle_seconds",
+})
+
+
+def _update_lock(path):
+    """The ONE cross-process lock serializing every write to this file.
+
+    Shared with ``mindie_knowledge.consent_store``'s lock implementation so
+    adapters never grow a second lock protocol. Lock timeout raises
+    ``consent_store.ConsentError`` with ``state="locked"``.
+    """
+    target = Path(path)
+    return consent_store._UpdateLock(target.with_name(target.name + ".lock"))
+
+
 def write(path, *, enabled, repository, project_roots, branch="main",
           idle_seconds=DEFAULT_IDLE_SECONDS, previous=None, **extensions):
     """First-configuration/settings-mutation helper used by tests and setup.
@@ -355,42 +398,96 @@ def write(path, *, enabled, repository, project_roots, branch="main",
     concurrent runtimes observe the change on their next read. ``enabled_at``
     is set only on an off->on edge. Extension keys already present in the file
     (fork/bot/transaction/…) are preserved across toggles; one component must
-    not silently delete another component's private configuration."""
-    previous = previous if isinstance(previous, dict) else {}
-    try:
-        on_disk = json.loads(Path(path).read_text())
-        if isinstance(on_disk, dict):
-            previous = {**on_disk, **previous}
-    except (OSError, ValueError):
-        pass
-    was_enabled = previous.get("enabled") is True
-    data = dict(previous)
-    data.update({
-        "schema": SCHEMA,
-        "enabled": bool(enabled),
-        "generation": secrets.token_hex(16),
-        "enabled_at": (
-            time.time() if enabled and not was_enabled
-            else previous.get("enabled_at") if enabled else None
-        ),
-        "repository": repository,
-        "branch": branch,
-        "project_roots": [str(Path(root).expanduser().resolve(strict=False))
-                          for root in project_roots],
-        "idle_seconds": idle_seconds,
-    })
-    for key, value in extensions.items():
-        if value is None:
-            data.pop(key, None)
-        else:
-            data[key] = value
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    from mindie_knowledge.markdown import _atomic_write_text
+    not silently delete another component's private configuration. The whole
+    read-merge-write holds the file's cross-process lock, so a concurrent
+    ``update_extensions`` stamp can neither be lost nor overwrite this
+    mutation."""
+    with _update_lock(path):
+        previous = previous if isinstance(previous, dict) else {}
+        try:
+            on_disk = json.loads(Path(path).read_text())
+            if isinstance(on_disk, dict):
+                previous = {**on_disk, **previous}
+        except (OSError, ValueError):
+            pass
+        was_enabled = previous.get("enabled") is True
+        data = dict(previous)
+        data.update({
+            "schema": SCHEMA,
+            "enabled": bool(enabled),
+            "generation": secrets.token_hex(16),
+            "enabled_at": (
+                time.time() if enabled and not was_enabled
+                else previous.get("enabled_at") if enabled else None
+            ),
+            "repository": repository,
+            "branch": branch,
+            "project_roots": [str(Path(root).expanduser().resolve(strict=False))
+                              for root in project_roots],
+            "idle_seconds": idle_seconds,
+        })
+        for key, value in extensions.items():
+            if value is None:
+                data.pop(key, None)
+            else:
+                data[key] = value
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        from mindie_knowledge.markdown import _atomic_write_text
 
-    _atomic_write_text(target, json.dumps(data, indent=2) + "\n")
-    try:
-        target.chmod(0o600)
-    except OSError:
-        pass
+        _atomic_write_text(target, json.dumps(data, indent=2) + "\n")
+        try:
+            target.chmod(0o600)
+        except OSError:
+            pass
+    return load(target)
+
+
+def update_extensions(path, **fields):
+    """Serialized extension-key stamp on an existing shared settings file.
+
+    For one-component extension keys (e.g. the ``consent_config`` wiring
+    stamp): each field is set, or removed when its value is None. Managed
+    keys (schema/enabled/generation/enabled_at/repository/branch/
+    project_roots/idle_seconds) are rejected — changing them is a real
+    settings mutation and must go through ``write`` with its fresh
+    generation. This stamp never refreshes ``generation``, so work already
+    accepted under the current generation is not revoked by it.
+
+    The read-modify-write holds the same cross-process lock as ``write``:
+    exactly one of the two orderings is observable — a concurrent user
+    disable either lands first (the stamp preserves ``enabled=false``) or
+    lands second (its locked merge preserves the stamp). There is no retry
+    loop and no overwrite of a concurrent mutation. A missing or corrupt
+    document fails honestly with ValueError instead of fabricating a config;
+    a lock timeout raises ``consent_store.ConsentError`` (state ``locked``).
+    """
+    if not fields:
+        raise ValueError("update_extensions requires at least one field")
+    overlap = _MANAGED_KEYS.intersection(fields)
+    if overlap:
+        raise ValueError(
+            f"managed keys {sorted(overlap)} must go through write(), not a stamp"
+        )
+    target = Path(path)
+    with _update_lock(target):
+        state = load(target)
+        if not state.schema_ok:
+            raise ValueError(
+                f"cannot stamp a {state.state} community settings file"
+            )
+        data = dict(state.raw)
+        for key, value in fields.items():
+            if value is None:
+                data.pop(key, None)
+            else:
+                data[key] = value
+        target.parent.mkdir(parents=True, exist_ok=True)
+        from mindie_knowledge.markdown import _atomic_write_text
+
+        _atomic_write_text(target, json.dumps(data, indent=2) + "\n")
+        try:
+            target.chmod(0o600)
+        except OSError:
+            pass
     return load(target)
