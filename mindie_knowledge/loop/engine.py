@@ -169,7 +169,7 @@ class Engine:
         settings = self._settings()
         if not settings.allows_capture():
             return dict(status="skipped",
-                        reason="community contribution is disabled or unconfigured")
+                        reason=settings.contribution_block_reason())
         if self.admission is None:
             return dict(status="skipped",
                         reason="no adapter admission is configured; identity unknown")
@@ -1339,7 +1339,23 @@ class Engine:
                 "detail='service restarted after input reservation; not replaying' "
                 "WHERE status='processing'"
             )
+            interrupted = [
+                row[0]
+                for row in self.store.db.execute(
+                    "SELECT id FROM regions WHERE status='attempted'"
+                ).fetchall()
+            ]
             self.store.db.execute("UPDATE regions SET status='failed', detail='interrupted attempt; no replay' WHERE status='attempted'")
+        # A crash-interrupted attempt already consumed its first model attempt
+        # without landing an outcome: the failed region still gets exactly one
+        # bounded delayed recovery, scheduled at the same storage boundary as
+        # the in-process deadline path. The persisted per-region counter keeps
+        # the total at two model attempts; an unverifiable source keeps the
+        # locatable gap instead of a third call.
+        for region_id in interrupted:
+            self.store.schedule_gap_recovery(
+                region_id, due=time.time() + GAP_RECOVERY_DELAY
+            )
         self.budget.recover_interrupted()
         self.revoke_stale()
         # Arm only. Applying here can block readiness on a network restore.

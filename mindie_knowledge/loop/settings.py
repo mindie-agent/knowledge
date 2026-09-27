@@ -7,13 +7,24 @@ model and before any outbound write — so flipping ``enabled`` or bumping
 unconfigured state fails **closed** for capture and contribution, but never
 blocks read-only retrieval, plugin updates or knowledge sync.
 
-This file is the one persistent installation-level choice. A saved explicit
-value (enabled or disabled) never expires: not on restart, upgrade, fork,
-network failure or failure counts. Its honest state is reported distinctly —
-``unconfigured``, ``missing``, ``unreadable``, ``corrupt``, ``disabled`` or
-``enabled`` — so a damaged file is never treated as a never-configured
-installation (no fresh onboarding) and a missing one is never treated as an
-explicit opt-out.
+This file is the persistent installation-level sharing configuration. A saved
+explicit value (enabled or disabled) never expires: not on restart, upgrade,
+fork, network failure or failure counts. Its honest state is reported
+distinctly — ``unconfigured``, ``missing``, ``unreadable``, ``corrupt``,
+``disabled`` or ``enabled`` — so a damaged file is never treated as a
+never-configured installation (no fresh onboarding) and a missing one is never
+treated as an explicit opt-out.
+
+The optional ``consent_config`` extension key (absolute path) names the
+profile-shared ``mindie-consent/1`` authority implemented by
+``mindie_knowledge.consent_store``. When present, every gate additionally
+requires that document's saved ``contribute`` choice: a missing, unreadable,
+corrupt or non-contribute consent stops capture, model and write paths while
+read-only helpers keep working, and the fault is reported as itself — never as
+first-time onboarding. The field grants no permission by itself: an explicit
+``enabled=false`` here always wins. Configs without the field keep their
+previous read behavior; the owning adapter wires the field once at its
+install/upgrade/entry boundary.
 """
 
 from __future__ import annotations
@@ -25,7 +36,10 @@ import secrets
 import time
 from pathlib import Path
 
+from mindie_knowledge import consent_store
+
 SCHEMA = "mindie-community-config/1"
+CONSENT_FIELD = "consent_config"
 DEFAULT_IDLE_SECONDS = 300
 MAX_IDLE_SECONDS = 86400
 _REPOSITORY_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
@@ -152,16 +166,28 @@ class CommunitySettings:
             self.idle_seconds = bounded_idle(self.raw.get("idle_seconds"))
         except ValueError:
             self.idle_seconds = DEFAULT_IDLE_SECONDS
+        # Consent gate extension: ``consent_config`` names the profile-shared
+        # consent authority (absolute path). It is re-read fresh together with
+        # this settings file, so a changed or damaged saved choice is observed
+        # at the same boundaries. None means the legacy format without the
+        # field; ``state="invalid"`` means a malformed field value, which
+        # fails closed like any other unreadable authority.
+        self.consent = None
+        consent_ref = self.raw.get(CONSENT_FIELD)
+        if self.schema_ok and consent_ref is not None:
+            if not isinstance(consent_ref, str) or not Path(consent_ref).is_absolute():
+                self.consent = dict(
+                    state="invalid", choice=None, reporting=None, path=None,
+                    error="consent_config must be an absolute path string",
+                )
+            else:
+                self.consent = consent_store.read(consent_ref)
 
     @property
     def configured(self):
         return self.schema_ok
 
-    def allows_capture(self):
-        """The whole capture/extraction/sanitization chain needs an explicit,
-        well-formed on: schema, enabled, opaque generation, a finite positive
-        authorization boundary and at least one absolute canonical root. Any
-        malformed enabled config authorizes nothing."""
+    def _base_allows_capture(self):
         return (
             self.schema_ok
             and self.enabled
@@ -169,6 +195,46 @@ class CommunitySettings:
             and self.enabled_at is not None
             and bool(self.project_roots)
         )
+
+    def consent_allows_contribution(self):
+        """The consent half of the capture/contribution gate.
+
+        Only a config carrying the ``consent_config`` extension consults the
+        saved choice; a legacy config without the field keeps its previous
+        read behavior (the owning adapter wires the field once at its
+        install/upgrade/entry boundary — the legacy format is read
+        compatibility, not a bypass). A configured authority must hold an
+        explicit ``contribute`` choice: missing, unreadable, corrupt, an
+        invalid field value or any other saved choice stops capture, model
+        and outbound-write paths while read-only helpers keep working. The
+        field never grants permission by itself — an explicit enabled=false
+        always wins.
+        """
+        if self.consent is None:
+            return True
+        return (
+            self.consent.get("state") == "ok"
+            and self.consent.get("choice") == "contribute"
+        )
+
+    def allows_capture(self):
+        """The whole capture/extraction/sanitization chain needs an explicit,
+        well-formed on: schema, enabled, opaque generation, a finite positive
+        authorization boundary and at least one absolute canonical root — plus,
+        when the config names a consent authority, a saved ``contribute``
+        choice. Any malformed enabled config authorizes nothing."""
+        return self._base_allows_capture() and self.consent_allows_contribution()
+
+    def contribution_block_reason(self):
+        """Short static reason the capture/model/write paths are closed."""
+        if self.allows_capture():
+            return ""
+        if not self._base_allows_capture():
+            return "community contribution is disabled or unconfigured"
+        state = (self.consent or {}).get("state")
+        if state != "ok":
+            return f"the saved consent authority is {state}; contribution is stopped"
+        return "the saved consent choice does not allow contribution"
 
     def in_scope(self, candidate):
         """Canonical containment check against the configured project roots.
@@ -220,6 +286,16 @@ class CommunitySettings:
             idle_seconds=self.idle_seconds,
             enabled_at=self.enabled_at,
             error=self.error,
+            consent=(
+                None
+                if self.consent is None
+                else dict(
+                    state=self.consent.get("state"),
+                    choice=self.consent.get("choice"),
+                    reporting=self.consent.get("reporting"),
+                    error=self.consent.get("error"),
+                )
+            ),
         )
 
 

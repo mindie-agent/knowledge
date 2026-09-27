@@ -12,16 +12,24 @@ config indirection is rejected, not aliased.
 ## The gate
 
 `capture_allowed = active adapter lease AND community enabled AND the lease's
-canonical project_root inside the configured scope`. The shared settings file
-is re-read before transcript reading, before every model spawn and before any
-outbound write. When community contribution is off — the default — there is no
-automatic capture, extraction or sanitization at all: the Hook short-circuits
-and creates no capture, cursor, draft or organizer call. Read-only retrieval,
-plugin updates and knowledge sync keep working; an existing service or local
-retrieval cache does not imply capture is enabled. Disabling mid-task cancels
-queued and running maintenance, the idle batch timer and unsent batches; it
-never deletes drafts or published data, and re-enabling never backfills the
-disabled period.
+canonical project_root inside the configured scope AND — when the shared
+config carries the consent_config extension — a saved contribute choice in the
+named mindie-consent/1 authority`. The shared settings file is re-read before
+transcript reading, before every model spawn and before any outbound write;
+the consent document named by `consent_config` (absolute path) is re-read with
+it. A missing, unreadable, corrupt or non-contribute consent closes the same
+capture/model/write paths while read-only helpers keep working, and the fault
+is reported as itself, never as first-time onboarding. The field grants no
+permission by itself: explicit `enabled=false` always wins, and a config
+without the field keeps its previous read behavior until the owning adapter
+wires it at install/upgrade/entry. When community contribution is off — the
+default — there is no automatic capture, extraction or sanitization at all:
+the Hook short-circuits and creates no capture, cursor, draft or organizer
+call. Read-only retrieval, plugin updates and knowledge sync keep working; an
+existing service or local retrieval cache does not imply capture is enabled.
+Disabling mid-task cancels queued and running maintenance, the idle batch
+timer and unsent batches; it never deletes drafts or published data, and
+re-enabling never backfills the disabled period.
 
 ## Capture and bounded increments
 
@@ -61,8 +69,16 @@ One organizer model call per accepted increment (input 64 KiB, structured
 result 32 KiB, runner 120s/outer 125s, one concurrent call, 6 per task-hour, 20 per
 domain-hour, pause after three consecutive failures; attempts are persisted
 before spawn and never replayed). Quota-deferred material stays unattempted;
-its persisted continuation survives restart. Only fresh/unattempted regions
-resume automatically; interrupted or failed model regions never replay.
+its persisted continuation survives restart. A region that failed with an
+explicit deadline, or whose attempt was interrupted without landing an
+outcome, gets exactly one bounded delayed recovery — at most two model
+attempts per region in total, the per-region counter persisted across
+restarts. The recovery re-reads the SAME source range with the recorded
+transcript identity and verifies the persisted end offset and content digest
+before any model call; it never widens the range, never pads the input and
+never touches new material. A second failure or an unverifiable source keeps
+the locatable, non-complete gap while other captures continue. Succeeded
+regions are never re-organized and saved results are never re-applied.
 Failed runners retain only the exit status, a trusted adapter category and
 elapsed seconds in the existing diagnostic. The adapter exit contract is
 `78=configuration`, `124=deadline`, `70=native`, `65=invalid_result`, and
