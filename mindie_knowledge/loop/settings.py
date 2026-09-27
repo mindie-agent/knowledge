@@ -126,13 +126,29 @@ class CommunitySettings:
         self.raw = data if isinstance(data, dict) else {}
         self.error = error
         self.schema_ok = error is None and self.raw.get("schema") == SCHEMA
-        enabled = self.schema_ok and self.raw.get("enabled") is True
+        # The read boundary first separates a VALID config from a fault state
+        # through the one existing normalizer — a schema-matching document
+        # with malformed values (enabled of the wrong type, out-of-range
+        # idle_seconds, bad roots, …) is damaged configuration, never an
+        # explicit disable.
+        self.valid = False
+        if self.schema_ok:
+            try:
+                normalize(self.raw)
+                self.valid = True
+            except ValueError:
+                self.valid = False
+        enabled = self.valid and self.raw.get("enabled") is True
         self.enabled = bool(enabled)
         if state is not None:
             self.state = state
         elif not self.schema_ok:
             self.state = "corrupt"
+        elif not self.valid:
+            self.state = "corrupt"
         else:
+            # "disabled" is reserved for an explicit boolean false in a valid
+            # document — the only value that is an active user revocation.
             self.state = "enabled" if self.enabled else "disabled"
         generation = self.raw.get("generation")
         # The generation is a nonempty opaque string shared by all components.
@@ -169,13 +185,19 @@ class CommunitySettings:
         # Consent gate extension: ``consent_config`` names the profile-shared
         # consent authority (absolute path). It is re-read fresh together with
         # this settings file, so a changed or damaged saved choice is observed
-        # at the same boundaries. None means the legacy format without the
-        # field; ``state="invalid"`` means a malformed field value, which
-        # fails closed like any other unreadable authority.
+        # at the same boundaries. The key is distinguished by EXISTENCE: only
+        # a wholly absent key is the legacy format; a present key holding
+        # null, an empty/non-string value or a relative path is a malformed
+        # field — ``state="invalid"`` — which fails closed like any other
+        # unreadable authority.
         self.consent = None
-        consent_ref = self.raw.get(CONSENT_FIELD)
-        if self.schema_ok and consent_ref is not None:
-            if not isinstance(consent_ref, str) or not Path(consent_ref).is_absolute():
+        if self.schema_ok and CONSENT_FIELD in self.raw:
+            consent_ref = self.raw.get(CONSENT_FIELD)
+            if (
+                not isinstance(consent_ref, str)
+                or not consent_ref
+                or not Path(consent_ref).is_absolute()
+            ):
                 self.consent = dict(
                     state="invalid", choice=None, reporting=None, path=None,
                     error="consent_config must be an absolute path string",
@@ -230,36 +252,46 @@ class CommunitySettings:
         if self.allows_capture():
             return ""
         if not self._base_allows_capture():
-            return "community contribution is disabled or unconfigured"
-        state = (self.consent or {}).get("state")
+            if self.state == "disabled":
+                return "community contribution is disabled or unconfigured"
+            return f"the community settings authority is {self.state}; contribution is stopped"
+        consent = self.consent or {}
+        state = consent.get("state")
         if state != "ok":
             return f"the saved consent authority is {state}; contribution is stopped"
+        if consent.get("choice") is None:
+            return "the consent authority holds no saved choice; contribution is stopped"
         return "the saved consent choice does not allow contribution"
 
     def capture_block_kind(self):
         """None when the gate is open, else ``"revoked"`` or ``"fault"``.
 
-        ``revoked`` is an explicit saved off: a valid config with
-        ``enabled=false``, or a valid consent document whose saved choice is
-        ``read-only``/``later``/``disabled``. Already-received work keeps the
-        revocation semantics (cancelled, unsent cancelled, never backfilled).
+        ``revoked`` is an explicit saved off, and only that: a VALID config
+        holding the boolean ``enabled=false``, or a valid consent document
+        whose saved choice is one of ``read-only``/``later``/``disabled``.
+        Already-received work keeps the revocation semantics (cancelled,
+        unsent cancelled, never backfilled).
 
-        ``fault`` is an unknown authority state: the settings file or the
-        named consent document is missing, unreadable, corrupt or malformed
-        (including an invalid ``consent_config`` value and an ``enabled`` but
-        otherwise malformed config). A fault is not a user revocation:
-        already-received work and saved results must be kept locatable and
-        resumed after the authority is restored and revalidates.
+        ``fault`` is every other closed state: the settings file or the named
+        consent document missing, unreadable, corrupt or malformed (including
+        a present but null/non-string/relative ``consent_config`` value and a
+        valid consent document with no saved choice — undetermined is not an
+        opt-out). A fault is not a user revocation: already-received work and
+        saved results must be kept locatable and resumed after the authority
+        is restored and revalidates.
         """
         if self.allows_capture():
             return None
         if self._base_allows_capture():
             # The sharing config itself is open; only the consent gate blocks.
-            return (
-                "revoked"
-                if (self.consent or {}).get("state") == "ok"
-                else "fault"
-            )
+            consent = self.consent or {}
+            if consent.get("state") == "ok" and consent.get("choice") in (
+                "read-only", "later", "disabled"
+            ):
+                return "revoked"
+            return "fault"
+        # state "disabled" is only ever assigned to a valid document holding
+        # the explicit boolean false (see __init__); anything else is a fault.
         return "revoked" if self.state == "disabled" else "fault"
 
     def in_scope(self, candidate):
@@ -379,46 +411,93 @@ _MANAGED_KEYS = frozenset({
 })
 
 
-def _update_lock(path):
-    """The ONE cross-process lock serializing every write to this file.
-
-    Shared with ``mindie_knowledge.consent_store``'s lock implementation so
-    adapters never grow a second lock protocol. Lock timeout raises
-    ``consent_store.ConsentError`` with ``state="locked"``.
-    """
+def _settings_lock_path(path):
+    """The lock file anchoring one write boundary: sibling ``<name>.lock``."""
     target = Path(path)
-    return consent_store._UpdateLock(target.with_name(target.name + ".lock"))
+    return target.with_name(target.name + ".lock")
 
 
-def write(path, *, enabled, repository, project_roots, branch="main",
-          idle_seconds=DEFAULT_IDLE_SECONDS, previous=None, **extensions):
-    """First-configuration/settings-mutation helper used by tests and setup.
+class CommunityWriteContext:
+    """The ONE explicit write boundary for a profile's community settings.
 
-    Every mutation sets a fresh nonempty opaque string ``generation`` so
-    concurrent runtimes observe the change on their next read. ``enabled_at``
-    is set only on an off->on edge. Extension keys already present in the file
-    (fork/bot/transaction/…) are preserved across toggles; one component must
-    not silently delete another component's private configuration. The whole
-    read-merge-write holds the file's cross-process lock, so a concurrent
-    ``update_extensions`` stamp can neither be lost nor overwrite this
-    mutation."""
-    with _update_lock(path):
-        previous = previous if isinstance(previous, dict) else {}
-        try:
-            on_disk = json.loads(Path(path).read_text())
-            if isinstance(on_disk, dict):
-                previous = {**on_disk, **previous}
-        except (OSError, ValueError):
-            pass
-        was_enabled = previous.get("enabled") is True
-        data = dict(previous)
+    Holds the profile's cross-process write lock (the consent store's bounded
+    OS-lock implementation — no second protocol) exactly once per call chain;
+    there is no thread-level "already locked" guessing and no nested
+    acquisition, so an adapter holding this context must call its methods —
+    not the module-level one-shot helpers — or the same-file flock would
+    self-lock.
+
+    Lock key rule: every writer sharing one profile — enable/disable,
+    configure, extension stamps, legacy adoption/migration — anchors at the
+    SAME lock key, the profile's canonical community path, even while the
+    declared target is still a legacy file being adopted. Only then do a
+    migration and a concurrent toggle serialize against each other. Inside
+    the lock the caller resolves and re-reads the CURRENT authority
+    (``read``) before writing, so a user's newer disable is never written
+    back into a deprecated file.
+
+    Lock timeout raises ``consent_store.ConsentError`` with
+    ``state="locked"``.
+    """
+
+    def __init__(self, lock_key):
+        self._lock = consent_store._UpdateLock(_settings_lock_path(lock_key))
+        self._held = False
+
+    def __enter__(self):
+        self._lock.__enter__()
+        self._held = True
+        return self
+
+    def __exit__(self, *exc):
+        self._held = False
+        self._lock.__exit__(*exc)
+
+    def _require_held(self):
+        if not self._held:
+            raise RuntimeError(
+                "community settings writes require holding CommunityWriteContext"
+            )
+
+    def read(self, path):
+        """Honest read of the current authority, inside the lock."""
+        self._require_held()
+        return load(path)
+
+    def write(self, path, *, enabled, repository, project_roots, branch="main",
+              idle_seconds=DEFAULT_IDLE_SECONDS, **extensions):
+        """Managed mutation: fresh ``generation`` per call, ``enabled_at`` on
+        the off->on edge. Field preservation merges over the CURRENT on-disk
+        document read inside this lock — never over a caller's stale
+        pre-lock snapshot. A corrupt or unreadable existing file fails with
+        ValueError and is left byte-identical (no implicit repair); a missing
+        file is a first configuration."""
+        self._require_held()
+        if "previous" in extensions:
+            raise TypeError(
+                "write() no longer accepts a stale 'previous' snapshot; the "
+                "merge base is the current document read inside this lock"
+            )
+        target = Path(path)
+        state = load(target)
+        if state.state in ("corrupt", "unreadable") and not state.schema_ok:
+            # The bytes are not a parseable mindie-community-config/1 document
+            # at all: fail and preserve them — never an implicit repair. A
+            # document that parses but carries malformed VALUES is rewritten
+            # normally: an explicit managed mutation with a fresh generation
+            # is exactly how such a config is repaired.
+            raise ValueError(
+                f"cannot write over a {state.state} community settings file"
+            )
+        data = dict(state.raw)
+        was_enabled = state.raw.get("enabled") is True
         data.update({
             "schema": SCHEMA,
             "enabled": bool(enabled),
             "generation": secrets.token_hex(16),
             "enabled_at": (
                 time.time() if enabled and not was_enabled
-                else previous.get("enabled_at") if enabled else None
+                else state.raw.get("enabled_at") if enabled else None
             ),
             "repository": repository,
             "branch": branch,
@@ -431,63 +510,86 @@ def write(path, *, enabled, repository, project_roots, branch="main",
                 data.pop(key, None)
             else:
                 data[key] = value
+        _atomic_write(target, data)
+        return load(target)
+
+    def update_extensions(self, path, **fields):
+        """Extension-key stamp (e.g. wiring ``consent_config``): sets each
+        field (None removes it) without touching ``generation``,
+        ``enabled_at`` or any managed key, so already-accepted work is never
+        revoked by a stamp. Managed keys are rejected. The current document
+        must validate through the one existing normalizer — a missing,
+        corrupt, unreadable or non-conforming document fails with ValueError
+        and is preserved byte-identical; nothing is fabricated or silently
+        repaired."""
+        self._require_held()
+        if not fields:
+            raise ValueError("update_extensions requires at least one field")
+        overlap = _MANAGED_KEYS.intersection(fields)
+        if overlap:
+            raise ValueError(
+                f"managed keys {sorted(overlap)} must go through write(), not a stamp"
+            )
         target = Path(path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        from mindie_knowledge.markdown import _atomic_write_text
-
-        _atomic_write_text(target, json.dumps(data, indent=2) + "\n")
-        try:
-            target.chmod(0o600)
-        except OSError:
-            pass
-    return load(target)
-
-
-def update_extensions(path, **fields):
-    """Serialized extension-key stamp on an existing shared settings file.
-
-    For one-component extension keys (e.g. the ``consent_config`` wiring
-    stamp): each field is set, or removed when its value is None. Managed
-    keys (schema/enabled/generation/enabled_at/repository/branch/
-    project_roots/idle_seconds) are rejected — changing them is a real
-    settings mutation and must go through ``write`` with its fresh
-    generation. This stamp never refreshes ``generation``, so work already
-    accepted under the current generation is not revoked by it.
-
-    The read-modify-write holds the same cross-process lock as ``write``:
-    exactly one of the two orderings is observable — a concurrent user
-    disable either lands first (the stamp preserves ``enabled=false``) or
-    lands second (its locked merge preserves the stamp). There is no retry
-    loop and no overwrite of a concurrent mutation. A missing or corrupt
-    document fails honestly with ValueError instead of fabricating a config;
-    a lock timeout raises ``consent_store.ConsentError`` (state ``locked``).
-    """
-    if not fields:
-        raise ValueError("update_extensions requires at least one field")
-    overlap = _MANAGED_KEYS.intersection(fields)
-    if overlap:
-        raise ValueError(
-            f"managed keys {sorted(overlap)} must go through write(), not a stamp"
-        )
-    target = Path(path)
-    with _update_lock(target):
         state = load(target)
-        if not state.schema_ok:
+        if state.state not in ("enabled", "disabled"):
             raise ValueError(
                 f"cannot stamp a {state.state} community settings file"
             )
+        try:
+            normalize(state.raw)
+        except ValueError as exc:
+            raise ValueError(
+                f"cannot stamp a non-conforming community settings file: {exc}"
+            ) from None
         data = dict(state.raw)
         for key, value in fields.items():
             if value is None:
                 data.pop(key, None)
             else:
                 data[key] = value
-        target.parent.mkdir(parents=True, exist_ok=True)
-        from mindie_knowledge.markdown import _atomic_write_text
+        _atomic_write(target, data)
+        return load(target)
 
-        _atomic_write_text(target, json.dumps(data, indent=2) + "\n")
-        try:
-            target.chmod(0o600)
-        except OSError:
-            pass
-    return load(target)
+
+def _atomic_write(target, data):
+    target.parent.mkdir(parents=True, exist_ok=True)
+    from mindie_knowledge.markdown import _atomic_write_text
+
+    _atomic_write_text(target, json.dumps(data, indent=2) + "\n")
+    try:
+        target.chmod(0o600)
+    except OSError:
+        pass
+
+
+def write(path, *, enabled, repository, project_roots, branch="main",
+          idle_seconds=DEFAULT_IDLE_SECONDS, **extensions):
+    """One-shot managed mutation: acquires the write boundary once.
+
+    Every mutation sets a fresh nonempty opaque string ``generation`` so
+    concurrent runtimes observe the change on their next read. Extension keys
+    already present in the file (fork/bot/transaction/…) are preserved across
+    toggles; one component must not silently delete another component's
+    private configuration. Adapters migrating or writing across a
+    legacy/canonical pair must drive ``CommunityWriteContext`` anchored at
+    the profile-canonical path instead of this per-path convenience entry.
+    """
+    with CommunityWriteContext(path) as ctx:
+        return ctx.write(
+            path, enabled=enabled, repository=repository,
+            project_roots=project_roots, branch=branch,
+            idle_seconds=idle_seconds, **extensions,
+        )
+
+
+def update_extensions(path, **fields):
+    """One-shot extension stamp: acquires the write boundary once.
+
+    See ``CommunityWriteContext.update_extensions``. Never refreshes
+    ``generation``: a stamp can neither revoke already-accepted work nor lose
+    a concurrent user enable/disable — exactly one ordering is observable,
+    and the locked read-merge preserves the other writer's fields in both.
+    """
+    with CommunityWriteContext(path) as ctx:
+        return ctx.update_extensions(path, **fields)
