@@ -1,4 +1,82 @@
-"""Shared pytest fixtures for the knowledge loop test-suite."""
+"""Shared pytest fixtures for the knowledge loop test-suite.
+
+Isolation is applied at import, before product modules resolve ``Path.home``
+or the diagnostics policy. The directory is ``MINDIE_KNOWLEDGE_TEST_ROOT``
+when the runner sets it, otherwise a fresh temporary directory. Reporting
+stays explicitly disabled.
+"""
+
+import json
+import os
+import tempfile
+from pathlib import Path
+
+from lane_support import PARSER_NAMES, parser_path
+
+_explicit_root = os.environ.get("MINDIE_KNOWLEDGE_TEST_ROOT")
+if _explicit_root:
+    ISOLATION_ROOT = Path(_explicit_root).expanduser().resolve()
+else:
+    ISOLATION_ROOT = Path(tempfile.mkdtemp(prefix="mindie-knowledge-test-"))
+os.environ["MINDIE_KNOWLEDGE_TEST_ROOT"] = str(ISOLATION_ROOT)
+REAL_HOME = Path(os.environ.get("HOME") or str(Path.home()))
+_WATCH = [
+    REAL_HOME / ".config" / "mindie-agent" / "diagnostics.json",
+    REAL_HOME / ".local" / "state" / "mindie" / "diagnostics",
+]
+for _parser_name in PARSER_NAMES:
+    if os.environ.get("MINDIE_FRAMEWORK_SOURCE") or os.environ.get(
+        f"MINDIE_PARSER_{_parser_name.upper()}"
+    ):
+        _WATCH.append(parser_path(_parser_name))
+
+
+def _snapshot(path):
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return {"exists": False}
+    return {
+        "exists": True,
+        "mtime_ns": info.st_mtime_ns,
+        "size": info.st_size,
+        "is_symlink": path.is_symlink(),
+    }
+
+
+ISOLATION_BEFORE = {str(path): _snapshot(path) for path in _WATCH}
+ISOLATION_ROOT.mkdir(parents=True, exist_ok=True)
+(ISOLATION_ROOT / "watched-before.json").write_text(
+    json.dumps(ISOLATION_BEFORE, indent=2) + "\n"
+)
+
+_home = ISOLATION_ROOT / "home"
+_config = ISOLATION_ROOT / "config"
+_state = ISOLATION_ROOT / "state"
+_diag_root = ISOLATION_ROOT / "diagnostics"
+for _directory in (_home, _config, _state, _diag_root):
+    _directory.mkdir(parents=True, exist_ok=True)
+os.environ["HOME"] = str(_home)
+os.environ["XDG_CONFIG_HOME"] = str(_config)
+os.environ["XDG_STATE_HOME"] = str(_state)
+os.environ["MINDIE_DIAGNOSTICS_ROOT"] = str(_diag_root)
+_policy_path = ISOLATION_ROOT / "diagnostics.json"
+os.environ["MINDIE_DIAGNOSTICS_CONFIG"] = str(_policy_path)
+_policy_path.write_text(
+    json.dumps(
+        {
+            "schema": "mindie.diagnostics.reporting.v1",
+            "purpose": "tool_fault_reporting",
+            "decision": "disabled",
+            "repository": "mindie-agent/knowledge",
+            "revision": "b34851a5df99f05787fd3c63ed6f6819",
+            "roots": [str(ISOLATION_ROOT)],
+        },
+        indent=2,
+    )
+    + "\n"
+)
+os.chmod(_policy_path, 0o600)
 
 import pytest
 
