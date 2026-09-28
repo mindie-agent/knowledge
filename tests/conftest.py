@@ -57,6 +57,8 @@ _diag_root = ISOLATION_ROOT / "diagnostics"
 for _directory in (_home, _config, _state, _diag_root):
     _directory.mkdir(parents=True, exist_ok=True)
 os.environ["HOME"] = str(_home)
+# Path.home() on Windows reads USERPROFILE before HOME.
+os.environ["USERPROFILE"] = str(_home)
 os.environ["XDG_CONFIG_HOME"] = str(_config)
 os.environ["XDG_STATE_HOME"] = str(_state)
 os.environ["MINDIE_DIAGNOSTICS_ROOT"] = str(_diag_root)

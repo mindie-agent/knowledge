@@ -88,11 +88,11 @@ def test_missing_adapter_is_honest_summary_only(tmp_path):
     runner = tmp_path / "runner.py"
     runner.write_text(
         "import json,sys\n"
-        "p=json.load(sys.stdin)\n"
+        "p=json.loads(sys.stdin.buffer.read().decode('utf-8'))\n"
         "assert p['coverage']['summary_only'] and 'no transcript adapter' "
         "in p['coverage']['notes'][0]\n"
-        "print(json.dumps({'entries':[{'entry_id':None,'title':'T',"
-        "'summary':'s','content':p['increment'][:100],'conditions':{}}]}))\n"
+        "sys.stdout.buffer.write(json.dumps({'entries':[{'entry_id':None,'title':'T',"
+        "'summary':'s','content':p['increment'][:100],'conditions':{}}]}).encode('utf-8'))\n"
     )
     engine = Engine(
         store, agent_command=[sys.executable, str(runner)],

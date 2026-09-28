@@ -40,10 +40,10 @@ from lane_support import (
 PARSERS_AND_IDS = PARSER_NAMES
 SUCCESS = (
     "import json, sys\n"
-    "payload = json.load(sys.stdin)\n"
+    "payload = json.loads(sys.stdin.buffer.read().decode('utf-8'))\n"
     "text = payload.get('increment', '')[:400]\n"
-    "print(json.dumps({'entries':[{'entry_id':None,'title':'Observed',"
-    "'summary':'production parser recovery','content':text,'conditions':{}}]}))\n"
+    "sys.stdout.buffer.write(json.dumps({'entries':[{'entry_id':None,'title':'Observed',"
+    "'summary':'production parser recovery','content':text,'conditions':{}}]}).encode('utf-8'))\n"
 )
 DEADLINE = "import sys\nsys.exit(124)\n"
 CHILD = textwrap.dedent(
@@ -51,7 +51,7 @@ CHILD = textwrap.dedent(
     import os, signal, sys
     mode = sys.argv[1]
     if mode == "model":
-        marker = open(os.environ["KILL_MARKER"], "a")
+        marker = open(os.environ["KILL_MARKER"], "a", encoding="utf-8", newline="\\n")
         marker.write("x\\n")
         marker.flush()
         os.fsync(marker.fileno())
@@ -59,7 +59,9 @@ CHILD = textwrap.dedent(
         parent = os.getppid()
         if parent <= 1:
             raise SystemExit("refusing to signal pid %s" % parent)
-        os.kill(parent, signal.SIGKILL)
+        # POSIX SIGKILL is not defined on Windows. SIGTERM there is TerminateProcess.
+        sig = getattr(signal, "SIGKILL", signal.SIGTERM)
+        os.kill(parent, sig)
         raise SystemExit(0)
     sys.path.insert(0, os.environ["GROK_CORE_REPO"])
     import importlib.util
@@ -95,7 +97,7 @@ def _runner(path, marker, body):
         "import pathlib\n"
         f"mark = pathlib.Path({str(marker)!r})\n"
         "mark.parent.mkdir(parents=True, exist_ok=True)\n"
-        "handle = mark.open('a')\n"
+        "handle = mark.open('a', encoding='utf-8', newline='\\n')\n"
         "handle.write('x\\n')\n"
         "handle.close()\n"
         + body
@@ -379,8 +381,13 @@ def test_killing_the_recovery_process_consumes_the_only_retry(tmp_path, parser_n
             start_new_session=True,
             check=False,
         )
-        assert proc.returncode < 0, (proc.returncode, proc.stdout, proc.stderr, spawn_count(kill_marker))
-        assert proc.returncode == -signal.SIGKILL
+        # POSIX reports the signal as a negative code. Windows TerminateProcess
+        # reports SIGTERM as a positive exit code. Either way the process did
+        # not finish the recovery itself.
+        expected = signal.SIGTERM if os.name == "nt" else -signal.SIGKILL
+        assert proc.returncode == expected, (
+            proc.returncode, proc.stdout, proc.stderr, spawn_count(kill_marker)
+        )
         assert spawn_count(kill_marker) == 1
         box["store"] = Store(root, domain)
         box["marker"] = retry_marker

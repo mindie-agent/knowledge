@@ -233,16 +233,90 @@ def installed_python():
     return sys.executable
 
 
+def kill_owned_group(pid):
+    """Stop one test-owned process tree. Never a system-wide scan.
+
+    POSIX signals the process group (the leader pid remains the group id
+    after that leader exits). Windows has no ``killpg``; ``taskkill /T``
+    stops that pid and the children it still owns.
+    """
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+        return
+    os.killpg(pid, signal.SIGKILL)
+
+
+def deny_read(path):
+    """Make a subsequent read raise ``PermissionError``.
+
+    Mode ``0`` does not remove the Windows read right, so there the current
+    user's read ACE is denied. The caller must ``allow_read`` in ``finally``.
+    """
+    path = Path(path)
+    if os.name == "nt":
+        user = os.environ.get("USERNAME") or os.environ.get("USER")
+        if not user:
+            raise RuntimeError("USERNAME is not set; cannot deny the Windows read ACE")
+        subprocess.run(
+            ["icacls", str(path), "/inheritance:r"],
+            check=True, capture_output=True, text=True,
+        )
+        subprocess.run(
+            ["icacls", str(path), "/grant:r", f"{user}:(F)"],
+            check=True, capture_output=True, text=True,
+        )
+        subprocess.run(
+            ["icacls", str(path), "/deny", f"{user}:(R)"],
+            check=True, capture_output=True, text=True,
+        )
+        return
+    path.chmod(0)
+
+
+def allow_read(path):
+    """Reverse ``deny_read`` so the test can inspect the preserved bytes."""
+    path = Path(path)
+    if os.name == "nt":
+        user = os.environ.get("USERNAME") or os.environ.get("USER")
+        if user:
+            subprocess.run(
+                ["icacls", str(path), "/remove:d", user],
+                check=False, capture_output=True, text=True,
+            )
+            subprocess.run(
+                ["icacls", str(path), "/grant:r", f"{user}:(F)"],
+                check=False, capture_output=True, text=True,
+            )
+        return
+    path.chmod(0o600)
+
+
 def reap(process, *, group=False):
     """Stop one test-owned process. Group mode is only for start_new_session.
 
-    The leader's pid is the process-group id. Children can still be in that
-    group after the leader has exited, so a dead leader does not skip the
-    group signal. This never scans the system for unrelated processes.
+    On POSIX the leader pid is the process-group id, including after that
+    leader has exited. On Windows the same call stops the owned tree with
+    ``taskkill /T``. This never scans the system for unrelated processes.
     """
     if process is None:
         return
-    if group:
+    if os.name == "nt":
+        if group or process.poll() is None:
+            try:
+                kill_owned_group(process.pid)
+            except (OSError, subprocess.TimeoutExpired):
+                if process.poll() is None:
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+    elif group:
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:

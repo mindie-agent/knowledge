@@ -22,10 +22,10 @@ def _runner(path, marker):
         "import pathlib, json, sys\n"
         f"mark = pathlib.Path({str(marker)!r})\n"
         "mark.write_text((mark.read_text() if mark.exists() else '') + 'x\\n')\n"
-        "payload = json.load(sys.stdin)\n"
+        "payload = json.loads(sys.stdin.buffer.read().decode('utf-8'))\n"
         "text = payload.get('increment', '')[:400]\n"
-        "print(json.dumps({'entries':[{'entry_id':None,'title':'Backlog',"
-        "'summary':'legacy pause outcome','content':text,'conditions':{}}]}))\n"
+        "sys.stdout.buffer.write(json.dumps({'entries':[{'entry_id':None,'title':'Backlog',"
+        "'summary':'legacy pause outcome','content':text,'conditions':{}}]}).encode('utf-8'))\n"
     )
 
 

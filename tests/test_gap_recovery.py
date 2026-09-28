@@ -46,9 +46,9 @@ def _append_transcript(path, texts):
 
 SUCCESS_RUNNER = (
     "import json,sys\n"
-    "p=json.load(sys.stdin)\n"
-    "print(json.dumps({'entries':[{'entry_id':None,'title':'Recovered observation',"
-    "'summary':'bounded recovery outcome','content':p['increment'][:400],'conditions':{}}]}))\n"
+    "p=json.loads(sys.stdin.buffer.read().decode('utf-8'))\n"
+    "sys.stdout.buffer.write(json.dumps({'entries':[{'entry_id':None,'title':'Recovered observation',"
+    "'summary':'bounded recovery outcome','content':p['increment'][:400],'conditions':{}}]}).encode('utf-8'))\n"
 )
 DEADLINE_RUNNER = "import sys\nsys.exit(124)\n"
 
@@ -85,7 +85,7 @@ def _counting_runner(gated, body):
     marker = gated["tmp_path"] / "spawn-count"
     gated["runner"].write_text(
         "import sys\n"
-        f"mark = open({str(marker)!r}, 'a'); mark.write('x\\n'); mark.close()\n"
+        f"mark = open({str(marker)!r}, 'a', encoding='utf-8', newline='\\n'); mark.write('x\\n'); mark.close()\n"
         + body
     )
     return marker

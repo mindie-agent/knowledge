@@ -22,7 +22,15 @@ from mindie_knowledge.loop.engine import Engine
 from mindie_knowledge.loop.store import Store
 
 from conftest import make_admission, write_settings
-from lane_support import SESSIONS, entry_documents, load_parser, transcript_path, write_transcript
+from lane_support import (
+    SESSIONS,
+    allow_read,
+    deny_read,
+    entry_documents,
+    load_parser,
+    transcript_path,
+    write_transcript,
+)
 
 PARSER_NAME = "kimi"
 SESSION = SESSIONS[PARSER_NAME]
@@ -46,11 +54,11 @@ def _runner(path, marker):
     path.write_text(
         "import pathlib, json, sys\n"
         f"mark = pathlib.Path({str(marker)!r})\n"
-        "mark.write_text((mark.read_text() if mark.exists() else '') + 'x\\n')\n"
-        "payload = json.load(sys.stdin)\n"
+        "mark.write_text((mark.read_text(encoding='utf-8') if mark.exists() else '') + 'x\\n', encoding='utf-8', newline='\\n')\n"
+        "payload = json.loads(sys.stdin.buffer.read().decode('utf-8'))\n"
         "text = payload.get('increment', '')[:400]\n"
-        "print(json.dumps({'entries':[{'entry_id':None,'title':'Gate observation',"
-        "'summary':'worker gate outcome','content':text,'conditions':{}}]}))\n"
+        "sys.stdout.buffer.write(json.dumps({'entries':[{'entry_id':None,'title':'Gate observation',"
+        "'summary':'worker gate outcome','content':text,'conditions':{}}]}).encode('utf-8'))\n"
     )
 
 
@@ -122,18 +130,23 @@ def _world(tmp_path, *, enabled, consent):
         elif consent == "corrupt":
             consent_path.write_text("{not json\n")
         elif consent == "unreadable":
-            blocked = tmp_path / "blocked"
-            blocked.mkdir()
-            consent_path = blocked / "mindie-consent.json"
+            consent_path = tmp_path / "mindie-consent.json"
             consent_path.write_text(
                 json.dumps(
                     {"schema": "mindie-consent/1", "choice": "contribute", "reporting": "later"}
                 )
-                + "\n"
+                + "\n",
+                encoding="utf-8",
+                newline="\n",
             )
-            absolute = str(consent_path.resolve())
-            blocked.chmod(0)
-            extensions["consent_config"] = absolute
+            deny_read(consent_path)
+            try:
+                consent_path.read_bytes()
+            except PermissionError:
+                pass
+            else:
+                raise AssertionError("unreadable consent fixture is still readable")
+            extensions["consent_config"] = str(consent_path.resolve())
         elif consent == "relative":
             consent_path.write_text(
                 json.dumps(
@@ -184,7 +197,7 @@ def _world(tmp_path, *, enabled, consent):
         "parser": parser,
         "settings": settings,
         "consent_path": consent_path,
-        "blocked": tmp_path / "blocked" if consent == "unreadable" else None,
+        "unreadable": consent_path if consent == "unreadable" else None,
     }
     if shape:
         _deform(world, shape)
@@ -204,9 +217,9 @@ def _stop(world):
 
 
 def _cleanup(world):
-    blocked = world.get("blocked")
-    if blocked is not None and blocked.exists():
-        blocked.chmod(0o700)
+    unreadable = world.get("unreadable")
+    if unreadable is not None:
+        allow_read(unreadable)
     world["store"].close()
 
 

@@ -20,7 +20,16 @@ from mindie_knowledge.loop.engine import Engine
 from mindie_knowledge.loop.store import Store
 
 from conftest import make_admission, write_settings
-from lane_support import REPO, SESSIONS, entry_documents, load_parser, reap, transcript_path, write_transcript
+from lane_support import (
+    REPO,
+    SESSIONS,
+    entry_documents,
+    kill_owned_group,
+    load_parser,
+    reap,
+    transcript_path,
+    write_transcript,
+)
 
 PARSER = "kimi"
 SESSION = SESSIONS[PARSER]
@@ -50,10 +59,10 @@ SUCCESS_MODEL = textwrap.dedent(
         if time.time() > deadline:
             raise SystemExit("winner model was not released")
         time.sleep(0.02)
-    payload = json.load(sys.stdin)
+    payload = json.loads(sys.stdin.buffer.read().decode("utf-8"))
     text = payload.get("increment", "")[:400]
-    print(json.dumps({"entries":[{"entry_id":None,"title":"Observed",
-        "summary":"interleaving","content":text,"conditions":{}}]}))
+    sys.stdout.buffer.write(json.dumps({"entries":[{"entry_id":None,"title":"Observed",
+        "summary":"interleaving","content":text,"conditions":{}}]}).encode("utf-8"))
     """
 )
 LOSER_FORBIDDEN_MODEL = textwrap.dedent(
@@ -167,16 +176,16 @@ def test_start_schedules_one_recovery_after_the_first_model_is_killed(tmp_path):
                 out = proc.poll()
                 pytest.fail(f"first model did not start (exit {out})")
             time.sleep(0.02)
-        os.killpg(proc.pid, signal.SIGKILL)
+        kill_owned_group(proc.pid)
         proc.wait(timeout=5)
         box["store"] = Store(box["root"], box["domain"])
         success = tmp_path / "success.py"
         success.write_text(
             "import json,sys\n"
-            "payload=json.load(sys.stdin)\n"
+            "payload=json.loads(sys.stdin.buffer.read().decode('utf-8'))\n"
             "text=payload.get('increment','')[:400]\n"
-            "print(json.dumps({'entries':[{'entry_id':None,'title':'Observed',"
-            "'summary':'crash window','content':text,'conditions':{}}]}))\n"
+            "sys.stdout.buffer.write(json.dumps({'entries':[{'entry_id':None,'title':'Observed',"
+            "'summary':'crash window','content':text,'conditions':{}}]}).encode('utf-8'))\n"
         )
         starter = _engine(box, success)
         starter.start()
@@ -340,6 +349,14 @@ def test_late_keep_gap_must_not_overwrite_a_committed_recovery(tmp_path):
             pass
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason=(
+        "POSIX-only: the leader pid remains the process-group id after it "
+        "exits, so killpg still reaches the child. Windows has no killpg; "
+        "owned-tree cleanup is taskkill /T while the process is alive."
+    ),
+)
 def test_reap_kills_children_after_the_leader_exits(tmp_path):
     """The leader exits first. Its 60s child stays in that process group."""
     child_pid_path = tmp_path / "child.pid"

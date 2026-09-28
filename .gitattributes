@@ -1,0 +1,2 @@
+# Exact production parser bytes. Windows checkout must not turn LF into CRLF.
+tests/fixtures/production-parsers/** text eol=lf

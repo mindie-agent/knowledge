@@ -435,6 +435,9 @@ def test_runner_exit_category_never_blocks_later_work(store, tmp_path):
         with pytest.raises(RuntimeError, match="category=configuration"):
             engine.agent(dict(role="organize"), attempt_id=f"cfg-{i}", root_hash="sc")
     # No pause state: the next attempt is admitted immediately.
-    engine.agent_command = [sys.executable, "-c", "import json; print(json.dumps({'entries': []}))"]
+    engine.agent_command = [
+        sys.executable, "-c",
+        "import json,sys; sys.stdout.buffer.write(json.dumps({'entries': []}).encode('utf-8'))",
+    ]
     result = engine.agent(dict(role="organize", entries=[]), attempt_id="after", root_hash="sc")
     assert result == {"entries": []}

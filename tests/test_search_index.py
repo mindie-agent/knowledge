@@ -400,11 +400,11 @@ def test_capture_proceeds_while_index_migration_is_pending(tmp_path):
     runner = tmp_path / "runner.py"
     runner.write_text(
         "import json,sys\n"
-        "p=json.load(sys.stdin)\n"
+        "p=json.loads(sys.stdin.buffer.read().decode('utf-8'))\n"
         "assert p['retrieved_refs']==[]\n"
         "assert any('not ready' in n for n in p['coverage']['notes'])\n"
-        "print(json.dumps({'entries':[{'entry_id':None,'title':'Cold capture',"
-        "'summary':'s','content':p['increment'][:100],'conditions':{}}]}))\n"
+        "sys.stdout.buffer.write(json.dumps({'entries':[{'entry_id':None,'title':'Cold capture',"
+        "'summary':'s','content':p['increment'][:100],'conditions':{}}]}).encode('utf-8'))\n"
     )
     store = Store(tmp_path / "store", "test")
     _corpus(store)

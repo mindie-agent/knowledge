@@ -14,7 +14,7 @@ import textwrap
 
 import pytest
 
-from lane_support import CHOICES, CONSENT_SCHEMA, REPORTING, REPO, reap
+from lane_support import CHOICES, CONSENT_SCHEMA, REPORTING, REPO, allow_read, deny_read, reap
 
 _CHILD = textwrap.dedent(
     """\
@@ -93,8 +93,8 @@ def test_read_distinguishes_missing_unreadable_and_corrupt_without_writing(api, 
     assert list(tmp_path.iterdir()) == before
 
     unread = tmp_path / "unreadable.json"
-    unread.write_text('{"schema":"mindie-consent/1","choice":"later"}\n')
-    unread.chmod(0)
+    unread.write_text('{"schema":"mindie-consent/1","choice":"later"}\n', encoding="utf-8", newline="\n")
+    deny_read(unread)
     try:
         with pytest.raises(PermissionError):
             unread.read_bytes()
@@ -103,7 +103,7 @@ def test_read_distinguishes_missing_unreadable_and_corrupt_without_writing(api, 
         assert seen["choice"] is None and seen["reporting"] is None
         assert isinstance(seen["error"], str) and seen["error"].strip()
     finally:
-        unread.chmod(0o600)
+        allow_read(unread)
     assert b'"choice":"later"' in unread.read_bytes() or b'"choice": "later"' in unread.read_bytes()
 
     samples = {
@@ -365,6 +365,8 @@ def test_cross_process_updates_merge_and_never_tear(api, tmp_path):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         workers = [
             subprocess.Popen(
@@ -374,6 +376,8 @@ def test_cross_process_updates_merge_and_never_tear(api, tmp_path):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
             )
             for command in commands
         ]
@@ -383,7 +387,12 @@ def test_cross_process_updates_merge_and_never_tear(api, tmp_path):
             if worker.returncode != 0:
                 failures.append((worker.returncode, stdout, stderr))
         reader_out, reader_err = reader.communicate(timeout=30)
-        assert not failures, failures
+        if failures:
+            rendered = "\n====\n".join(
+                f"exit {code}\n--- stdout ---\n{out}\n--- stderr ---\n{err}"
+                for code, out, err in failures
+            )
+            pytest.fail("consent workers failed\n" + rendered)
         assert reader.returncode == 0, reader_err
         assert int(reader_out.strip() or "0") == 0, reader_err
     finally:

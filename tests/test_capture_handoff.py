@@ -210,9 +210,9 @@ def test_apply_failure_keeps_the_scanned_result(tmp_path, monkeypatch):
     store = Store(tmp_path / "root", "test")
     script = tmp_path / "agent.py"
     script.write_text(
-        "import json,sys\nsys.stdin.read()\n"
-        "print(json.dumps({'entries':[{'entry_id':None,'title':'Case',"
-        "'summary':'Short','conditions':{},'content':'Observed rank 0 failed.'}]}))\n"
+        "import json,sys\nsys.stdin.buffer.read()\n"
+        "sys.stdout.buffer.write(json.dumps({'entries':[{'entry_id':None,'title':'Case',"
+        "'summary':'Short','conditions':{},'content':'Observed rank 0 failed.'}]}).encode('utf-8'))\n"
     )
     try:
         engine = Engine(
