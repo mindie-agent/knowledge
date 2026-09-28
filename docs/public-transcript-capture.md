@@ -20,6 +20,10 @@ transaction. Body creation consumes no maintenance model budget. Existing
 authorization checks, revocation, fork filtering, receipt-based restoration,
 outbox, publication and query interfaces continue to apply. The database is
 authoritative; draft files and the search index are derived views.
+On migration, legacy organizer gaps remain failed and uncommitted legacy model
+results remain held for inspection. Neither recovery route can call a body
+model or apply its result in public-transcript mode. Appends refresh the source
+excerpt so retrieval does not keep showing an earlier superseded observation.
 
 Without `summary_command`, a clearly labeled source excerpt supplies the title
 and retrieval introduction. An optional summary argv receives redacted source

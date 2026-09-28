@@ -284,6 +284,8 @@ class Engine:
         return settings
 
     def agent(self, payload, *, attempt_id, root_hash, gate=None, reserve_region=None):
+        if self.capture_mode == "public-transcript":
+            raise ValueError("public transcript capture forbids body model calls")
         raw = canonical(payload)
         if len(raw.encode("utf-8")) > MAX_INPUT:
             raise ValueError("maintenance input exceeds limit")
@@ -429,9 +431,6 @@ class Engine:
         owed its one bounded recovery) and just waits out the fault."""
         reason = self.store.continuation_reason(ident) or ""
         if reason.startswith("gap-recovery:"):
-            if self.capture_mode == "public-transcript":
-                self.store.mark_capture(ident, "failed", "legacy organizer gap retained; not replayed through transcript capture")
-                return
             self.store.schedule_continuation(
                 ident, due=time.time() + 60, reason=reason, eligible=1,
             )
@@ -930,6 +929,14 @@ class Engine:
         record = self.budget.application(attempt_id)
         if record is None or not record.get("result"):
             return
+        if self.capture_mode == "public-transcript":
+            # Retain an uncommitted legacy result for inspection, but do not
+            # publish model-authored bodies under the new transcript contract.
+            with self.store._write_txn():
+                self.store.db.execute("UPDATE maintenance_attempts SET status='held' WHERE id=?", (attempt_id,))
+                if row:
+                    self.store.mark_capture(row['id'], 'failed', 'legacy model result held; not applied to public transcript')
+            return
         try:
             self._revalidate(row)
         except (AdmissionUnreadable, GateFault):
@@ -1265,6 +1272,9 @@ class Engine:
             return
         reason = self.store.continuation_reason(ident) or ""
         if reason.startswith("gap-recovery:"):
+            if self.capture_mode == "public-transcript":
+                self.store.mark_capture(ident, "failed", "legacy organizer gap retained; not replayed through transcript capture")
+                return
             self._recover_gap(row, reason.split(":", 1)[1].strip())
             return
         region = {}

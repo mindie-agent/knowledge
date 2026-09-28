@@ -55,7 +55,9 @@ def capture(engine, row, text, region):
         if reserved is None:
             raise CursorConflict('cursor changed before local body commit')
         if task:
-            doc, _ = store.append_observation(entry_id, masked, marker=inc['digest'], producer=owner, generation=row['generation'])
+            _, summary = fallback_header(masked)
+            doc, _ = store.append_observation(entry_id, masked, marker=inc['digest'], producer=owner,
+                                              generation=row['generation'], header=dict(summary='Latest conversation excerpt: ' + summary.removeprefix('Conversation excerpt: ')))
         else:
             title, summary = fallback_header(masked)
             doc = store.create_draft(kind='experience', title=title, summary=summary, content=masked,

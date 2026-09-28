@@ -140,8 +140,15 @@ def redact(text, *, executable, key, private_paths=()):
     for path in private_paths:
         if not isinstance(path, str) or len(path) < 3:
             continue
-        for spelling in {path.rstrip('/\\'), path.replace('\\', '/').rstrip('/')}:
-            pattern = re.escape(spelling) + r'(?=$|[/\\\s`"\'<>),;:\]])'
+        normalized = path.replace('\\', '/').rstrip('/')
+        spellings = {path.rstrip('/\\'), normalized}
+        if re.match(r'^[A-Za-z]:/', normalized):
+            spellings.update((normalized.replace('/', '\\'), '/mnt/' + normalized[0].lower() + normalized[2:]))
+        elif re.match(r'^/mnt/[A-Za-z]/', normalized):
+            windows = normalized[5].upper() + ':' + normalized[6:]
+            spellings.update((windows, windows.replace('/', '\\')))
+        for spelling in spellings:
+            pattern = re.escape(spelling) + r'(?=$|[/\\\s`"\'<>),;:\]?#]|\.(?=$|\s))'
             flags = re.IGNORECASE if re.match(r'^[A-Za-z]:', spelling) else 0
             spans.extend((m.start(), m.end(), 'local-path') for m in re.finditer(pattern, text, flags))
     placeholders = [m.span() for m in re.finditer(r'<redacted:[a-z0-9-]+:[0-9a-f]{12}>', text)]

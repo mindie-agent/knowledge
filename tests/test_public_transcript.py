@@ -87,6 +87,7 @@ def test_restart_and_duplicate_stop_append_one_task_record(pipeline):
     assert len(docs) == 1
     assert docs[0]['content'].count('first-public-marker') == 1
     assert docs[0]['content'].count('second-public-marker') == 1
+    assert 'second-public-marker' in docs[0]['summary']
     assert store.cursor(str(path.resolve()))['ok_finish'] == path.stat().st_size
 
 
@@ -139,11 +140,12 @@ def test_summary_cannot_rewrite_body_and_failure_does_not_block(pipeline):
 
 
 def test_real_scanner_secrets_unicode_overlap_and_technical_negative_controls(scanner):
-    text = '中文\npassword = "Hk8Pm7Wz9Rq2Vt6S" # gitleaks:allow\nAuthorization: Bearer AbCdEf1234567890\nemail=private@private.company\nssh root@10.88.0.9\nC:\\Users\\alice\\work\\run.py\n'
+    text = '中文\npassword = "Hk8Pm7Wz9Rq2Vt6S" # gitleaks:allow\nAuthorization: Bearer AbCdEf1234567890\nemail=private@private.company\nssh root@10.88.0.9\nC:\\Users\\alice\\work\\run.py\nhttps://hooks.slack.com/services/T00000000/B00000000/abcdefghijklmnopqrstuvwx # gitleaks:allow\n'
     controls = 'torch==2.10.0.post2 vllm==0.11.0 shape=(1, 4096) BF16 8 tokens 哈希 ' + 'abcdef0123456789' * 4
     masked, rules = redact(text + controls, executable=scanner, key=b'a' * 32)
-    for secret in ('Hk8Pm7Wz9Rq2Vt6S', 'AbCdEf1234567890', 'private@private.company', '10.88.0.9', 'alice'):
+    for secret in ('Hk8Pm7Wz9Rq2Vt6S', 'AbCdEf1234567890', 'private@private.company', '10.88.0.9', 'alice', 'abcdefghijklmnopqrstuvwx'):
         assert secret not in masked
+    assert 'secret-slack-webhook-url' in rules
     assert controls in masked
     assert redact(text + controls, executable=scanner, key=b'a' * 32)[0] == masked
     assert redact(masked, executable=scanner, key=b'a' * 32)[0] == masked
@@ -175,6 +177,43 @@ def test_profile_paths_across_file_uri_wsl_and_windows(scanner):
     assert 'alice' not in masked
     assert 'torch/nn/functional.py' in masked
     assert redact(masked, executable=scanner, key=b'a' * 32)[0] == masked
+
+
+def test_workspace_aliases_and_uri_suffixes(scanner):
+    for scope in ('D:/private/work/task', r'D:\private\work\task', '/mnt/d/private/work/task'):
+        source = 'D:/private/work/task#fragment ' + r'D:\private\work\task?x=1 D:\private\work\task. /mnt/d/private/work/task/result'
+        masked, _ = redact(source, executable=scanner, key=b'a' * 32, private_paths=(scope,))
+        assert 'private/work/task' not in masked and r'private\work\task' not in masked
+    source = 'D:/private/work/task-other D:/private/work/task.extra'
+    assert redact(source, executable=scanner, key=b'a' * 32, private_paths=('D:/private/work/task',))[0] == source
+
+
+def test_upgrade_retains_legacy_gap_and_checkpoint_without_body_model(pipeline):
+    engine, store, path = pipeline
+    append(path, 'public source marker')
+    event = engine.capture(session_id='manual-A', turn_id='legacy', transcript_path=str(path))
+    row = store.capture_row(event['id'])
+    inc = transcript_double.read_material(path, 0, session_id='manual-A', not_before=0)
+    region = store.reserve_region(capture_id=row['id'], file_identity=str(path.resolve()),
+        identity=inc['identity'], start=inc['start'], finish=inc['end'], region_digest=inc['digest'],
+        observed_cursor=None, status='failed', detail='legacy timeout')
+    store.schedule_gap_recovery(region, due=time.time())
+    engine.agent_command = [sys.executable, '-c', 'raise Exception("must not call")']
+    engine._process(row['id'])
+    assert store.capture_row(row['id'])['status'] == 'failed'
+    assert store.coverage_gaps(str(path.resolve()))
+    assert store.drafts_changed() == []
+    assert store.db.execute('SELECT COUNT(*) FROM maintenance_attempts').fetchone()[0] == 0
+    with pytest.raises(ValueError, match='forbids body model'):
+        engine.agent(dict(role='organize'), attempt_id='forbidden', root_hash=row['root_session'])
+    attempt = 'organize:' + row['id'] + ':legacy-result'
+    engine.budget.reserve(attempt, row['root_session'], 'organize')
+    result = json.dumps(dict(entries=[dict(title='old', summary='old', content='model body')]))
+    engine.budget.checkpoint(attempt, result, '{}', capture_id=row['id'], capture_status='apply-pending')
+    engine._apply_saved(attempt, row)
+    assert engine.budget.application(attempt)['status'] == 'held'
+    assert engine.budget.application(attempt)['result'] == result
+    assert store.drafts_changed() == []
 
 
 def test_scanner_failure_never_consumes_input(pipeline):
