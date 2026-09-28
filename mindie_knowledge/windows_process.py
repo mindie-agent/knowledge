@@ -102,11 +102,17 @@ def _resume_windows_process(process):
                 if not thread:
                     raise ctypes.WinError(ctypes.get_last_error())
                 try:
-                    if kernel.ResumeThread(thread) == 0xFFFFFFFF:
+                    previous = kernel.ResumeThread(thread)
+                    if previous == 0xFFFFFFFF:
                         raise ctypes.WinError(ctypes.get_last_error())
                 finally:
                     kernel.CloseHandle(thread)
-                return
+                if previous == 1:
+                    return
+                if previous > 1:
+                    raise OSError("owned primary thread has an unexpected suspend count")
+                # An injected, already-running thread is not the primary
+                # thread we created suspended. Continue to the owned one.
             more = kernel.Thread32Next(snapshot, ctypes.byref(entry))
         raise OSError("owned suspended process has no primary thread")
     finally:
