@@ -9,6 +9,22 @@ path exporting `FileIdentity`/`identify`/`read_material`; without it capture
 is honest summary-only) and `feeds`. The legacy `session_activation` adapter
 config indirection is rejected, not aliased.
 
+## Persistent choice and internal task binding
+
+The native adapter is the user entry: `/mindie-agent` in Kimi/Claude Code,
+or `$mindie-agent` in Codex. Its first use after installation records one
+choice in the profile's `mindie-consent/1` document. Subsequent tasks, forks,
+restarts, upgrades and ordinary failures reuse that choice. Binding a native
+task is internal bookkeeping, not a new authorization or a manual workflow.
+An explicit choice change remains possible through the same entry.
+
+All writers serialize changes to the shared authority with one canonical
+lock and reload the current document while holding it. A migration stamp
+uses core normalization; damaged, foreign or rejected documents keep their
+bytes and report a fault. A missing first-install document can be created;
+explicit managed configuration may repair parseable current-schema values.
+Ordinary reads do not migrate, repair or rewrite settings.
+
 ## The gate
 
 `capture_allowed = active adapter lease AND community enabled AND the lease's
