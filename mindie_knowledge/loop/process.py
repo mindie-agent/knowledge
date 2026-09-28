@@ -10,12 +10,8 @@ Process-tree cleanup: POSIX uses a new session and ``killpg``. Windows
 assigns the spawned process to a Job Object so descendants stay owned, then
 ``TerminateJobObject``. A suspended start establishes Job ownership before
 the child can create descendants; community Git/gh calls share this mechanism.
-Honest limitation: the child starts runnable BEFORE job assignment, so a
-descendant spawned in that race window can escape ownership, and the
-taskkill fallback can lose orphans whose parent already exited. This module
-does NOT prove reliable Windows tree ownership; that needs an atomic
-create-suspended/assign/resume sequence or an equivalent bounded supervisor
-and real Windows acceptance, which remains open (root note 9).
+Real Windows tests cover both normal exit and inherited-pipe timeout after
+the leader exits, for this runner and the community subprocess caller.
 """
 
 import os
@@ -68,6 +64,8 @@ def annotated_error(exc, category, started, exit_code=None, stage="run"):
         reportable=category in {"invalid_result", "output_limit", "cleanup"},
     )
     return exc
+
+
 def _spawn(command, stdin):
     if os.name == "nt":
         from mindie_knowledge.windows_process import spawn_owned
