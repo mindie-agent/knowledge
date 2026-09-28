@@ -362,8 +362,9 @@ def load(path) -> CommunitySettings:
 
     The reported ``state`` keeps a missing file, an unreadable one, a damaged
     one and an explicit saved choice strictly apart. The read goes through
-    the consent store's shared-delete open on Windows so a concurrent locked
-    writer's atomic replace never fails against this gate read."""
+    the consent store's Windows read path (FILE_SHARE_DELETE); together with
+    the writer's POSIX-semantics rename in the shared atomic writer, a locked
+    write never fails against this gate read."""
     if not path:
         return CommunitySettings(
             None, {}, error="community_config is not configured",
@@ -555,14 +556,13 @@ class CommunityWriteContext:
 
 
 def _atomic_write(target, data):
-    target.parent.mkdir(parents=True, exist_ok=True)
-    from mindie_knowledge.markdown import _atomic_write_text
+    """Publish one JSON document through the shared atomic writer.
 
-    _atomic_write_text(target, json.dumps(data, indent=2) + "\n")
-    try:
-        target.chmod(0o600)
-    except OSError:
-        pass
+    Same serialization (``json.dumps(..., indent=2)`` + newline), unique
+    temp file, fsync, and the platform replace mechanism as the consent
+    authority — one publication mechanism, no second writer. Mode 0600.
+    Callers hold the canonical CommunityWriteContext lock."""
+    consent_store._write_document(target, data)
 
 
 def write(path, *, enabled, repository, project_roots, branch="main",
