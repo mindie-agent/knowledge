@@ -30,9 +30,9 @@ def test_wake_survives_hook_process_group_kill(tmp_path):
     agent = tmp_path / "agent.py"
     agent.write_text(
         "import json,sys\n"
-        f"open({str(calls)!r}, 'a').write('call\\n')\n"
-        "sys.stdin.read()\n"
-        "print(json.dumps({'entries': []}))\n"
+        f"open({str(calls)!r}, 'a', encoding='utf-8', newline='\\n').write('call\\n')\n"
+        "sys.stdin.buffer.read()\n"
+        "sys.stdout.buffer.write(json.dumps({'entries': []}).encode('utf-8'))\n"
     )
     from mindie_knowledge.loop.store import Store
 

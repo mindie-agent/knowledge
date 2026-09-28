@@ -173,15 +173,6 @@ def _upsert_continuation(db, ident, due, reason, eligible):
     )
 
 
-def _hold_capture(db, ident):
-    """Park a paused capture without a fictitious future due time."""
-    db.execute(
-        "UPDATE captures SET status='pending', detail=? WHERE id=?",
-        ("maintenance-paused", ident),
-    )
-    _upsert_continuation(db, ident, 0, "maintenance-paused", False)
-
-
 def _valid_retry_at(value):
     """A Retry-After hint is a finite Unix-epoch number — never a bool, NaN
     or infinity (anything else is ignored, never honored)."""
@@ -195,8 +186,7 @@ def _valid_retry_at(value):
 
 def commit_capture(
     db, *, namespace, root_session, session, turn, transcript, summary,
-    generation, boundary, scope, activation_epoch, hold=None,
-    kind="turn", event_key=None,
+    generation, boundary, scope, activation_epoch, kind="turn", event_key=None,
 ):
     """Insert or adopt one capture. The caller holds the write transaction.
 
@@ -205,7 +195,7 @@ def commit_capture(
     activation epoch or sharing generation no longer matches is cancelled in
     place; the id stays so the event is not captured again. ``processing``
     and terminal rows are not rewritten. A repeat makes a dormant tail or
-    admission wait eligible again. It does not clear a maintenance pause.
+    admission wait eligible again.
     """
     if kind not in _IDENTITY_KINDS:
         raise ValueError("invalid identity kind")
@@ -254,9 +244,6 @@ def commit_capture(
                 id=ident, status="cancelled", duplicate=True,
                 revoked="activation-revoked" if epoch_changed else "generation-revoked",
             )
-        if hold == "maintenance-paused" and status == "queued":
-            _hold_capture(db, ident)
-            return dict(id=ident, status="pending", duplicate=True, revoked=None)
         if status in _UNPROCESSED_CAPTURE:
             db.execute(
                 "UPDATE continuations SET due=?, eligible=1 "
@@ -276,9 +263,6 @@ def commit_capture(
             kind, stored_event,
         ),
     )
-    if hold == "maintenance-paused":
-        _hold_capture(db, ident)
-        return dict(id=ident, status="pending", duplicate=False, revoked=None)
     return dict(id=ident, status="queued", duplicate=False, revoked=None)
 
 
@@ -389,6 +373,19 @@ class Store:
             self.db.execute("ALTER TABLE sent_receipts ADD COLUMN markers TEXT")
         if receipt_columns and "batch_revision" not in receipt_columns:
             self.db.execute("ALTER TABLE sent_receipts ADD COLUMN batch_revision TEXT")
+        region_columns = {
+            row[1] for row in self.db.execute("PRAGMA table_info(regions)")
+        }
+        if region_columns and "recovery" not in region_columns:
+            # Bounded gap recovery: one delayed recovery model attempt per
+            # deadline-failed region (total at most two), persisted across
+            # restarts. ``identity`` is the transcript identity observed when
+            # the region was reserved, so the recovery re-read proves it sees
+            # the same source range and content.
+            self.db.execute(
+                "ALTER TABLE regions ADD COLUMN recovery INTEGER NOT NULL DEFAULT 0"
+            )
+            self.db.execute("ALTER TABLE regions ADD COLUMN identity TEXT")
         staging_columns = {
             row[1] for row in self.db.execute("PRAGMA table_info(feed_staging)")
         }
@@ -415,6 +412,17 @@ class Store:
         self.capture_floor = float(self.db.execute(
             "SELECT value FROM meta WHERE key='capture_floor'"
         ).fetchone()[0])
+        # Legacy one-time migration at the single atomic storage boundary:
+        # the retired maintenance pause latch left captures parked with
+        # reason='maintenance-paused', eligible=0. Clear the latch and re-due
+        # exactly those rows; every other dormant/revoked/cancelled state is
+        # untouched. Idempotent — once migrated, no rows match.
+        self.db.execute("DELETE FROM state WHERE key='maintenance_paused'")
+        self.db.execute(
+            "UPDATE continuations SET due=?, eligible=1 "
+            "WHERE reason='maintenance-paused' AND eligible=0",
+            (time.time(),),
+        )
         self.db.commit()
 
     @contextlib.contextmanager
@@ -2479,7 +2487,7 @@ class Store:
 
     def add_capture(self, *, root_session, session, turn, transcript, summary,
                     generation=None, boundary=None, scope=None, namespace="",
-                    activation_epoch=None, hold=None, kind="turn", event_key=None):
+                    activation_epoch=None, kind="turn", event_key=None):
         if kind not in _IDENTITY_KINDS:
             raise ValueError("invalid identity kind")
         if kind == "notification":
@@ -2498,14 +2506,12 @@ class Store:
             raise ValueError("summary exceeds the bounded envelope")
         if namespace and not _HARNESS_RE.fullmatch(namespace):
             raise ValueError("invalid capture namespace")
-        if hold not in {None, "maintenance-paused"}:
-            raise ValueError("invalid capture hold")
         with self._write_txn():
             result = commit_capture(
                 self.db, namespace=namespace, root_session=root_session,
                 session=session, turn=turn, transcript=transcript,
                 summary=summary.strip(), generation=generation, boundary=boundary,
-                scope=scope, activation_epoch=activation_epoch, hold=hold,
+                scope=scope, activation_epoch=activation_epoch,
                 kind=kind, event_key=event_key,
             )
         if result.get("revoked") is None:
@@ -2614,11 +2620,23 @@ class Store:
             ).fetchone()
             if already is not None:
                 return None
-            self.db.execute(
-                "INSERT INTO regions VALUES(?,?,?,?,?,?,?,?,?)",
-                (ident, capture_id, file_identity, start, finish, region_digest,
-                 status, str(detail)[:1000], now),
-            )
+            columns = {
+                row[1] for row in self.db.execute("PRAGMA table_info(regions)")
+            }
+            if "recovery" in columns:
+                self.db.execute(
+                    "INSERT INTO regions(id, capture_id, file_identity, start, "
+                    "finish, digest, status, detail, created, recovery, identity) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,0,?)",
+                    (ident, capture_id, file_identity, start, finish, region_digest,
+                     status, str(detail)[:1000], now, identity or None),
+                )
+            else:
+                self.db.execute(
+                    "INSERT INTO regions VALUES(?,?,?,?,?,?,?,?,?)",
+                    (ident, capture_id, file_identity, start, finish, region_digest,
+                     status, str(detail)[:1000], now),
+                )
             self.db.execute(
                 "INSERT INTO cursors VALUES(?,?,?,?,0,?) "
                 "ON CONFLICT(file_identity) DO UPDATE SET "
@@ -2708,6 +2726,82 @@ class Store:
                     (file_identity,),
                 ).fetchall()
         return [dict(r) for r in rows]
+
+    # ------------------------------------------------- bounded gap recovery
+
+    def schedule_gap_recovery(self, region_id, *, due):
+        """Schedule the one permitted delayed recovery for a deadline-failed
+        region. The recovery counter is persisted BEFORE the continuation so
+        a crash or restart can never grant a third model attempt. Returns the
+        region row when the recovery was scheduled, else None (already
+        recovered, not failed, or unknown region)."""
+        with self._write_txn():
+            row = self.db.execute(
+                "SELECT * FROM regions WHERE id=?", (region_id,)
+            ).fetchone()
+            if (
+                row is None
+                or row["status"] != "failed"
+                or int(row["recovery"] or 0) != 0
+            ):
+                return None
+            self.db.execute(
+                "UPDATE regions SET recovery=1 WHERE id=?", (region_id,)
+            )
+            capture_id = row["capture_id"]
+            detail = f"gap-recovery:{region_id}"
+            self.db.execute(
+                "UPDATE captures SET status='pending', detail=? WHERE id=? "
+                "AND status IN ('queued','pending','deferred','failed','processing')",
+                (detail[:1000], capture_id),
+            )
+            _upsert_continuation(self.db, capture_id, due, detail, True)
+            return dict(row)
+
+    def gap_region(self, region_id):
+        with self.lock:
+            row = self.db.execute(
+                "SELECT * FROM regions WHERE id=?", (region_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def finish_gap_if_unresolved(self, region_id, capture_id, detail):
+        """Record a failed recovery ONLY when no concurrent recovery won.
+
+        Both failure writes are guarded in one transaction: the region must
+        still be ``failed`` (a winner's checkpoint already flipped it to
+        ``succeeded`` atomically with its saved result) and the capture is
+        only flipped while still in the unprocessed family — never over an
+        ``apply-pending`` saved result or an ``organized`` outcome. Returns
+        True when this call landed the failure. A late loser must not
+        downgrade an already recovered success: the OS can preempt it
+        between its failed reservation and these writes.
+        """
+        detail = str(detail)[:1000]
+        with self._write_txn():
+            region = self.db.execute(
+                "SELECT status FROM regions WHERE id=?", (region_id,)
+            ).fetchone()
+            if region is None or region["status"] != "failed":
+                return False
+            self.db.execute(
+                "UPDATE regions SET status='failed', detail=? WHERE id=?",
+                (detail, region_id),
+            )
+            capture = self.db.execute(
+                "SELECT status FROM captures WHERE id=?", (capture_id,)
+            ).fetchone()
+            if capture is not None and capture["status"] in (
+                "queued", "pending", "deferred"
+            ):
+                self.db.execute(
+                    "UPDATE captures SET status='failed', detail=? WHERE id=?",
+                    (detail, capture_id),
+                )
+                self.db.execute(
+                    "DELETE FROM continuations WHERE capture_id=?", (capture_id,)
+                )
+            return True
 
     # ---------------------------------------------------------------- legacy
 

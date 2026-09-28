@@ -207,10 +207,10 @@ def gated(tmp_path):
     runner = tmp_path / "runner.py"
     runner.write_text(
         "import json,sys\n"
-        "p=json.load(sys.stdin)\n"
-        "print(json.dumps({'entries':[{'entry_id':None,'title':'Device mapping',"
+        "p=json.loads(sys.stdin.buffer.read().decode('utf-8'))\n"
+        "sys.stdout.buffer.write(json.dumps({'entries':[{'entry_id':None,'title':'Device mapping',"
         "'summary':'Container logical ids restart at zero.',"
-        "'content':p['increment'][:400],'conditions':{}}]}))\n"
+        "'content':p['increment'][:400],'conditions':{}}]}).encode('utf-8'))\n"
     )
     store = Store(tmp_path / "store", "test")
     from mindie_knowledge.loop.activation import Admission

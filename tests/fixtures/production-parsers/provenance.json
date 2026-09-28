@@ -1,0 +1,25 @@
+{
+  "extracted_by": "git show <commit>:<source_path>",
+  "not_a_test_double": true,
+  "framework_source_relative": "tests/fixtures/production-parsers",
+  "parsers": {
+    "kimi": {
+      "commit": "068dfa0d0e102d7e62c08fbf0454de1d1cb4eb6a",
+      "source_path": "scripts/transcript.py",
+      "fixture": "kimi/scripts/transcript.py",
+      "sha256": "273199811f6d1524d3622d17862134392d0571620773921f75fe1f1eb0869d41"
+    },
+    "cc": {
+      "commit": "2d9b091fd0b3dd5b2f4ce03d4162ce2a27e5c826",
+      "source_path": "scripts/transcript.py",
+      "fixture": "cc/scripts/transcript.py",
+      "sha256": "535e8cee4555e4f644a0ccfe72b32b21de4bbdae6b6b998f4a4b54e8b7cf29d5"
+    },
+    "codex": {
+      "commit": "7714aa70fd161befa61b42bf80376bb58f343637",
+      "source_path": "plugins/mindie-agent/scripts/codex_transcript.py",
+      "fixture": "codex/plugins/mindie-agent/scripts/codex_transcript.py",
+      "sha256": "9b82d3f89996e2b3f1336cb3c9893f9a4b671fa1ea48544a5f06b76d56384a34"
+    }
+  }
+}

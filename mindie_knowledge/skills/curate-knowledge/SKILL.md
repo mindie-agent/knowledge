@@ -25,7 +25,7 @@ anymore; do not invent them.
 | --- | --- | --- | --- |
 | Ordinary query / explain / feedback | The current admitted task | MCP `knowledge_query`, `knowledge_explain`, `knowledge_feedback` | Maintenance APIs, publication |
 | Background organization | The domain service after an admitted Stop | Durable notification and authorized worker wake; bounded increments | A second user-facing model turn |
-| Maintenance (status, gaps, resume) | An explicit maintenance task | `status`, `sharing-status`, `maintenance-resume` CLI | Scanning unrelated tasks or transcripts |
+| Maintenance (status, gaps) | An explicit maintenance task | `status`, `sharing-status` CLI | Scanning unrelated tasks or transcripts |
 
 Discovery, install, or reading this file does not activate the plugin, start
 the knowledge service, or authorize a public contribution.
@@ -47,12 +47,13 @@ Operational status is inspectable without any model:
 ```sh
 python -m mindie_knowledge sharing-status --config domain.json
 python -m mindie_knowledge status --config domain.json
-python -m mindie_knowledge maintenance-resume --config domain.json
 python -m mindie_knowledge sync --config domain.json
 ```
 
 Statuses to read precisely: sharing `disabled`/unconfigured; `coverage gap`
-(failed transcript regions are consumed and skipped, never silently reread);
+(a failed transcript region stays consumed and visible; only a region that
+failed with an explicit deadline receives one bounded delayed recovery, and
+a second failure keeps the gap locatable without blocking other work);
 `draft full` (the ordinary-file publication platform limit was reached;
 checkpointed material remains, with no automatic condensing or model replay);
 `unknown` (the existing worker queries remote state before any further write);
@@ -60,8 +61,8 @@ checkpointed material remains, with no automatic condensing or model replay);
 persisted backoff and no organizer replay); `pending scope`
 when a lease's project root is outside the configured roots.
 
-The pause circuit (three consecutive model failures) lifts only through
-`maintenance-resume`; resume never replays failed work. Do not scrape other
+There is no pause circuit and no resume command: failure counts are
+diagnostic only and never gate captures. Do not scrape other
 tasks, home directories, or private stores to "fill" gaps.
 
 ## Judgments worth preserving

@@ -18,6 +18,29 @@ def test_missing_or_malformed_settings_fail_closed(tmp_path):
     assert not settings_mod.load(wrong_schema).allows_capture()
 
 
+def test_states_distinguish_missing_corrupt_disabled_and_enabled(tmp_path):
+    """A damaged file is never a never-configured install, and a saved
+    explicit off is neither missing nor damaged (no fresh onboarding, no
+    guessed consent)."""
+    missing = settings_mod.load(tmp_path / "absent.json")
+    assert missing.state == "missing" and not missing.configured
+    unconfigured = settings_mod.load(None)
+    assert unconfigured.state == "unconfigured"
+    corrupt = tmp_path / "corrupt.json"
+    corrupt.write_text("{not json")
+    loaded = settings_mod.load(corrupt)
+    assert loaded.state == "corrupt" and not loaded.configured
+    wrong_schema = tmp_path / "wrong.json"
+    wrong_schema.write_text(json.dumps({"schema": "other/9", "enabled": True}))
+    assert settings_mod.load(wrong_schema).state == "corrupt"
+    off = write_settings(tmp_path / "off.json", enabled=False, roots=[tmp_path])
+    assert off.state == "disabled" and off.configured and not off.enabled
+    on = write_settings(tmp_path / "on.json", enabled=True, roots=[tmp_path])
+    assert on.state == "enabled" and on.configured and on.allows_capture()
+    assert settings_mod.load(tmp_path / "off.json").state == "disabled"
+    assert "state" in on.public_status()
+
+
 def test_enabled_requires_generation_boundary_and_roots(tmp_path):
     path = tmp_path / "community.json"
     settings = write_settings(path, enabled=True, roots=[tmp_path])

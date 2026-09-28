@@ -238,7 +238,7 @@ class Service:
             threading.Thread(target=self.close, daemon=True).start()
             return dict(status="stopping")
         work = method in {
-            "query", "explain", "feedback", "capture", "sync", "maintenance_resume",
+            "query", "explain", "feedback", "capture", "sync",
         }
         if work and not self.engine.begin_work():
             raise ValueError("service is not admitting new work")
@@ -289,8 +289,6 @@ class Service:
             return self.engine.capture(**args)
         if method == "sync":
             return [feed.sync(force=True) for feed in self.feeds]
-        if method == "maintenance_resume":
-            return self.engine.budget.resume()
         raise ValueError("unsupported operation")
 
     # -------------------------------------------------------------- serving

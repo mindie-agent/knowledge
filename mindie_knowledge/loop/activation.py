@@ -18,24 +18,27 @@ config state.
 
 Canonical semantics (shared by every adapter):
 
-- Authorization persists for the same native task until revoked
-  (``deactivate``), the failure circuit pauses it (3 consecutive failures) or
-  the user actually changes its project scope. There is no wall-clock expiry
-  and no config-byte/runtime-path fingerprint.
+- A lease is an internal identity binding for one native task, established
+  automatically by the adapter when the user invokes the entry. It is not a
+  consent prompt: the installation-level shared settings file is the only
+  persistent user choice. A binding lasts until an explicit ``deactivate``
+  or an actual project-scope change. There is no wall-clock expiry, no
+  failure-count pause and no config-byte/runtime-path fingerprint — ordinary
+  failures never revoke a binding and never require a manual
+  revoke/reactivate cycle.
 - A repeated healthy ``activate`` preserves the existing random token and the
   original ``activated_at`` capture boundary. A fresh activation (new,
   revoked or changed scope) ROTATES the token and boundary — no deterministic
-  reusable capability survives revocation. A paused lease is never unpaused
-  by ``activate``; recovery is explicit revoke/reactivate.
+  reusable capability survives revocation.
 - ``resolve(activation_token)`` returns the owning VALID lease (or None).
 - ``claim(session, kind, identity, token=None)`` atomically consumes a
   durable attempt identity and returns bool: True exactly once per
   ``(session, kind, identity)`` — any repeat is False, even after a failure
   or crash, and attempts survive ``deactivate`` so revoke/reactivate never
   replays old work.
-- ``finish(session, activation_token, succeeded)`` updates the task's
-  consecutive-failure counter: a valid successful call resets it only while
-  the lease is not paused; failures >= 3 never auto-reset.
+- ``finish(session, activation_token, succeeded)`` records the outcome in
+  the task's consecutive-failure diagnostic counter. The counter is
+  observability only: it never gates activation, capture or claims.
 """
 
 from __future__ import annotations
@@ -52,7 +55,6 @@ from .store import session_key
 
 BASE_COLUMNS = {"session", "token", "enabled", "failures"}
 CAPTURE_COLUMNS = BASE_COLUMNS | {"project_root", "root_session", "activated_at"}
-MAX_FAILURES = 3
 
 
 class AdmissionUnavailable(RuntimeError):
@@ -141,8 +143,7 @@ class Admission:
                 return []
             names = [row[1] for row in db.execute("PRAGMA table_info(leases)")]
             rows = db.execute(
-                "SELECT * FROM leases WHERE enabled=1 AND failures<? " + sql,
-                (MAX_FAILURES, *args),
+                "SELECT * FROM leases WHERE enabled=1 " + sql, args
             ).fetchall()
             result = []
             for row in rows:
@@ -158,10 +159,11 @@ class Admission:
     # ------------------------------------------------------------ activation
 
     def inspect(self, session):
-        """Read one diagnostic lease, including paused/disabled rows; never grant.
+        """Read one diagnostic lease, including disabled rows; never grant.
 
         Unlike ``active_lease``, this reports a broken or locked store honestly.
-        It never returns a token, initializes schema, or resets the circuit.
+        It never returns a token or initializes schema. The failure count is
+        diagnostic only — there is no paused state.
         """
         result = dict(status="missing", enabled=False)
         if not isinstance(session, str) or not session.strip() or len(session) > 256:
@@ -178,9 +180,8 @@ class Admission:
             ).fetchone()
             if row is not None:
                 enabled, failures, project_root = row
-                paused = bool(enabled) and failures >= MAX_FAILURES
-                result = dict(status="paused" if paused else "active" if enabled else "inactive",
-                              enabled=bool(enabled) and not paused, failures=failures,
+                result = dict(status="active" if enabled else "inactive",
+                              enabled=bool(enabled), failures=failures,
                               project_root=project_root)
         except FileNotFoundError:
             pass
@@ -192,14 +193,13 @@ class Admission:
         return result
 
     def activate(self, session, *, project_root, root_session=None):
-        """Explicitly authorize one native task for capture.
+        """Bind one native task internally for capture.
 
-        A repeated healthy activate for the same session and scope preserves
-        its token and original ``activated_at`` capture boundary. A paused
-        lease is NOT reset — recovery is explicit ``deactivate`` plus a fresh
-        activate. A fresh activation (new session, after revocation, or a
-        changed project scope) rotates the token and boundary. Returns the
-        lease dict.
+        A repeated activate for the same session and scope preserves its
+        token and original ``activated_at`` capture boundary, whatever the
+        diagnostic failure counter says. A fresh activation (new session,
+        after revocation, or a changed project scope) rotates the token and
+        boundary. Returns the lease dict.
         """
         if not isinstance(session, str) or not session.strip() or len(session) > 256:
             raise ValueError("session must be nonempty text of at most 256 characters")
@@ -215,10 +215,6 @@ class Admission:
                 "SELECT * FROM leases WHERE session=?", (session,)
             ).fetchone()
             now = time.time()
-            if row and row[2] == 1 and row[3] >= MAX_FAILURES:
-                # Paused by the failure circuit: activate is never a bypass
-                # and never a success-shaped enabled grant.
-                return row
             if row and row[2] == 1 and row[4] == scope:
                 # Healthy re-activation: keep the token and original boundary.
                 db.execute(
@@ -245,13 +241,11 @@ class Admission:
             ).fetchone()
 
         row = self._write(op)
-        paused = bool(row[2]) and row[3] >= MAX_FAILURES
         return {
             "session": row[0],
             "token": row[1],
-            "enabled": bool(row[2]) and not paused,
+            "enabled": bool(row[2]),
             "failures": row[3],
-            "paused": paused,
             "project_root": row[4],
             "root_session": row[5],
             "activated_at": row[6],
@@ -317,10 +311,9 @@ class Admission:
     def capture_authorization(self, session, token, *, timeout):
         """Read one lease for a Stop handoff.
 
-        Returns ``state`` of ``admitted``, ``inactive``, ``paused``, or
-        ``schema``. A locked or unreadable database raises
-        ``AdmissionUnavailable`` instead of looking inactive. The token is
-        not copied into the result.
+        Returns ``state`` of ``admitted``, ``inactive``, or ``schema``. A
+        locked or unreadable database raises ``AdmissionUnavailable`` instead
+        of looking inactive. The token is not copied into the result.
         """
         if (
             not isinstance(session, str)
@@ -367,8 +360,6 @@ class Admission:
             if not matches:
                 return {"state": "inactive"}
             failures = int(lease.get("failures") or 0)
-            if failures >= MAX_FAILURES:
-                return {"state": "paused", "failures": failures}
             root = lease.get("project_root")
             if not isinstance(root, str) or not root:
                 return {"state": "schema"}
@@ -439,8 +430,6 @@ class Admission:
             if lease.get("enabled") != 1:
                 return {"state": "inactive"}
             failures = int(lease.get("failures") or 0)
-            if failures >= MAX_FAILURES:
-                return {"state": "paused", "failures": failures}
             token = lease.get("token")
             if not isinstance(token, str) or not token or len(token) > 512:
                 return {"state": "schema"}
@@ -503,9 +492,9 @@ class Admission:
         """Atomically consume one durable attempt identity; returns True
         exactly once per ``(session, kind, identity)`` — any repeat is False,
         even after a failure or crash, and attempts survive deactivation.
-        Enabled/token/failure-threshold checks and the insert run in the
-        SAME BEGIN IMMEDIATE transaction so a revoke racing this claim
-        cannot admit after the lease is gone."""
+        Enabled/token checks and the insert run in the SAME BEGIN IMMEDIATE
+        transaction so a revoke racing this claim cannot admit after the
+        lease is gone."""
         if not isinstance(session, str) or not session.strip():
             raise ValueError("session is not manually activated")
         for value, name in ((kind, "kind"), (identity, "identity")):
@@ -519,11 +508,7 @@ class Admission:
                 "SELECT token, enabled, failures FROM leases WHERE session=?",
                 (session,),
             ).fetchone()
-            if (
-                row is None
-                or row[1] != 1
-                or row[2] >= MAX_FAILURES
-            ):
+            if row is None or row[1] != 1:
                 raise ValueError("session is not manually activated")
             if token is not None and (
                 not isinstance(token, str)
@@ -539,12 +524,11 @@ class Admission:
         return self._write(op)
 
     def finish(self, session, activation_token, succeeded):
-        """Record the outcome of one admitted call against the task's
-        consecutive-failure counter. The UPDATE is conditioned on the exact
-        session + activation token + enabled, so an old in-flight outcome
-        cannot mutate a newly rotated lease. A valid successful call resets
-        the counter only while the lease is not paused; a lease at 3+
-        failures never auto-recovers."""
+        """Record the outcome of one admitted call in the task's
+        consecutive-failure diagnostic counter. The UPDATE is conditioned on
+        the exact session + activation token + enabled, so an old in-flight
+        outcome cannot mutate a newly rotated lease. The counter is pure
+        observability: it never pauses or revokes the lease."""
         if not isinstance(session, str) or not session:
             raise ValueError("invalid activation token")
         if not isinstance(activation_token, str) or not activation_token:
@@ -567,8 +551,8 @@ class Admission:
             if succeeded:
                 db.execute(
                     "UPDATE leases SET failures=0 WHERE session=? AND token=? "
-                    "AND enabled=1 AND failures<?",
-                    (session, activation_token, MAX_FAILURES),
+                    "AND enabled=1",
+                    (session, activation_token),
                 )
             else:
                 db.execute(
@@ -578,27 +562,3 @@ class Admission:
                 )
 
         self._write(op)
-
-    def _paused(self):
-        """Enabled but circuit-paused lease rows (read-only)."""
-        if not self.path.is_file():
-            return []
-        try:
-            db = sqlite3.connect(
-                self.path.as_uri() + "?mode=ro", uri=True, timeout=0.1
-            )
-        except sqlite3.Error:
-            return []
-        try:
-            names = [row[1] for row in db.execute("PRAGMA table_info(leases)")]
-            return [
-                dict(zip(names, row))
-                for row in db.execute(
-                    "SELECT * FROM leases WHERE enabled=1 AND failures>=?",
-                    (MAX_FAILURES,),
-                )
-            ]
-        except sqlite3.Error:
-            return []
-        finally:
-            db.close()

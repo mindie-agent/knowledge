@@ -26,18 +26,24 @@ end-to-end acceptance are reported separately in each adapter repository.
 
 ## Boundaries
 
+- The adapters ask for a contribution choice only once after installation and persist it in the shared profile. New tasks and forks bind internally without asking again; ordinary failures do not revoke the choice.
 - Community contribution is a single explicit switch (`mindie-community-config/1`). Off means no capture, extraction or sanitization at all — not local-only capture. Retrieval, updates and sync keep working.
 - Entries have stable opaque IDs and internally computed content revisions. Upstream deletion withdraws an entry; cached pinned reads explicitly identify historical material. Local drafts update by append-only observations and never restore withdrawn content.
 - Harness adapters expose `knowledge_query`, `knowledge_explain` and optional `knowledge_feedback`; each adapter verifies native task identity and the core rechecks its shared admission grant. Feedback is fully optional up/down with an optional one-line reason; there is no judge and no voting weight.
 - Raw task records stay with the user's Harness. Only redaction-scanned canonical entry Markdown and vote files ever reach the contribution staging directory.
-- Temporary publication or sync failures recover through the existing background worker with persisted backoff. Packaging and submission do not call a model, and recovery never replays an organizer attempt. Confirmed submissions retain minimal receipts; the current remote PR or upstream main provides the published body.
+- Temporary publication or sync failures recover through the existing background worker with persisted backoff. Packaging and submission do not call a model or rerun organization. Deadline-interrupted organization has its own bounded recovery of the exact recorded region. Confirmed submissions retain minimal receipts; the current remote PR or upstream main provides the published body.
 - The core uses the shared `mindie-diagnostics` component directly for bounded local failure logs and incident references; automatic fault reporting has its own explicit consent, separate from community contribution.
+
+See [framework stability and verification](docs/framework-stability.md) for the
+current behavior, reproducible checks and acceptance boundaries.
 
 ## Development
 
 ```sh
 python -m pip install -e '.[test]'
-python -m pytest -q tests
+MINDIE_FRAMEWORK_SOURCE=tests/fixtures/production-parsers python -m pytest -q tests
 ```
+
+Run that from the repository root. The variable selects the frozen production parser fixtures in `tests/fixtures/production-parsers` (`provenance.json` records each source commit, path, and sha256). `MINDIE_PARSER_KIMI`, `MINDIE_PARSER_CC`, and `MINDIE_PARSER_CODEX` override one file. An unset variable does not search sibling checkouts or a production install; a missing or non-file path raises `MissingParserCheckout` instead of skipping.
 
 The public knowledge base starts empty in the new `mindie-entry/2` format; there is no legacy migration or compatibility layer. Pre-existing private user files stay inert.

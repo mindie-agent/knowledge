@@ -7,12 +7,27 @@ later content is appended as a marker-deduplicated, self-contained
 observation. The input region is durably reserved BEFORE the model spawns,
 so every outcome — failure, crash, cancellation — consumes it; attempted and
 successful cursors are separate and failed regions stay visible as coverage
-gaps. Nothing here replays failed work.
+gaps.
+
+A region that failed with an explicit deadline and has no saved result gets
+exactly one delayed background recovery (at most two model attempts per
+region in total, the counter persisted across restarts). The recovery
+re-reads the SAME source range with the SAME transcript identity and
+verifies the recorded end offset and content digest before any model call;
+an unverifiable or again-failing recovery keeps a locatable, non-complete
+gap while other captures and new material continue. Successful regions are
+never re-organized and saved results are never re-applied.
 
 Sharing revocation is live: the outbox/idle thread rereads the shared
 settings file about once a second; disabling (or replacing) the configuration
 cancels in-flight model work, pending batch timers and unsent contributions,
-and never backfills the disabled period after re-enable.
+and never backfills the disabled period after re-enable. An *unknown*
+authority state — the settings file or the named consent document missing,
+unreadable, corrupt or malformed — is a fault, not a revocation (GateFault):
+no new read/model/outbound-write happens, but already-received captures,
+pending gap recoveries and saved apply results are parked with a persisted
+bounded backoff and resume once the authority is restored and revalidates;
+unsent batches are held, not cancelled.
 """
 
 from __future__ import annotations
@@ -41,10 +56,21 @@ MAX_INPUT = 64 * 1024
 SUMMARY_FIELD = 4096
 _EOF_SETTLE_LIMIT = 3
 _PARTIAL_LIMIT = 4
+# One delayed recovery attempt for a deadline-failed region; the persisted
+# per-region counter, not wall time, bounds the total model attempts to two.
+GAP_RECOVERY_DELAY = 300.0
 
 
 class AdmissionUnreadable(Exception):
     """Admission storage could not be read. This is not a revocation."""
+
+
+class GateFault(Exception):
+    """The settings/consent authority is in an unknown state (missing,
+    unreadable, corrupt or malformed). This is not a revocation: no new
+    read/model/write happens, and durably received work or saved results are
+    parked with a bounded backoff — never cancelled, never dropped — until
+    the authority is restored and revalidation passes again."""
 
 
 class CursorConflict(Exception):
@@ -130,9 +156,10 @@ class Engine:
 
     def _unexpected(self, operation, stage, exc):
         """Report an unhandled internal error. Expected cancellation, budget,
-        config/caller, and community business errors are not incidents."""
+        config/caller, authority-fault, and community business errors are not
+        incidents."""
         if isinstance(exc, (MaintenanceCancelled, AdmissionUnreadable, CursorConflict,
-                            BudgetExceeded, OSError, ValueError, TypeError)):
+                            GateFault, BudgetExceeded, OSError, ValueError, TypeError)):
             return
         try:
             from mindie_knowledge.community.common import CommunityError
@@ -151,21 +178,19 @@ class Engine:
                 cwd=None, harness=""):
         """Admit one Stop event into the capture table.
 
-        Community off short-circuits before any row. A paused maintenance
-        circuit still records the turn and holds it until explicit resume;
-        it does not drop the event. The Stop hook commits through the same
-        identity before it talks to this process.
+        Community off short-circuits before any row. The Stop hook commits
+        through the same identity before it talks to this process.
         """
         settings = self._settings()
         if not settings.allows_capture():
             return dict(status="skipped",
-                        reason="community contribution is disabled or unconfigured")
+                        reason=settings.contribution_block_reason())
         if self.admission is None:
             return dict(status="skipped",
                         reason="no adapter admission is configured; identity unknown")
         lease = self.admission.active_lease(session_id)
         if lease is None:
-            return dict(status="skipped", reason="session is not manually active")
+            return dict(status="skipped", reason="session is not bound; invoke the entry once")
         if not lease.get("capture_schema"):
             return dict(status="skipped",
                         reason="adapter lease store predates the capture schema")
@@ -173,7 +198,6 @@ class Engine:
         if not scope or not settings.in_scope(scope):
             return dict(status="skipped",
                         reason="the lease's project root is outside the authorized scope")
-        paused = self.budget.status()["paused"]
         root_session = lease.get("root_session") or session_id
         root_hash = session_key(root_session)
         activated_at = lease.get("activated_at")
@@ -192,9 +216,8 @@ class Engine:
             generation=settings.generation, boundary=boundary, scope=scope,
             namespace=namespace,
             activation_epoch=activation_epoch(lease["token"]),
-            hold="maintenance-paused" if paused else None,
         )
-        if captured.get("revoked") or paused:
+        if captured.get("revoked"):
             return captured
         if captured["status"] in {"queued", "pending", "deferred"}:
             try:
@@ -212,15 +235,23 @@ class Engine:
     def _gate_live(self):
         if self.stop.is_set():
             raise MaintenanceCancelled("service is stopping")
-        if not self._settings().allows_capture():
+        block = self._settings().capture_block_kind()
+        if block == "fault":
+            raise GateFault("consent/settings authority is unavailable")
+        if block == "revoked":
             raise MaintenanceCancelled("sharing disabled before model spawn")
 
     def _revalidate(self, row):
         """The capture's persisted authorization must still hold exactly:
         same settings generation, live lease, unchanged authorized scope.
-        Anything else is a revocation — the material never reaches a child."""
+        Anything else is a revocation — the material never reaches a child.
+        An unknown authority state is a GateFault, not a revocation: the
+        material stays parked and the saved result is never dropped."""
         settings = self._settings()
-        if not settings.allows_capture():
+        block = settings.capture_block_kind()
+        if block == "fault":
+            raise GateFault("consent/settings authority is unavailable")
+        if block == "revoked":
             raise MaintenanceCancelled("sharing disabled")
         if row["generation"] is not None and settings.generation != row["generation"]:
             raise MaintenanceCancelled("settings generation changed since admission")
@@ -284,7 +315,7 @@ class Engine:
         except MaintenanceCancelled:
             outcome = None
             raise
-        except (AdmissionUnreadable, CursorConflict):
+        except (AdmissionUnreadable, CursorConflict, GateFault):
             if not started:
                 self.budget.abandon_unstarted(attempt_id)
                 outcome = "abandoned"
@@ -296,7 +327,8 @@ class Engine:
         finally:
             # A validated result stays 'running' until the caller checkpoints
             # it. Finishing success here would drop the output on an apply crash.
-            # An unstarted admission or cursor conflict is abandoned, not failed.
+            # An unstarted admission, cursor conflict or gate fault is
+            # abandoned, not failed.
             # A per-item content failure stays consumed but does not feed the
             # domain pause circuit.
             if outcome is not True and outcome != "abandoned":
@@ -375,6 +407,34 @@ class Engine:
         self._defer_counted(
             ident, "admission-unreadable", _PARTIAL_LIMIT,
             dormant_reason="admission-unreadable",
+        )
+
+    def _defer_gate_fault(self, ident):
+        """Park durably received work while the settings/consent authority is
+        in an unknown state. Nothing is cancelled and no saved result is
+        dropped: the capture stays pending with a persisted, capped backoff
+        and resumes once the authority is restored and revalidation passes.
+        A pending gap recovery keeps its routing reason (the region is still
+        owed its one bounded recovery) and just waits out the fault."""
+        reason = self.store.continuation_reason(ident) or ""
+        if reason.startswith("gap-recovery:"):
+            self.store.schedule_continuation(
+                ident, due=time.time() + 60, reason=reason, eligible=1,
+            )
+            return
+        try:
+            count = (
+                int(reason.split(":", 1)[1])
+                if reason.startswith("gate-fault:")
+                else 0
+            )
+        except ValueError:
+            count = 0
+        count += 1
+        self.store.defer_capture(
+            ident,
+            due=time.time() + min(3600.0, 30.0 * 2.0 ** min(count - 1, 6)),
+            reason=f"gate-fault:{count}", eligible=1,
         )
 
     def _defer_reread(self, ident):
@@ -852,7 +912,7 @@ class Engine:
             return
         try:
             self._revalidate(row)
-        except AdmissionUnreadable:
+        except (AdmissionUnreadable, GateFault):
             # The body stays. A later due continuation retries the apply.
             if row and row.get("id"):
                 self._defer_apply(row["id"], transient=True)
@@ -982,17 +1042,192 @@ class Engine:
             notes.append("retrieval index not ready; organized without optional refs")
             return []
 
+    def _recover_gap(self, row, region_id):
+        """The one permitted delayed recovery of a deadline-failed region.
+
+        Re-reads exactly the failed source range with the recorded transcript
+        identity and verifies the persisted end offset and content digest
+        before any model call — never the live cursor and never new material.
+        A second failure (or an unverifiable source) leaves a locatable,
+        non-complete gap; other captures continue.
+        """
+        ident = row["id"]
+        region = self.store.gap_region(region_id)
+        if region is None:
+            self.store.mark_capture(
+                ident, "failed", "gap recovery region is missing; gap retained"
+            )
+            return
+        if region["status"] != "failed":
+            # Already resolved (or cancelled) elsewhere: resume normal flow.
+            self.store.defer_capture(
+                ident, due=time.time(), reason="gap already resolved; continuing",
+            )
+            return
+
+        def keep_gap(detail):
+            detail = f"{detail}; gap retained at [{region['start']},{region['finish']})"
+            # Guarded: a concurrent winner's recovered success is never
+            # downgraded by this loser's late failure write.
+            self.store.finish_gap_if_unresolved(region_id, ident, detail)
+
+        try:
+            self._revalidate(row)
+        except AdmissionUnreadable:
+            self.store.schedule_continuation(
+                ident, due=time.time() + 60,
+                reason=f"gap-recovery:{region_id}", eligible=1,
+            )
+            return
+        except GateFault:
+            # Wait out the authority fault; the region keeps its one recovery.
+            self.store.schedule_continuation(
+                ident, due=time.time() + 60,
+                reason=f"gap-recovery:{region_id}", eligible=1,
+            )
+            return
+        except MaintenanceCancelled as exc:
+            self.store.mark_capture(ident, "cancelled", str(exc)[:500])
+            return
+        parser = self.transcript
+        if parser is None or not row["transcript"]:
+            keep_gap("gap recovery requires the original transcript")
+            return
+        key = str(Path(row["transcript"]).resolve(strict=False))
+        if key != region["file_identity"]:
+            keep_gap("gap recovery source path changed")
+            return
+        expected = None
+        if region.get("identity"):
+            expected = parser.FileIdentity.unserialize(region["identity"], key)
+            if expected is None:
+                keep_gap("persisted transcript identity is unusable")
+                return
+        import inspect
+
+        try:
+            exact_range = "scan_until" in inspect.signature(
+                parser.read_material
+            ).parameters
+        except (TypeError, ValueError):
+            exact_range = False
+        if not exact_range:
+            keep_gap("transcript parser lacks exact-range recovery support")
+            return
+        inc = parser.read_material(
+            row["transcript"], int(region["start"]),
+            session_id=row["session"], not_before=row["boundary"],
+            expected=expected, scan_until=int(region["finish"]),
+        )
+        if (
+            inc.get("status") != "ok"
+            or inc.get("end") != region["finish"]
+            or inc.get("digest") != region["digest"]
+            or not str(inc.get("text") or "").strip()
+        ):
+            keep_gap("gap recovery could not verify the same source range")
+            return
+        masked, rules = mask_text(inc["text"])
+        notes = ["bounded deadline-gap recovery"]
+        if rules:
+            notes.append("pre-model redaction: " + ", ".join(rules))
+        if not masked.strip():
+            keep_gap("recovery increment fully redacted")
+            return
+        opaque = self.store.opaque_for(row["root_session"])
+        marker = (inc.get("digest") or region["digest"])[:64]
+        payload = dict(
+            role="organize", domain=self.store.domain, increment=masked,
+            coverage=dict(
+                summary_only=False, notes=notes,
+                gaps=len(self.store.coverage_gaps(key)),
+                ranges=inc.get("coverage", []),
+                start=inc.get("start"), end=inc.get("end"),
+                more=inc.get("more", False),
+            ),
+            existing_drafts=self.store.draft_headers(
+                owner=opaque, generation=row["generation"], query=masked),
+            retrieved_refs=self._optional_refs(masked, notes),
+        )
+        while payload["existing_drafts"] and len(canonical(payload).encode()) > MAX_INPUT:
+            payload["existing_drafts"].pop()
+        attempt_id = f"organize:{ident}:{marker}:recover"
+        try:
+            result = self.agent(
+                payload, attempt_id=attempt_id,
+                root_hash=row["root_session"],
+                gate=lambda: self._revalidate(row),
+            )
+        except BudgetExceeded as exc:
+            if exc.retry_at is not None:
+                self.store.schedule_continuation(
+                    ident, due=exc.retry_at,
+                    reason=f"gap-recovery:{region_id}", eligible=1,
+                )
+                return
+            keep_gap(f"gap recovery exhausted ({exc})")
+            return
+        except AdmissionUnreadable:
+            self.store.schedule_continuation(
+                ident, due=time.time() + 60,
+                reason=f"gap-recovery:{region_id}", eligible=1,
+            )
+            return
+        except CursorConflict:
+            self.store.schedule_continuation(
+                ident, due=time.time() + 8,
+                reason=f"gap-recovery:{region_id}", eligible=1,
+            )
+            return
+        except GateFault:
+            self.store.schedule_continuation(
+                ident, due=time.time() + 60,
+                reason=f"gap-recovery:{region_id}", eligible=1,
+            )
+            return
+        except MaintenanceCancelled as exc:
+            self.store.mark_capture(ident, "cancelled", str(exc)[:500])
+            return
+        except (RuntimeError, TimeoutError, ValueError, OSError) as exc:
+            keep_gap(f"gap recovery failed again ({type(exc).__name__})")
+            return
+        try:
+            self._revalidate(row)  # again before applying any result
+        except AdmissionUnreadable:
+            self._checkpoint_result(
+                attempt_id, result, {"region_id": region_id}, inc, False, notes, row,
+            )
+            return
+        except GateFault:
+            # Save the recovered result; the apply waits out the fault.
+            self._checkpoint_result(
+                attempt_id, result, {"region_id": region_id}, inc, False, notes, row,
+            )
+            return
+        except MaintenanceCancelled as exc:
+            self.store.mark_capture(ident, "cancelled", str(exc)[:500])
+            return
+        self._checkpoint_result(
+            attempt_id, result, {"region_id": region_id}, inc, False, notes, row,
+            apply=True,
+        )
+        self.last_activity = time.monotonic()
+
     def _process(self, ident):
         row = self.store.capture_row(ident)
         if row is None:
             return
         if row["status"] not in {"queued", "pending", "deferred"}:
             return
-        if self.budget.status()["paused"]:
-            self.store.dormant_capture(ident, reason="maintenance-paused")
-            return
         settings = self._settings()
-        if not settings.allows_capture():
+        block = settings.capture_block_kind()
+        if block == "fault":
+            # An unknown authority state is not a revocation: park the
+            # received work with a bounded backoff; it resumes unchanged
+            # after the authority is restored.
+            self._defer_gate_fault(ident)
+            return
+        if block == "revoked":
             self.store.mark_capture(ident, "cancelled", "sharing disabled while queued")
             return
         lease = self.admission.active_lease(row["session"]) if self.admission else None
@@ -1008,12 +1243,19 @@ class Engine:
                 ident, "discarded", "no maintenance runner is configured"
             )
             return
+        reason = self.store.continuation_reason(ident) or ""
+        if reason.startswith("gap-recovery:"):
+            self._recover_gap(row, reason.split(":", 1)[1].strip())
+            return
         region = {}
         try:
             try:
                 self._revalidate(row)
             except AdmissionUnreadable:
                 self._defer_admission(ident)
+                return
+            except GateFault:
+                self._defer_gate_fault(ident)
                 return
             except MaintenanceCancelled as exc:
                 self.store.mark_capture(ident, "cancelled", str(exc)[:500])
@@ -1093,6 +1335,11 @@ class Engine:
             except CursorConflict:
                 self._defer_reread(ident)
                 return
+            except GateFault:
+                # Pre-spawn authority fault: the attempt was abandoned before
+                # any region reservation; park the capture unchanged.
+                self._defer_gate_fault(ident)
+                return
             except MaintenanceCancelled as exc:
                 if region.get("region_id"):
                     self.store.finish_region(
@@ -1103,6 +1350,14 @@ class Engine:
             try:
                 self._revalidate(row)  # again before applying any result
             except AdmissionUnreadable:
+                self._checkpoint_result(
+                    attempt_id, result, region, inc, summary_only, notes, row,
+                )
+                return
+            except GateFault:
+                # The model result is durably saved; only the apply waits out
+                # the authority fault (apply-pending continuation, backoff in
+                # _apply_saved). Nothing is cancelled, nothing is re-run.
                 self._checkpoint_result(
                     attempt_id, result, region, inc, summary_only, notes, row,
                 )
@@ -1124,6 +1379,9 @@ class Engine:
                 self.store.defer_capture(ident, due=exc.retry_at, reason=str(exc))
             else:
                 self.store.mark_capture(ident, "discarded", str(exc))
+        except GateFault:
+            # Safety net for any gate site above: park, never drop.
+            self._defer_gate_fault(ident)
         except Exception as exc:
             self._unexpected("knowledge.capture", "process", exc)
             detail = f"{type(exc).__name__}: {exc}"[:1000]
@@ -1133,6 +1391,17 @@ class Engine:
                 return
             if region.get("region_id"):
                 self.store.finish_region(region["region_id"], "failed", detail)
+                if (
+                    getattr(exc, "mindie_category", None) == "deadline"
+                    and row.get("transcript")
+                    and self.store.schedule_gap_recovery(
+                        region["region_id"], due=time.time() + GAP_RECOVERY_DELAY
+                    )
+                    is not None
+                ):
+                    # The gap keeps one delayed recovery: the capture stays
+                    # pending on its gap-recovery continuation, not failed.
+                    return
             self.store.mark_capture(ident, "failed", detail)
 
     # ---------------------------------------------------------------- worker
@@ -1168,7 +1437,23 @@ class Engine:
                 "detail='service restarted after input reservation; not replaying' "
                 "WHERE status='processing'"
             )
+            interrupted = [
+                row[0]
+                for row in self.store.db.execute(
+                    "SELECT id FROM regions WHERE status='attempted'"
+                ).fetchall()
+            ]
             self.store.db.execute("UPDATE regions SET status='failed', detail='interrupted attempt; no replay' WHERE status='attempted'")
+        # A crash-interrupted attempt already consumed its first model attempt
+        # without landing an outcome: the failed region still gets exactly one
+        # bounded delayed recovery, scheduled at the same storage boundary as
+        # the in-process deadline path. The persisted per-region counter keeps
+        # the total at two model attempts; an unverifiable source keeps the
+        # locatable gap instead of a third call.
+        for region_id in interrupted:
+            self.store.schedule_gap_recovery(
+                region_id, due=time.time() + GAP_RECOVERY_DELAY
+            )
         self.budget.recover_interrupted()
         self.revoke_stale()
         # Arm only. Applying here can block readiness on a network restore.
@@ -1180,11 +1465,13 @@ class Engine:
         """Restart/poll-edge safety net: when sharing is enabled, pending
         batches of any other generation become disabled; when it is disabled,
         every unsent batch and publishable vote is cancelled. Old material is
-        never backfilled into a new generation."""
+        never backfilled into a new generation. An unknown authority state
+        (fault) is not a revocation: unsent work is held, not cancelled."""
         settings = self._settings()
-        if settings.allows_capture():
+        block = settings.capture_block_kind()
+        if block is None:
             self.store.disable_foreign_pending(settings.generation)
-        else:
+        elif block == "revoked":
             self._cancel_unsent("sharing disabled; unsent work cancelled")
 
     def run(self):
@@ -1206,7 +1493,8 @@ class Engine:
                             self.end_work()
                     elif not ident:
                         self._apply_due()
-                except (MaintenanceCancelled, AdmissionUnreadable, CursorConflict):
+                except (MaintenanceCancelled, AdmissionUnreadable, CursorConflict,
+                        GateFault):
                     continue
                 except Exception as exc:
                     self._unexpected("knowledge.worker", "run", exc)
@@ -1221,7 +1509,8 @@ class Engine:
                         self._process(ident)
                     finally:
                         self.end_work()
-            except (MaintenanceCancelled, AdmissionUnreadable, CursorConflict):
+            except (MaintenanceCancelled, AdmissionUnreadable, CursorConflict,
+                    GateFault):
                 pass
             except Exception as exc:  # never let the worker die silently
                 self._unexpected("knowledge.worker", "run", exc)
@@ -1337,8 +1626,16 @@ class Engine:
         while not self.stop.is_set():
             try:
                 settings = self._settings()
-                generation = settings.generation if settings.allows_capture() else None
-                if self._generation is not None and generation != self._generation:
+                block = settings.capture_block_kind()
+                generation = settings.generation if block is None else None
+                if block == "fault":
+                    # Unknown authority state: hold unsent/pending work in
+                    # place — no cancel edge, no send, no flush. Work resumes
+                    # unchanged once the authority is restored; a generation
+                    # that genuinely changed is still caught on the next
+                    # non-fault tick by the edge below.
+                    pass
+                elif self._generation is not None and generation != self._generation:
                     if generation is None:
                         self._cancel_unsent("sharing disabled; unsent work cancelled")
                     else:
@@ -1346,7 +1643,8 @@ class Engine:
                             "settings generation changed; unsent work cancelled"
                         )
                         self._cancel.clear()
-                self._generation = generation
+                if block != "fault":
+                    self._generation = generation
                 # Local read-only index maintenance: runs even with community
                 # contribution off (no capture/model/publication), in bounded
                 # resumable slices, off the query path.

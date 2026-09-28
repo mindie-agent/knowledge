@@ -9,19 +9,50 @@ path exporting `FileIdentity`/`identify`/`read_material`; without it capture
 is honest summary-only) and `feeds`. The legacy `session_activation` adapter
 config indirection is rejected, not aliased.
 
+## Persistent choice and internal task binding
+
+The native adapter is the user entry: `/mindie-agent` in Kimi/Claude Code,
+or `$mindie-agent` in Codex. Its first use after installation records one
+choice in the profile's `mindie-consent/1` document. Subsequent tasks, forks,
+restarts, upgrades and ordinary failures reuse that choice. Binding a native
+task is internal bookkeeping, not a new authorization or a manual workflow.
+An explicit choice change remains possible through the same entry.
+
+All writers serialize changes to the shared authority with one canonical
+lock and reload the current document while holding it. A migration stamp
+uses core normalization; damaged, foreign or rejected documents keep their
+bytes and report a fault. A missing first-install document can be created;
+explicit managed configuration may repair parseable current-schema values.
+Ordinary reads do not migrate, repair or rewrite settings.
+
 ## The gate
 
 `capture_allowed = active adapter lease AND community enabled AND the lease's
-canonical project_root inside the configured scope`. The shared settings file
-is re-read before transcript reading, before every model spawn and before any
-outbound write. When community contribution is off — the default — there is no
-automatic capture, extraction or sanitization at all: the Hook short-circuits
-and creates no capture, cursor, draft or organizer call. Read-only retrieval,
-plugin updates and knowledge sync keep working; an existing service or local
-retrieval cache does not imply capture is enabled. Disabling mid-task cancels
-queued and running maintenance, the idle batch timer and unsent batches; it
-never deletes drafts or published data, and re-enabling never backfills the
-disabled period.
+canonical project_root inside the configured scope AND — when the shared
+config carries the consent_config extension — a saved contribute choice in the
+named mindie-consent/1 authority`. The shared settings file is re-read before
+transcript reading, before every model spawn and before any outbound write;
+the consent document named by `consent_config` (absolute path) is re-read with
+it. A missing, unreadable, corrupt or non-contribute consent closes the same
+capture/model/write paths while read-only helpers keep working, and the fault
+is reported as itself, never as first-time onboarding. The field grants no
+permission by itself: explicit `enabled=false` always wins, and a config
+without the field keeps its previous read behavior until the owning adapter
+wires it at install/upgrade/entry. When community contribution is off — the
+default — there is no automatic capture, extraction or sanitization at all:
+the Hook short-circuits and creates no capture, cursor, draft or organizer
+call. Read-only retrieval, plugin updates and knowledge sync keep working; an
+existing service or local retrieval cache does not imply capture is enabled.
+Disabling mid-task cancels queued and running maintenance, the idle batch
+timer and unsent batches; it never deletes drafts or published data, and
+re-enabling never backfills the disabled period. An *unknown* authority state
+— the settings file or the named consent document missing, unreadable,
+corrupt or malformed — is a fault, not a revocation: no new read, model call
+or outbound write happens, but already-received captures, pending gap
+recoveries and saved apply results are parked with a persisted bounded
+backoff and unsent batches are held, all resuming once the authority is
+restored and revalidates. Repairing a damaged file is the user's explicit
+action and is never re-onboarding.
 
 ## Capture and bounded increments
 
@@ -57,12 +88,20 @@ stays at the next cursor; head/tail field clipping and oversized record skips
 are explicit coverage gaps. Reads validate task identity, inode and prefix on
 the same file handle, including nonzero offsets.
 
-One organizer model call per accepted increment (input 64 KiB, structured
-result 32 KiB, runner 120s/outer 125s, one concurrent call, 6 per task-hour, 20 per
-domain-hour, pause after three consecutive failures; attempts are persisted
-before spawn and never replayed). Quota-deferred material stays unattempted;
-its persisted continuation survives restart. Only fresh/unattempted regions
-resume automatically; interrupted or failed model regions never replay.
+The initial organizer call for each accepted increment is bounded (input
+64 KiB, structured result 32 KiB, runner 120s/outer 125s, one concurrent call,
+6 per task-hour, 20 per domain-hour). Attempts are persisted before spawn;
+failure counts are diagnostic and never pause the domain. Quota-deferred material stays unattempted;
+its persisted continuation survives restart. A region that failed with an
+explicit deadline, or whose attempt was interrupted without landing an
+outcome, gets exactly one bounded delayed recovery — at most two model
+attempts per region in total, the per-region counter persisted across
+restarts. The recovery re-reads the SAME source range with the recorded
+transcript identity and verifies the persisted end offset and content digest
+before any model call; it never widens the range, never pads the input and
+never touches new material. A second failure or an unverifiable source keeps
+the locatable, non-complete gap while other captures continue. Succeeded
+regions are never re-organized and saved results are never re-applied.
 Failed runners retain only the exit status, a trusted adapter category and
 elapsed seconds in the existing diagnostic. The adapter exit contract is
 `78=configuration`, `124=deadline`, `70=native`, `65=invalid_result`, and
@@ -243,7 +282,6 @@ mindie-knowledge serve --config domain.json      # foreground service
 mindie-knowledge status --config domain.json     # live or local read-only status
 mindie-knowledge sharing-status --config domain.json
 mindie-knowledge sync --config domain.json       # one bounded knowledge sync
-mindie-knowledge maintenance-resume --config domain.json
 mindie-knowledge stop --config domain.json
 mindie-knowledge hook --config domain.json       # Stop envelope on stdin
 mindie-knowledge contribution-inspect --config domain.json --batch ID

@@ -54,18 +54,134 @@ def test_session_quota_rolls_forward_without_replaying_old_attempts(store, monke
     with pytest.raises(BudgetExceeded,match='already been attempted'):budget.reserve('0','s','organize')
 
 
-def test_failures_pause_across_restart_and_resume_does_not_replay(store):
+def test_failures_never_pause_and_attempts_stay_consumed(store):
     budget = MaintenanceBudget(store)
     for i in range(3):
         budget.reserve(str(i), "s", "organize")
         budget.finish(str(i), False)
     budget = MaintenanceBudget(store)
-    assert budget.status()["paused"]
-    with pytest.raises(BudgetExceeded, match="paused"):
-        budget.reserve("new", "s", "organize")
-    assert not budget.resume()["paused"]
+    # No pause latch exists: new work is admitted immediately, and a consumed
+    # attempt identity is still never replayed.
+    budget.reserve("new", "s", "organize")
+    budget.finish("new", True)
     with pytest.raises(BudgetExceeded, match="already been attempted"):
         budget.reserve("0", "s", "organize")
+    assert "paused" not in budget.status()
+
+
+def test_legacy_pause_latch_and_backlog_migrate_on_store_open(store):
+    parked = store.add_capture(
+        root_session="r", session="s", turn="t", transcript=None,
+        summary="legacy parked work",
+    )
+    with store._write_txn():
+        store.db.execute(
+            "INSERT OR REPLACE INTO state VALUES('maintenance_paused', 'legacy')"
+        )
+    store.dormant_capture(parked["id"], reason="maintenance-paused")
+    with store._write_txn():
+        store.db.execute(
+            "INSERT INTO continuations VALUES('cap-2', 0, 'incomplete-tail', 0)"
+        )
+    root = store.root
+    store.close()
+    # Reopening the store migrates exactly the paused backlog; other dormant
+    # reasons are untouched, and the migration is idempotent.
+    migrated = Store(root.parent, root.name)
+    try:
+        with migrated.lock:
+            assert migrated.db.execute(
+                "SELECT 1 FROM state WHERE key='maintenance_paused'"
+            ).fetchone() is None
+            rows = dict(
+                migrated.db.execute(
+                    "SELECT capture_id, eligible FROM continuations"
+                ).fetchall()
+            )
+        assert rows == {parked["id"]: 1, "cap-2": 0}
+        due = migrated.due_capture()
+        assert due == parked["id"]
+    finally:
+        migrated.close()
+    again = Store(root.parent, root.name)
+    try:
+        with again.lock:
+            assert again.db.execute(
+                "SELECT 1 FROM state WHERE key='maintenance_paused'"
+            ).fetchone() is None
+    finally:
+        again.close()
+    store = Store(root.parent, root.name)
+    try:
+        budget = MaintenanceBudget(store)
+        budget.reserve("after-migration", "s", "organize")
+        budget.finish("after-migration", True)
+    finally:
+        store.close()
+
+
+def test_legacy_paused_capture_completes_through_the_worker(store, tmp_path):
+    """F4: a capture parked ONLY by the retired latch is consumed after the
+    store-open migration and finishes through the normal worker path."""
+    import sys
+
+    from conftest import write_settings
+
+    from mindie_knowledge.loop.activation import Admission
+    from mindie_knowledge.loop.engine import Engine
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    settings_path = tmp_path / "community.json"
+    write_settings(settings_path, enabled=True, roots=[project])
+    admission = Admission(tmp_path / "admission.sqlite3")
+    admission.activate("manual-A", project_root=str(project))
+    runner = tmp_path / "runner.py"
+    runner.write_text("print('{\"entries\": []}')")
+    engine = Engine(
+        store,
+        agent_command=[sys.executable, str(runner)],
+        settings_path=settings_path,
+        admission=admission,
+    )
+    captured = engine.capture(
+        session_id="manual-A", turn_id="t1", summary="pending legacy work"
+    )
+    assert captured["status"] == "queued"
+    # Simulate the retired latch exactly: parked ineligible, state row present.
+    with store._write_txn():
+        store.db.execute(
+            "INSERT OR REPLACE INTO state VALUES('maintenance_paused', 'legacy')"
+        )
+        store.db.execute(
+            "UPDATE continuations SET due=0, eligible=1 WHERE capture_id=?",
+            (captured["id"],),
+        )
+    store.dormant_capture(captured["id"], reason="maintenance-paused")
+    assert store.due_capture() is None
+    root = store.root
+    store.close()
+    # Upgrade/restart: reopening migrates the backlog; the worker then
+    # consumes it through the normal path and the content converges.
+    reopened = Store(root.parent, root.name)
+    try:
+        assert reopened.due_capture() == captured["id"]
+        engine = Engine(
+            reopened,
+            agent_command=[sys.executable, str(runner)],
+            settings_path=settings_path,
+            admission=admission,
+        )
+        engine._process(captured["id"])
+        row = reopened.capture_row(captured["id"])
+        assert row["status"] == "organized", row["detail"]
+        assert reopened.due_capture() is None
+        with reopened.lock:
+            assert reopened.db.execute(
+                "SELECT count(*) FROM continuations"
+            ).fetchone()[0] == 0
+    finally:
+        reopened.close()
 
 
 def test_concurrent_duplicate_reserves_only_one_call(store):
@@ -262,44 +378,49 @@ def test_bounded_run_cancellation_kills_the_whole_process_tree(tmp_path):
         process_module._spawn = real_spawn
 
 
-def test_interrupted_attempts_count_toward_pause_across_restarts(store):
+def test_interrupted_attempts_are_consumed_without_pausing(store):
     for i in range(3):
         budget = MaintenanceBudget(store)
         budget.reserve('crash-' + str(i), 'session', 'organize')
         restarted = MaintenanceBudget(store)
         restarted.recover_interrupted()
-    assert restarted.status()['paused']
-    with pytest.raises(BudgetExceeded, match='paused'):
-        restarted.reserve('new', 'session', 'organize')
-    restarted.resume()
+    # Interrupted attempts stay consumed (no replay) but never pause the domain.
+    restarted.reserve('new', 'session', 'organize')
+    restarted.finish('new', True)
     with pytest.raises(BudgetExceeded, match='already been attempted'):
         restarted.reserve('crash-0', 'session', 'organize')
+    with store.lock:
+        rows = store.db.execute(
+            "SELECT status FROM maintenance_attempts WHERE id LIKE 'crash-%'"
+        ).fetchall()
+    assert {row[0] for row in rows} == {"failed"}
 
 
-def test_per_item_content_failures_do_not_pause_the_domain(store):
-    """One task's invalid model result is consumed (never replayed) but must
-    not pause other tasks' maintenance; shared configuration/runtime failures
-    still feed the circuit."""
+def test_failure_categories_are_recorded_without_a_domain_latch(store):
+    """Per-item content failures are recorded as ``invalid``, shared/systemic
+    ones as ``failed``; both stay consumed and visible, and neither pauses
+    unrelated work — recovery is per-capture and bounded."""
     budget = MaintenanceBudget(store)
     for i in range(3):
         budget.reserve(f"bad-{i}", f"s{i}", "organize")
         budget.finish(f"bad-{i}", False, category="invalid_result")
-    assert not budget.status()["paused"]
     row = store.db.execute(
         "SELECT status FROM maintenance_attempts WHERE id='bad-0'"
     ).fetchone()
-    assert row[0] == "invalid"  # consumed and visible, not a circuit failure
-    budget.reserve("good", "sg", "organize")  # other work admitted normally
-    budget.finish("good", True)
+    assert row[0] == "invalid"  # consumed and visible
     for i in range(3):
         budget.reserve(f"cfg-{i}", f"sc{i}", "organize")
         budget.finish(f"cfg-{i}", False, category="configuration")
-    assert budget.status()["paused"]
-    # An uncategorized failure keeps the conservative shared semantics.
-    assert not MaintenanceBudget(store).resume()["paused"]
+    row = store.db.execute(
+        "SELECT status FROM maintenance_attempts WHERE id='cfg-0'"
+    ).fetchone()
+    assert row[0] == "failed"
+    # Other work is admitted normally after any failure mix.
+    budget.reserve("good", "sg", "organize")
+    budget.finish("good", True)
 
 
-def test_runner_exit_category_drives_circuit_scope(store, tmp_path):
+def test_runner_exit_category_never_blocks_later_work(store, tmp_path):
     from conftest import write_settings
 
     settings_path = tmp_path / "community.json"
@@ -309,9 +430,14 @@ def test_runner_exit_category_drives_circuit_scope(store, tmp_path):
     for i in range(3):
         with pytest.raises(RuntimeError, match="category=invalid_result"):
             engine.agent(dict(role="organize"), attempt_id=f"bad-{i}", root_hash="s")
-    assert not engine.budget.status()["paused"]
     engine.agent_command = [sys.executable, "-c", "import sys; sys.exit(78)"]
     for i in range(3):
         with pytest.raises(RuntimeError, match="category=configuration"):
             engine.agent(dict(role="organize"), attempt_id=f"cfg-{i}", root_hash="sc")
-    assert engine.budget.status()["paused"]
+    # No pause state: the next attempt is admitted immediately.
+    engine.agent_command = [
+        sys.executable, "-c",
+        "import json,sys; sys.stdout.buffer.write(json.dumps({'entries': []}).encode('utf-8'))",
+    ]
+    result = engine.agent(dict(role="organize", entries=[]), attempt_id="after", root_hash="sc")
+    assert result == {"entries": []}

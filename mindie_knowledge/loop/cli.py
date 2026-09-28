@@ -440,7 +440,6 @@ def main(argv=None):
             "stop",
             "sync",
             "sharing-status",
-            "maintenance-resume",
             "contribution-inspect",
             "contribution-reconcile",
             "contribution-retry",
@@ -517,18 +516,6 @@ def main(argv=None):
                 )
             finally:
                 store.close()
-        print(json.dumps(result, ensure_ascii=False, indent=2))
-        return 0
-    if args.operation == "maintenance-resume":
-        store = _open_existing_store(config)
-        if store is None:
-            raise ValueError("no knowledge store exists for this domain")
-        from .budget import MaintenanceBudget
-
-        try:
-            result = MaintenanceBudget(store).resume()
-        finally:
-            store.close()
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     if args.operation == "status":
