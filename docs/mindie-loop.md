@@ -88,10 +88,10 @@ stays at the next cursor; head/tail field clipping and oversized record skips
 are explicit coverage gaps. Reads validate task identity, inode and prefix on
 the same file handle, including nonzero offsets.
 
-One organizer model call per accepted increment (input 64 KiB, structured
-result 32 KiB, runner 120s/outer 125s, one concurrent call, 6 per task-hour, 20 per
-domain-hour, pause after three consecutive failures; attempts are persisted
-before spawn and never replayed). Quota-deferred material stays unattempted;
+The initial organizer call for each accepted increment is bounded (input
+64 KiB, structured result 32 KiB, runner 120s/outer 125s, one concurrent call,
+6 per task-hour, 20 per domain-hour). Attempts are persisted before spawn;
+failure counts are diagnostic and never pause the domain. Quota-deferred material stays unattempted;
 its persisted continuation survives restart. A region that failed with an
 explicit deadline, or whose attempt was interrupted without landing an
 outcome, gets exactly one bounded delayed recovery — at most two model
