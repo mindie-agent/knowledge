@@ -278,10 +278,8 @@ def request_wake(config_path, *, budget_seconds=0.4, session_id, event=None):
         if isinstance(event, str) and len(event) == 64:
             argv.extend(["--event", event])
         try:
-            process = subprocess.Popen(
-                argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True,
-            )
+            from .process import spawn_service
+            process = spawn_service(argv)
         except OSError:
             out.update(wake="failed", runtime="unavailable", reason="wake-failed",
                        recovery=_RECOVERY["wake-failed"])
@@ -327,11 +325,10 @@ def run_wake(config_path, event=None):
                     config, stage="runtime", cause="worker-unavailable", event=event,
                 )
             return 0
-        process = subprocess.Popen(
+        from .process import spawn_service
+        process = spawn_service(
             [sys.executable, "-m", "mindie_knowledge.loop.cli", "serve",
              "--config", str(Path(config_path).resolve())],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True,
         )
         holder = _read_wake(config)
         holder["service_pid"] = process.pid

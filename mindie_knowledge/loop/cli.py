@@ -171,16 +171,8 @@ def ensure_service(config_path):
                 return probe()
             except FileNotFoundError:
                 pass
-            spawn = dict(
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            if os.name == "nt":
-                spawn["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-            else:
-                spawn["start_new_session"] = True
-            process = subprocess.Popen(
+            from .process import spawn_service
+            process = spawn_service(
                 [
                     sys.executable,
                     "-m",
@@ -189,7 +181,6 @@ def ensure_service(config_path):
                     "--config",
                     str(Path(config_path).resolve()),
                 ],
-                **spawn,
             )
         for _attempt in range(MAX_STARTUP_PROBES):
             remaining = deadline - time.monotonic()

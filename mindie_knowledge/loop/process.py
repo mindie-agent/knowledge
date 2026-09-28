@@ -26,6 +26,25 @@ import time
 from .dfx import failure
 
 
+def spawn_service(command):
+    """Transfer an explicit local service/starter beyond the short caller.
+
+    Windows callers that own a Job must explicitly permit breakaway. Failure
+    stays visible; never return a false successful start inside a dying Job.
+    The service remains owned by its consumer lock and authenticated endpoint.
+    """
+    options = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL, close_fds=True)
+    if os.name == "nt":
+        options["creationflags"] = (
+            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+            | subprocess.CREATE_BREAKAWAY_FROM_JOB
+        )
+    else:
+        options["start_new_session"] = True
+    return subprocess.Popen(command, **options)
+
+
 class MaintenanceCancelled(RuntimeError):
     """The owning service is stopping; interrupted work is not replayed."""
 
