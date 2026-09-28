@@ -52,6 +52,15 @@ def test_serve_starts_with_actual_configured_parser(tmp_path):
             assert result["status"] == "stopping"
             process.wait(timeout=5)
             assert process.returncode == 0
+            from mindie_knowledge.loop.handoff import _probe
+            from mindie_knowledge.loop.locks import lock_held
+
+            # The persistent connection file survives shutdown. A short TCP
+            # timeout on Windows must not turn a released consumer into an
+            # ambiguous live service and prevent the next startup.
+            assert connection_path.is_file()
+            assert lock_held(connection_path.with_name("consumer.lock")) is False
+            assert _probe(json.loads(config.read_text()), .01) == "absent"
         finally:
             if process.poll() is None:
                 process.terminate()
@@ -60,6 +69,21 @@ def test_serve_starts_with_actual_configured_parser(tmp_path):
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=2)
+
+
+def test_lifetime_lock_observation_is_conservative_and_preserves_metadata(tmp_path):
+    from mindie_knowledge.loop.locks import StartLock, lock_held
+
+    path = tmp_path / "consumer.lock"
+    assert lock_held(path) is None
+    assert not path.exists()
+    with StartLock(path):
+        stamp = path.stat().st_mtime_ns
+        assert lock_held(path) is True
+        assert path.stat().st_mtime_ns == stamp
+    metadata = path.read_bytes()
+    assert lock_held(path) is False
+    assert path.read_bytes() == metadata
 
 
 def test_loopback_bind_skips_reverse_dns(tmp_path, monkeypatch):

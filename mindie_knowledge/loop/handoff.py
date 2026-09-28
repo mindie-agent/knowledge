@@ -164,8 +164,15 @@ def _accept_row(db, *, namespace, root_hash, session, turn, transcript, summary,
 
 def _probe(config, timeout):
     from .cli import connect
+    from .locks import lock_held
     from .transport import rpc
 
+    # The service holds this OS lock until storage and listener are closed.
+    # Windows may report a closed loopback port as a timeout for ~2 seconds;
+    # a released lifetime lock is stronger evidence than a short TCP probe.
+    consumer = Path(config["root"]) / config["domain"] / "consumer.lock"
+    if lock_held(consumer) is False:
+        return "absent"
     try:
         connection = connect(config)
     except FileNotFoundError:

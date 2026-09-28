@@ -56,6 +56,15 @@ it is separate from acceptance inside a native Windows agent host.
 
 ## Integration and acceptance boundaries
 
+The persistent `consumer.lock` is held until the service has closed its
+listener and store. `lock_held` observes the OS lock without rewriting PID
+metadata; missing or unreadable locks remain unknown. Startup can therefore
+recognize a released consumer even on Windows, where a short connection
+attempt to a closed loopback port may time out before refusal is reported.
+The real service startup test checks this post-shutdown state. Adapter
+handoff tests must also confirm release rather than force-kill a fixture
+and treat that cleanup as successful production shutdown.
+
 Publish the exact dependency commits before adapter CI. Process the reviewed
 PRs in order: knowledge core, Claude Code, Kimi, Codex. Preserve published
 commit identities used by runtime and test pins.

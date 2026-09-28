@@ -13,6 +13,7 @@ create→write window just yields a conservative ``busy``.
 from __future__ import annotations
 
 import json
+import errno
 import os
 import time
 from pathlib import Path
@@ -45,6 +46,27 @@ def _unlock_file(fd: int) -> None:
         import fcntl
 
         fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+def lock_held(path):
+    """Observe an existing OS lock: True held, False released, None unknown.
+
+    Never create/unlink the file or interpret its diagnostic PID. Opening a
+    second descriptor and trying the real lock also works after owner exit.
+    """
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except OSError:
+        return None
+    try:
+        try:
+            _lock_file_nb(fd)
+        except OSError as exc:
+            return True if exc.errno in (errno.EACCES, errno.EAGAIN) else None
+        _unlock_file(fd)
+        return False
+    finally:
+        os.close(fd)
 
 
 class StartLock:
