@@ -8,7 +8,8 @@ briefly and drop nothing while the consumer is alive.
 
 Process-tree cleanup: POSIX uses a new session and ``killpg``. Windows
 assigns the spawned process to a Job Object so descendants stay owned, then
-``TerminateJobObject`` (``taskkill /T`` only if job assignment fails).
+``TerminateJobObject``. A suspended start establishes Job ownership before
+the child can create descendants; community Git/gh calls share this mechanism.
 Honest limitation: the child starts runnable BEFORE job assignment, so a
 descendant spawned in that race window can escape ownership, and the
 taskkill fallback can lose orphans whose parent already exited. This module
@@ -67,98 +68,16 @@ def annotated_error(exc, category, started, exit_code=None, stage="run"):
         reportable=category in {"invalid_result", "output_limit", "cleanup"},
     )
     return exc
-
-
-_JOB_KILL_ON_CLOSE = 0x2000
-_JOBOBJECT_EXTENDED_LIMIT_INFORMATION = 9
-
-
-def _windows_job_api():
-    import ctypes
-    from ctypes import wintypes
-
-    class Basic(ctypes.Structure):
-        _fields_ = [
-            ("PerProcessUserTimeLimit", ctypes.c_int64),
-            ("PerJobUserTimeLimit", ctypes.c_int64),
-            ("LimitFlags", wintypes.DWORD),
-            ("MinimumWorkingSetSize", ctypes.c_size_t),
-            ("MaximumWorkingSetSize", ctypes.c_size_t),
-            ("ActiveProcessLimit", wintypes.DWORD),
-            ("Affinity", ctypes.c_size_t),
-            ("PriorityClass", wintypes.DWORD),
-            ("SchedulingClass", wintypes.DWORD),
-        ]
-
-    class IO(ctypes.Structure):
-        _fields_ = [
-            (name, ctypes.c_uint64)
-            for name in (
-                "ReadOperationCount",
-                "WriteOperationCount",
-                "OtherOperationCount",
-                "ReadTransferCount",
-                "WriteTransferCount",
-                "OtherTransferCount",
-            )
-        ]
-
-    class Extended(ctypes.Structure):
-        _fields_ = [
-            ("BasicLimitInformation", Basic),
-            ("IoInfo", IO),
-            ("ProcessMemoryLimit", ctypes.c_size_t),
-            ("JobMemoryLimit", ctypes.c_size_t),
-            ("PeakProcessMemoryUsed", ctypes.c_size_t),
-            ("PeakJobMemoryUsed", ctypes.c_size_t),
-        ]
-
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel.CreateJobObjectW.restype = wintypes.HANDLE
-    kernel.SetInformationJobObject.argtypes = [
-        wintypes.HANDLE,
-        ctypes.c_int,
-        ctypes.c_void_p,
-        wintypes.DWORD,
-    ]
-    kernel.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
-    kernel.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
-    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-    return kernel, ctypes, Extended
-
-
-def _attach_windows_job(process):
-    """Own ``process`` and future descendants. None if assignment is refused."""
-    kernel, ctypes, Extended = _windows_job_api()
-    job = kernel.CreateJobObjectW(None, None)
-    if not job:
-        return None
-    limits = Extended()
-    limits.BasicLimitInformation.LimitFlags = _JOB_KILL_ON_CLOSE
-    handle = int(process._handle)
-    if not kernel.SetInformationJobObject(
-        job,
-        _JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        ctypes.byref(limits),
-        ctypes.sizeof(limits),
-    ) or not kernel.AssignProcessToJobObject(job, handle):
-        kernel.CloseHandle(job)
-        return None
-    return job
-
-
 def _spawn(command, stdin):
     if os.name == "nt":
-        process = subprocess.Popen(
+        from mindie_knowledge.windows_process import spawn_owned
+        return spawn_owned(
             command,
             stdin=stdin,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
             env={**os.environ, "MINDIE_MAINTENANCE_GROUP": "1"},
         )
-        process._mindie_job = _attach_windows_job(process)
-        return process
     return subprocess.Popen(
         command,
         stdin=stdin,
@@ -172,28 +91,8 @@ def _spawn(command, stdin):
 def terminate_tree(process):
     """Terminate the whole owned tree rooted at ``process``; never raises."""
     if os.name == "nt":
-        job = getattr(process, "_mindie_job", None)
-        if job:
-            process._mindie_job = None
-            kernel, _, _ = _windows_job_api()
-            try:
-                kernel.TerminateJobObject(job, 1)
-            except OSError:
-                pass
-            try:
-                kernel.CloseHandle(job)
-            except OSError:
-                pass
-            return
-        try:
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(process.pid)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=5,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+        from mindie_knowledge.windows_process import terminate_owned
+        terminate_owned(process)
         return
     try:
         os.killpg(process.pid, signal.SIGTERM)

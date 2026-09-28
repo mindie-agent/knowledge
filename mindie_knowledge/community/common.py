@@ -272,14 +272,14 @@ def run_argv(
         merged_env.update({str(k): str(v) for k, v in env.items()})
     try:
         if os.name == "nt":
-            process = subprocess.Popen(
+            from mindie_knowledge.windows_process import spawn_owned
+            process = spawn_owned(
                 argv,
                 stdin=stdin_target,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 cwd=str(cwd) if cwd else None,
                 env=merged_env,
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
             )
         else:
             process = subprocess.Popen(
