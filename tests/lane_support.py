@@ -283,10 +283,7 @@ def deny_read(path):
     """
     path = Path(path)
     if os.name == "nt":
-        user = os.environ.get("USERNAME") or os.environ.get("USER")
-        if not user:
-            raise RuntimeError("USERNAME is not set; cannot deny the Windows read ACE")
-        _icacls(path, "/deny", f"{user}:(RD)")
+        _icacls(path, "/deny", f"{_windows_user_sid()}:(RD)")
         return
     path.chmod(0)
 
@@ -295,12 +292,28 @@ def allow_read(path):
     """Reverse ``deny_read`` so the test can inspect the preserved bytes."""
     path = Path(path)
     if os.name == "nt":
-        user = os.environ.get("USERNAME") or os.environ.get("USER")
-        if not user:
-            raise RuntimeError("USERNAME is not set; cannot remove the Windows deny ACE")
-        _icacls(path, "/remove:d", user)
+        _icacls(path, "/remove:d", _windows_user_sid())
         return
     path.chmod(0o600)
+
+
+def _windows_user_sid():
+    """Target the current user, even when the computer has the same name.
+
+    An unqualified USERNAME can resolve to the computer/domain SID rather
+    than its user. icacls reports success but that ACE does not deny reads.
+    Numeric SIDs use the documented leading '*' icacls syntax.
+    """
+    import csv
+    result = subprocess.run(
+        ["whoami", "/user", "/fo", "csv", "/nh"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        check=True, timeout=10,
+    )
+    rows = list(csv.reader(result.stdout.splitlines()))
+    if len(rows) != 1 or len(rows[0]) != 2 or not rows[0][1].startswith("S-1-"):
+        raise RuntimeError("cannot resolve the current Windows user SID")
+    return "*" + rows[0][1]
 
 
 def reap(process, *, group=False):
