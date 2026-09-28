@@ -37,7 +37,9 @@ end-to-end acceptance are reported separately in each adapter repository.
 
 ```sh
 python -m pip install -e '.[test]'
-python -m pytest -q tests
+MINDIE_FRAMEWORK_SOURCE=tests/fixtures/production-parsers python -m pytest -q tests
 ```
+
+Run that from the repository root. The variable selects the frozen production parser fixtures in `tests/fixtures/production-parsers` (`provenance.json` records each source commit, path, and sha256). `MINDIE_PARSER_KIMI`, `MINDIE_PARSER_CC`, and `MINDIE_PARSER_CODEX` override one file. An unset variable does not search sibling checkouts or a production install; a missing or non-file path raises `MissingParserCheckout` instead of skipping.
 
 The public knowledge base starts empty in the new `mindie-entry/2` format; there is no legacy migration or compatibility layer. Pre-existing private user files stay inert.

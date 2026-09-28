@@ -13,14 +13,19 @@ import pytest
 
 from lane_support import (
     PARSER_NAMES,
+    REPO,
     SESSIONS,
+    MissingParserCheckout,
     encode_header,
     encode_record,
+    file_sha256,
     isolation_root,
     load_parser,
     parser_path,
     transcript_path,
 )
+
+BUNDLE = REPO / "tests" / "fixtures" / "production-parsers"
 
 TOKEN = "IOCTRL tail increment"
 
@@ -165,6 +170,71 @@ def test_fork_identity_read_keeps_the_tail_increment_bounded(tmp_path, parser_na
     assert io_bytes > logical, report
     assert io_bytes < 48 * 1024, report
     assert report["model_calls"] == 0
+
+
+_DECLARED_PARSERS = {
+    "kimi": (
+        "068dfa0d0e102d7e62c08fbf0454de1d1cb4eb6a",
+        "scripts/transcript.py",
+        "273199811f6d1524d3622d17862134392d0571620773921f75fe1f1eb0869d41",
+    ),
+    "cc": (
+        "2d9b091fd0b3dd5b2f4ce03d4162ce2a27e5c826",
+        "scripts/transcript.py",
+        "535e8cee4555e4f644a0ccfe72b32b21de4bbdae6b6b998f4a4b54e8b7cf29d5",
+    ),
+    "codex": (
+        "7714aa70fd161befa61b42bf80376bb58f343637",
+        "plugins/mindie-agent/scripts/codex_transcript.py",
+        "9b82d3f89996e2b3f1336cb3c9893f9a4b671fa1ea48544a5f06b76d56384a34",
+    ),
+}
+
+
+def test_committed_parser_fixtures_match_provenance():
+    """The bundle is the git-show bytes named in provenance, not a double."""
+    provenance = json.loads((BUNDLE / "provenance.json").read_text())
+    assert set(provenance["parsers"]) == set(_DECLARED_PARSERS)
+    for name, (commit, source_path, digest) in _DECLARED_PARSERS.items():
+        recorded = provenance["parsers"][name]
+        fixture = BUNDLE / recorded["fixture"]
+        assert recorded["commit"] == commit
+        assert recorded["source_path"] == source_path
+        assert recorded["sha256"] == digest
+        assert fixture.is_file(), name
+        assert file_sha256(fixture) == digest
+
+
+def test_explicit_parser_override_beats_framework_source(tmp_path, monkeypatch):
+    provenance = json.loads((BUNDLE / "provenance.json").read_text())
+    kimi = (BUNDLE / provenance["parsers"]["kimi"]["fixture"]).resolve()
+    monkeypatch.setenv("MINDIE_FRAMEWORK_SOURCE", str(tmp_path))
+    monkeypatch.setenv("MINDIE_PARSER_KIMI", str(kimi))
+    assert parser_path("kimi").resolve() == kimi
+    with pytest.raises(MissingParserCheckout, match="is not a file"):
+        parser_path("cc")
+
+
+def test_missing_or_invalid_parser_fixture_is_an_error(tmp_path, monkeypatch):
+    for name in ("MINDIE_FRAMEWORK_SOURCE", "MINDIE_PARSER_KIMI", "MINDIE_PARSER_CC", "MINDIE_PARSER_CODEX"):
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(MissingParserCheckout, match="MINDIE_PARSER_KIMI"):
+        parser_path("kimi")
+    missing = tmp_path / "missing-transcript.py"
+    monkeypatch.setenv("MINDIE_PARSER_KIMI", str(missing))
+    with pytest.raises(MissingParserCheckout, match="is not a file"):
+        parser_path("kimi")
+    empty = tmp_path / "empty-source"
+    empty.mkdir()
+    monkeypatch.delenv("MINDIE_PARSER_KIMI")
+    monkeypatch.setenv("MINDIE_FRAMEWORK_SOURCE", str(empty))
+    with pytest.raises(MissingParserCheckout, match="is not a file"):
+        parser_path("kimi")
+    bad = tmp_path / "not-a-parser.py"
+    bad.write_text("x = 1\n")
+    monkeypatch.setenv("MINDIE_PARSER_KIMI", str(bad))
+    with pytest.raises(RuntimeError, match="does not export"):
+        load_parser("kimi")
 
 
 def test_kimi_fork_boundary_drops_parent_material(tmp_path):

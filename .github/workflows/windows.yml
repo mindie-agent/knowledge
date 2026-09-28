@@ -29,6 +29,7 @@ jobs:
         env:
           HOME: ${{ runner.temp }}/knowledge-test-home
           USERPROFILE: ${{ runner.temp }}/knowledge-test-home
+          MINDIE_FRAMEWORK_SOURCE: tests/fixtures/production-parsers
         run: |
           uv run --no-sync python -c "import os; from pathlib import Path; Path(os.environ['HOME']).mkdir(parents=True, exist_ok=True)"
           uv run --no-sync python -m pytest -q tests --junitxml=native-knowledge.xml

@@ -43,14 +43,20 @@ def isolation_root():
 
 
 def parser_path(name):
-    """Resolve one frozen parser. Never a production install and never a copy."""
+    """Resolve one frozen parser to an absolute file.
+
+    ``MINDIE_PARSER_*`` overrides ``MINDIE_FRAMEWORK_SOURCE``. A relative
+    value is resolved from the current directory, then returned absolute so
+    a later working-directory change still opens that file. Never a
+    production install and never a synthesized double.
+    """
     if name not in _PARSER_RELATIVE:
         raise MissingParserCheckout(
             f"unknown parser {name!r}; expected one of {', '.join(PARSER_NAMES)}"
         )
     override = os.environ.get(f"MINDIE_PARSER_{name.upper()}")
     if override:
-        path = Path(override)
+        path = Path(override).expanduser()
         origin = f"MINDIE_PARSER_{name.upper()}"
     else:
         root = os.environ.get("MINDIE_FRAMEWORK_SOURCE")
@@ -61,8 +67,9 @@ def parser_path(name):
                 f"to that transcript module, or MINDIE_FRAMEWORK_SOURCE to a checkout "
                 f"containing {relative}. A production install is not a substitute."
             )
-        path = Path(root) / _PARSER_RELATIVE[name]
+        path = Path(root).expanduser() / _PARSER_RELATIVE[name]
         origin = "MINDIE_FRAMEWORK_SOURCE"
+    path = path.resolve()
     if not path.is_file():
         raise MissingParserCheckout(
             f"parser {name!r} from {origin} is not a file: {path}"
