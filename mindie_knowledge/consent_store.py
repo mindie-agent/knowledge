@@ -30,8 +30,8 @@ file open at that instant. This module's read path therefore opens with
 FILE_SHARE_DELETE on Windows (see ``_open_for_read``): a writer never fails
 because the authority was read. Readers outside this module that hold the
 file open WITHOUT delete sharing can still transiently block a writer on
-Windows — no writer-side mechanism exists for that (no retry wrapper is
-added by design).
+Windows. Such a failed update preserves the existing document and reports
+the error; it does not retry or reopen onboarding.
 """
 
 from __future__ import annotations
@@ -170,6 +170,9 @@ if os.name == "nt":
         _wt.LPVOID, _wt.DWORD, _wt.DWORD, _wt.HANDLE,
     )
     _CreateFileW.restype = _wt.HANDLE
+    _CloseHandle = _kernel32.CloseHandle
+    _CloseHandle.argtypes = (_wt.HANDLE,)
+    _CloseHandle.restype = _wt.BOOL
     _GENERIC_READ = 0x80000000
     _SHARE_READ_WRITE_DELETE = 0x1 | 0x2 | 0x4
     _OPEN_EXISTING = 3
@@ -180,7 +183,7 @@ if os.name == "nt":
 def _open_for_read(path):
     """Open the consent document for reading and return the binary stream.
 
-    Windows only (used nowhere else): the open carries
+    On Windows the open carries
     FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE. A stdlib
     ``open(path, "rb")`` on Windows shares read/write but DENIES delete, so
     ``os.replace`` (MoveFileEx) in ``_write_document`` fails with
@@ -207,7 +210,7 @@ def _open_for_read(path):
     try:
         fd = _msvcrt.open_osfhandle(handle, os.O_RDONLY)
     except OSError:
-        _kernel32.CloseHandle(handle)
+        _CloseHandle(handle)
         raise
     return os.fdopen(fd, "rb")
 
