@@ -11,6 +11,37 @@ import time
 import transcript_double
 
 
+def test_cold_wake_uses_its_existing_startup_budget(tmp_path, monkeypatch):
+    """A real 2.4 s interpreter startup used to be killed after 3 x .5 s."""
+    from mindie_knowledge.loop import handoff, process
+    from mindie_knowledge.loop.cli import connect
+    from mindie_knowledge.loop.transport import rpc
+    config = tmp_path / 'engine.json'
+    value = dict(root=str(tmp_path / 'data'), domain='test')
+    config.write_text(json.dumps(value), encoding='utf-8')
+    original = process.spawn_service
+    owned = []
+    def delayed(command):
+        child = original([sys.executable, '-c',
+            "import time,runpy; time.sleep(2.4); runpy.run_module('mindie_knowledge.loop.cli', run_name='__main__')",
+            *command[3:]])
+        owned.append(child)
+        return child
+    monkeypatch.setattr(process, 'spawn_service', delayed)
+    try:
+        handoff.run_wake(config)
+        assert len(owned) == 1
+        assert owned[0].poll() is None, 'starter killed its owned service before the configured deadline'
+        assert rpc(connect(value), 'status', timeout=1)['worker_alive']
+        assert rpc(connect(value), 'stop_if_idle', timeout=1)['idle']
+        owned[0].wait(timeout=5)
+    finally:
+        for child in owned:
+            if child.poll() is None:
+                process.terminate_tree(child)
+            child.wait(timeout=3)
+
+
 def test_serve_starts_with_actual_configured_parser(tmp_path):
     adapter = tmp_path / "adapter_parser.py"
     shutil.copy(transcript_double.__file__, adapter)

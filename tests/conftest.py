@@ -116,6 +116,15 @@ def pytest_configure(config):
         pytest.exit("\n".join(_FIXTURE_ERRORS), returncode=2)
 
 
+def pytest_collection_modifyitems(items):
+    # One collection, each case once. Product output and process lifetime
+    # failures surface before the cheaper but numerous leaf checks.
+    priority = ('test_public_transcript.py', 'test_windows_process_ownership.py',
+                'test_service_startup.py', 'test_production_parser_recovery.py')
+    order = {name: index for index, name in enumerate(priority)}
+    items.sort(key=lambda item: order.get(item.path.name, len(order)))
+
+
 from mindie_knowledge.loop import settings as settings_mod
 from mindie_knowledge.loop.activation import Admission
 from mindie_knowledge.loop.store import Store

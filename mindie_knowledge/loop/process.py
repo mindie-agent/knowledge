@@ -37,7 +37,7 @@ def spawn_service(command):
                    stderr=subprocess.DEVNULL, close_fds=True)
     if os.name == "nt":
         options["creationflags"] = (
-            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
             | subprocess.CREATE_BREAKAWAY_FROM_JOB
         )
     else:

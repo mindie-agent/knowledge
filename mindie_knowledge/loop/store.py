@@ -349,6 +349,11 @@ class Store:
                 kind TEXT NOT NULL,
                 detail TEXT NOT NULL,
                 created REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS transcript_tasks(
+                task_key TEXT PRIMARY KEY, entry_id TEXT NOT NULL,
+                capture_id TEXT NOT NULL, body_digest TEXT NOT NULL,
+                summary_status TEXT NOT NULL, summary_detail TEXT NOT NULL,
+                updated REAL NOT NULL, summary_due REAL NOT NULL);
         """)
         capture_columns = {
             row[1] for row in self.db.execute("PRAGMA table_info(captures)")
@@ -998,6 +1003,43 @@ class Store:
         )
 
     # ---------------------------------------------------------------- drafts
+
+    def transcript_task(self, task_key):
+        with self.lock:
+            row = self.db.execute("SELECT * FROM transcript_tasks WHERE task_key=?", (task_key,)).fetchone()
+        return dict(row) if row else None
+
+    def redaction_key(self):
+        """Private random HMAC key; no original sensitive values are retained."""
+        import secrets
+        with self._write_txn():
+            self.db.execute("INSERT OR IGNORE INTO meta VALUES('redaction_key', ?)", (secrets.token_hex(32),))
+            value = self.db.execute("SELECT value FROM meta WHERE key='redaction_key'").fetchone()[0]
+        return bytes.fromhex(value)
+
+    def update_draft_header(self, entry_id, *, expected_body, title, summary, generation):
+        """Metadata-only compare/apply: a model can never supply body content."""
+        from mindie_knowledge.retrieval import index_text
+        with self._write_txn():
+            row = self._row(entry_id)
+            if row is None or not row['draft_revision']:
+                return False
+            base = self._revision_doc(entry_id, row['draft_revision'])
+            if digest(base['content']) != expected_body or not self.granted('draft', entry_id, base['revision'], generation):
+                return False
+            doc = dict(base, title=title, summary=summary)
+            doc['revision'] = documents.revision_of(doc)
+            documents.validate(doc)
+            now = time.time()
+            self._insert_revision(doc, row['origin'], now)
+            self.db.execute("INSERT OR REPLACE INTO grants VALUES(?,?,?,?,?)", ('draft', entry_id, doc['revision'], generation, now))
+            visible = not row['feed_active']
+            self.db.execute("UPDATE entries SET draft_revision=?, title=?, doc=?, updated=? WHERE entry_id=?",
+                            (doc['revision'], title, canonical(doc) if visible else row['doc'], now, entry_id))
+            self._write_draft_file(doc)
+            if visible:
+                self._index_upsert_tokens(entry_id, index_text(self._doc_source_text(doc)), self._doc_state_digest(doc))
+            return True
 
     def _write_draft_file(self, doc):
         from .documents import render_entry

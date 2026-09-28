@@ -99,7 +99,8 @@ def mask_text(text):
 
 class Engine:
     def __init__(self, store, *, agent_command=None, settings_path=None,
-                 admission=None, state_dir=None, transcript_adapter=None):
+                 admission=None, state_dir=None, transcript_adapter=None,
+                 capture_mode="organize", redactor_executable=None, summary_command=None):
         """``transcript_adapter`` is the already-loaded trusted parser module
         (absolute local module from engine config ``transcript_adapter``)
         exporting ``FileIdentity``/``identify``/``read_material``. Without it
@@ -112,6 +113,15 @@ class Engine:
             raise ValueError("agent_command must be a nonempty argv list or None")
         self.store = store
         self.agent_command = agent_command
+        if capture_mode not in {"organize", "public-transcript"}:
+            raise ValueError("unknown capture mode")
+        if capture_mode == "public-transcript" and not redactor_executable:
+            raise ValueError("public transcript capture requires an installed redactor")
+        if summary_command is not None and (not isinstance(summary_command, list) or not summary_command or not all(isinstance(x, str) for x in summary_command)):
+            raise ValueError("summary_command must be a nonempty argv list")
+        self.capture_mode = capture_mode
+        self.redactor_executable = redactor_executable
+        self.summary_command = summary_command
         self.settings_path = settings_path
         self.admission = admission
         self.transcript = transcript_adapter
@@ -419,6 +429,9 @@ class Engine:
         owed its one bounded recovery) and just waits out the fault."""
         reason = self.store.continuation_reason(ident) or ""
         if reason.startswith("gap-recovery:"):
+            if self.capture_mode == "public-transcript":
+                self.store.mark_capture(ident, "failed", "legacy organizer gap retained; not replayed through transcript capture")
+                return
             self.store.schedule_continuation(
                 ident, due=time.time() + 60, reason=reason, eligible=1,
             )
@@ -494,7 +507,7 @@ class Engine:
 
     def _summary_fallback(self, row, note, fail_detail):
         """Turn captures may use a bounded summary. Notifications never do."""
-        if self._is_notification(row):
+        if self._is_notification(row) or self.capture_mode == "public-transcript":
             self.store.mark_capture(row["id"], "failed", fail_detail)
             return "stop"
         if row["summary"].strip():
@@ -1239,7 +1252,7 @@ class Engine:
                 return
             self.store.mark_capture(ident, "cancelled", "task deactivated while queued")
             return
-        if not self.agent_command:
+        if not self.agent_command and self.capture_mode != "public-transcript":
             self.store.mark_capture(
                 ident, "discarded", "no maintenance runner is configured"
             )
@@ -1277,6 +1290,13 @@ class Engine:
             if outcome is None:
                 return
             text, summary_only, notes = outcome
+            if self.capture_mode == "public-transcript":
+                if summary_only:
+                    self.store.mark_capture(ident, "failed", "public transcript mode forbids summary fallback")
+                    return
+                from .transcript_capture import capture
+                capture(self, row, text, region)
+                return
             if summary_only and self._is_notification(row):
                 self.store.mark_capture(
                     ident, "failed", "notification forbids summary fallback",
@@ -1380,10 +1400,28 @@ class Engine:
                 self.store.defer_capture(ident, due=exc.retry_at, reason=str(exc))
             else:
                 self.store.mark_capture(ident, "discarded", str(exc))
+        except CursorConflict:
+            self._defer_reread(ident)
+        except AdmissionUnreadable:
+            self._defer_admission(ident)
+        except MaintenanceCancelled:
+            self.store.mark_capture(ident, "cancelled", "capture authority revoked")
         except GateFault:
             # Safety net for any gate site above: park, never drop.
             self._defer_gate_fault(ident)
         except Exception as exc:
+            if self.capture_mode == "public-transcript" and isinstance(exc, OSError):
+                # Deterministic local work retries unchanged input. No body/
+                # cursor transaction committed and no model was called.
+                previous = self.store.continuation_reason(ident) or ""
+                try:
+                    attempt = int(previous.split(":")[1]) if previous.startswith("public-io:") else 0
+                except (ValueError, IndexError):
+                    attempt = 0
+                attempt += 1
+                self.store.defer_capture(ident, due=time.time() + min(300, 2 ** min(attempt, 8)),
+                                         reason=f"public-io:{attempt}:{type(exc).__name__}")
+                return
             self._unexpected("knowledge.capture", "process", exc)
             detail = f"{type(exc).__name__}: {exc}"[:1000]
             self._error(detail)
@@ -1433,6 +1471,7 @@ class Engine:
 
     def start(self):
         with self.store.lock, self.store.db:
+            self.store.db.execute("UPDATE transcript_tasks SET summary_status='failed', summary_detail='interrupted; body retained' WHERE summary_status='running'")
             self.store.db.execute(
                 "UPDATE captures SET status='failed', "
                 "detail='service restarted after input reservation; not replaying' "
@@ -1494,6 +1533,9 @@ class Engine:
                             self.end_work()
                     elif not ident:
                         self._apply_due()
+                        if self.capture_mode == "public-transcript":
+                            from .transcript_capture import summarize_due
+                            summarize_due(self)
                 except (MaintenanceCancelled, AdmissionUnreadable, CursorConflict,
                         GateFault):
                     continue
@@ -1779,6 +1821,8 @@ class Engine:
             frozen = self._frozen
         return dict(
             **self.store.status(),
+            capture_pipeline=self.capture_mode,
+            summary_mode="optional-model" if self.summary_command else "source-excerpt",
             maintenance_pending=self.queue.unfinished_tasks,
             maintenance_budget=self.budget.status(),
             sharing=settings.public_status(),

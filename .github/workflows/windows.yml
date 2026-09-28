@@ -25,12 +25,6 @@ jobs:
         run: |
           uv venv
           uv pip install -e '.[test]'
-      - name: Windows process ownership
-        if: runner.os == 'Windows'
-        env:
-          HOME: ${{ runner.temp }}/knowledge-test-home
-          USERPROFILE: ${{ runner.temp }}/knowledge-test-home
-        run: uv run --no-sync python -m pytest -q tests/test_windows_process_ownership.py tests/test_windows_empty_lock.py
       - name: Component tests
         env:
           HOME: ${{ runner.temp }}/knowledge-test-home
@@ -38,7 +32,7 @@ jobs:
           MINDIE_FRAMEWORK_SOURCE: tests/fixtures/production-parsers
         run: |
           uv run --no-sync python -c "import os; from pathlib import Path; Path(os.environ['HOME']).mkdir(parents=True, exist_ok=True)"
-          uv run --no-sync python -m pytest -q tests --junitxml=native-knowledge.xml
+          uv run --no-sync python -m pytest -q tests --maxfail=1 --junitxml=native-knowledge.xml
       - uses: actions/upload-artifact@v4
         if: always()
         with:

@@ -55,6 +55,15 @@ def validate_config(config):
     if "admission_path" in config and not isinstance(config["admission_path"], str):
         raise ValueError("admission_path must be an explicit SQLite file path")
     adapter = config.get("transcript_adapter")
+    mode = config.get("capture_mode", "organize")
+    if mode not in {"organize", "public-transcript"}:
+        raise ValueError("unknown capture mode")
+    if mode == "public-transcript":
+        scanner = config.get("redactor_executable")
+        if not isinstance(scanner, str) or not Path(scanner).is_absolute():
+            raise ValueError("public transcript mode requires an absolute redactor_executable")
+        if not adapter:
+            raise ValueError("public transcript mode requires a transcript adapter")
     if adapter is not None:
         candidate = Path(adapter)
         if (
@@ -182,11 +191,12 @@ def ensure_service(config_path):
                     str(Path(config_path).resolve()),
                 ],
             )
+        interval = max(0, STARTUP_TIMEOUT - .3) / MAX_STARTUP_PROBES
         for _attempt in range(MAX_STARTUP_PROBES):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            time.sleep(min(0.5, remaining))
+            time.sleep(min(interval, remaining))
             if process is not None and process.poll() is not None:
                 raise RuntimeError("knowledge service exited during startup; no retry")
             try:
@@ -377,7 +387,9 @@ def _serve(config_path, config):
         stage = "engine"
         engine = Engine(store, agent_command=config.get("agent_command"),
                         settings_path=config.get("community_config"), admission=admission,
-                        transcript_adapter=transcript)
+                        transcript_adapter=transcript, capture_mode=config.get("capture_mode", "organize"),
+                        redactor_executable=config.get("redactor_executable"),
+                        summary_command=config.get("summary_command"))
         stage = "service"
         service = Service(engine, connection_path=connection_path(config),
                           admission=admission, feeds=_feeds(config, store))

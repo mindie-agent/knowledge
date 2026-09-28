@@ -144,7 +144,9 @@ def terminate_owned(process):
 
 def spawn_owned(command, **kwargs):
     """Create a process with descendant ownership established before it runs."""
-    kwargs["creationflags"] = kwargs.get("creationflags", 0) | subprocess.CREATE_NEW_PROCESS_GROUP | 0x4
+    kwargs["creationflags"] = (kwargs.get("creationflags", 0)
+                               | subprocess.CREATE_NEW_PROCESS_GROUP
+                               | subprocess.CREATE_NO_WINDOW | 0x4)
     process = subprocess.Popen(command, **kwargs)
     try:
         _own_windows_tree(process)

@@ -296,7 +296,7 @@ def request_wake(config_path, *, budget_seconds=0.4, session_id, event=None):
 
 def run_wake(config_path, event=None):
     """Detached one-shot starter. Not a retry loop and not an installer."""
-    from .cli import config_at
+    from .cli import config_at, STARTUP_TIMEOUT, MAX_STARTUP_PROBES
     from .diagnostics import clear_delivery_event, record_delivery_failure
     from .locks import StartInProgress, StartLock
     from .process import terminate_tree
@@ -333,14 +333,15 @@ def run_wake(config_path, event=None):
         holder = _read_wake(config)
         holder["service_pid"] = process.pid
         _wake_file(config).write_text(json.dumps(holder))
-        deadline = time.monotonic() + 5
-        for _ in range(3):
+        deadline = time.monotonic() + STARTUP_TIMEOUT
+        interval = max(0, STARTUP_TIMEOUT - .3) / MAX_STARTUP_PROBES
+        for _ in range(MAX_STARTUP_PROBES):
             if process.poll() is not None:
                 break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            time.sleep(min(0.5, remaining))
+            time.sleep(min(interval, remaining))
             if _probe(config, min(0.3, max(0.05, deadline - time.monotonic()))) == "ready":
                 ready = True
                 if event:
