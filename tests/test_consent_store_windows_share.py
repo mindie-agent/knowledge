@@ -1,50 +1,53 @@
-"""The consent authority's reads must never make a writer's atomic replace fail.
+"""Publication while a product read handle is open.
 
-On Windows a stdlib ``open`` shares read/write but denies delete, so
-``os.replace`` (MoveFileEx) fails with ERROR_SHARING_VIOLATION whenever a
-reader holds the destination open at that instant. The store's read path
-opens with FILE_SHARE_DELETE there. This check is cross-platform by
-construction: on POSIX the replace tolerates any open reader anyway; on
-Windows it exercises the shared-delete branch for real.
+``FILE_SHARE_DELETE`` on the reader is required and not sufficient. CPython
+documents that ``os.replace`` / ``MoveFileExW`` still rejects an open
+destination (https://github.com/python/cpython/issues/90161). These tests
+call the product writers only. They do not assert that ``os.replace``
+succeeds against an open Windows file.
 """
 
-import os
+import json
 
 from mindie_knowledge import consent_store
+from mindie_knowledge.loop import settings as settings_mod
+
+from test_consent_store_contract import _product_read_stream
+
+REPOSITORY = "mindie-agent/knowledge-vllm-ascend"
 
 
-def test_replace_succeeds_while_a_reader_holds_the_file(tmp_path):
-    target = tmp_path / "consent.json"
-    target.write_text('{"schema":"mindie-consent/1","choice":"later"}\n')
-    if os.name == "nt":
-        reader = consent_store._open_for_read(target)
-    else:
-        reader = open(target, "rb")
+def test_held_product_read_keeps_old_community_json(tmp_path):
+    """Community settings use their own writer, not ``consent_store``.
+
+    ``settings.write`` then ``update_extensions`` must land the new document.
+    The handle opened by the product read must still contain the complete
+    pre-write JSON.
+    """
+    path = tmp_path / "community.json"
+    root = tmp_path / "proj"
+    root.mkdir()
+    settings_mod.write(
+        path, enabled=True, repository=REPOSITORY, project_roots=[root], fork="lane/fork",
+    )
+    old = path.read_bytes()
+    stamp = str((tmp_path / "authority.json").resolve())
+    held = _product_read_stream(consent_store, path)
     try:
-        fresh = tmp_path / "fresh.json"
-        fresh.write_text('{"schema":"mindie-consent/1","choice":"contribute"}\n')
-        os.replace(fresh, target)  # must not fail against the open reader
+        settings_mod.write(
+            path, enabled=False, repository=REPOSITORY, project_roots=[root],
+        )
+        settings_mod.update_extensions(path, consent_config=stamp)
+        held.seek(0)
+        previous = held.read()
     finally:
-        reader.close()
-    assert b"contribute" in target.read_bytes()
-
-
-def test_record_choice_completes_while_a_reader_holds_the_file(tmp_path):
-    target = tmp_path / "consent.json"
-    consent_store.record_choice(target, "later")
-    if os.name == "nt":
-        reader = consent_store._open_for_read(target)
-    else:
-        reader = open(target, "rb")
-    try:
-        result = consent_store.record_choice(target, "contribute")
-    finally:
-        reader.close()
-    assert result["state"] == "ok" and result["choice"] == "contribute"
-
-
-def test_read_maps_missing_through_the_same_branch(tmp_path):
-    state, data = consent_store._read_raw(tmp_path / "missing.json")
-    assert state == "missing" and data is None
-    found = consent_store.read(tmp_path / "missing.json")
-    assert found["state"] == "missing" and found["error"] is None
+        held.close()
+    new = json.loads(path.read_bytes())
+    old_doc = json.loads(old)
+    assert previous == old
+    assert old_doc["enabled"] is True
+    assert "consent_config" not in old_doc
+    assert new["enabled"] is False
+    assert new["generation"] != old_doc["generation"]
+    assert new["consent_config"] == stamp
+    assert new["fork"] == "lane/fork"

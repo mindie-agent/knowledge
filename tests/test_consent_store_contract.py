@@ -427,15 +427,16 @@ def test_cross_process_updates_merge_and_never_tear(api, tmp_path):
     assert stat.S_ISREG(path.stat().st_mode)
 
 
-def test_held_product_read_allows_atomic_publication(api, tmp_path):
+@pytest.mark.parametrize("filename", ["consent.json", "同意-\U0001F600.json"])
+def test_held_product_read_allows_atomic_publication(api, tmp_path, filename):
     """One held product read must not stop a serialized publication.
 
-    On Windows ``d0538`` the product read is a non-sharing stdlib open, so
-    ``os.replace`` fails and this assertion is red. Delete-sharing product
-    reads make the same assertion green. POSIX replace already tolerates
-    any open reader.
+    Sharing delete on the reader does not make ``os.replace`` succeed on
+    Windows. The product writer must still publish both fields while this
+    handle is open. The non-BMP filename is a real path, not an escaped
+    ASCII substitute.
     """
-    path = tmp_path / "consent.json"
+    path = tmp_path / filename
     api.record_choice(path, "later")
     api.record_reporting(path, "disabled")
     held = _product_read_stream(api, path)
