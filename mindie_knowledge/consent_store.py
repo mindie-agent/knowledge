@@ -25,19 +25,23 @@ Semantics (the precise contract is the lane's ``API.md``):
   no-write result, preserving the original data.
 
 Platform note: on Windows a stdlib ``open`` shares read/write but denies
-delete, so an atomic ``os.replace`` would fail whenever a reader holds the
-file open at that instant. This module's read path therefore opens with
-FILE_SHARE_DELETE on Windows (see ``_open_for_read``): a writer never fails
-because the authority was read. Readers outside this module that hold the
-file open WITHOUT delete sharing can still transiently block a writer on
-Windows — no writer-side mechanism exists for that (no retry wrapper is
-added by design).
+delete, and MoveFileExW (``os.replace``) refuses a destination with ANY
+open handle — even one opened with FILE_SHARE_DELETE (CPython issue 90161).
+This module therefore does BOTH halves: reads open with FILE_SHARE_DELETE
+(``_open_for_read``), and writes supersede via the NTFS POSIX-semantics
+rename ``SetFileInformationByHandle(FileRenameInfoEx, REPLACE_IF_EXISTS|
+POSIX_SEMANTICS)`` (``_atomic_replace``), which tolerates existing handles
+and keeps old handles valid for reads. On a filesystem/platform without
+that support the write fails honestly with the preserved document and the
+original WinError — no retry wrapper, no fallback that would silently
+change semantics.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import struct
 import tempfile
 import time
 from pathlib import Path
@@ -170,26 +174,49 @@ if os.name == "nt":
         _wt.LPVOID, _wt.DWORD, _wt.DWORD, _wt.HANDLE,
     )
     _CreateFileW.restype = _wt.HANDLE
+    _CloseHandle = _kernel32.CloseHandle
+    _CloseHandle.argtypes = (_wt.HANDLE,)
+    _CloseHandle.restype = _wt.BOOL
+    _SetFileInformationByHandle = _kernel32.SetFileInformationByHandle
+    _SetFileInformationByHandle.argtypes = (
+        _wt.HANDLE, ctypes.c_int, _wt.LPVOID, _wt.DWORD,
+    )
+    _SetFileInformationByHandle.restype = _wt.BOOL
     _GENERIC_READ = 0x80000000
+    _DELETE_ACCESS = 0x00010000
     _SHARE_READ_WRITE_DELETE = 0x1 | 0x2 | 0x4
     _OPEN_EXISTING = 3
     _FILE_ATTRIBUTE_NORMAL = 0x80
     _INVALID_HANDLE = _wt.HANDLE(-1).value
+    _FILE_RENAME_INFO_EX = 22
+    _RENAME_REPLACE_IF_EXISTS = 0x1
+    _RENAME_POSIX_SEMANTICS = 0x2
+
+
+def _map_win_error(code, path):
+    """Preserve the Windows error as the read/write contract's OSError kind."""
+    if code in (2, 3):  # ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND
+        return FileNotFoundError(2, "consent file does not exist", str(path))
+    if code in (5, 32):  # ERROR_ACCESS_DENIED / ERROR_SHARING_VIOLATION
+        return PermissionError(13, "consent file is not accessible", str(path))
+    return OSError(None, f"cannot access consent file (winerror {code})", str(path))
 
 
 def _open_for_read(path):
     """Open the consent document for reading and return the binary stream.
 
-    Windows only (used nowhere else): the open carries
+    On Windows the open carries
     FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE. A stdlib
-    ``open(path, "rb")`` on Windows shares read/write but DENIES delete, so
-    ``os.replace`` (MoveFileEx) in ``_write_document`` fails with
-    ERROR_SHARING_VIOLATION whenever a reader holds the file open at that
-    instant — a writer must never fail because someone read the authority.
-    With delete sharing, the atomic replace always wins against this reader.
-    Error mapping preserves the read contract: file/path-not-found (2/3)
-    becomes FileNotFoundError (``missing``), access-denied/sharing (5/32)
-    becomes PermissionError (``unreadable``), anything else a plain OSError.
+    ``open(path, "rb")`` on Windows shares read/write but DENIES delete.
+    Delete sharing by itself does NOT make ``os.replace`` succeed —
+    MoveFileExW still refuses a destination with any open handle (CPython
+    issue 90161); the writer side therefore uses the POSIX-semantics rename
+    in ``_atomic_replace``. Readers still must share delete so existing
+    handles stay valid after the superseding rename instead of pinning the
+    old name. Error mapping preserves the read contract: file/path-not-found
+    (2/3) becomes FileNotFoundError (``missing``), access-denied/sharing
+    (5/32) becomes PermissionError (``unreadable``), anything else a plain
+    OSError.
     """
     if os.name != "nt":
         return open(path, "rb")
@@ -198,16 +225,11 @@ def _open_for_read(path):
         None, _OPEN_EXISTING, _FILE_ATTRIBUTE_NORMAL, None,
     )
     if handle is None or handle == _INVALID_HANDLE:
-        code = ctypes.get_last_error()
-        if code in (2, 3):  # ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND
-            raise FileNotFoundError(2, "consent file does not exist", str(path))
-        if code in (5, 32):  # ERROR_ACCESS_DENIED / ERROR_SHARING_VIOLATION
-            raise PermissionError(13, "consent file is not readable", str(path))
-        raise OSError(None, f"cannot open consent file (winerror {code})", str(path))
+        raise _map_win_error(ctypes.get_last_error(), path)
     try:
         fd = _msvcrt.open_osfhandle(handle, os.O_RDONLY)
     except OSError:
-        _kernel32.CloseHandle(handle)
+        _CloseHandle(handle)
         raise
     return os.fdopen(fd, "rb")
 
@@ -286,8 +308,55 @@ def read(path):
 # -------------------------------------------------------------------- write
 
 
+def _atomic_replace(source, target):
+    """Atomically supersede ``target`` with the already-written ``source``.
+
+    POSIX uses ``os.replace`` unchanged. On Windows, MoveFileExW
+    (``os.replace``) refuses a destination with ANY open handle — including
+    handles opened with FILE_SHARE_DELETE (CPython issue 90161) — so the
+    replace instead opens the source with DELETE access (required for
+    rename; full read/write/delete sharing) and issues
+    ``SetFileInformationByHandle(FileRenameInfoEx=22)`` with
+    FILE_RENAME_REPLACE_IF_EXISTS|FILE_RENAME_POSIX_SEMANTICS (flags 0x3).
+    Per MSDN FILE_RENAME_INFORMATION, that supersedes the destination even
+    with existing handles, keeps old handles valid for reads, and opens the
+    renamed file at the target name afterwards. The source handle is closed
+    in all cases. Errors keep the WinError as OSError/PermissionError via
+    ``_map_win_error``. No retry, no delete-then-move gap, no fallback that
+    would silently change the semantics on filesystems without support.
+    """
+    if os.name != "nt":
+        os.replace(source, target)
+        return
+    handle = _CreateFileW(
+        str(source), _DELETE_ACCESS, _SHARE_READ_WRITE_DELETE,
+        None, _OPEN_EXISTING, _FILE_ATTRIBUTE_NORMAL, None,
+    )
+    if handle is None or handle == _INVALID_HANDLE:
+        raise _map_win_error(ctypes.get_last_error(), source)
+    try:
+        name = str(Path(target).resolve())
+        name_bytes = name.encode("utf-16-le")  # byte length covers non-BMP
+        ptr = ctypes.sizeof(ctypes.c_void_p)
+        root_off = (4 + ptr - 1) // ptr * ptr  # Flags DWORD, HANDLE aligned
+        length_off = root_off + ptr
+        name_off = length_off + 4
+        buffer = (ctypes.c_char * (name_off + len(name_bytes)))()  # zeroed
+        struct.pack_into(
+            "<I", buffer, 0, _RENAME_REPLACE_IF_EXISTS | _RENAME_POSIX_SEMANTICS
+        )
+        struct.pack_into("<I", buffer, length_off, len(name_bytes))
+        ctypes.memmove(ctypes.addressof(buffer) + name_off, name_bytes, len(name_bytes))
+        if not _SetFileInformationByHandle(
+            handle, _FILE_RENAME_INFO_EX, buffer, len(buffer)
+        ):
+            raise _map_win_error(ctypes.get_last_error(), target)
+    finally:
+        _CloseHandle(handle)
+
+
 def _write_document(path, data):
-    """Replace ``path`` atomically: unique temp file, fsync, os.replace."""
+    """Replace ``path`` atomically: unique temp file, fsync, _atomic_replace."""
     path.parent.mkdir(parents=True, exist_ok=True)
     raw = (json.dumps(data, indent=2) + "\n").encode("utf-8")
     fd, temporary_name = tempfile.mkstemp(
@@ -299,7 +368,7 @@ def _write_document(path, data):
             stream.write(raw)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        _atomic_replace(temporary, path)
     finally:
         if temporary.exists():
             temporary.unlink()

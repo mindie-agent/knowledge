@@ -39,8 +39,9 @@ class SharingDisabled(CommunityError):
 def load_settings_file(path: Path) -> dict[str, Any]:
     """Read and minimally validate the shared config file (fail closed).
 
-    The read shares the consent store's shared-delete open on Windows, so a
-    concurrent locked writer's atomic replace never fails against it."""
+    The read shares the consent store's Windows read path (FILE_SHARE_DELETE);
+    together with the writer's POSIX-semantics rename in the shared atomic
+    writer, a locked write never fails against it."""
     from mindie_knowledge import consent_store
 
     try:
