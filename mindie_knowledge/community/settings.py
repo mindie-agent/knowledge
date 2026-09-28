@@ -37,9 +37,14 @@ class SharingDisabled(CommunityError):
 
 
 def load_settings_file(path: Path) -> dict[str, Any]:
-    """Read and minimally validate the shared config file (fail closed)."""
+    """Read and minimally validate the shared config file (fail closed).
+
+    The read shares the consent store's shared-delete open on Windows, so a
+    concurrent locked writer's atomic replace never fails against it."""
+    from mindie_knowledge import consent_store
+
     try:
-        raw = path.read_bytes()
+        raw = consent_store._read_bytes(path)
     except OSError as exc:
         raise CommunityError(f"cannot read community config: {exc.strerror or exc}")
     if len(raw) > MAX_CONFIG_BYTES:
