@@ -115,6 +115,34 @@ def test_failed_revision_never_resent(settings, state_dir, transport):
     assert retried["status"] == "submitted"
 
 
+def test_missing_publication_executable_resumes_identical_batch_after_repair(
+    settings, state_dir, transport, tmp_path,
+):
+    from mindie_knowledge.community.common import run_argv
+
+    class MissingExecutableTransport(type(transport)):
+        def create_pull_request(self, repo, **kwargs):
+            # Exercise the real spawn boundary, not a forged unavailable receipt.
+            run_argv([str(tmp_path / "missing-gh")], timeout=1)
+
+    batch = make_batch("batch-missing-gh", [entry_file(make_entry())])
+    failing = MissingExecutableTransport(transport.path, transport.remotes)
+    receipt = submit_batch(batch, settings, state_dir, transport=failing)
+    assert receipt["status"] == "unavailable"
+    assert "executable not found" in receipt["detail"]
+    # The same stored payload can resume without explicit_retry or a new id.
+    repaired = submit_batch(batch, settings, state_dir, transport=transport)
+    assert repaired["status"] in {"submitted", "updated"}
+    assert repaired["pr_url"]
+
+
+def test_unlaunchable_executable_is_recoverable_before_any_child_runs(tmp_path):
+    from mindie_knowledge.community.common import run_argv, TransientError
+
+    with pytest.raises(TransientError, match="cannot start"):
+        run_argv([str(tmp_path)], timeout=1)
+
+
 def test_unknown_push_outcome_reconciles_readonly(settings, state_dir, transport, remote_url):
     class UnknownPushTransport(type(transport)):
         def create_pull_request(self, repo, **kwargs):

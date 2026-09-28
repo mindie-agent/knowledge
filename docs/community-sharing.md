@@ -37,7 +37,10 @@ or configures that bot, and no model is ever called here.
   unresolved revision is never automatically resent; explicit retry
   (`batch["explicit_retry"] = true`) resumes from already-pushed commits. A
   transient environment failure (`unavailable`) is resubmitted by the caller
-  with persisted backoff. Unknown outcomes resolve through one bounded
+  with persisted backoff. This includes a missing or unlaunchable Git/gh
+  executable: a failed spawn performed no write. Runtime status reports missing
+  local executables without probing authentication or blocking business work.
+  Authentication/authorization rejections remain terminal. Unknown outcomes resolve through one bounded
   read-only reconciliation per scheduler opportunity, spaced by a persisted
   backoff with no permanent exhaustion cap: confirmation requires the exact
   expected head or Git ancestry proof that the expected commit reached our

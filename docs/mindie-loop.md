@@ -89,8 +89,13 @@ are explicit coverage gaps. Reads validate task identity, inode and prefix on
 the same file handle, including nonzero offsets.
 
 The initial organizer call for each accepted increment is bounded (input
-64 KiB, structured result 32 KiB, runner 120s/outer 125s, one concurrent call,
+64 KiB, structured result 32 KiB, runner up to 300s/outer 305s, one concurrent call,
 6 per task-hour, 20 per domain-hour). Attempts are persisted before spawn;
+The shared lifetime constants also keep admission exclusive through process
+cleanup (315s). Codex consumes the core runner deadline; older adapters may
+impose a shorter native bound. A real 44 KiB GPT-6-Luna/max increment required
+140 seconds, exceeding the former 120s bound. Extending the supported lifetime
+does not increase input/output limits or the number of attempts.
 failure counts are diagnostic and never pause the domain. Quota-deferred material stays unattempted;
 its persisted continuation survives restart. A region that failed with an
 explicit deadline, or whose attempt was interrupted without landing an

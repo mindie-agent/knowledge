@@ -45,6 +45,7 @@ from .activation import activation_epoch
 from .budget import BudgetExceeded, MaintenanceBudget
 from .dfx import failure
 from .documents import MAX_FILE_BYTES, DraftFull
+from .limits import ORGANIZER_PROCESS_TIMEOUT
 from .process import MaintenanceCancelled, bounded_run
 from .store import Store, canonical, digest, new_identity, session_key
 
@@ -289,7 +290,7 @@ class Engine:
                 reserve_region()  # budget admitted; consume exactly this input before spawn
             started = True
             output = bounded_run(
-                self.agent_command, raw, timeout=125, max_output=131072,
+                self.agent_command, raw, timeout=ORGANIZER_PROCESS_TIMEOUT, max_output=131072,
                 cancel=self._cancel,
             )
             try:
@@ -1767,6 +1768,12 @@ class Engine:
 
     def status(self):
         settings = self._settings()
+        # Passive local prerequisite visibility. Executables being present
+        # proves neither authentication nor permission to publish.
+        import shutil
+        transport = settings.as_dict().get("transport", "gh")
+        required = ["git", "gh"] if transport == "gh" else ["git"]
+        missing = [name for name in required if shutil.which(name) is None]
         with self._activity_lock:
             activity = self._activity
             frozen = self._frozen
@@ -1776,6 +1783,10 @@ class Engine:
             maintenance_budget=self.budget.status(),
             sharing=settings.public_status(),
             community_package=self.community is not None,
+            publication_runtime=dict(
+                state="unavailable" if missing else "executables-present",
+                missing=missing, authentication="not-checked",
+            ),
             errors=self.errors,
             activity=activity,
             admission_frozen=frozen,
