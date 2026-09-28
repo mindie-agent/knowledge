@@ -32,19 +32,18 @@ _CHILD = textwrap.dedent(
         for i in range(loops):
             consent_store.record_reporting(path, "enabled" if i % 2 == 0 else "later")
     elif mode == "read":
+        # Product API only. A stdlib open() denies FILE_SHARE_DELETE on
+        # Windows and would block os.replace; that is a different observer.
         deadline = time.time() + float(sys.argv[3])
+        choices = {"contribute", "read-only", "later", "disabled"}
+        reporting = {"enabled", "disabled", "later"}
         while time.time() < deadline:
-            try:
-                raw = open(path, "rb").read()
-            except FileNotFoundError:
-                errors += 1
-                continue
-            try:
-                data = json.loads(raw)
-            except ValueError:
-                errors += 1
-                continue
-            if not isinstance(data, dict) or data.get("schema") != "mindie-consent/1":
+            seen = consent_store.read(path)
+            if (
+                seen.get("state") != "ok"
+                or seen.get("choice") not in choices
+                or seen.get("reporting") not in reporting
+            ):
                 errors += 1
         print(errors)
     else:
@@ -334,6 +333,19 @@ def test_migrate_keeps_existing_authority_and_corrupt_bytes(api, tmp_path):
     assert corrupt.read_bytes() == blob
 
 
+def _product_read_stream(api, path):
+    """The handle ``read`` actually holds, not a third-party open().
+
+    Current ``d0538`` reads with ``path.read_bytes()`` (stdlib ``open``).
+    A later product may publish ``_open_for_read``. This does not reimplement
+    either opener.
+    """
+    opener = getattr(api, "_open_for_read", None)
+    if opener is None:
+        return open(path, "rb")
+    return opener(path)
+
+
 def test_cross_process_updates_merge_and_never_tear(api, tmp_path):
     path = tmp_path / "consent.json"
     api.record_choice(path, "later")
@@ -413,3 +425,58 @@ def test_cross_process_updates_merge_and_never_tear(api, tmp_path):
     )
     assert unexpected == []
     assert stat.S_ISREG(path.stat().st_mode)
+
+
+def test_held_product_read_allows_atomic_publication(api, tmp_path):
+    """One held product read must not stop a serialized publication.
+
+    On Windows ``d0538`` the product read is a non-sharing stdlib open, so
+    ``os.replace`` fails and this assertion is red. Delete-sharing product
+    reads make the same assertion green. POSIX replace already tolerates
+    any open reader.
+    """
+    path = tmp_path / "consent.json"
+    api.record_choice(path, "later")
+    api.record_reporting(path, "disabled")
+    held = _product_read_stream(api, path)
+    try:
+        result = api.record_choice(path, "contribute")
+    finally:
+        held.close()
+    assert result["state"] == "ok", result
+    assert result["choice"] == "contribute"
+    assert result["reporting"] == "disabled"
+    disk = json.loads(path.read_bytes())
+    assert disk["schema"] == CONSENT_SCHEMA
+    assert disk["choice"] == "contribute"
+    assert disk["reporting"] == "disabled"
+
+
+@pytest.mark.skipif(
+    os.name != "nt",
+    reason=(
+        "POSIX os.replace is not blocked by an open reader. On Windows a "
+        "stdlib open denies FILE_SHARE_DELETE; that external handle is not "
+        "a product read and is not what the stress test observes."
+    ),
+)
+def test_nonsharing_external_handle_preserves_bytes(api, tmp_path):
+    """A third-party handle that denies delete sharing fails one publication.
+
+    The bytes already on disk stay. The test does not retry the writer.
+    """
+    path = tmp_path / "consent.json"
+    api.record_choice(path, "later")
+    api.record_reporting(path, "disabled")
+    before = path.read_bytes()
+    held = open(path, "rb")
+    try:
+        with pytest.raises(PermissionError):
+            api.record_choice(path, "contribute")
+    finally:
+        held.close()
+    assert path.read_bytes() == before
+    seen = api.read(path)
+    assert seen["state"] == "ok"
+    assert seen["choice"] == "later"
+    assert seen["reporting"] == "disabled"
