@@ -326,10 +326,15 @@ def run_wake(config_path, event=None):
                 )
             return 0
         from .process import spawn_service
-        process = spawn_service(
-            [sys.executable, "-m", "mindie_knowledge.loop.cli", "serve",
-             "--config", str(Path(config_path).resolve())],
-        )
+        try:
+            process = spawn_service(
+                [sys.executable, "-m", "mindie_knowledge.loop.cli", "serve",
+                 "--config", str(Path(config_path).resolve())],
+                from_detached_starter=True,
+            )
+        except OSError:
+            record_delivery_failure(config, stage="wake", cause="wake-failed", event=event)
+            return 0
         holder = _read_wake(config)
         holder["service_pid"] = process.pid
         _wake_file(config).write_text(json.dumps(holder))

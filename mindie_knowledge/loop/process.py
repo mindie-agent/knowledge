@@ -26,19 +26,22 @@ import time
 from .dfx import failure
 
 
-def spawn_service(command):
+def spawn_service(command, *, from_detached_starter=False):
     """Transfer an explicit local service/starter beyond the short caller.
 
     Windows callers that own a Job must explicitly permit breakaway. Failure
     stays visible; never return a false successful start inside a dying Job.
     The service remains owned by its consumer lock and authenticated endpoint.
+    A detached starter has already crossed the short caller's Job boundary.
+    Its service inherits that surviving boundary: trying to break away again
+    can be denied by an outer host Job even though the first transfer succeeded.
     """
     options = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                    stderr=subprocess.DEVNULL, close_fds=True)
     if os.name == "nt":
         options["creationflags"] = (
             subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
-            | subprocess.CREATE_BREAKAWAY_FROM_JOB
+            | (0 if from_detached_starter else subprocess.CREATE_BREAKAWAY_FROM_JOB)
         )
     else:
         options["start_new_session"] = True

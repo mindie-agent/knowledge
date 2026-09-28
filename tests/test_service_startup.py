@@ -11,6 +11,28 @@ import time
 import transcript_double
 
 
+def test_cold_wake_spawn_failure_is_visible_and_releases_ownership(tmp_path, monkeypatch):
+    from mindie_knowledge.loop import handoff, process
+    from mindie_knowledge.loop.locks import lock_held
+
+    config = tmp_path / 'engine.json'
+    root = tmp_path / 'data'
+    config.write_text(json.dumps(dict(root=str(root), domain='test')), encoding='utf-8')
+    event = 'a' * 64
+
+    def denied(*args, **kwargs):
+        raise PermissionError('private-path-and-provider-detail')
+
+    monkeypatch.setattr(process, 'spawn_service', denied)
+    assert handoff.run_wake(config, event=event) == 0
+    diagnostic = (root / 'test/latest-delivery.json').read_text(encoding='utf-8')
+    payload = json.loads(diagnostic)
+    assert payload['cause'] == 'wake-failed'
+    assert payload['stage'] == 'wake' and payload['event'] == event
+    assert 'private-path-and-provider-detail' not in diagnostic
+    assert lock_held(root / 'test/start.lock') is False
+
+
 def test_cold_wake_uses_its_existing_startup_budget(tmp_path, monkeypatch):
     """A real 2.4 s interpreter startup used to be killed after 3 x .5 s."""
     from mindie_knowledge.loop import handoff, process
@@ -21,10 +43,10 @@ def test_cold_wake_uses_its_existing_startup_budget(tmp_path, monkeypatch):
     config.write_text(json.dumps(value), encoding='utf-8')
     original = process.spawn_service
     owned = []
-    def delayed(command):
+    def delayed(command, **options):
         child = original([sys.executable, '-c',
             "import time,runpy; time.sleep(2.4); runpy.run_module('mindie_knowledge.loop.cli', run_name='__main__')",
-            *command[3:]])
+            *command[3:]], **options)
         owned.append(child)
         return child
     monkeypatch.setattr(process, 'spawn_service', delayed)
