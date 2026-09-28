@@ -120,6 +120,7 @@ def test_summary_cannot_rewrite_body_and_failure_does_not_block(pipeline):
     assert store.drafts_changed()[0]['content'] == before
     task = dict(store.db.execute('SELECT * FROM transcript_tasks').fetchone())
     assert task['summary_status'] == 'failed'
+    assert store.status()['transcript_summaries'] == {'failed': 1}
     engine.summary_command = [sys.executable, '-c', 'raise Exception("must not retry same version")']
     transcript_capture.summarize_due(engine)
     assert store.transcript_task(task['task_key']) == task
@@ -158,6 +159,24 @@ def test_dense_private_addresses_and_unicode_line_separators(scanner):
     assert len(set(__import__('re').findall(r'<redacted:ipv4-address:[^>]+>', masked))) == 1
 
 
+def test_known_workspace_paths_are_masked_in_markdown_and_both_windows_spellings(scanner):
+    text = r'[report](D:/private/work/task/report.md) and D:\private\work\task\result.json; keep D:/private/work/task-other/public'
+    masked, _ = redact(text, executable=scanner, key=b'a' * 32, private_paths=(r'D:\private\work\task',))
+    assert 'D:/private/work/task/report' not in masked and r'D:\private\work\task\result' not in masked
+    assert 'report.md' in masked and 'result.json' in masked
+    assert 'D:/private/work/task-other/public' in masked
+
+
+def test_profile_paths_across_file_uri_wsl_and_windows(scanner):
+    paths = ('file:///home/alice/work/run.py', '/mnt/c/Users/alice/work/run.py',
+             'C:/Users/alice/work/run.py', r'C:\Users\alice\work\run.py')
+    source = '\n'.join(paths) + '\nPublic module: torch/nn/functional.py'
+    masked, _ = redact(source, executable=scanner, key=b'a' * 32)
+    assert 'alice' not in masked
+    assert 'torch/nn/functional.py' in masked
+    assert redact(masked, executable=scanner, key=b'a' * 32)[0] == masked
+
+
 def test_scanner_failure_never_consumes_input(pipeline):
     engine, store, path = pipeline
     engine.redactor_executable = str(path.parent / 'missing-scanner')
@@ -182,3 +201,19 @@ def test_revoked_pending_summary_does_not_block_next_task(pipeline):
     state = store.db.execute('SELECT summary_status FROM transcript_tasks').fetchone()[0]
     assert state == 'cancelled'
     assert store.drafts_changed()[0]['content'].count('original public marker') == 1
+
+
+def test_partial_summary_is_labeled_by_code_and_retains_whole_body(pipeline, monkeypatch):
+    engine, store, path = pipeline
+    engine.summary_command = [sys.executable, '-c', 'print(\'{"title":"Case", "summary":"Model claimed full coverage."}\')']
+    monkeypatch.setattr(transcript_capture, 'SUMMARY_INPUT_BYTES', 64)
+    append(path, 'first marker ' + 'public middle observation ' * 30 + 'last marker')
+    process(engine, path, 'partial')
+    before = store.drafts_changed()[0]['content']
+    engine.last_activity = time.monotonic() - 10
+    with store._write_txn():
+        store.db.execute('UPDATE transcript_tasks SET summary_due=0')
+    transcript_capture.summarize_due(engine)
+    doc = store.drafts_changed()[0]
+    assert doc['content'] == before
+    assert doc['summary'].startswith('Excerpt summary (partial source): ')

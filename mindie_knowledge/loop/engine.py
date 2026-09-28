@@ -716,6 +716,12 @@ class Engine:
             self.store.mark_capture(row["id"], "failed",
                                     "transcript identity mismatch; not read")
             return None
+        if self.capture_mode == "public-transcript" and status in {
+            "invalid-record", "invalid-boundary", "oversize",
+        }:
+            self.store.mark_capture(row["id"], "failed",
+                                    "public transcript " + status + "; cursor unchanged")
+            return None
         # missing/unreadable transcript
         fallback = self._summary_fallback(
             row, "transcript unreadable; summary-only",

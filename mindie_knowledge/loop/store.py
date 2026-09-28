@@ -2868,6 +2868,8 @@ class Store:
                 domain=self.domain,
                 schema=SCHEMA,
                 entries=counts,
+                transcript_summaries={r[0]: r[1] for r in self.db.execute(
+                    "SELECT summary_status, count(*) FROM transcript_tasks GROUP BY summary_status")},
                 withdrawn=self.db.execute(
                     "SELECT count(*) FROM entries WHERE published_revision "
                     "IS NOT NULL AND feed_active=0"

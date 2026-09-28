@@ -7,6 +7,7 @@ and their only write capability is the title/summary store method.
 """
 import json
 import time
+from pathlib import Path
 
 from .process import bounded_run
 from .store import canonical, digest, new_identity
@@ -35,7 +36,8 @@ def capture(engine, row, text, region):
     inc = region.get('inc') or {}
     if not inc or inc.get('coverage'):
         raise ValueError('public transcript is incomplete; body not saved as complete')
-    masked, rules = redact(text, executable=engine.redactor_executable, key=store.redaction_key())
+    masked, rules = redact(text, executable=engine.redactor_executable, key=store.redaction_key(),
+                           private_paths=(row['scope'], str(Path.home())))
     engine._revalidate(row)
     owner = store.opaque_for(row['root_session'])
     task_key = digest([MODE, store.domain, row['session'], row['generation']])
@@ -98,7 +100,8 @@ def summarize_due(engine):
             if not changed:
                 return
             reserved = True
-        body, _ = redact(doc['content'], executable=engine.redactor_executable, key=store.redaction_key())
+        body, _ = redact(doc['content'], executable=engine.redactor_executable, key=store.redaction_key(),
+                         private_paths=(row['scope'], str(Path.home())))
         encoded = body.encode('utf-8')
         partial = len(encoded) > SUMMARY_INPUT_BYTES
         if partial:
@@ -113,7 +116,11 @@ def summarize_due(engine):
             raise ValueError('summary metadata must be nonempty text')
         clean = {}
         for field, value in result.items():
-            clean[field], _ = redact(value.strip(), executable=engine.redactor_executable, key=store.redaction_key())
+            clean[field], _ = redact(value.strip(), executable=engine.redactor_executable, key=store.redaction_key(),
+                                      private_paths=(row['scope'], str(Path.home())))
+        if partial:
+            # This boundary is enforced by code, not left to model obedience.
+            clean['summary'] = 'Excerpt summary (partial source): ' + excerpt(clean['summary'], 1900)
         engine._gate_live()
         engine._revalidate(row)
         applied = store.update_draft_header(task['entry_id'], expected_body=task['body_digest'], generation=row['generation'], **clean)

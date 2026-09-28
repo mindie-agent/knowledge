@@ -403,7 +403,7 @@ RULES: tuple[Rule, ...] = (
         description="absolute path revealing a user account",
         hint="use a placeholder such as /home/<user>/... or a relative path",
         pattern=re.compile(
-            r"(?<![\w/])(?:/home|/Users|/export/home|/data/home|/root)/"
+            r"(?<![\w/])(?:file://)?(?:/home|/Users|/export/home|/data/home|/root|/mnt/[a-z]/Users)/"
             + _PLACEHOLDER_START + r"[^\s\"'`,;:()\[\]]+"
         ),
     ),
@@ -412,7 +412,8 @@ RULES: tuple[Rule, ...] = (
         description="Windows profile path revealing a user account",
         hint="use a placeholder such as C:\\Users\\<user>\\...",
         pattern=re.compile(
-            r"\b[A-Za-z]:\\Users\\" + _PLACEHOLDER_START + r"([^\\\s\"']+)"
+            r"\b[A-Za-z]:[\\/]Users[\\/]" + _PLACEHOLDER_START + r"([^\\/\s\"']+)",
+            re.IGNORECASE,
         ),
     ),
     Rule(

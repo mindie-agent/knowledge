@@ -16,6 +16,7 @@ from pathlib import Path
 import platform
 import re
 import subprocess
+import sys
 import tarfile
 import tempfile
 import urllib.request
@@ -86,7 +87,7 @@ def _replace(path, data):
         Path(name).unlink(missing_ok=True)
 
 
-def redact(text, *, executable, key):
+def redact(text, *, executable, key, private_paths=()):
     if not executable or not Path(executable).is_absolute():
         raise ValueError("transcript redaction requires an installed scanner")
     # Never honor transcript comments, repository config or environment
@@ -136,6 +137,13 @@ def redact(text, *, executable, key):
     except (ValueError, KeyError, TypeError, IndexError):
         raise ValueError("transcript secret scanner returned invalid spans") from None
     spans.extend((f.start, f.end, f.rule) for f in scan_text(text))
+    for path in private_paths:
+        if not isinstance(path, str) or len(path) < 3:
+            continue
+        for spelling in {path.rstrip('/\\'), path.replace('\\', '/').rstrip('/')}:
+            pattern = re.escape(spelling) + r'(?=$|[/\\\s`"\'<>),;:\]])'
+            flags = re.IGNORECASE if re.match(r'^[A-Za-z]:', spelling) else 0
+            spans.extend((m.start(), m.end(), 'local-path') for m in re.finditer(pattern, text, flags))
     placeholders = [m.span() for m in re.finditer(r'<redacted:[a-z0-9-]+:[0-9a-f]{12}>', text)]
     spans = [(start, end, rule) for start, end, rule in spans
              if not any(left <= start and end <= right for left, right in placeholders)]
@@ -161,4 +169,4 @@ def redact(text, *, executable, key):
 
 
 if __name__ == "__main__":
-    print(install_scanner())
+    sys.stdout.buffer.write((install_scanner() + '\n').encode('utf-8'))
