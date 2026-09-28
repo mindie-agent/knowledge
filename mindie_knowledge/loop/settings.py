@@ -361,14 +361,16 @@ def load(path) -> CommunitySettings:
     """Read the settings file once. Never raises; failures mean disabled.
 
     The reported ``state`` keeps a missing file, an unreadable one, a damaged
-    one and an explicit saved choice strictly apart."""
+    one and an explicit saved choice strictly apart. The read goes through
+    the consent store's shared-delete open on Windows so a concurrent locked
+    writer's atomic replace never fails against this gate read."""
     if not path:
         return CommunitySettings(
             None, {}, error="community_config is not configured",
             state="unconfigured",
         )
     try:
-        raw = Path(path).read_bytes()
+        raw = consent_store._read_bytes(Path(path))
     except FileNotFoundError:
         return CommunitySettings(
             path, {}, error="settings file does not exist", state="missing",

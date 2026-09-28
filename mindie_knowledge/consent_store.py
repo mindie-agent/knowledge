@@ -23,6 +23,15 @@ Semantics (the precise contract is the lane's ``API.md``):
   explicit install/upgrade/entry boundary. An existing valid authority
   always wins; evidence that is missing or conflicting yields a diagnosable
   no-write result, preserving the original data.
+
+Platform note: on Windows a stdlib ``open`` shares read/write but denies
+delete, so an atomic ``os.replace`` would fail whenever a reader holds the
+file open at that instant. This module's read path therefore opens with
+FILE_SHARE_DELETE on Windows (see ``_open_for_read``): a writer never fails
+because the authority was read. Readers outside this module that hold the
+file open WITHOUT delete sharing can still transiently block a writer on
+Windows — no writer-side mechanism exists for that (no retry wrapper is
+added by design).
 """
 
 from __future__ import annotations
@@ -149,10 +158,69 @@ class _UpdateLock:
 # --------------------------------------------------------------------- read
 
 
+if os.name == "nt":
+    import ctypes
+    from ctypes import wintypes as _wt
+    import msvcrt as _msvcrt
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _CreateFileW = _kernel32.CreateFileW
+    _CreateFileW.argtypes = (
+        _wt.LPCWSTR, _wt.DWORD, _wt.DWORD,
+        _wt.LPVOID, _wt.DWORD, _wt.DWORD, _wt.HANDLE,
+    )
+    _CreateFileW.restype = _wt.HANDLE
+    _GENERIC_READ = 0x80000000
+    _SHARE_READ_WRITE_DELETE = 0x1 | 0x2 | 0x4
+    _OPEN_EXISTING = 3
+    _FILE_ATTRIBUTE_NORMAL = 0x80
+    _INVALID_HANDLE = _wt.HANDLE(-1).value
+
+
+def _open_for_read(path):
+    """Open the consent document for reading and return the binary stream.
+
+    Windows only (used nowhere else): the open carries
+    FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE. A stdlib
+    ``open(path, "rb")`` on Windows shares read/write but DENIES delete, so
+    ``os.replace`` (MoveFileEx) in ``_write_document`` fails with
+    ERROR_SHARING_VIOLATION whenever a reader holds the file open at that
+    instant — a writer must never fail because someone read the authority.
+    With delete sharing, the atomic replace always wins against this reader.
+    Error mapping preserves the read contract: file/path-not-found (2/3)
+    becomes FileNotFoundError (``missing``), access-denied/sharing (5/32)
+    becomes PermissionError (``unreadable``), anything else a plain OSError.
+    """
+    if os.name != "nt":
+        return open(path, "rb")
+    handle = _CreateFileW(
+        str(path), _GENERIC_READ, _SHARE_READ_WRITE_DELETE,
+        None, _OPEN_EXISTING, _FILE_ATTRIBUTE_NORMAL, None,
+    )
+    if handle is None or handle == _INVALID_HANDLE:
+        code = ctypes.get_last_error()
+        if code in (2, 3):  # ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND
+            raise FileNotFoundError(2, "consent file does not exist", str(path))
+        if code in (5, 32):  # ERROR_ACCESS_DENIED / ERROR_SHARING_VIOLATION
+            raise PermissionError(13, "consent file is not readable", str(path))
+        raise OSError(None, f"cannot open consent file (winerror {code})", str(path))
+    try:
+        fd = _msvcrt.open_osfhandle(handle, os.O_RDONLY)
+    except OSError:
+        _kernel32.CloseHandle(handle)
+        raise
+    return os.fdopen(fd, "rb")
+
+
+def _read_bytes(path):
+    with _open_for_read(path) as stream:
+        return stream.read()
+
+
 def _read_raw(path):
     """(state, data): data is the raw document dict only when state is ok."""
     try:
-        raw = path.read_bytes()
+        raw = _read_bytes(path)
     except FileNotFoundError:
         return "missing", None
     except OSError:
