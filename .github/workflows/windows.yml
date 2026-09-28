@@ -10,7 +10,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
@@ -25,7 +25,13 @@ jobs:
         run: |
           uv venv
           uv pip install -e '.[test]'
-      - name: Native loop, feed, redaction, CLI and service lifecycle tests
+      - name: Windows process ownership
+        if: runner.os == 'Windows'
+        env:
+          HOME: ${{ runner.temp }}/knowledge-test-home
+          USERPROFILE: ${{ runner.temp }}/knowledge-test-home
+        run: uv run --no-sync python -m pytest -q tests/test_windows_process_ownership.py tests/test_windows_empty_lock.py
+      - name: Component tests
         env:
           HOME: ${{ runner.temp }}/knowledge-test-home
           USERPROFILE: ${{ runner.temp }}/knowledge-test-home

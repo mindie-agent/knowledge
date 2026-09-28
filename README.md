@@ -41,9 +41,9 @@ current behavior, reproducible checks and acceptance boundaries.
 
 ```sh
 python -m pip install -e '.[test]'
-MINDIE_FRAMEWORK_SOURCE=tests/fixtures/production-parsers python -m pytest -q tests
+python -m pytest -q tests
 ```
 
-Run that from the repository root. The variable selects the frozen production parser fixtures in `tests/fixtures/production-parsers` (`provenance.json` records each source commit, path, and sha256). `MINDIE_PARSER_KIMI`, `MINDIE_PARSER_CC`, and `MINDIE_PARSER_CODEX` override one file. An unset variable does not search sibling checkouts or a production install; a missing or non-file path raises `MissingParserCheckout` instead of skipping.
+Run that from the repository root. If `MINDIE_FRAMEWORK_SOURCE` is unset, the test `conftest` uses the committed `tests/fixtures/production-parsers` and checks the three parser files exist. An explicit path that is missing or incomplete exits pytest with a setup error and does not search a production install. `MINDIE_PARSER_KIMI`, `MINDIE_PARSER_CC`, and `MINDIE_PARSER_CODEX` still override one file.
 
 The public knowledge base starts empty in the new `mindie-entry/2` format; there is no legacy migration or compatibility layer. Pre-existing private user files stay inert.

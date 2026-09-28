@@ -13,6 +13,35 @@ from pathlib import Path
 
 from lane_support import PARSER_NAMES, parser_path
 
+_REPO = Path(__file__).resolve().parents[1]
+_COMMITTED_PARSERS = _REPO / "tests" / "fixtures" / "production-parsers"
+_PARSER_FILES = (
+    "kimi/scripts/transcript.py",
+    "cc/scripts/transcript.py",
+    "codex/plugins/mindie-agent/scripts/codex_transcript.py",
+)
+
+
+def _framework_source_errors():
+    """Use the committed parsers when unset. An explicit path is never replaced."""
+    raw = os.environ.get("MINDIE_FRAMEWORK_SOURCE", "").strip()
+    if not raw:
+        os.environ["MINDIE_FRAMEWORK_SOURCE"] = str(_COMMITTED_PARSERS)
+        root = _COMMITTED_PARSERS
+        origin = "committed tests/fixtures/production-parsers"
+    else:
+        root = Path(raw).expanduser()
+        origin = "MINDIE_FRAMEWORK_SOURCE=" + raw
+    if not root.is_dir():
+        return [f"setup: {origin} is not a directory: {root}"]
+    missing = [rel for rel in _PARSER_FILES if not (root / rel).is_file()]
+    if missing:
+        return [f"setup: {origin} missing {', '.join(missing)}"]
+    return []
+
+
+_FIXTURE_ERRORS = _framework_source_errors()
+
 _explicit_root = os.environ.get("MINDIE_KNOWLEDGE_TEST_ROOT")
 if _explicit_root:
     ISOLATION_ROOT = Path(_explicit_root).expanduser().resolve()
@@ -24,11 +53,12 @@ _WATCH = [
     REAL_HOME / ".config" / "mindie-agent" / "diagnostics.json",
     REAL_HOME / ".local" / "state" / "mindie" / "diagnostics",
 ]
-for _parser_name in PARSER_NAMES:
-    if os.environ.get("MINDIE_FRAMEWORK_SOURCE") or os.environ.get(
-        f"MINDIE_PARSER_{_parser_name.upper()}"
-    ):
-        _WATCH.append(parser_path(_parser_name))
+if not _FIXTURE_ERRORS:
+    for _parser_name in PARSER_NAMES:
+        if os.environ.get("MINDIE_FRAMEWORK_SOURCE") or os.environ.get(
+            f"MINDIE_PARSER_{_parser_name.upper()}"
+        ):
+            _WATCH.append(parser_path(_parser_name))
 
 
 def _snapshot(path):
@@ -57,7 +87,6 @@ _diag_root = ISOLATION_ROOT / "diagnostics"
 for _directory in (_home, _config, _state, _diag_root):
     _directory.mkdir(parents=True, exist_ok=True)
 os.environ["HOME"] = str(_home)
-# Path.home() on Windows reads USERPROFILE before HOME.
 os.environ["USERPROFILE"] = str(_home)
 os.environ["XDG_CONFIG_HOME"] = str(_config)
 os.environ["XDG_STATE_HOME"] = str(_state)
@@ -81,6 +110,11 @@ _policy_path.write_text(
 os.chmod(_policy_path, 0o600)
 
 import pytest
+
+def pytest_configure(config):
+    if _FIXTURE_ERRORS:
+        pytest.exit("\n".join(_FIXTURE_ERRORS), returncode=2)
+
 
 from mindie_knowledge.loop import settings as settings_mod
 from mindie_knowledge.loop.activation import Admission
