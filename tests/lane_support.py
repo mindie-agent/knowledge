@@ -252,29 +252,41 @@ def kill_owned_group(pid):
     os.killpg(pid, signal.SIGKILL)
 
 
+def _icacls(path, *args):
+    """One icacls change. A non-zero exit is a test failure, not a skip."""
+    completed = subprocess.run(
+        ["icacls", str(path), *args],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if completed.returncode != 0:
+        raise AssertionError(
+            "icacls "
+            + " ".join(args)
+            + f" exited {completed.returncode}\n"
+            + completed.stdout
+            + completed.stderr
+        )
+    return completed
+
+
 def deny_read(path):
     """Make a subsequent read raise ``PermissionError``.
 
-    Mode ``0`` does not remove the Windows read right, so there the current
-    user's read ACE is denied. The caller must ``allow_read`` in ``finally``.
+    Mode ``0`` does that on POSIX. On Windows ``(R)`` also denies
+    ``READ_CONTROL``, so later ``icacls`` cannot repair the DACL. Deny only
+    ``RD`` (read data) and leave the DACL readable. The caller must
+    ``allow_read`` in ``finally``.
     """
     path = Path(path)
     if os.name == "nt":
         user = os.environ.get("USERNAME") or os.environ.get("USER")
         if not user:
             raise RuntimeError("USERNAME is not set; cannot deny the Windows read ACE")
-        subprocess.run(
-            ["icacls", str(path), "/inheritance:r"],
-            check=True, capture_output=True, text=True,
-        )
-        subprocess.run(
-            ["icacls", str(path), "/grant:r", f"{user}:(F)"],
-            check=True, capture_output=True, text=True,
-        )
-        subprocess.run(
-            ["icacls", str(path), "/deny", f"{user}:(R)"],
-            check=True, capture_output=True, text=True,
-        )
+        _icacls(path, "/deny", f"{user}:(RD)")
         return
     path.chmod(0)
 
@@ -284,15 +296,9 @@ def allow_read(path):
     path = Path(path)
     if os.name == "nt":
         user = os.environ.get("USERNAME") or os.environ.get("USER")
-        if user:
-            subprocess.run(
-                ["icacls", str(path), "/remove:d", user],
-                check=False, capture_output=True, text=True,
-            )
-            subprocess.run(
-                ["icacls", str(path), "/grant:r", f"{user}:(F)"],
-                check=False, capture_output=True, text=True,
-            )
+        if not user:
+            raise RuntimeError("USERNAME is not set; cannot remove the Windows deny ACE")
+        _icacls(path, "/remove:d", user)
         return
     path.chmod(0o600)
 

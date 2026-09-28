@@ -56,13 +56,15 @@ CHILD = textwrap.dedent(
         marker.flush()
         os.fsync(marker.fileno())
         marker.close()
-        parent = os.getppid()
-        if parent <= 1:
-            raise SystemExit("refusing to signal pid %s" % parent)
-        # POSIX SIGKILL is not defined on Windows. SIGTERM there is TerminateProcess.
-        sig = getattr(signal, "SIGKILL", signal.SIGTERM)
-        os.kill(parent, sig)
+        # The venv python.exe on Windows is a launcher. getppid() is that
+        # launcher, not the engine running this file in recover mode.
+        target = int(os.environ["ENGINE_PID"])
+        if target <= 1:
+            raise SystemExit("refusing to signal pid %s" % target)
+        sig = signal.SIGTERM if os.name == "nt" else signal.SIGKILL
+        os.kill(target, sig)
         raise SystemExit(0)
+    os.environ["ENGINE_PID"] = str(os.getpid())
     sys.path.insert(0, os.environ["GROK_CORE_REPO"])
     import importlib.util
     from mindie_knowledge.loop.activation import Admission
