@@ -164,8 +164,15 @@ def _accept_row(db, *, namespace, root_hash, session, turn, transcript, summary,
 
 def _probe(config, timeout):
     from .cli import connect
+    from .locks import lock_held
     from .transport import rpc
 
+    # The service holds this OS lock until storage and listener are closed.
+    # Windows may report a closed loopback port as a timeout for ~2 seconds;
+    # a released lifetime lock is stronger evidence than a short TCP probe.
+    consumer = Path(config["root"]) / config["domain"] / "consumer.lock"
+    if lock_held(consumer) is False:
+        return "absent"
     try:
         connection = connect(config)
     except FileNotFoundError:
@@ -271,10 +278,8 @@ def request_wake(config_path, *, budget_seconds=0.4, session_id, event=None):
         if isinstance(event, str) and len(event) == 64:
             argv.extend(["--event", event])
         try:
-            process = subprocess.Popen(
-                argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True,
-            )
+            from .process import spawn_service
+            process = spawn_service(argv)
         except OSError:
             out.update(wake="failed", runtime="unavailable", reason="wake-failed",
                        recovery=_RECOVERY["wake-failed"])
@@ -291,7 +296,7 @@ def request_wake(config_path, *, budget_seconds=0.4, session_id, event=None):
 
 def run_wake(config_path, event=None):
     """Detached one-shot starter. Not a retry loop and not an installer."""
-    from .cli import config_at
+    from .cli import config_at, STARTUP_TIMEOUT, MAX_STARTUP_PROBES
     from .diagnostics import clear_delivery_event, record_delivery_failure
     from .locks import StartInProgress, StartLock
     from .process import terminate_tree
@@ -320,23 +325,28 @@ def run_wake(config_path, event=None):
                     config, stage="runtime", cause="worker-unavailable", event=event,
                 )
             return 0
-        process = subprocess.Popen(
-            [sys.executable, "-m", "mindie_knowledge.loop.cli", "serve",
-             "--config", str(Path(config_path).resolve())],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True,
-        )
+        from .process import spawn_service
+        try:
+            process = spawn_service(
+                [sys.executable, "-m", "mindie_knowledge.loop.cli", "serve",
+                 "--config", str(Path(config_path).resolve())],
+                from_detached_starter=True,
+            )
+        except OSError:
+            record_delivery_failure(config, stage="wake", cause="wake-failed", event=event)
+            return 0
         holder = _read_wake(config)
         holder["service_pid"] = process.pid
         _wake_file(config).write_text(json.dumps(holder))
-        deadline = time.monotonic() + 5
-        for _ in range(3):
+        deadline = time.monotonic() + STARTUP_TIMEOUT
+        interval = max(0, STARTUP_TIMEOUT - .3) / MAX_STARTUP_PROBES
+        for _ in range(MAX_STARTUP_PROBES):
             if process.poll() is not None:
                 break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            time.sleep(min(0.5, remaining))
+            time.sleep(min(interval, remaining))
             if _probe(config, min(0.3, max(0.05, deadline - time.monotonic()))) == "ready":
                 ready = True
                 if event:
@@ -432,6 +442,13 @@ def accept_stop(config_path, event):
         summary = ""
         if transcript is None:
             return _result(stage="rejected", reason="no-capturable-material", summary_dropped=False)
+    elif config.get("capture_mode") == "public-transcript":
+        if transcript is None:
+            return _result(stage="rejected", reason="no-capturable-material")
+        # Selection/redaction happens in the worker. The handoff stores only
+        # the native source reference, never another raw copy of its answer.
+        summary = ""
+        dropped = bool(raw_summary)
     else:
         summary = raw_summary if isinstance(raw_summary, str) else ""
         if len(summary) > SUMMARY_LIMIT:

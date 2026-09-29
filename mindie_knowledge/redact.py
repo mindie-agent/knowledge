@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import re
 import sys
+import heapq
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
@@ -402,7 +403,7 @@ RULES: tuple[Rule, ...] = (
         description="absolute path revealing a user account",
         hint="use a placeholder such as /home/<user>/... or a relative path",
         pattern=re.compile(
-            r"(?<![\w/])(?:/home|/Users|/export/home|/data/home|/root)/"
+            r"(?<![\w/])(?:file://)?(?:/home|/Users|/export/home|/data/home|/root|/mnt/[a-z]/Users)/"
             + _PLACEHOLDER_START + r"[^\s\"'`,;:()\[\]]+"
         ),
     ),
@@ -411,7 +412,8 @@ RULES: tuple[Rule, ...] = (
         description="Windows profile path revealing a user account",
         hint="use a placeholder such as C:\\Users\\<user>\\...",
         pattern=re.compile(
-            r"\b[A-Za-z]:\\Users\\" + _PLACEHOLDER_START + r"([^\\\s\"']+)"
+            r"\b[A-Za-z]:[\\/]Users[\\/]" + _PLACEHOLDER_START + r"([^\\/\s\"']+)",
+            re.IGNORECASE,
         ),
     ),
     Rule(
@@ -670,16 +672,23 @@ def scan_text(text: str, allow: Allowlist | None = None, path: str = "<text>") -
     findings: list[Finding] = []
     claimed: list[tuple[int, int]] = []
     for rule in RULES:
+        # Each built-in finder yields disjoint spans in source order. Merge
+        # its claims once, instead of comparing every match to every earlier
+        # match (quadratic for a long public conversation with many hosts).
+        added = []
+        cursor = 0
         for start, end in rule.spans(text):
             if start == end:
                 continue
-            if any(s < end and start < e for s, e in claimed):
+            while cursor < len(claimed) and claimed[cursor][1] <= start:
+                cursor += 1
+            if cursor < len(claimed) and claimed[cursor][0] < end:
                 continue
             value = text[start:end]
             if allow.is_allowed(value):
-                claimed.append((start, end))
+                added.append((start, end))
                 continue
-            claimed.append((start, end))
+            added.append((start, end))
             findings.append(
                 Finding(
                     path=path,
@@ -690,6 +699,7 @@ def scan_text(text: str, allow: Allowlist | None = None, path: str = "<text>") -
                     end=end,
                 )
             )
+        claimed = list(heapq.merge(claimed, added))
     return findings
 
 

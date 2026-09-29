@@ -272,14 +272,14 @@ def run_argv(
         merged_env.update({str(k): str(v) for k, v in env.items()})
     try:
         if os.name == "nt":
-            process = subprocess.Popen(
+            from mindie_knowledge.windows_process import spawn_owned
+            process = spawn_owned(
                 argv,
                 stdin=stdin_target,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 cwd=str(cwd) if cwd else None,
                 env=merged_env,
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
             )
         else:
             process = subprocess.Popen(
@@ -294,11 +294,14 @@ def run_argv(
     except FileNotFoundError:
         if input_file:
             input_file.close()
-        raise CommunityError(f"executable not found: {argv[0]}")
+        raise TransientError(f"executable not found: {argv[0]}")
     except OSError as exc:
         if input_file:
             input_file.close()
-        raise CommunityError(f"cannot start {argv[0]}: {exc.strerror or exc}")
+        # Spawn failed before the child could act. Keep the exact publication
+        # pending under the existing backoff so repairing the local runtime
+        # resumes it; this is neither content rejection nor uncertain write.
+        raise TransientError(f"cannot start {argv[0]}: {exc.strerror or exc}")
 
     # Bounded in-flight buffer: producers block instead of outgrowing max_output.
     chunks: "queue.Queue" = queue.Queue(maxsize=max(8, max_output // 4096 + 8))

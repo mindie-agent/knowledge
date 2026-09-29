@@ -11,6 +11,59 @@ import time
 import transcript_double
 
 
+def test_cold_wake_spawn_failure_is_visible_and_releases_ownership(tmp_path, monkeypatch):
+    from mindie_knowledge.loop import handoff, process
+    from mindie_knowledge.loop.locks import lock_held
+
+    config = tmp_path / 'engine.json'
+    root = tmp_path / 'data'
+    config.write_text(json.dumps(dict(root=str(root), domain='test')), encoding='utf-8')
+    event = 'a' * 64
+
+    def denied(*args, **kwargs):
+        raise PermissionError('private-path-and-provider-detail')
+
+    monkeypatch.setattr(process, 'spawn_service', denied)
+    assert handoff.run_wake(config, event=event) == 0
+    diagnostic = (root / 'test/latest-delivery.json').read_text(encoding='utf-8')
+    payload = json.loads(diagnostic)
+    assert payload['cause'] == 'wake-failed'
+    assert payload['stage'] == 'wake' and payload['event'] == event
+    assert 'private-path-and-provider-detail' not in diagnostic
+    assert lock_held(root / 'test/start.lock') is False
+
+
+def test_cold_wake_uses_its_existing_startup_budget(tmp_path, monkeypatch):
+    """A real 2.4 s interpreter startup used to be killed after 3 x .5 s."""
+    from mindie_knowledge.loop import handoff, process
+    from mindie_knowledge.loop.cli import connect
+    from mindie_knowledge.loop.transport import rpc
+    config = tmp_path / 'engine.json'
+    value = dict(root=str(tmp_path / 'data'), domain='test')
+    config.write_text(json.dumps(value), encoding='utf-8')
+    original = process.spawn_service
+    owned = []
+    def delayed(command, **options):
+        child = original([sys.executable, '-c',
+            "import time,runpy; time.sleep(2.4); runpy.run_module('mindie_knowledge.loop.cli', run_name='__main__')",
+            *command[3:]], **options)
+        owned.append(child)
+        return child
+    monkeypatch.setattr(process, 'spawn_service', delayed)
+    try:
+        handoff.run_wake(config)
+        assert len(owned) == 1
+        assert owned[0].poll() is None, 'starter killed its owned service before the configured deadline'
+        assert rpc(connect(value), 'status', timeout=1)['worker_alive']
+        assert rpc(connect(value), 'stop_if_idle', timeout=1)['idle']
+        owned[0].wait(timeout=5)
+    finally:
+        for child in owned:
+            if child.poll() is None:
+                process.terminate_tree(child)
+            child.wait(timeout=3)
+
+
 def test_serve_starts_with_actual_configured_parser(tmp_path):
     adapter = tmp_path / "adapter_parser.py"
     shutil.copy(transcript_double.__file__, adapter)
@@ -52,6 +105,15 @@ def test_serve_starts_with_actual_configured_parser(tmp_path):
             assert result["status"] == "stopping"
             process.wait(timeout=5)
             assert process.returncode == 0
+            from mindie_knowledge.loop.handoff import _probe
+            from mindie_knowledge.loop.locks import lock_held
+
+            # The persistent connection file survives shutdown. A short TCP
+            # timeout on Windows must not turn a released consumer into an
+            # ambiguous live service and prevent the next startup.
+            assert connection_path.is_file()
+            assert lock_held(connection_path.with_name("consumer.lock")) is False
+            assert _probe(json.loads(config.read_text()), .01) == "absent"
         finally:
             if process.poll() is None:
                 process.terminate()
@@ -60,6 +122,21 @@ def test_serve_starts_with_actual_configured_parser(tmp_path):
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=2)
+
+
+def test_lifetime_lock_observation_is_conservative_and_preserves_metadata(tmp_path):
+    from mindie_knowledge.loop.locks import StartLock, lock_held
+
+    path = tmp_path / "consumer.lock"
+    assert lock_held(path) is None
+    assert not path.exists()
+    with StartLock(path):
+        stamp = path.stat().st_mtime_ns
+        assert lock_held(path) is True
+        assert path.stat().st_mtime_ns == stamp
+    metadata = path.read_bytes()
+    assert lock_held(path) is False
+    assert path.read_bytes() == metadata
 
 
 def test_loopback_bind_skips_reverse_dns(tmp_path, monkeypatch):

@@ -467,6 +467,9 @@ def test_stage_and_commit_many_paths_exceeding_argv_limit(tmp_path):
          "commit", "-q", "-m", "seed"], cwd=work)
     seeded = git(["rev-parse", "HEAD"], cwd=work)
     assert gitops.stage_and_commit(work, [], "nothing", Deadline(30, 10)) == seeded
+    # Real developer Git configuration must not turn canonical LF publication
+    # into one conversion warning per file and exhaust the bounded subprocess.
+    git(["config", "core.autocrlf", "true"], cwd=work)
 
     stem = "n" * 240
     paths = [f"wide/{i:04d}-{stem}" for i in range(4300)]
@@ -475,9 +478,11 @@ def test_stage_and_commit_many_paths_exceeding_argv_limit(tmp_path):
     for path in paths:
         target = work / path
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text("x\n", encoding="utf-8")
+        target.write_bytes(b"x\n")
     committed = gitops.stage_and_commit(work, paths, "many paths", Deadline(60, 10))
     assert committed and committed != seeded
     listed = set(git(["ls-files"], cwd=work).splitlines())
     assert set(paths) <= listed
     assert "wide/name with space.txt" in listed
+    assert git(["config", "core.autocrlf"], cwd=work) == "true"
+    assert gitops.stage_and_commit(work, paths, "unchanged", Deadline(60, 10)) is None

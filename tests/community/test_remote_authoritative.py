@@ -253,6 +253,53 @@ def test_bot_edited_open_pr_receives_only_new_delta_multi_cycle(tmp_path):
         store.close()
 
 
+def test_merged_then_open_followup_keeps_all_observations_on_one_pr(tmp_path):
+    """A third save must update the suffixed follow-up, not branch from main."""
+    remote_url = make_remote(tmp_path, 'content')
+    settings = _loop_settings(tmp_path, remote_url)
+    store = Store(tmp_path / 'store', 'npu')
+    try:
+        engine = _engine(store, settings)
+        doc = store.create_draft(kind='experience', title='Case', summary='s',
+            content='Original public observation.', owner=PRODUCER, generation=settings.generation)
+        batch_id = build_batch(store, settings=settings)[0]
+        first = _submit(engine, store, batch_id)
+        assert first['status'] == 'submitted'
+        transport = _transport(store, remote_url)
+        transport.merge_pull_request(REPO, 1, sha=first['head_sha'], method='merge', deadline=_deadline())
+        for index, text in enumerate(('Second observation before review.', 'Third observation while review is pending.')):
+            # Restart/compaction must still use the confirmed PR body.
+            engine = _engine(store, settings)
+            engine._apply_one(dict(entry_id=doc['entry_id'], title=None, summary='s',
+                content=text, conditions={}), opaque=PRODUCER, marker=str(index + 1) * 32,
+                generation=settings.generation)
+            build_batch(store, settings=settings)
+            receipt = _submit(engine, store, batch_id)
+            assert receipt['status'] == ('submitted' if index == 0 else 'updated'), receipt['detail']
+        pulls = json.loads(transport.path.read_text())['repos'][REPO]['pulls']
+        assert len(pulls) == 2
+        assert pulls['2']['head']['ref'] != _branch('npu', batch_id)
+        content = _branch_file(remote_url, pulls['2']['head']['ref'], f"cases/{doc['entry_id']}.md", tmp_path, 'verify-followup')
+        for text in ('Original public observation.', 'Second observation before review.', 'Third observation while review is pending.'):
+            assert content.count(text) == 1
+        assert store.sent_receipt(doc['entry_id'])['pr_url'].endswith('/2')
+
+        # Conflicting recorded open PRs require inspection, never an arbitrary
+        # base that could silently drop one branch's accepted observations.
+        data = json.loads(transport.path.read_text())
+        data['repos'][REPO]['pulls']['1'].update(state='open', merged=False)
+        transport.path.write_text(json.dumps(data))
+        engine._apply_one(dict(entry_id=doc['entry_id'], title=None, summary='s',
+            content='Fourth observation.', conditions={}), opaque=PRODUCER,
+            marker='4' * 32, generation=settings.generation)
+        build_batch(store, settings=settings)
+        refused = _submit(engine, store, batch_id)
+        assert refused['status'] == 'needs_review'
+        assert len(json.loads(transport.path.read_text())['repos'][REPO]['pulls']) == 2
+    finally:
+        store.close()
+
+
 def test_rejected_pr_quarantines_its_material_and_new_entries_flow(tmp_path):
     """A proven closed-unmerged PR quarantines exactly its own entries; later
     unrelated material is published on a fresh branch/PR without resurrecting

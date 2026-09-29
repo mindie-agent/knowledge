@@ -29,11 +29,13 @@ SQLite requirement. Install `pip install -e '.[test]'` for core, or
 `pip install -r runtime-requirements.txt` for an adapter, then run:
 
 ```sh
-MINDIE_FRAMEWORK_SOURCE=tests/fixtures/production-parsers python -m pytest -q tests
+python -m pytest -q tests
 ```
 
-Tests use committed real parser/peer fixtures or exact Git revisions declared
-in the workflow. They do not discover a user's production installation.
+Unset `MINDIE_FRAMEWORK_SOURCE` selects the committed parser fixture and
+checks those files exist. A bad explicit path is a setup error, not a product
+failure. The Windows job runs `tests/test_windows_process_ownership.py`
+before the full suite. These are real subprocess checks, without a model or provider credentials.
 Missing dependencies fail explicitly. Keep failure-path, concurrency and
 recovery cases bounded and deterministic; model sessions are reserved for
 checks that actually need a native host.
@@ -53,6 +55,15 @@ onboarding or a retry loop. Windows CI checks this filesystem contract;
 it is separate from acceptance inside a native Windows agent host.
 
 ## Integration and acceptance boundaries
+
+The persistent `consumer.lock` is held until the service has closed its
+listener and store. `lock_held` observes the OS lock without rewriting PID
+metadata; missing or unreadable locks remain unknown. Startup can therefore
+recognize a released consumer even on Windows, where a short connection
+attempt to a closed loopback port may time out before refusal is reported.
+The real service startup test checks this post-shutdown state. Adapter
+handoff tests must also confirm release rather than force-kill a fixture
+and treat that cleanup as successful production shutdown.
 
 Publish the exact dependency commits before adapter CI. Process the reviewed
 PRs in order: knowledge core, Claude Code, Kimi, Codex. Preserve published

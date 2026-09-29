@@ -3,6 +3,7 @@
 import time
 
 from .store import _upsert_continuation
+from .limits import ORGANIZER_LEASE_SECONDS
 
 # The model may return 32 KiB. Saving that result also stores at most three
 # assigned entry ids and new flags. Those local fields are not a second gate.
@@ -83,9 +84,9 @@ class MaintenanceBudget:
                                      retry_at=first + 3601)
             if db.execute(
                 "SELECT 1 FROM maintenance_attempts WHERE status='running' AND started>?",
-                (now - 135,),
+                (now - ORGANIZER_LEASE_SECONDS,),
             ).fetchone():
-                raise BudgetExceeded("another maintenance call is in progress", retry_at=now + 135)
+                raise BudgetExceeded("another maintenance call is in progress", retry_at=now + ORGANIZER_LEASE_SECONDS)
             db.execute(
                 "INSERT INTO maintenance_attempts"
                 "(id, session, role, started, status) VALUES(?,?,?,?,?)",

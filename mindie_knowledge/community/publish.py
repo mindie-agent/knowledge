@@ -610,14 +610,15 @@ def _pr_number_absent(exc: BaseException) -> bool:
 def _own_prior_pr(ledger, batch_id, transport, repository, branch, deadline):
     """Locate our own contribution PR: ledger first, bounded lookup second.
 
-    Only PRs whose head branch is our deterministic contribution branch are
-    considered ours; unrelated PRs are never touched.
+    Recorded PR/branch pairs include the suffixed branches created after a
+    merge. A prefix match alone never establishes ownership. Without a receipt,
+    only the initial deterministic branch is discoverable.
     """
-    numbers = {
-        row["pr_number"]
-        for row in ledger.all_for_batch(batch_id)
-        if row.get("pr_number")
-    }
+    recorded = {}
+    for row in ledger.all_for_batch(batch_id):
+        if row.get("pr_number") and row.get("repository") == repository:
+            recorded.setdefault(row["pr_number"], set()).add(row["branch"])
+    numbers = set(recorded)
     found = []
     for number in sorted(numbers):
         try:
@@ -636,12 +637,14 @@ def _own_prior_pr(ledger, batch_id, transport, repository, branch, deadline):
         found = transport.find_pull_requests(
             repository, head_branch=branch, deadline=deadline
         )
-    own = [pr for pr in found if pr.get("head", {}).get("ref") == branch]
-    open_pr = next((pr for pr in own if pr.get("state") == "open"), None)
-    if open_pr:
-        return open_pr
-    merged = [pr for pr in own if pr.get("merged")]
-    return merged[-1] if merged else (own[-1] if own else None)
+    own = [pr for pr in found
+           if pr.get("head", {}).get("ref") in recorded.get(pr.get("number"), {branch})]
+    open_prs = [pr for pr in own if pr.get("state") == "open"]
+    if len(open_prs) > 1:
+        raise CommunityError("multiple recorded open PRs for one contribution; inspect before appending", status="needs_review")
+    if open_prs:
+        return open_prs[0]
+    return max(own, key=lambda pr: pr["number"]) if own else None
 
 
 def _owned_head(pr, branch, settings) -> bool:

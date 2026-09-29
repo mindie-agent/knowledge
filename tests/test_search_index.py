@@ -580,7 +580,11 @@ def test_query_header_describes_the_published_ref_not_the_draft(tmp_path):
             content="sharedneedle body", conditions={"v": "1.0"}, owner=PRODUCER,
         )
         published = store.get(store.ref(draft["entry_id"]))
+        assert store.query("sharedneedle")["results"][0]["origin"] == "draft"
         store.install_feed([published], feed_ident="f" * 64)
+        published_hit = store.query("sharedneedle")["results"][0]
+        assert published_hit["origin"] == "feed"
+        assert published_hit["supplemental"] is False
         store.append_observation(
             draft["entry_id"], "later private note", marker="ab" * 16,
             producer=PRODUCER,
@@ -596,6 +600,7 @@ def test_query_header_describes_the_published_ref_not_the_draft(tmp_path):
         hits = store.query("sharedneedle")["results"]
         assert len(hits) == 1
         hit = hits[0]
+        assert hit["origin"] == "feed"
         assert hit["supplemental"] is True
         resolved = store.get(hit["ref"])
         assert resolved["revision"] == published["revision"]

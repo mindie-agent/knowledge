@@ -13,6 +13,7 @@ create→write window just yields a conservative ``busy``.
 from __future__ import annotations
 
 import json
+import errno
 import os
 import time
 from pathlib import Path
@@ -47,6 +48,27 @@ def _unlock_file(fd: int) -> None:
         fcntl.flock(fd, fcntl.LOCK_UN)
 
 
+def lock_held(path):
+    """Observe an existing OS lock: True held, False released, None unknown.
+
+    Never create/unlink the file or interpret its diagnostic PID. Opening a
+    second descriptor and trying the real lock also works after owner exit.
+    """
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except OSError:
+        return None
+    try:
+        try:
+            _lock_file_nb(fd)
+        except OSError as exc:
+            return True if exc.errno in (errno.EACCES, errno.EAGAIN) else None
+        _unlock_file(fd)
+        return False
+    finally:
+        os.close(fd)
+
+
 class StartLock:
     def __init__(self, path):
         self.path = Path(path)
@@ -59,8 +81,7 @@ class StartLock:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
         try:
-            if os.name == "nt" and os.fstat(fd).st_size == 0:
-                os.write(fd, b" ")  # msvcrt.locking needs byte 0 to exist
+            # Windows permits locking beyond EOF; acquire before any write.
             _lock_file_nb(fd)
         except OSError:
             os.close(fd)

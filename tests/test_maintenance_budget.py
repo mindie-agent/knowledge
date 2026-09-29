@@ -28,6 +28,32 @@ def test_durable_attempt_id_is_consumed_before_model_execution(store):
         budget.reserve("job", "session", "organize")
 
 
+def test_live_organizer_still_excludes_a_second_task_past_old_lease(store, monkeypatch):
+    from mindie_knowledge.loop.limits import ORGANIZER_TIMEOUT
+
+    clock = [10000.0]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    budget = MaintenanceBudget(store)
+    budget.reserve("first", "session-a", "organize")
+    # A supported slow model is still within its deadline; another task must
+    # not start concurrently when the former hard-coded 135s lease expires.
+    clock[0] += ORGANIZER_TIMEOUT - 1
+    with pytest.raises(BudgetExceeded, match="in progress"):
+        budget.reserve("second", "session-b", "organize")
+    budget.finish("first", True)
+    budget.reserve("second", "session-b", "organize")
+
+
+def test_status_exposes_missing_publisher_without_spawning_or_blocking_store(store, monkeypatch):
+    import shutil
+
+    monkeypatch.setattr(shutil, "which", lambda name: None if name == "gh" else "/git")
+    status = Engine(store).status()
+    assert status["publication_runtime"] == dict(
+        state="unavailable", missing=["gh"], authentication="not-checked",
+    )
+
+
 def test_session_and_hourly_limits_apply_to_successes_too(store):
     budget = MaintenanceBudget(store)
     for i in range(6):

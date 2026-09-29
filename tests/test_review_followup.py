@@ -3,6 +3,7 @@
 import json
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 
@@ -300,7 +301,7 @@ def test_live_pid_in_wake_json_does_not_coalesce(tmp_path, monkeypatch):
     class _Proc:
         pid = 424242
 
-    live = subprocess.Popen(["sleep", "30"])
+    live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     monkeypatch.setattr(
         "mindie_knowledge.loop.handoff.subprocess.Popen",
         lambda *args, **kwargs: spawned.append(args) or _Proc(),

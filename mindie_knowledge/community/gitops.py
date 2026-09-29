@@ -211,7 +211,11 @@ def stage_and_commit(
         return current_head(work_dir, deadline)
     spec = b"\0".join(path.encode("utf-8") for path in paths) + b"\0"
     _git(
-        ["add", "--pathspec-from-file=-", "--pathspec-file-nul"],
+        # apply_files writes canonical LF bytes. Inheriting a developer's
+        # autocrlf=true emits a warning for every LF file on staging, which can
+        # exhaust the output budget for a valid large batch. Scope this policy
+        # to this command; do not rewrite repository or user Git settings.
+        ["-c", "core.autocrlf=false", "add", "--pathspec-from-file=-", "--pathspec-file-nul"],
         deadline,
         cwd=work_dir,
         env=env,
