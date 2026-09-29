@@ -442,6 +442,13 @@ def accept_stop(config_path, event):
         summary = ""
         if transcript is None:
             return _result(stage="rejected", reason="no-capturable-material", summary_dropped=False)
+    elif config.get("capture_mode") == "public-transcript":
+        if transcript is None:
+            return _result(stage="rejected", reason="no-capturable-material")
+        # Selection/redaction happens in the worker. The handoff stores only
+        # the native source reference, never another raw copy of its answer.
+        summary = ""
+        dropped = bool(raw_summary)
     else:
         summary = raw_summary if isinstance(raw_summary, str) else ""
         if len(summary) > SUMMARY_LIMIT:

@@ -5,7 +5,8 @@ own `transcript_adapter`, and name an installed `redactor_executable`. Existing
 adapters retain their current organizer path; the core never infers a harness
 format or silently switches other clients.
 
-The parser supplies authorized public messages and exact source-byte ranges.
+The handoff queue retains only the native transcript reference, not an extra
+raw copy of the final answer. The parser supplies authorized public messages and exact source-byte ranges.
 The core uses a checksum-pinned Gitleaks 8.30.1 release plus its existing privacy
 rules before saving the messages. Setup calls
 `python -m mindie_knowledge.loop.transcript_redaction` to install the supported
@@ -23,7 +24,7 @@ authoritative; draft files and the search index are derived views.
 On migration, legacy organizer gaps remain failed and uncommitted legacy model
 results remain held for inspection. Neither recovery route can call a body
 model or apply its result in public-transcript mode. Appends refresh the source
-excerpt so retrieval does not keep showing an earlier superseded observation.
+excerpt and excerpt title so retrieval does not keep showing an earlier superseded observation.
 
 Without `summary_command`, a clearly labeled source excerpt supplies the title
 and retrieval introduction. An optional summary argv receives redacted source

@@ -145,6 +145,30 @@ def test_overlong_summary_keeps_the_transcript_reference(tmp_path):
         store.close()
 
 
+def test_public_transcript_handoff_never_stores_raw_native_answer(tmp_path):
+    project = tmp_path / 'proj'
+    project.mkdir()
+    config, admission = _ready(tmp_path, project)
+    value = json.loads(config.read_text())
+    value['capture_mode'] = 'public-transcript'
+    # Stop validates configuration shape but never opens the parser/scanner.
+    value['transcript_adapter'] = str(tmp_path / 'worker-only-parser.py')
+    value['redactor_executable'] = str(tmp_path / 'worker-only-scanner')
+    config.write_text(json.dumps(value))
+    transcript = project / 'native.jsonl'
+    result = capture_hook(config, _event(admission, transcript_path=str(transcript),
+        last_assistant_message='private raw native answer'))
+    assert result['capture_id'] and result['summary_dropped'], result
+    store = Store(tmp_path / 'root', 'test')
+    try:
+        assert store.capture_row(result['capture_id'])['summary'] == ''
+        assert store.capture_row(result['capture_id'])['transcript'] == str(transcript)
+        missing = capture_hook(config, _event(admission, turn_id='missing-source'))
+        assert missing['stage'] == 'rejected' and missing['capture_id'] is None
+    finally:
+        store.close()
+
+
 def test_reactivated_epoch_cancels_the_queued_turn(tmp_path):
     project = tmp_path / "proj"
     project.mkdir()

@@ -221,6 +221,12 @@ class Engine:
             return dict(status="skipped",
                         reason="service is not admitting new work")
         namespace = harness if isinstance(harness, str) else ""
+        if self.capture_mode == "public-transcript":
+            if not transcript_path:
+                return dict(status="skipped", reason="public transcript reference is required")
+            # The native transcript is the only raw source. Do not duplicate
+            # an unredacted final answer in the durable handoff queue.
+            summary = ""
         captured = self.store.add_capture(
             root_session=root_hash, session=session_id, turn=turn_id,
             transcript=transcript_path, summary=summary or "",

@@ -47,8 +47,8 @@ def append(path, text):
         stream.write(json.dumps(record, ensure_ascii=False) + '\n')
 
 
-def process(engine, path, turn):
-    result = engine.capture(session_id='manual-A', turn_id=turn, transcript_path=str(path))
+def process(engine, path, turn, **kwargs):
+    result = engine.capture(session_id='manual-A', turn_id=turn, transcript_path=str(path), **kwargs)
     engine._process(result['id'])
     row = engine.store.capture_row(result['id'])
     assert row['status'] == 'organized', row
@@ -58,7 +58,8 @@ def process(engine, path, turn):
 def test_body_is_saved_without_runner_and_export_preserves_it(pipeline):
     engine, store, path = pipeline
     append(path, 'Synthetic NPU case: eager inference returned 8 tokens. Reported result, not a readiness claim.')
-    process(engine, path, 'first')
+    row = process(engine, path, 'first', summary='private raw native answer')
+    assert row['summary'] == ''
     docs = store.drafts_changed(generation=engine._settings().generation)
     assert len(docs) == 1
     assert 'returned 8 tokens' in docs[0]['content']
@@ -88,6 +89,7 @@ def test_restart_and_duplicate_stop_append_one_task_record(pipeline):
     assert docs[0]['content'].count('first-public-marker') == 1
     assert docs[0]['content'].count('second-public-marker') == 1
     assert 'second-public-marker' in docs[0]['summary']
+    assert 'second-public-marker' in docs[0]['title']
     assert store.cursor(str(path.resolve()))['ok_finish'] == path.stat().st_size
 
 
