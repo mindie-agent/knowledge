@@ -361,6 +361,11 @@ class Store:
         capture_columns = {
             row[1] for row in self.db.execute("PRAGMA table_info(captures)")
         }
+        task_columns = {row[1] for row in self.db.execute("PRAGMA table_info(transcript_tasks)")}
+        if "authorization" not in task_columns:
+            # Explicit imports use the importing session's authority, without
+            # creating a capture or a watcher for the historical session.
+            self.db.execute("ALTER TABLE transcript_tasks ADD COLUMN authorization TEXT")
         if capture_columns and "activation_epoch" not in capture_columns:
             self.db.execute("ALTER TABLE captures ADD COLUMN activation_epoch TEXT")
         if capture_columns and "identity_kind" not in capture_columns:
@@ -440,10 +445,14 @@ class Store:
             (time.time(),),
         )
         if self.db.execute(
-            "SELECT 1 FROM meta WHERE key='latest-draft-only'"
+            "SELECT 1 FROM meta WHERE key='latest-body-only'"
         ).fetchone() is None:
-            self._prune_draft_history()
-            self.db.execute("INSERT INTO meta VALUES('latest-draft-only', '1')")
+            self._prune_body_history()
+            # Retired full-body mirrors are not a second source of truth.
+            for mirror in (self.root / 'drafts').glob('*.md'):
+                if re.fullmatch(r'[0-9a-f]{64}', mirror.stem):
+                    mirror.unlink(missing_ok=True)
+            self.db.execute("INSERT INTO meta VALUES('latest-body-only', '1')")
         self.db.commit()
 
     @contextlib.contextmanager
@@ -875,7 +884,7 @@ class Store:
 
     WITHDRAWN_NOTE = (
         "withdrawn from the published knowledge base by upstream deletion; "
-        "this is a retained historical copy, not current published material"
+        "the published body is no longer retained"
     )
 
     def ref(self, entry_id, revision=None):
@@ -969,8 +978,8 @@ class Store:
         )
 
     def get(self, ref):
-        """Exact document for a retained reference; old draft pins expire.
-        A withdrawn entry stays readable with an explicit flag and note."""
+        """Exact current document; superseded body references expire.
+        A withdrawn entry has a body-free state marker, not a historical copy."""
         with self.lock:
             entry_id, revision = self._parse_ref(ref)
             row = self._row(entry_id)
@@ -1066,23 +1075,32 @@ class Store:
                             (doc['revision'], title, canonical(doc) if visible else row['doc'], now, entry_id))
             if visible:
                 self._index_upsert_tokens(entry_id, index_text(self._doc_source_text(doc)), self._doc_state_digest(doc))
-            self._prune_draft_history(entry_id)
+            self._prune_body_history(entry_id)
             return True
 
-    def _prune_draft_history(self, entry_id=None):
-        """Keep the current draft and published body; outbox owns sent bytes.
+    def _prune_body_history(self, entry_id=None):
+        """Keep only current work and the active published body; no historical bodies.
 
         Called in the same transaction as a draft update. The unscoped form
-        runs once when an existing store adopts latest-only draft retention.
+        runs once when an existing store adopts latest-only body retention.
         SQLite reuses freed pages; this does not run VACUUM on the hot path.
         """
         args = () if entry_id is None else (entry_id,)
         revision_scope = "" if entry_id is None else " AND r.entry_id=?"
         grant_scope = "" if entry_id is None else " AND g.identity=?"
+        # Withdrawn published material leaves only its identity/current state.
+        # An unsent working draft is still current work and stays separately.
+        entry_scope = "" if entry_id is None else " AND entry_id=?"
+        self.db.execute(
+            "UPDATE entries SET doc=json_set(doc, '$.content', '') "
+            "WHERE published_revision IS NOT NULL AND feed_active=0" + entry_scope,
+            args,
+        )
         removed = self.db.execute(
-            "DELETE FROM revisions AS r WHERE r.source='draft'" + revision_scope +
+            "DELETE FROM revisions AS r WHERE 1=1" + revision_scope +
             " AND NOT EXISTS (SELECT 1 FROM entries AS e WHERE e.entry_id=r.entry_id"
-            " AND r.revision IN (e.draft_revision, e.published_revision))", args,
+            " AND (r.revision=e.draft_revision OR (e.feed_active=1"
+            " AND r.revision=e.published_revision)))", args,
         ).rowcount
         self.db.execute(
             "DELETE FROM grants AS g WHERE g.kind='draft'" + grant_scope +
@@ -1245,7 +1263,7 @@ class Store:
                     # Only a genuinely visible document enters the index; for
                     # a feed-active entry the published body keeps the row.
                     self._index_upsert_tokens(entry_id, tokens_text, text_digest)
-                self._prune_draft_history(entry_id)
+                self._prune_body_history(entry_id)
                 return doc, True
         raise BlockingIOError(
             "draft kept changing across bounded retries; append not applied "
@@ -1590,8 +1608,8 @@ class Store:
         at a time instead of holding every body in memory): it is consumed
         inside this single write transaction, so a mid-iteration parse or IO
         failure rolls the whole candidate back and keeps the old cache.
-        Every revision body is retained; entries the tree no longer carries
-        leave ordinary search but stay readable by reference. A published
+        Only current bodies are retained. Superseded or withdrawn published
+        bodies are removed; their pinned references no longer resolve. A published
         revision of the same entry folds over its draft in search; the local
         draft is then re-seated onto the new authoritative body, keeping only
         not-yet-sent observation additions (see ``rebase_draft_on_published``)
@@ -1648,9 +1666,9 @@ class Store:
             # Once an entry has a published revision its visibility is
             # governed by the feed alone: leaving the tree (or a valid empty
             # tree) removes it from search, and its stale draft copy is never
-            # resurrected. All bodies stay readable by pinned reference. The
-            # derived index rows leave in the same transaction.
+            # resurrected. Old bodies and index rows leave in the same transaction.
             self._index_sweep_invisible()
+            self._prune_body_history()
             return dict(entries=len(seen))
 
     # ------------------------------------------------------- entry quarantine
@@ -2217,7 +2235,7 @@ class Store:
                         (self.root / "drafts" / f"{entry_id}.md").unlink()
                     except OSError:
                         pass
-                removed["revisions"] += self._prune_draft_history(entry_id)
+                removed["revisions"] += self._prune_body_history(entry_id)
             self._record_sent_receipts(row, batch)
             generation = row["generation"]
             if generation and batch_refs:
@@ -2470,7 +2488,7 @@ class Store:
                     (self.root / "drafts" / f"{entry_id}.md").unlink()
                 except OSError:
                     pass
-                self._prune_draft_history(entry_id)
+                self._prune_body_history(entry_id)
                 return None
             self._insert_revision(rebuilt, "draft", now)
             self.db.execute(
@@ -2484,7 +2502,7 @@ class Store:
                 "WHERE entry_id=?",
                 (rebuilt["revision"], published["title"], now, entry_id),
             )
-            self._prune_draft_history(entry_id)
+            self._prune_body_history(entry_id)
             return rebuilt
 
     def restore_draft(self, entry_id, doc, *, generation=None):
@@ -2528,7 +2546,7 @@ class Store:
             )
             if visible:
                 self._index_upsert_tokens(entry_id, tokens_text, text_digest)
-            self._prune_draft_history(entry_id)
+            self._prune_body_history(entry_id)
             return doc
 
     # --------------------------------------------------------------- capture

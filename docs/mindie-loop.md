@@ -118,16 +118,19 @@ the author's own contribution after synchronization. A local-only hit is
 `draft`. A draft that advances beyond its published revision is labeled `supplemental`,
 never a second hit. Withdrawal is deletion from the upstream main tree: after
 a successful sync the entry leaves ordinary search and is never resurrected
-by its local draft, while retained pinned reads return an explicit
-`withdrawn` flag with a readable note. Query references pin short 16-hex
+by its local draft. Its published body is removed, while an unpinned read returns
+a body-free `withdrawn` state marker. Query references pin short 16-hex
 entry/revision prefixes (`mindie://<domain>/<entry>@<revision>`, full hashes
 only on the rare collision). A retained reference reads its exact body;
-superseded local draft references expire rather than reading a newer body.
-Drafts keep only the latest content and sharing grant. The outbox owns the
+superseded draft and feed references expire rather than reading a newer body.
+Drafts and the feed keep only current content. The outbox owns the
 payload of a pending send, so it does not require draft history. Existing
-stores discard superseded draft rows once on opening; freed database pages
-are reused without a full database rewrite on each append. Published cached
-revisions remain readable. Ambiguous prefixes fail instead of guessing.
+stores discard superseded body rows and retired draft mirrors once on opening;
+freed database pages are reused without a full database rewrite on each append.
+The private feed Git cache fetches depth one and prunes obsolete refs and objects
+when its tip changes (or once when an older cache adopts this policy).
+An active published body and genuinely unsent work remain current state, not a
+series of historical revisions. Ambiguous prefixes fail instead of guessing.
 
 ### Local retrieval index
 

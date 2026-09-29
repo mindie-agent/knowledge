@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import hashlib
 import io
+import time
 from pathlib import Path
 
 from .activation import activation_epoch
-from .store import digest, new_identity, session_key
-from .transcript_capture import fallback_header
+from .store import canonical, digest, new_identity, session_key
+from .transcript_capture import fallback_header, SUMMARY_SETTLE_SECONDS
 from .transcript_redaction import redact
 
 
@@ -145,6 +146,17 @@ def import_transcript(engine, *, session_id, token, source, source_session,
                                      generation=settings.generation)
         store.db.execute('INSERT OR REPLACE INTO history_imports VALUES(?,?,?,?,?,?)',
                          (key, entry_id, len(body), fingerprint, settings.generation, doc['revision']))
+        # One summary for this imported body, under the current session's
+        # existing grant. A repeat exits above; no historical session is activated.
+        now = time.time()
+        store.db.execute(
+            'INSERT OR REPLACE INTO transcript_tasks '
+            '(task_key,entry_id,capture_id,body_digest,summary_status,summary_detail,updated,summary_due,authorization) '
+            'VALUES(?,?,?,?,?,?,?,?,?)',
+            (digest(['history-summary', key]), entry_id, '', digest(doc['content']),
+             'pending' if engine.summary_command else 'excerpt', '', now,
+             now + SUMMARY_SETTLE_SECONDS, canonical(row)),
+        )
     return dict(status='imported' if prior is None else 'extended',
                 ref=store.ref(entry_id, doc['revision']), redaction_rules=rules,
                 publication='pending', **coverage)

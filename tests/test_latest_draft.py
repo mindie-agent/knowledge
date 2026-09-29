@@ -66,7 +66,7 @@ def test_existing_store_discards_old_drafts_once_and_keeps_published_cache(tmp_p
         with store._write_txn():
             store._insert_revision(old, "draft", 0)
             store.grant("draft", old["entry_id"], old["revision"], "allowed")
-            store.db.execute("DELETE FROM meta WHERE key='latest-draft-only'")
+            store.db.execute("DELETE FROM meta WHERE key='latest-body-only'")
     with closing(Store(root, "test")) as store:
         assert store._revision_doc(old["entry_id"], old["revision"]) is None
         assert store._revision_doc(new["entry_id"], new["revision"]) == new
@@ -76,11 +76,11 @@ def test_existing_store_discards_old_drafts_once_and_keeps_published_cache(tmp_p
 
 def test_failed_append_rolls_back_latest_body_and_retention(store, monkeypatch):
     old = draft(store)
-    prune = store._prune_draft_history
+    prune = store._prune_body_history
     def fail(entry_id):
         prune(entry_id)
         raise OSError("synthetic transaction failure")
-    monkeypatch.setattr(store, "_prune_draft_history", fail)
+    monkeypatch.setattr(store, "_prune_body_history", fail)
     with pytest.raises(OSError):
         store.append_observation(old["entry_id"], "Not committed", marker="c" * 32,
                                  generation="allowed")

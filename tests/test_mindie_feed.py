@@ -66,7 +66,7 @@ def env(tmp_path):
     store.close()
 
 
-def test_sync_installs_and_keeps_exact_history(env):
+def test_sync_keeps_only_current_published_body(env):
     git, repo, store, feed = env
     first = commit_docs(git, repo, [entry_doc("1" * 64, "Device gate")])
     receipt = feed.sync()
@@ -78,15 +78,17 @@ def test_sync_installs_and_keeps_exact_history(env):
     revised = entry_doc("1" * 64, "Device gate revised")
     second = commit_docs(git, repo, [revised])
     assert feed.sync()["commit"] == second
-    # A saved reference stays on its observed revision; re-querying shows the new one.
-    assert store.get(hits[0]["ref"])["revision"] == v1
+    # A stale pin expires instead of silently resolving to another revision.
+    with pytest.raises(ValueError, match='unknown pinned revision'):
+        store.get(hits[0]["ref"])
     current = store.get(store.query("Device gate")["results"][0]["ref"])
     assert current["revision"] == revised["revision"]
-    pinned = store.get(store.ref("1" * 64, v1))
-    assert pinned["title"] == "Device gate"  # exact old body retained
+    with pytest.raises(ValueError, match='unknown pinned revision'):
+        store.get(store.ref("1" * 64, v1))
+    assert store.db.execute('SELECT count(*) FROM revisions').fetchone()[0] == 1
 
 
-def test_upstream_deletion_withdraws_but_pinned_reads_stay_explicit(env):
+def test_upstream_deletion_removes_body_and_expires_pinned_reads(env):
     git, repo, store, feed = env
     # A local draft of the same entry exists before publication.
     store.create_draft(kind="experience", title="Old driver note",
@@ -100,16 +102,20 @@ def test_upstream_deletion_withdraws_but_pinned_reads_stay_explicit(env):
     commit_docs(git, repo, [])  # deleted from the upstream main tree
     assert feed.sync()["entries"] == 0
     assert store.query("Old driver")["results"] == []  # gone from retrieval
-    doc = store.get(pinned)  # cached pinned read remains for history
+    with pytest.raises(ValueError, match='unknown pinned revision'):
+        store.get(pinned)
+    doc = store.get(store.ref("2" * 64))
     assert doc["withdrawn"] is True and "withdrawn" in doc["note"]
+    assert doc['content'] == ''
     assert "Old driver" in doc["title"]
     assert store.get(store.ref("2" * 64))["withdrawn"] is True
     # The stale local draft neither resurrects the entry in search nor
     # becomes a new publication candidate.
     assert store.drafts_changed(generation="gen-1") == []
-    # Old feedback on the withdrawn entry may be recorded but stays local.
-    store.record_vote(root_hash="9" * 64, ref=pinned, rating="down",
-                      reason="superseded", publishable=True, generation="gen-1")
+    # Feedback cannot pretend an expired body is still present.
+    with pytest.raises(ValueError, match='unknown pinned revision'):
+        store.record_vote(root_hash="9" * 64, ref=pinned, rating="down",
+                          reason="superseded", publishable=True, generation="gen-1")
     assert store.unbatched_votes(generation="gen-1") == []
 
 
@@ -121,7 +127,8 @@ def test_empty_generation_is_valid_and_clears_search(env):
     commit_docs(git, repo, [])  # empty tree: withdrawal of everything
     assert feed.sync()["entries"] == 0
     assert store.query("Temporary")["results"] == []
-    assert store.get(store.ref("3" * 64))["content"]  # still explainable
+    assert store.get(store.ref("3" * 64))["content"] == ''
+    assert store.db.execute('SELECT count(*) FROM revisions').fetchone()[0] == 0
 
 
 def test_old_corpus_layout_is_not_an_empty_feed(env):
@@ -330,3 +337,22 @@ def test_feed_grows_past_1024_entries(env):
     assert store.get(store.ref(f"{1025:04x}" + "0" * 60))["title"] == "Accumulated case 1025"
     # And the same corpus revalidates as unchanged without restaging.
     assert feed.sync()["status"] == "unchanged"
+
+
+def test_sync_discards_old_git_objects_and_old_database_bodies(env):
+    git, repo, store, feed = env
+    first = entry_doc('c' * 64, 'original only marker')
+    first_commit = commit_docs(git, repo, [first])
+    old_blob = git('rev-parse', f'{first_commit}:cases/{first["entry_id"][:12]}.md')
+    assert feed.sync()['status'] == 'synced'
+    for i in range(3):
+        current = entry_doc('c' * 64, f'current only marker {i}')
+        commit_docs(git, repo, [current])
+        assert feed.sync()['status'] == 'synced'
+        assert store.db.execute('SELECT count(*) FROM revisions').fetchone()[0] == 1
+    count = subprocess.check_output(['git', '-C', str(feed.repo), 'rev-list', '--all', '--count'], text=True)
+    assert count.strip() == '1'
+    missing = subprocess.run(['git', '-C', str(feed.repo), 'cat-file', '-e', old_blob], capture_output=True)
+    assert missing.returncode != 0
+    assert store.get(store.ref('c' * 64))['title'] == current['title']
+    assert store.db.execute('SELECT count(*) FROM feed_staging').fetchone()[0] == 0

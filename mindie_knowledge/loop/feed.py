@@ -18,8 +18,8 @@ commit; a transient failure (OSError/timeout) persists its attempt count and
 a backoff ``next_check`` and is retried automatically once due — never a
 permanent exhaustion after three attempts. A bad candidate always keeps the
 old cache. An empty tree is valid and empties ordinary search — withdrawal
-is deletion from the tree — while every historical revision body stays
-readable by pinned reference with an explicit withdrawn flag.
+is deletion from the tree. Superseded bodies are removed and pinned
+historical references expire; the owned Git cache retains only the fetched tip.
 
 Remote discovery never latches permanently: each sync makes one bounded
 discovery pass, and after three consecutive transport failures it defers
@@ -134,7 +134,7 @@ class Feed:
             url = Path(url).resolve().as_uri()
         try:
             completed = run_argv(
-                ["git", "clone", "--bare", "--quiet", "--depth=1", "--single-branch",
+                ["git", "clone", "--bare", "--quiet", "--depth=1", "--single-branch", "--no-tags",
                  "--branch", self.ref, url, str(self.repo)],
                 timeout=min(remaining, 25), max_output=65536, input_bytes=b"",
                 env=_feed_git_env(),
@@ -149,6 +149,27 @@ class Feed:
             )
 
     # ----------------------------------------------------------------- sync
+
+    def _retain_tip(self, commit, deadline):
+        """Prune history in this private read cache, under the sync lock.
+
+        The installed database does not depend on old Git objects. Keep only
+        the candidate tip, including when a candidate later fails validation.
+        Interrupted cleanup is retried on the next sync, not in a busy loop.
+        """
+        key = 'feed-git-tip:' + self.ident
+        if self.store.feed_get(key) == {'commit': commit}:
+            return
+        tip = 'refs/heads/mindie-current'
+        self._git('update-ref', tip, commit, deadline=deadline)
+        self._git('symbolic-ref', 'HEAD', tip, deadline=deadline)
+        refs = self._git('for-each-ref', '--format=%(refname)', deadline=deadline)
+        for ref in refs.decode().splitlines():
+            if ref != tip:
+                self._git('update-ref', '-d', ref, deadline=deadline)
+        self._git('reflog', 'expire', '--expire=now', '--all', deadline=deadline)
+        self._git('gc', '--prune=now', '--quiet', deadline=deadline)
+        self.store.feed_set(key, {'commit': commit})
 
     def _candidate(self):
         return self.store.feed_get(f"feed-candidate:{self.ident}") or {}
@@ -317,11 +338,12 @@ class Feed:
             try:
                 if not self.repo.is_dir():
                     self._clone(deadline)
-                self._git("fetch", "--quiet", "origin", self.ref, deadline=deadline)
+                self._git("fetch", "--quiet", "--depth=1", "--no-tags", "origin", self.ref, deadline=deadline)
                 commit = self._git("rev-parse", "FETCH_HEAD", deadline=deadline)
                 commit = commit.decode().strip()
                 if not re.fullmatch(r"[0-9a-f]{40}", commit):
                     raise OSError("remote ref did not resolve to a commit")
+                self._retain_tip(commit, deadline)
             except (OSError, TimeoutError) as exc:
                 self.store.feed_set(receipt_key, dict(
                     receipt, status="unavailable", repository=self.repository,

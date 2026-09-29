@@ -17,7 +17,12 @@ filter, and freeze `scan_until` to the selected snapshot size.
 
 Public messages are redacted together with the installed scanner and shared r3
 privacy rules, including complete or unterminated private-key blocks. One file
-becomes one experience entry with an excerpt header; no model writes its body.
+becomes one experience entry with an initial excerpt header; no model writes its body.
+When the adapter supplies `summary_command`, the same transaction schedules one
+title/summary task for that body. It uses the importing session's saved authority
+and reads only the saved redacted body, never reopening the source. Revocation
+prevents the call or discards its result. Repeating identical content does not
+schedule another attempt. Failure keeps the labeled excerpt and a visible status.
 Pages neither clip messages nor become a second raw history store. Source format
 failure, incomplete EOF, replacement, scanner failure or permission revocation
 before commit leaves that file unimported. Counts expose corrupt skipped records.

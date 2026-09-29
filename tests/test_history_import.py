@@ -237,3 +237,53 @@ def test_ordinary_capture_does_not_import_pre_activation_history(case):
     engine._process(capture['id'])
     assert engine.store.drafts_changed() == []
     assert engine.store.db.execute('SELECT COUNT(*) FROM history_imports').fetchone()[0] == 0
+
+
+def summary_due(engine):
+    import time
+    from mindie_knowledge.loop.transcript_capture import summarize_due
+    engine.last_activity = time.monotonic() - 10
+    with engine.store._write_txn():
+        engine.store.db.execute('UPDATE transcript_tasks SET summary_due=0')
+    summarize_due(engine)
+
+
+def test_import_summary_uses_saved_public_body_once_without_reopening_history(case):
+    import sys
+    engine, source = case
+    marker = source.parent / 'calls'
+    command = ('import json,sys; from pathlib import Path; '
+               f'p=Path({str(marker)!r}); p.write_text(p.read_text()+"x" if p.exists() else "x"); '
+               'v=json.load(sys.stdin); assert "technical result" in v["text"]; '
+               'print(json.dumps(dict(title="Useful title", summary="Reported technical result; not a rerun.")))')
+    engine.summary_command = [sys.executable, '-c', command]
+    append(source, message('technical result'))
+    contribute(case)
+    before = engine.store.drafts_changed()[0]['content']
+    assert contribute(case)['status'] == 'unchanged'
+    source.unlink()  # Background summary reads the saved redacted body only.
+    summary_due(engine)
+    summary_due(engine)
+    after = engine.store.drafts_changed()[0]
+    assert after['content'] == before and after['title'] == 'Useful title'
+    assert marker.read_text() == 'x'
+    task = dict(engine.store.db.execute('SELECT * FROM transcript_tasks').fetchone())
+    assert task['summary_status'] == 'complete'
+    assert json.loads(task['authorization'])['session'] == 'manual-A'
+    assert engine.admission.active_lease('old-unactivated') is None
+    assert engine.store.db.execute('SELECT COUNT(*) FROM captures').fetchone()[0] == 0
+    assert engine.store.db.execute('SELECT COUNT(*) FROM revisions').fetchone()[0] == 1
+
+
+def test_import_summary_does_not_spawn_after_contribution_revocation(case):
+    import sys
+    engine, source = case
+    marker = source.parent / 'must-not-run'
+    engine.summary_command = [sys.executable, '-c', f'from pathlib import Path; Path({str(marker)!r}).touch()']
+    append(source, message('saved result'))
+    contribute(case)
+    write_settings(engine.settings_path, enabled=False, roots=[source.parent])
+    summary_due(engine)
+    assert not marker.exists()
+    assert engine.store.db.execute('SELECT summary_status FROM transcript_tasks').fetchone()[0] == 'cancelled'
+    assert 'saved result' in engine.store.drafts_changed()[0]['content']

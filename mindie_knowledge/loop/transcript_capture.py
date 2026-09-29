@@ -76,7 +76,9 @@ def capture(engine, row, text, region):
             doc = store.create_draft(kind='experience', title=title, summary=summary, content=masked,
                                      owner=owner, entry_id=entry_id, generation=row['generation'])
         store.finish_region(reserved, 'succeeded', 'public messages saved; model calls=0')
-        store.db.execute('INSERT OR REPLACE INTO transcript_tasks VALUES(?,?,?,?,?,?,?,?)',
+        store.db.execute('INSERT OR REPLACE INTO transcript_tasks '
+                         '(task_key,entry_id,capture_id,body_digest,summary_status,summary_detail,updated,summary_due) '
+                         'VALUES(?,?,?,?,?,?,?,?)',
                          (task_key, entry_id, row['id'], digest(doc['content']),
                           'pending' if engine.summary_command else 'excerpt', '', time.time(), time.time() + SUMMARY_SETTLE_SECONDS))
         detail = canonical(dict(pipeline=MODE, refs=[store.ref(entry_id, doc['revision'])],
@@ -102,7 +104,7 @@ def summarize_due(engine):
     reserved = False
     status, detail = 'failed', ''
     try:
-        row = store.capture_row(task['capture_id'])
+        row = json.loads(task['authorization']) if task.get('authorization') else store.capture_row(task['capture_id'])
         engine._summary_cancel.clear()
         engine._gate_live()
         engine._revalidate(row)
