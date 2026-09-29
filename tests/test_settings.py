@@ -159,3 +159,58 @@ def test_scope_aliases_duplicates_and_order_do_not_rewrite_authority(tmp_path):
     assert repeated.generation == original.generation
     assert repeated.enabled_at == original.enabled_at
     assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize('choice', ['disabled', 'read-only', 'later'])
+def test_interrupted_enable_reuses_one_boundary_for_the_same_optout(tmp_path, choice):
+    from mindie_knowledge import consent_store
+    consent = tmp_path / 'consent.json'
+    consent_store.record_choice(consent, 'contribute')
+    path = tmp_path / 'community.json'
+    original = write_settings(path, roots=[tmp_path], consent_config=str(consent))
+    consent_store.record_choice(consent, choice)
+
+    def enable():
+        with settings_mod.CommunityWriteContext(path) as writer:
+            return writer.write(path, enabled=True, repository=original.repository,
+                                project_roots=[tmp_path])
+
+    first = enable()
+    assert first.generation != original.generation
+    assert first.enabled_at >= original.enabled_at
+    saved = path.read_bytes()
+    for _ in range(3):
+        repeated = enable()
+        assert not repeated.allows_capture()
+        assert repeated.enabled_at == first.enabled_at
+        assert path.read_bytes() == saved
+    # Completion of the interrupted operation grants the one saved boundary.
+    consent_store.record_choice(consent, 'contribute')
+    completed = enable()
+    assert completed.allows_capture()
+    assert path.read_bytes() == saved
+    # Another genuine opt-out and enable still establishes a new boundary.
+    consent_store.record_choice(consent, choice)
+    again = enable()
+    assert again.generation != first.generation
+    assert again.enabled_at >= first.enabled_at
+
+
+def test_interrupted_first_enable_keeps_its_original_boundary(tmp_path):
+    from mindie_knowledge import consent_store
+    consent = tmp_path / 'consent.json'
+    consent_store.record_choice(consent, 'later')
+    path = tmp_path / 'community.json'
+    requested = dict(enabled=True, repository='owner/knowledge',
+                     project_roots=[str(tmp_path)], consent_config=str(consent))
+    with settings_mod.CommunityWriteContext(path) as writer:
+        first = writer.configure(path, requested)
+    saved = path.read_bytes()
+    for _ in range(3):
+        with settings_mod.CommunityWriteContext(path) as writer:
+            repeated = writer.configure(path, requested)
+        assert repeated.enabled_at == first.enabled_at
+        assert not repeated.allows_capture()
+        assert path.read_bytes() == saved
+    consent_store.record_choice(consent, 'contribute')
+    assert settings_mod.load(path).allows_capture()

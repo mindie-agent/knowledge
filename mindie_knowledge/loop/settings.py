@@ -29,6 +29,7 @@ install/upgrade/entry boundary.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -438,11 +439,20 @@ def transition(previous, requested):
     if not changed:
         # Scope order and path aliases do not express a new user choice.
         data['project_roots'] = prior['project_roots']
-    # Explicitly enabling after a saved opt-out establishes a fresh boundary,
-    # even if an interrupted prior toggle left the two documents inconsistent.
-    if data.get('enabled') and CONSENT_FIELD in old:
-        changed |= CommunitySettings(None, old).capture_block_kind() == 'revoked'
-    data['generation'] = secrets.token_hex(16) if changed else old['generation']
+    # An enable interrupted between the settings and consent writes must
+    # resume the same boundary. The saved opt-out already has an identity
+    # (choice + choice_at); derive one generation for this policy/choice.
+    # A later explicit opt-out gets a new choice_at and a new generation.
+    resumed_generation = None
+    if data.get('enabled') and CONSENT_FIELD in data:
+        consent = CommunitySettings(None, data).consent or {}
+        if consent.get('state') == 'ok' and consent.get('choice') in {'read-only', 'later', 'disabled'}:
+            intent = [SCHEMA, data[CONSENT_FIELD], consent['choice'], consent.get('choice_at'),
+                      [data.get(key) for key in policy], sorted(roots(data))]
+            resumed_generation = hashlib.sha256(json.dumps(intent, ensure_ascii=True,
+                separators=(',', ':')).encode('utf-8')).hexdigest()[:32]
+            changed |= prior.get('generation') != resumed_generation
+    data['generation'] = (resumed_generation or secrets.token_hex(16)) if changed else old['generation']
     data['enabled_at'] = ((time.time() if changed else old.get('enabled_at'))
                           if data.get('enabled') else None)
     return normalize(data)
