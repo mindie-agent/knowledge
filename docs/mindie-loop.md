@@ -167,8 +167,10 @@ because a requested condition differs. Reference `knowledge` entries can be
 filtered by conflicting caller-supplied conditions. Neither path replaces the
 agent's assessment of the detailed evidence and limits.
 
-Search folds draft and published lineage: the published revision wins, and a
-draft that advances beyond its published revision is labeled `supplemental`,
+Search folds draft and published lineage: the published revision wins and
+the returned `origin` describes that visible revision (`feed`), including
+the author's own contribution after synchronization. A local-only hit is
+`draft`. A draft that advances beyond its published revision is labeled `supplemental`,
 never a second hit. Withdrawal is deletion from the upstream main tree: after
 a successful sync the entry leaves ordinary search and is never resurrected
 by its local draft, while retained pinned reads return an explicit

@@ -1449,7 +1449,11 @@ class Store:
                     kind=row["kind"], title=doc["title"],
                     summary=doc["summary"],
                     conditions=doc["conditions"],
-                    origin=row["origin"], supplemental=supplemental,
+                    # Describe the returned revision, not how this entry first
+                    # arrived locally. An author's own published contribution
+                    # is feed material too; its draft overlay stays separate.
+                    origin="feed" if row["feed_active"] else row["origin"],
+                    supplemental=supplemental,
                     score=round(-row["rank"], 8),
                 ))
             output.sort(key=lambda item: (-item["score"], item["ref"]))
