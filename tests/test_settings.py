@@ -142,3 +142,20 @@ def test_removed_policy_extension_stays_removed_and_changes_boundary_once(tmp_pa
         repeated = writer.write(path, enabled=True, repository=original.repository,
                                 project_roots=[tmp_path], fork=None)
     assert repeated.generation == removed.generation
+
+
+def test_scope_aliases_duplicates_and_order_do_not_rewrite_authority(tmp_path):
+    path = tmp_path / 'community.json'
+    left, right = tmp_path / 'left', tmp_path / 'right'
+    left.mkdir()
+    right.mkdir()
+    original = write_settings(path, roots=[left, right])
+    before = path.read_bytes()
+    alias = str(left) + '/../left'
+    assert settings_mod.normalized_roots([str(left), alias]) == [str(left.resolve())]
+    with settings_mod.CommunityWriteContext(path) as writer:
+        repeated = writer.write(path, enabled=True, repository=original.repository,
+                                project_roots=[right, alias, left])
+    assert repeated.generation == original.generation
+    assert repeated.enabled_at == original.enabled_at
+    assert path.read_bytes() == before

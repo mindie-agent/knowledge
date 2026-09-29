@@ -68,9 +68,11 @@ def normalized_roots(value):
         isinstance(item, str) and Path(item).is_absolute() for item in value
     ):
         raise ValueError("'project_roots' must be absolute paths")
-    return [
-        str(Path(item).expanduser().resolve(strict=False)) for item in value
-    ]
+    roots = {}
+    for item in value:
+        path = str(Path(item).expanduser().resolve(strict=False))
+        roots.setdefault(path.casefold() if os.name == 'nt' else path, path)
+    return list(roots.values())
 
 
 def bounded_idle(value):
@@ -433,6 +435,9 @@ def transition(previous, requested):
     changed = (not prior.get('generation')
                or any(prior.get(key) != data.get(key) for key in policy)
                or roots(prior) != roots(data))
+    if not changed:
+        # Scope order and path aliases do not express a new user choice.
+        data['project_roots'] = prior['project_roots']
     # Explicitly enabling after a saved opt-out establishes a fresh boundary,
     # even if an interrupted prior toggle left the two documents inconsistent.
     if data.get('enabled') and CONSENT_FIELD in old:
