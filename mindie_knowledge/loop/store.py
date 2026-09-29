@@ -2,10 +2,10 @@
 
 This is the ``mindie-store/3`` runtime store (``store-v3.sqlite3``) serving
 canonical ``mindie-entry/2`` documents. It replaces content-as-identity with
-stable opaque entry IDs plus an explicit revision history: every known body —
-local draft revisions and published revisions installed from the content
-repository — is retained, so an old pinned reference always reads the exact
-historical bytes while ordinary search shows the current published version.
+stable opaque entry IDs and content revisions. Local drafts retain only their
+latest body; superseded draft references expire. Pending publication owns its
+payload in the outbox independently. Published revisions installed from the
+content repository remain available to pinned readers.
 Local drafts update by append-only, marker-deduplicated observations; draft
 ownership lives in a private entry-owner relation, never in a downloaded
 document. Withdrawal is upstream deletion: an entry the feed tree no longer
@@ -435,6 +435,11 @@ class Store:
             "WHERE reason='maintenance-paused' AND eligible=0",
             (time.time(),),
         )
+        if self.db.execute(
+            "SELECT 1 FROM meta WHERE key='latest-draft-only'"
+        ).fetchone() is None:
+            self._prune_draft_history()
+            self.db.execute("INSERT INTO meta VALUES('latest-draft-only', '1')")
         self.db.commit()
 
     @contextlib.contextmanager
@@ -960,7 +965,7 @@ class Store:
         )
 
     def get(self, ref):
-        """Exact document for a reference; a pinned revision reads history.
+        """Exact document for a retained reference; old draft pins expire.
         A withdrawn entry stays readable with an explicit flag and note."""
         with self.lock:
             entry_id, revision = self._parse_ref(ref)
@@ -976,6 +981,18 @@ class Store:
             if self._withdrawn(row):
                 return dict(doc, withdrawn=True, note=self.WITHDRAWN_NOTE)
             return dict(doc, withdrawn=False)
+
+    def is_withdrawn(self, ref):
+        """Publication checks current withdrawal state, not a past draft body."""
+        with self.lock:
+            entry_id, _ = self._parse_ref(ref.split("@", 1)[0])
+            row = self.db.execute(
+                "SELECT published_revision, feed_active FROM entries WHERE entry_id=?",
+                (entry_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("unknown reference in this domain")
+            return self._withdrawn(row)
 
     # One-call response protection for the native wire (the MCP wrappers
     # duplicate the body as content.text plus structuredContent, so 32 Ki
@@ -1038,18 +1055,43 @@ class Store:
             doc['revision'] = documents.revision_of(doc)
             documents.validate(doc)
             now = time.time()
-            self._insert_revision(doc, row['origin'], now)
+            self._insert_revision(doc, 'draft', now)
             self.db.execute("INSERT OR REPLACE INTO grants VALUES(?,?,?,?,?)", ('draft', entry_id, doc['revision'], generation, now))
             visible = not row['feed_active']
             self.db.execute("UPDATE entries SET draft_revision=?, title=?, doc=?, updated=? WHERE entry_id=?",
                             (doc['revision'], title, canonical(doc) if visible else row['doc'], now, entry_id))
             if visible:
                 self._index_upsert_tokens(entry_id, index_text(self._doc_source_text(doc)), self._doc_state_digest(doc))
+            self._prune_draft_history(entry_id)
             return True
+
+    def _prune_draft_history(self, entry_id=None):
+        """Keep the current draft and published body; outbox owns sent bytes.
+
+        Called in the same transaction as a draft update. The unscoped form
+        runs once when an existing store adopts latest-only draft retention.
+        SQLite reuses freed pages; this does not run VACUUM on the hot path.
+        """
+        args = () if entry_id is None else (entry_id,)
+        revision_scope = "" if entry_id is None else " AND r.entry_id=?"
+        grant_scope = "" if entry_id is None else " AND g.identity=?"
+        removed = self.db.execute(
+            "DELETE FROM revisions AS r WHERE r.source='draft'" + revision_scope +
+            " AND NOT EXISTS (SELECT 1 FROM entries AS e WHERE e.entry_id=r.entry_id"
+            " AND r.revision IN (e.draft_revision, e.published_revision))", args,
+        ).rowcount
+        self.db.execute(
+            "DELETE FROM grants AS g WHERE g.kind='draft'" + grant_scope +
+            " AND NOT EXISTS (SELECT 1 FROM entries AS e WHERE e.entry_id=g.identity"
+            " AND e.draft_revision=g.revision)", args,
+        )
+        return removed
 
     def _insert_revision(self, doc, source, created):
         self.db.execute(
-            "INSERT OR REPLACE INTO revisions VALUES(?,?,?,?,?)",
+            "INSERT INTO revisions VALUES(?,?,?,?,?) "
+            "ON CONFLICT(entry_id, revision) DO UPDATE SET "
+            "source=CASE WHEN revisions.source='feed' THEN 'feed' ELSE excluded.source END",
             (doc["entry_id"], doc["revision"], canonical(doc), source, created),
         )
 
@@ -1179,7 +1221,7 @@ class Store:
                         "draft material belongs to another sharing generation; "
                         "it stays local instead of being republished"
                     )
-                self._insert_revision(doc, current["origin"], now)
+                self._insert_revision(doc, "draft", now)
                 if generation is not None:
                     self.db.execute(
                         "INSERT OR REPLACE INTO grants VALUES(?,?,?,?,?)",
@@ -1199,6 +1241,7 @@ class Store:
                     # Only a genuinely visible document enters the index; for
                     # a feed-active entry the published body keeps the row.
                     self._index_upsert_tokens(entry_id, tokens_text, text_digest)
+                self._prune_draft_history(entry_id)
                 return doc, True
         raise BlockingIOError(
             "draft kept changing across bounded retries; append not applied "
@@ -1570,12 +1613,7 @@ class Store:
                     raise ValueError("duplicate entry identity in feed")
                 seen.add(doc["entry_id"])
                 row = self._row(doc["entry_id"])
-                existing = (
-                    self._revision_doc(doc["entry_id"], doc["revision"])
-                    if row is not None else None
-                )
-                if existing is None:
-                    self._insert_revision(doc, "feed", now)
+                self._insert_revision(doc, "feed", now)
                 if row is None:
                     self.db.execute(
                         "INSERT INTO entries(entry_id, kind, title, origin, "
@@ -2112,31 +2150,13 @@ class Store:
 
     CONFIRMED_BATCH = ("submitted", "updated", "unchanged")
 
-    def _protected_revisions(self, exclude_batch):
-        """Revisions still referenced by any unsent or unresolved batch."""
-        protected = set()
-        for row in self.db.execute(
-            "SELECT batch, status FROM outbox WHERE batch_id != ?", (exclude_batch,)
-        ):
-            if row["status"] in self.CONFIRMED_BATCH:
-                continue
-            try:
-                batch = json.loads(row["batch"])
-            except ValueError:
-                continue
-            for ref in batch.get("entry_refs", []):
-                parsed = _exact_revision_ref(ref)
-                if parsed is not None:
-                    protected.add(parsed)
-        return protected
-
     def compact_confirmed(self, batch_id):
         """Post-confirmation payload cleanup: the GitHub branch is the durable
         body source for a confirmed (submitted/updated/unchanged) batch.
 
-        Removes exactly THIS batch's sent draft history (even when a newer
-        unsent draft exists — that current draft and any protected/published
-        revisions stay). Capture summaries are cleared only for organized
+        Drops this batch's current draft when no newer unsent draft exists.
+        Other pending batches carry their own payloads. Published revisions
+        stay. Capture summaries are cleared only for organized
         captures whose recorded refs are a nonempty subset of this batch's
         exact entry@revision refs; unversioned or otherwise ambiguous coverage
         is left intact. The outbox row shrinks to a tiny receipt; a per-entry
@@ -2152,7 +2172,6 @@ class Store:
             if row is None or row["status"] not in self.CONFIRMED_BATCH:
                 return None
             batch = json.loads(row["batch"])
-            protected = self._protected_revisions(batch_id)
             removed = dict(entries=0, revisions=0, captures=0, staging=0)
             file_receipts = [
                 {key: file[key] for key in ("path", "sha256") if key in file}
@@ -2169,33 +2188,7 @@ class Store:
                 if entry is None:
                     continue
                 current = entry["draft_revision"]
-                kept = {entry["published_revision"]}
-                kept |= {
-                    revision for (ent, revision) in protected if ent == entry_id
-                }
-                if current and current != sent_revision:
-                    kept.add(current)
-                if (entry_id, sent_revision) in protected:
-                    kept.add(sent_revision)
-                kept.discard(None)
-                if (entry_id, sent_revision) not in protected:
-                    kept.discard(sent_revision)
-                if kept:
-                    cursor = self.db.execute(
-                        "DELETE FROM revisions WHERE entry_id=? AND source='draft' "
-                        f"AND revision NOT IN ({','.join('?' for _ in kept)})",
-                        (entry_id, *sorted(kept)),
-                    )
-                else:
-                    cursor = self.db.execute(
-                        "DELETE FROM revisions WHERE entry_id=? AND source='draft'",
-                        (entry_id,),
-                    )
-                removed["revisions"] += cursor.rowcount
-                if (
-                    current == sent_revision
-                    and (entry_id, sent_revision) not in protected
-                ):
+                if current == sent_revision:
                     if entry["published_revision"]:
                         published = self._revision_doc(
                             entry_id, entry["published_revision"]
@@ -2220,6 +2213,7 @@ class Store:
                         (self.root / "drafts" / f"{entry_id}.md").unlink()
                     except OSError:
                         pass
+                removed["revisions"] += self._prune_draft_history(entry_id)
             self._record_sent_receipts(row, batch)
             generation = row["generation"]
             if generation and batch_refs:
@@ -2472,8 +2466,9 @@ class Store:
                     (self.root / "drafts" / f"{entry_id}.md").unlink()
                 except OSError:
                     pass
+                self._prune_draft_history(entry_id)
                 return None
-            self._insert_revision(rebuilt, row["origin"], now)
+            self._insert_revision(rebuilt, "draft", now)
             self.db.execute(
                 "INSERT OR REPLACE INTO grants "
                 "SELECT 'draft', identity, ?, generation, ? FROM grants "
@@ -2485,6 +2480,7 @@ class Store:
                 "WHERE entry_id=?",
                 (rebuilt["revision"], published["title"], now, entry_id),
             )
+            self._prune_draft_history(entry_id)
             return rebuilt
 
     def restore_draft(self, entry_id, doc, *, generation=None):
@@ -2528,6 +2524,7 @@ class Store:
             )
             if visible:
                 self._index_upsert_tokens(entry_id, tokens_text, text_digest)
+            self._prune_draft_history(entry_id)
             return doc
 
     # --------------------------------------------------------------- capture

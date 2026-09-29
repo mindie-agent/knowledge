@@ -169,8 +169,8 @@ def test_compact_confirmed_removes_sent_payload_and_keeps_receipts(tmp_path):
     header = json.loads(row["doc"])
     assert header["title"] == "Sent case" and header["content"] == ""
     assert store._revision_doc(doc["entry_id"], doc["revision"]) is None
-    # The protected older revision referenced by unsent/failed work survives.
-    assert store._revision_doc(doc["entry_id"], other_revision["revision"]) is not None
+    # Outbox payloads no longer pin redundant local draft history.
+    assert store._revision_doc(doc["entry_id"], other_revision["revision"]) is None
     assert store.capture_row(covered["id"])["summary"] == ""
     assert store.capture_row(newer["id"])["summary"] == "newer unsent summary"
     # A different draft's earlier capture is not cleared by timestamp.

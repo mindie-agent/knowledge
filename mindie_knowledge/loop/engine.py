@@ -1637,7 +1637,7 @@ class Engine:
             return
         batch = json.loads(batch_row["batch"])
         try:
-            withdrawn = any(self.store.get(ref).get("withdrawn", False)
+            withdrawn = any(self.store.is_withdrawn(ref)
                             for ref in batch["entry_refs"])
         except ValueError:
             self.store.mark_batch(batch_row["batch_id"], "needs_review",

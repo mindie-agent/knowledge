@@ -43,7 +43,7 @@ def test_retry_limit_applies_after_due_filter_and_cancel_preserves_uncertain_rec
     assert all(store.batch(str(i))['status'] == 'unknown' for i in range(4))
 
 
-def test_no_mirror_needed_for_restart_export_or_pinned_history(tmp_path):
+def test_latest_draft_survives_restart_without_mirror_or_history(tmp_path):
     root = tmp_path / 'store'
     with closing(Store(root, 'test')) as store:
         original = draft(store)
@@ -54,7 +54,8 @@ def test_no_mirror_needed_for_restart_export_or_pinned_history(tmp_path):
         expected = render_entry(current)
         assert not list((root / 'drafts').glob('*.md'))
     with closing(Store(root, 'test')) as reopened:
-        assert reopened.get(old_ref)['content'] == original['content']
+        with pytest.raises(ValueError, match='unknown pinned revision'):
+            reopened.get(old_ref)
         restored = reopened.get(new_ref)
         assert restored.pop('withdrawn') is False
         assert render_entry(restored) == expected
