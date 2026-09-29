@@ -637,14 +637,14 @@ class Engine:
         if status in {"ok", "unchanged"}:
             if status == "ok" and inc["end"] > inc["start"]:
                 # Consumed bytes held no public material; consume them visibly.
+                detail = canonical(dict(note="no public material",
+                                        discarded_records=inc.get('discarded_records', [])))
                 region_id = reserve(inc["start"], inc["end"], inc["digest"],
-                                    status="succeeded", detail=canonical(dict(
-                                        note="no public material",
-                                        discarded_records=inc.get('discarded_records', []))))
+                                    status="succeeded", detail=detail)
                 if region_id is None:
                     self._defer_reread(row["id"])
                     return None
-                self.store.finish_region(region_id, "succeeded")
+                self.store.finish_region(region_id, "succeeded", detail)
             if inc.get("more") and inc["end"] > inc["start"]:
                 self.store.defer_capture(row["id"], due=time.time()+1,
                                          reason="noise scanned; more authorized bytes remain")

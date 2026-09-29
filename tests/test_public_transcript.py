@@ -76,6 +76,21 @@ def test_body_is_saved_without_runner_and_export_preserves_it(pipeline):
     assert public['content'] == docs[0]['content']
 
 
+def test_corrupt_only_page_keeps_a_diagnostic_and_allows_later_public_text(pipeline):
+    engine, store, path = pipeline
+    with path.open('ab') as stream:
+        stream.write(b'{broken-record}\n')
+    event = engine.capture(session_id='manual-A', turn_id='corrupt-only', transcript_path=str(path))
+    engine._process(event['id'])
+    assert store.drafts_changed() == []
+    assert store.cursor(str(path.resolve()))['ok_finish'] == path.stat().st_size
+    detail = json.loads(store.db.execute('SELECT detail FROM regions').fetchone()[0])
+    assert detail['discarded_records'][0]['reason'] == 'invalid record'
+    append(path, 'public-after-corrupt-only-page')
+    process(engine, path, 'later')
+    assert store.drafts_changed()[0]['content'] == '### user\npublic-after-corrupt-only-page'
+
+
 def test_restart_and_duplicate_stop_append_one_task_record(pipeline):
     engine, store, path = pipeline
     append(path, 'first-public-marker')
