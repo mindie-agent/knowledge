@@ -114,12 +114,16 @@ class _BoundedHTTPServer(ThreadingHTTPServer):
 
 class Service:
     def __init__(self, engine, *, connection_path=None, admission=None, feeds=(),
-                 max_workers=8, request_timeout=10.0):
+                 max_workers=8, request_timeout=10.0, config_path=None):
         self.engine, self.store = engine, engine.store
         self.admission = admission
         self.feeds = list(feeds)
         self.token = secrets.token_urlsafe(32)
         self.connection_path = Path(connection_path) if connection_path else None
+        self.config_path = Path(config_path) if config_path else None
+        self._next_config_check = 0.0
+        self._config_missing_since = None
+        self._config_retired = False
         service = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -188,6 +192,7 @@ class Service:
             max_workers=max_workers,
             slot_wait=min(5.0, request_timeout),
         )
+        self.http.service_actions = self._check_config_lifetime
         self.connection = dict(
             url=f"http://127.0.0.1:{self.http.server_port}",
             token=self.token,
@@ -292,6 +297,32 @@ class Service:
         raise ValueError("unsupported operation")
 
     # -------------------------------------------------------------- serving
+
+    def _check_config_lifetime(self):
+        """Retire an idle detached service after its configuration disappears.
+
+        Reuse the HTTP loop, with no extra worker or per-request filesystem
+        reads. Two observations thirty seconds apart tolerate atomic config
+        replacement. A stat error is not evidence of deletion. Busy work is
+        never interrupted, and persisted receipts remain available.
+        """
+        if self.config_path is None or self._config_retired:
+            return
+        now = time.monotonic()
+        if now < self._next_config_check:
+            return
+        self._next_config_check = now + 30.0
+        try:
+            self.config_path.stat()
+        except FileNotFoundError:
+            if self._config_missing_since is None:
+                self._config_missing_since = now
+            elif now - self._config_missing_since >= 30.0:
+                self._config_retired = self._stop_if_idle().get("idle", False)
+        except OSError:
+            self._config_missing_since = None
+        else:
+            self._config_missing_since = None
 
     def serve(self):
         try:
