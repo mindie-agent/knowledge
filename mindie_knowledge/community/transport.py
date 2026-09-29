@@ -499,6 +499,10 @@ class FileTransport(Transport):
             }
             repo_state["pulls"][str(number)] = pr
             self._write(data)
+        self._record_pr_ref(repo, number, sha, deadline)
+        return dict(pr)
+
+    def _record_pr_ref(self, repo, number, sha, deadline):
         if sha:
             url = self.remotes.get(repo)
             if url:
@@ -517,8 +521,6 @@ class FileTransport(Transport):
                     raise CommunityError(
                         f"cannot record PR head ref: {result.err_text.strip()[:200]}"
                     )
-        return dict(pr)
-
     def update_pull_request(self, repo, number, *, title, body, deadline) -> dict:
         deadline.step("update pull request")
         with self.lock:
@@ -531,7 +533,11 @@ class FileTransport(Transport):
             pr["body"] = body
             pr["head"]["sha"] = self._tip(repo, pr["head"]["ref"], deadline) or pr["head"]["sha"]
             self._write(data)
-            return dict(pr)
+        # A pushed update moves GitHub's PR ref as well as its API head.
+        # Keeping only the API current made multi-update fixture sequences
+        # disagree with the actual GitHub lifecycle.
+        self._record_pr_ref(repo, number, pr['head']['sha'], deadline)
+        return dict(pr)
 
 
     def _ensure_mirror(self, repo: str, url: str, deadline: Deadline) -> Path:
