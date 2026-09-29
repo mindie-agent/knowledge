@@ -10,6 +10,14 @@ import time
 import pytest
 
 
+@pytest.mark.skipif(os.name != 'nt', reason='Windows native process status')
+def test_native_resume_reports_invalid_owned_handle():
+    from types import SimpleNamespace
+    from mindie_knowledge.windows_process import _resume_windows_process
+    with pytest.raises(OSError):
+        _resume_windows_process(SimpleNamespace(_handle=0))
+
+
 @pytest.mark.skipif(os.name != 'nt', reason='Actual Windows console inheritance')
 @pytest.mark.parametrize('kind', ['owned', 'service'])
 def test_python_venv_helper_does_not_create_a_console(tmp_path, kind):

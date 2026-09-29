@@ -1612,8 +1612,7 @@ class Engine:
         """Sharing revocation cancels pending timers and unsent contributions."""
         self._cancel.set()
         self._summary_cancel.set()
-        for batch in self.store.outbox_pending():
-            self.store.mark_batch(batch["batch_id"], "disabled", detail=reason)
+        self.store.cancel_pending(reason)
         with self.store._write_txn():
             self.store.db.execute(
                 "UPDATE votes SET publishable=0 WHERE batch_id IS NULL"
@@ -1739,7 +1738,7 @@ class Engine:
                     finally:
                         self.end_work()
                 if generation is not None and not self._is_frozen():
-                    for row in self.store.outbox_unresolved()[:2]:
+                    for row in self.store.outbox_unresolved(limit=2, due_only=True):
                         if self._is_frozen():
                             break
                         if self.store.reconcile_due(row["batch_id"]) and self.begin_work():
@@ -1750,7 +1749,7 @@ class Engine:
                     # Transient send failures resume automatically with
                     # persisted backoff: the stored batch payload is retried,
                     # never rebuilt from scratch and never silently dropped.
-                    for row in self.store.outbox_unavailable()[:2]:
+                    for row in self.store.outbox_unavailable(limit=2, due_only=True):
                         if self._is_frozen():
                             break
                         if self.store.retry_due(row["batch_id"]) and self.begin_work():
@@ -1758,7 +1757,7 @@ class Engine:
                                 self._submit(row)
                             finally:
                                 self.end_work()
-                    for row in self.store.outbox_pending()[:2]:
+                    for row in self.store.outbox_pending(limit=2):
                         if self._is_frozen():
                             break
                         if self.begin_work():
@@ -1766,7 +1765,7 @@ class Engine:
                                 self._submit(row)
                             finally:
                                 self.end_work()
-                    material = self.store.drafts_changed(
+                    material = self.store.has_changed_drafts(
                         generation=generation
                     ) or self.store.unbatched_votes(generation=generation)
                     if material:

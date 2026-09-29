@@ -35,7 +35,6 @@ import threading
 import time
 from pathlib import Path
 
-from mindie_knowledge.markdown import _atomic_write_text
 
 from . import documents
 from .documents import DraftFull
@@ -406,6 +405,14 @@ class Store:
             self.db.execute(
                 "ALTER TABLE entries ADD COLUMN conditions TEXT NOT NULL DEFAULT '{}'"
             )
+        # Polling cost follows actionable rows, not lifetime task history.
+        # These additive indexes also work with existing databases.
+        self.db.executescript("""
+            CREATE INDEX IF NOT EXISTS captures_by_status ON captures(status, created);
+            CREATE INDEX IF NOT EXISTS summaries_pending ON transcript_tasks(summary_due, updated)
+                WHERE summary_status='pending';
+            CREATE INDEX IF NOT EXISTS outbox_by_status ON outbox(status, next_attempt, created);
+        """)
         self._init_search_index()
         self.db.execute(
             "INSERT OR REPLACE INTO meta VALUES('schema', ?)", (SCHEMA,)
@@ -1036,17 +1043,9 @@ class Store:
             visible = not row['feed_active']
             self.db.execute("UPDATE entries SET draft_revision=?, title=?, doc=?, updated=? WHERE entry_id=?",
                             (doc['revision'], title, canonical(doc) if visible else row['doc'], now, entry_id))
-            self._write_draft_file(doc)
             if visible:
                 self._index_upsert_tokens(entry_id, index_text(self._doc_source_text(doc)), self._doc_state_digest(doc))
             return True
-
-    def _write_draft_file(self, doc):
-        from .documents import render_entry
-
-        _atomic_write_text(
-            self.root / "drafts" / f"{doc['entry_id']}.md", render_entry(doc)
-        )
 
     def _insert_revision(self, doc, source, created):
         self.db.execute(
@@ -1111,7 +1110,6 @@ class Store:
                     "INSERT OR REPLACE INTO grants VALUES(?,?,?,?,?)",
                     ("draft", entry_id, doc["revision"], generation, now),
                 )
-            self._write_draft_file(doc)
             self._index_upsert_tokens(entry_id, tokens_text, text_digest)
         return doc
 
@@ -1197,7 +1195,6 @@ class Store:
                      else current["conditions"],
                      entry_id),
                 )
-                self._write_draft_file(doc)
                 if visible:
                     # Only a genuinely visible document enters the index; for
                     # a feed-active entry the published body keeps the row.
@@ -1219,6 +1216,27 @@ class Store:
         "WHERE entry_quarantine.entry_id=entries.entry_id)"
     )
 
+    def _changed_draft_refs(self, generation, limit=None):
+        sql = "SELECT entries.entry_id, entries.draft_revision FROM entries "
+        params = []
+        if generation is not None:
+            sql += ("JOIN grants ON grants.kind='draft' "
+                    "AND grants.identity=entries.entry_id "
+                    "AND grants.revision=entries.draft_revision AND grants.generation=? ")
+            params.append(generation)
+        sql += ("WHERE entries.draft_revision IS NOT NULL "
+                "AND entries.draft_revision != COALESCE(entries.batched_revision, '') "
+                f"AND {self._NOT_WITHDRAWN} AND {self._NOT_QUARANTINED}")
+        if limit is not None:
+            sql += ' LIMIT ?'
+            params.append(limit)
+        return self.db.execute(sql, params)
+
+    def has_changed_drafts(self, *, generation=None):
+        """Check the same publication eligibility without loading any body."""
+        with self.lock:
+            return self._changed_draft_refs(generation, limit=1).fetchone() is not None
+
     def drafts_changed(self, *, generation=None):
         """Draft revision bodies not yet included in any outbox batch.
 
@@ -1232,27 +1250,7 @@ class Store:
         longer carries is never a new publication; a quarantined entry stays
         out of automatic batches."""
         with self.lock:
-            if generation is not None:
-                rows = self.db.execute(
-                    "SELECT entries.entry_id, entries.draft_revision FROM entries "
-                    "JOIN grants ON grants.kind='draft' "
-                    "AND grants.identity=entries.entry_id "
-                    "AND grants.revision=entries.draft_revision "
-                    "AND grants.generation=? "
-                    "WHERE entries.draft_revision IS NOT NULL "
-                    "AND entries.draft_revision != COALESCE(entries.batched_revision, '') "
-                    f"AND {self._NOT_WITHDRAWN} AND {self._NOT_QUARANTINED}",
-                    (generation,),
-                ).fetchall()
-            else:
-                rows = self.db.execute(
-                    "SELECT entry_id, draft_revision FROM entries "
-                    "WHERE draft_revision IS NOT NULL "
-                    "AND draft_revision != COALESCE(batched_revision, '') "
-                    "AND NOT EXISTS (SELECT 1 FROM entry_quarantine "
-                    "WHERE entry_quarantine.entry_id=entries.entry_id) "
-                    f"AND {self._NOT_WITHDRAWN.replace('entries.', '')}"
-                ).fetchall()
+            rows = self._changed_draft_refs(generation).fetchall()
             return [self._revision_doc(r["entry_id"], r["draft_revision"])
                     for r in rows]
 
@@ -2012,15 +2010,30 @@ class Store:
             )
             return cursor.rowcount
 
-    def outbox_pending(self):
+    def _outbox_rows(self, condition, *, limit=None, due_only=False):
+        sql = 'SELECT * FROM outbox WHERE (' + condition + ')'
+        params = []
+        if due_only:
+            sql += ' AND (next_attempt IS NULL OR next_attempt<=?)'
+            params.append(time.time())
+        sql += ' ORDER BY created'
+        if limit is not None:
+            sql += ' LIMIT ?'
+            params.append(limit)
+        return [dict(row) for row in self.db.execute(sql, params)]
+
+    def outbox_pending(self, *, limit=None):
         """Never-attempted batches (resumable after a forced shutdown)."""
         with self.lock:
-            return [
-                dict(r)
-                for r in self.db.execute(
-                    "SELECT * FROM outbox WHERE status='pending' AND attempted IS NULL"
-                )
-            ]
+            return self._outbox_rows("status='pending' AND attempted IS NULL", limit=limit)
+
+    def cancel_pending(self, detail):
+        """Cancel unsent operations without deserializing their payloads."""
+        with self._write_txn():
+            return self.db.execute(
+                "UPDATE outbox SET status='disabled', detail=?, updated=? "
+                "WHERE status='pending' AND attempted IS NULL", (detail, time.time())
+            ).rowcount
 
     def _operation_due(self, batch_id):
         """Persisted exponential backoff gate for one bounded outbox operation.
@@ -2079,31 +2092,21 @@ class Store:
             )
         return True
 
-    def outbox_unresolved(self):
+    def outbox_unresolved(self, *, limit=None, due_only=False):
         """Attempted but outcome-unknown batches needing bounded reconciliation."""
         with self.lock:
-            return [
-                dict(r)
-                for r in self.db.execute(
-                    "SELECT * FROM outbox WHERE (status='unknown' "
-                    "OR (status='pending' AND attempted IS NOT NULL))"
-                )
-            ]
+            return self._outbox_rows("status='unknown' OR (status='pending' AND attempted IS NOT NULL)",
+                                     limit=limit, due_only=due_only)
 
-    def outbox_unavailable(self):
+    def outbox_unavailable(self, *, limit=None, due_only=False):
         """Batches whose last send hit a transient environment failure.
 
         The stored payload is intact (nothing confirmed, nothing compacted);
         resubmission retries the exact same operation with persisted backoff.
         """
         with self.lock:
-            return [
-                dict(r)
-                for r in self.db.execute(
-                    "SELECT * FROM outbox WHERE status='unavailable' "
-                    "AND attempted IS NOT NULL ORDER BY created"
-                )
-            ]
+            return self._outbox_rows("status='unavailable' AND attempted IS NOT NULL",
+                                     limit=limit, due_only=due_only)
 
     # ---------------------------------------------- confirmed-PR compaction
 
@@ -2482,7 +2485,6 @@ class Store:
                 "WHERE entry_id=?",
                 (rebuilt["revision"], published["title"], now, entry_id),
             )
-            self._write_draft_file(rebuilt)
             return rebuilt
 
     def restore_draft(self, entry_id, doc, *, generation=None):
@@ -2524,7 +2526,6 @@ class Store:
                  canonical(doc["conditions"]) if visible else row["conditions"],
                  entry_id),
             )
-            self._write_draft_file(doc)
             if visible:
                 self._index_upsert_tokens(entry_id, tokens_text, text_digest)
             return doc
