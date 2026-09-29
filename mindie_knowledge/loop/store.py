@@ -353,6 +353,10 @@ class Store:
                 capture_id TEXT NOT NULL, body_digest TEXT NOT NULL,
                 summary_status TEXT NOT NULL, summary_detail TEXT NOT NULL,
                 updated REAL NOT NULL, summary_due REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS history_imports(
+                source_key TEXT PRIMARY KEY, entry_id TEXT NOT NULL,
+                content_chars INTEGER NOT NULL, content_digest TEXT NOT NULL,
+                generation TEXT NOT NULL, revision TEXT NOT NULL);
         """)
         capture_columns = {
             row[1] for row in self.db.execute("PRAGMA table_info(captures)")

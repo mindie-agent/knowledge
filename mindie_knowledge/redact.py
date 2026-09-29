@@ -98,7 +98,9 @@ from mindie_knowledge._common import (  # noqa: E402
 #: with a plausible distribution name. CIDR, range, and port forms, endpoint
 #: words as the name, and bare version-looking tokens stay reported. A
 #: relaxation; keep profile r2.
-REDACTION_PROFILE = "r2"
+#: r3: mask complete private-key blocks. Missing or mismatched END markers
+#: cover the supplied remainder, including blank lines and long fragments.
+REDACTION_PROFILE = "r3"
 
 
 # --------------------------------------------------------------------------- #
@@ -317,8 +319,28 @@ def _ipv4_spans(text: str) -> Iterator[tuple[int, int]]:
         yield m.span()
 
 
+_PRIVATE_KEY_BEGIN = re.compile(r"-----BEGIN ((?:[A-Z0-9]+ )*PRIVATE KEY)-----")
+
+
+def _private_key_blocks(text):
+    cursor = 0
+    for match in _PRIVATE_KEY_BEGIN.finditer(text):
+        if match.start() < cursor:
+            continue
+        end_marker = '-----END ' + match.group(1) + '-----'
+        end = text.find(end_marker, match.end())
+        cursor = len(text) if end < 0 else end + len(end_marker)
+        yield match.start(), cursor
+
+
 RULES: tuple[Rule, ...] = (
     # --- credentials ------------------------------------------------------
+    Rule(
+        id="credential-private-key",
+        description="private-key block, including incomplete fragments",
+        hint="never submit private keys or fragments",
+        finder=_private_key_blocks,
+    ),
     Rule(
         id="credential-known-format",
         description="token in a well-known provider format",
