@@ -1700,13 +1700,18 @@ class Engine:
                     # that genuinely changed is still caught on the next
                     # non-fault tick by the edge below.
                     pass
-                elif self._generation is not None and generation != self._generation:
+                elif generation != self._generation:
                     if generation is None:
                         self._cancel_unsent("sharing disabled; unsent work cancelled")
                     else:
-                        self._cancel_unsent(
-                            "settings generation changed; unsent work cancelled"
-                        )
+                        if self._generation is not None:
+                            self._cancel_unsent(
+                                "settings generation changed; unsent work cancelled"
+                            )
+                        # A service started while sharing was disabled has no
+                        # previous generation, but revoke_stale() left its
+                        # cancellation event set. New authorized work must
+                        # not inherit that cancellation.
                         self._cancel.clear()
                 if block != "fault":
                     self._generation = generation
