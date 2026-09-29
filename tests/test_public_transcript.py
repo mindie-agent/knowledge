@@ -155,6 +155,40 @@ def test_real_scanner_secrets_unicode_overlap_and_technical_negative_controls(sc
     assert redact(masked, executable=scanner, key=b'a' * 32)[0] == masked
 
 
+@pytest.mark.parametrize('failure', ['scanner', 'interrupted'])
+def test_metadata_recovers_the_same_body_without_another_stop(pipeline, failure):
+    engine, store, path = pipeline
+    engine.summary_command = [sys.executable, '-c',
+        'print(\'{"title":"Recovered title", "summary":"Recovered public observations."}\')']
+    append(path, 'body-survives-metadata-interruption')
+    process(engine, path, 'last-stop')
+    before = store.drafts_changed()[0]['content']
+    engine.last_activity = time.monotonic() - 10
+    with store._write_txn():
+        store.db.execute('UPDATE transcript_tasks SET summary_due=0')
+    if failure == 'scanner':
+        scanner = engine.redactor_executable
+        engine.redactor_executable = str(path.parent / 'unavailable-scanner')
+        transcript_capture.summarize_due(engine)
+        task = dict(store.db.execute('SELECT * FROM transcript_tasks').fetchone())
+        assert task['summary_status'] == 'pending'
+        assert task['summary_due'] > time.time()
+        assert store.drafts_changed()[0]['content'] == before
+        engine.redactor_executable = scanner
+    else:
+        with store._write_txn():
+            store.db.execute("UPDATE transcript_tasks SET summary_status='running'")
+    engine.start()
+    try:
+        with store._write_txn():
+            store.db.execute('UPDATE transcript_tasks SET summary_due=0')
+        wait_until(lambda: store.drafts_changed()[0]['title'] == 'Recovered title')
+        assert store.drafts_changed()[0]['content'] == before
+        assert store.db.execute('SELECT COUNT(*) FROM captures').fetchone()[0] == 1
+    finally:
+        engine.shutdown()
+
+
 def test_dense_private_addresses_and_unicode_line_separators(scanner):
     public = '中文\u2028still one scanner line\n'
     source = public + 'password = "Hk8Pm7Wz9Rq2Vt6S"\n' + ('10.88.0.9 BF16 shape=(1, 4096)\n' * 4000)
@@ -220,7 +254,7 @@ def test_upgrade_retains_legacy_gap_and_checkpoint_without_body_model(pipeline):
     assert store.drafts_changed() == []
 
 
-@pytest.mark.parametrize('failure', ['missing', 'exit'])
+@pytest.mark.parametrize('failure', ['missing', 'exit', 'invalid-report'])
 def test_scanner_recovers_same_notification_without_new_stop(pipeline, monkeypatch, failure):
     engine, store, path = pipeline
     scanner = engine.redactor_executable
@@ -229,10 +263,11 @@ def test_scanner_recovers_same_notification_without_new_stop(pipeline, monkeypat
     append(path, 'Authorization: Bearer AbCdEf1234567890')
     event = engine.capture(session_id='manual-A', turn_id='bad', transcript_path=str(path))
     with monkeypatch.context() as patcher:
-        if failure == 'exit':
+        if failure in {'exit', 'invalid-report'}:
             import subprocess
             patcher.setattr('mindie_knowledge.loop.transcript_redaction.subprocess.run',
-                lambda *args, **kwargs: subprocess.CompletedProcess(args, 2, b'', b''))
+                lambda *args, **kwargs: subprocess.CompletedProcess(
+                    args, 2 if failure == 'exit' else 0, b'not-json', b''))
         engine._process(event['id'])
     assert store.drafts_changed() == []
     assert store.cursor(str(path.resolve())) is None
@@ -369,3 +404,73 @@ def test_production_parsers_preserve_large_public_messages_through_export(tmp_pa
         assert doc['content'] == '### user\n' + text
         from mindie_knowledge.loop.documents import render_entry, parse_entry
         assert parse_entry(render_entry(doc))['content'] == doc['content']
+
+
+def test_kimi_lineage_recovers_without_exporting_inherited_history(tmp_path, scanner):
+    session = SESSIONS['kimi']
+    settings = tmp_path / 'community.json'
+    write_settings(settings, roots=[tmp_path])
+    admission = Admission(make_admission(tmp_path, project_root=tmp_path, session=session))
+    path = transcript_path('kimi', tmp_path, session)
+    from lane_support import encode_record
+    when = time.time() + 2
+    path.write_bytes(encode_record('kimi', session, 'inherited-parent-marker', when)
+                     + encode_record('kimi', session, 'new-child-marker', when + 2))
+    state = path.parents[2] / 'state.json'
+    state.unlink()
+    with closing(Store(tmp_path / 'store', 'test')) as store:
+        engine = Engine(store, settings_path=settings, admission=admission,
+                        transcript_adapter=load_parser('kimi'), capture_mode='public-transcript',
+                        redactor_executable=scanner)
+        event = engine.capture(session_id=session, turn_id='lineage', transcript_path=str(path))
+        engine._process(event['id'])
+        assert store.drafts_changed() == []
+        assert store.cursor(str(path.resolve())) is None
+        assert store.continuation_reason(event['id']).startswith('public-io:')
+        state.write_text(json.dumps(dict(forkedFrom='parent', createdAt=int((when + 1) * 1000))), encoding='utf-8')
+        engine.start()
+        try:
+            wait_until(lambda: bool(store.drafts_changed()))
+            body = store.drafts_changed()[0]['content']
+            assert 'new-child-marker' in body
+            assert 'inherited-parent-marker' not in body
+            assert store.capture_row(event['id'])['status'] == 'organized'
+        finally:
+            engine.shutdown()
+
+
+@pytest.mark.parametrize('harness', ['codex', 'kimi', 'cc'])
+@pytest.mark.parametrize('bad', [b'{"bad":broken}\n', b'null\n', b'\xff\n'])
+def test_corrupt_record_does_not_lose_valid_neighbors(tmp_path, scanner, harness, bad):
+    from lane_support import encode_record
+    session = SESSIONS[harness]
+    settings = tmp_path / 'community.json'
+    write_settings(settings, roots=[tmp_path])
+    admission = Admission(make_admission(tmp_path, project_root=tmp_path, session=session))
+    path = transcript_path(harness, tmp_path, session)
+    when = time.time() + 2
+    write_transcript(harness, path, session, ['before-bad-marker'], when)
+    with path.open('ab') as stream:
+        stream.write(bad)
+        stream.write(encode_record(harness, session, 'after-bad-marker', when + 2))
+    with closing(Store(tmp_path / 'store', 'test')) as store:
+        engine = Engine(store, settings_path=settings, admission=admission,
+                        transcript_adapter=load_parser(harness), capture_mode='public-transcript',
+                        redactor_executable=scanner)
+        event = engine.capture(session_id=session, turn_id='broken-line', transcript_path=str(path))
+        engine._process(event['id'])
+        row = store.capture_row(event['id'])
+        assert row['status'] == 'organized', row
+        discarded = json.loads(row['detail'])['discarded_records']
+        assert len(discarded) == 1 and discarded[0]['reason'] == 'invalid record'
+        assert discarded[0]['end'] - discarded[0]['start'] == len(bad)
+        assert store.cursor(str(path.resolve()))['ok_finish'] == path.stat().st_size
+        body = store.drafts_changed()[0]['content']
+        assert body == '### user\nbefore-bad-marker\n\n### user\nafter-bad-marker'
+        # A later Stop must also continue, not reread either neighbor.
+        with path.open('ab') as stream:
+            stream.write(encode_record(harness, session, 'later-marker', when + 3))
+        second = engine.capture(session_id=session, turn_id='later', transcript_path=str(path))
+        engine._process(second['id'])
+        final = store.drafts_changed()[0]['content']
+        assert final.count('before-bad-marker') == final.count('after-bad-marker') == final.count('later-marker') == 1

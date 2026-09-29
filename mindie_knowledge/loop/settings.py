@@ -411,15 +411,14 @@ _MANAGED_KEYS = frozenset({
 
 
 def transition(previous, requested):
-    """One authority transition for every adapter and settings writer.
+    """Compare the current authority with a complete requested document.
 
     Repeating a request is a no-op. Only a changed contribution policy starts
     a new generation; runtime wiring and delivery preferences never revoke
     accepted work. Caller-supplied generation/time values are not authority.
     """
     old = previous if isinstance(previous, dict) else {}
-    data = dict(old)
-    data.update(requested)
+    data = dict(requested)
     data['schema'] = SCHEMA
     data['project_roots'] = normalized_roots(data.get('project_roots', []))
     policy = ('enabled', 'repository', 'branch', 'visibility', 'account', 'fork')
@@ -437,7 +436,7 @@ def transition(previous, requested):
     # Explicitly enabling after a saved opt-out establishes a fresh boundary,
     # even if an interrupted prior toggle left the two documents inconsistent.
     if data.get('enabled') and CONSENT_FIELD in old:
-        changed |= not CommunitySettings(None, old).consent_allows_contribution()
+        changed |= CommunitySettings(None, old).capture_block_kind() == 'revoked'
     data['generation'] = secrets.token_hex(16) if changed else old['generation']
     data['enabled_at'] = ((time.time() if changed else old.get('enabled_at'))
                           if data.get('enabled') else None)
@@ -508,8 +507,10 @@ class CommunityWriteContext:
             raise ValueError('existing community settings are damaged; bytes preserved')
         if requested is None and state.schema_ok:
             return state
-        data = transition(state.raw, requested or dict(enabled=False, repository=None,
-                          project_roots=[], branch='main', idle_seconds=300))
+        data = dict(state.raw)
+        data.update(requested or dict(enabled=False, repository=None,
+                    project_roots=[], branch='main', idle_seconds=300))
+        data = transition(state.raw, data)
         if data != state.raw:
             _atomic_write(Path(path), data)
         return load(path)

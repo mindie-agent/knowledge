@@ -139,7 +139,7 @@ def redact(text, *, executable, key, private_paths=()):
                 spans.append((start, start + len(secret), "secret-" + item["RuleID"]))
                 found = text.find(match, found + len(match), hi)
     except (ValueError, KeyError, TypeError, IndexError):
-        raise ValueError("transcript secret scanner returned invalid spans") from None
+        raise ScannerUnavailable("transcript secret scanner returned invalid spans") from None
     spans.extend((f.start, f.end, f.rule) for f in scan_text(text))
     for path in private_paths:
         if not isinstance(path, str) or len(path) < 3:

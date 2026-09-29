@@ -14,6 +14,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -137,6 +138,12 @@ def transcript_path(name, root, session):
     else:
         raise ValueError(name)
     path.parent.mkdir(parents=True, exist_ok=True)
+    if name == 'kimi':
+        # Real Kimi sessions have a separate lineage authority. Do not let
+        # a stateless synthetic fixture silently stand in for a root task.
+        state = path.parents[2] / 'state.json'
+        if not state.exists():
+            state.write_text(json.dumps(dict(createdAt=int(time.time() * 1000))), encoding='utf-8')
     return path
 
 

@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from mindie_knowledge.loop import settings as settings_mod
 
 from conftest import write_settings
@@ -94,3 +96,49 @@ def test_as_dict_keeps_schema_extensions_and_config_path(tmp_path):
     assert data["schema"] == "mindie-community-config/1"
     assert data["transaction"] == {"mode": "batch"}
     assert data["config_path"] == str(tmp_path / "c.json")
+
+
+@pytest.mark.parametrize('fault', ['missing', 'corrupt', 'undetermined'])
+def test_authority_fault_does_not_renew_existing_permission(tmp_path, fault):
+    from mindie_knowledge import consent_store
+
+    consent = tmp_path / 'consent.json'
+    consent_store.record_choice(consent, 'contribute')
+    path = tmp_path / 'community.json'
+    original = write_settings(path, roots=[tmp_path], consent_config=str(consent))
+    before = path.read_bytes()
+    if fault == 'missing':
+        consent.unlink()
+    elif fault == 'corrupt':
+        consent.write_text('{broken', encoding='utf-8')
+    else:
+        consent.write_text(json.dumps(dict(schema='mindie-consent/1')), encoding='utf-8')
+    for _ in range(2):
+        with settings_mod.CommunityWriteContext(path) as writer:
+            writer.write(path, enabled=True, repository=original.repository,
+                         project_roots=[tmp_path])
+        assert path.read_bytes() == before
+        assert settings_mod.load(path).capture_block_kind() == 'fault'
+    # Restoring the same authority resumes the original boundary, rather
+    # than making already accepted work stale after a temporary fault.
+    consent.unlink(missing_ok=True)
+    consent_store.record_choice(consent, 'contribute')
+    restored = settings_mod.load(path)
+    assert restored.allows_capture()
+    assert restored.generation == original.generation
+    assert restored.enabled_at == original.enabled_at
+
+
+def test_removed_policy_extension_stays_removed_and_changes_boundary_once(tmp_path):
+    path = tmp_path / 'community.json'
+    original = write_settings(path, roots=[tmp_path], fork='owner/fork', bot=dict(name='bot'))
+    with settings_mod.CommunityWriteContext(path) as writer:
+        removed = writer.write(path, enabled=True, repository=original.repository,
+                               project_roots=[tmp_path], fork=None)
+    assert 'fork' not in removed.raw
+    assert removed.raw['bot'] == original.raw['bot']
+    assert removed.generation != original.generation
+    with settings_mod.CommunityWriteContext(path) as writer:
+        repeated = writer.write(path, enabled=True, repository=original.repository,
+                                project_roots=[tmp_path], fork=None)
+    assert repeated.generation == removed.generation

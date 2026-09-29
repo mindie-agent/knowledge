@@ -317,9 +317,14 @@ def read_material(path, start, *, session_id=None, not_before=None, expected=Non
                 except (ValueError, UnicodeDecodeError):
                     record = None
                 if not isinstance(record, dict):
-                    result.update(status="invalid-record", coverage_note="invalid complete JSONL record; not consumed")
-                    result["coverage"].append(dict(start=offset, end=stream.tell(), reason="invalid record"))
-                    break
+                    # A corrupt complete record is isolated, never exported.
+                    # Its byte position is retained without copying raw content.
+                    result.setdefault("discarded_records", []).append(
+                        dict(start=offset, end=stream.tell(), reason="invalid record"))
+                    consumed.update(raw)
+                    result["end"] = stream.tell()
+                    result["skipped_records"] += 1
+                    continue
                 extracted = None
                 if isinstance(record, dict):
                     if record.get("type") in KNOWN:
@@ -339,10 +344,14 @@ def read_material(path, start, *, session_id=None, not_before=None, expected=Non
                 if extracted and extracted[1]:
                     stamp = _timestamp(record)
                     if not_before is not None and stamp is None:
-                        result.update(status='invalid-record', timestamps_reliable=False,
-                                      coverage_note='public message timestamp unavailable; not consumed')
-                        result['coverage'].append(dict(start=offset, end=stream.tell(), reason='missing public timestamp'))
-                        break
+                        # Without a timestamp this record is not authorized.
+                        # Omit only this record; later dated messages can proceed.
+                        result.setdefault("discarded_records", []).append(
+                            dict(start=offset, end=stream.tell(), reason="missing public timestamp"))
+                        consumed.update(raw)
+                        result["end"] = stream.tell()
+                        result["skipped_records"] += 1
+                        continue
                     if not_before is not None and stamp < not_before:
                         extracted = None
                     else:

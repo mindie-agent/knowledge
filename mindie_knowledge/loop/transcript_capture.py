@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .process import bounded_run
 from .store import canonical, digest, new_identity
-from .transcript_redaction import redact
+from .transcript_redaction import ScannerUnavailable, redact
 
 MODE = "public-transcript"
 SUMMARY_SECONDS = 45
@@ -66,7 +66,8 @@ def capture(engine, row, text, region):
                          (task_key, entry_id, row['id'], digest(doc['content']),
                           'pending' if engine.summary_command else 'excerpt', '', time.time(), time.time() + SUMMARY_SETTLE_SECONDS))
         detail = canonical(dict(pipeline=MODE, refs=[store.ref(entry_id, doc['revision'])],
-                                redaction_rules=rules, body_model_calls=0))
+                                redaction_rules=rules, body_model_calls=0,
+                                discarded_records=inc.get('discarded_records', [])))
         store.mark_capture(row['id'], 'organized', detail)
         if inc.get('more'):
             store.defer_capture(row['id'], due=time.time(), reason='more public transcript bytes')
@@ -119,10 +120,15 @@ def summarize_due(engine):
         applied = store.update_draft_header(task['entry_id'], expected_body=task['body_digest'], generation=row['generation'], **clean)
         status = 'complete' if applied else 'superseded'
     except MaintenanceCancelled:
-        status, detail = 'cancelled', 'authority revoked or service stopped'
+        status = 'pending' if engine.stop.is_set() else 'cancelled'
+        detail = 'service stopped; body retained' if status == 'pending' else 'authority revoked'
+    except ScannerUnavailable:
+        # No model was needed to retry local redaction. Keep this body version
+        # due even if it is the final Stop; do not wait for another user turn.
+        status, detail = 'pending', 'scanner unavailable; body retained'
     except (AdmissionUnreadable, GateFault):
         if reserved:
-            status, detail = 'failed', 'authority unavailable after metadata reservation'
+            status, detail = 'pending', 'authority unavailable; body retained'
         else:
             with store._write_txn():
                 store.db.execute('UPDATE transcript_tasks SET summary_due=? WHERE task_key=? AND body_digest=?',
@@ -133,6 +139,6 @@ def summarize_due(engine):
     finally:
         if reserved or status in {'superseded', 'cancelled'}:
             with store._write_txn():
-                store.db.execute('UPDATE transcript_tasks SET summary_status=?, summary_detail=? WHERE task_key=? AND body_digest=?',
-                                 (status, detail, task['task_key'], task['body_digest']))
+                store.db.execute('UPDATE transcript_tasks SET summary_status=?, summary_detail=?, summary_due=? WHERE task_key=? AND body_digest=?',
+                                 (status, detail, time.time() + 30, task['task_key'], task['body_digest']))
         engine.end_work()

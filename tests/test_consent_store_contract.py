@@ -71,6 +71,19 @@ def _bytes(path):
     return path.read_bytes() if path.exists() else None
 
 
+def test_repeating_contribution_choice_is_a_byte_identical_noop(api, tmp_path):
+    path = tmp_path / 'consent.json'
+    api.record_choice(path, 'contribute')
+    before = path.read_bytes(), path.stat().st_mtime_ns
+    api.record_choice(path, 'contribute')
+    assert (path.read_bytes(), path.stat().st_mtime_ns) == before
+    api.record_choice(path, 'disabled')
+    assert api.read(path)['choice'] == 'disabled'
+    api.record_choice(path, 'contribute')
+    assert api.read(path)['choice'] == 'contribute'
+    assert path.read_bytes() != before[0]
+
+
 def _load(path):
     return json.loads(path.read_text())
 

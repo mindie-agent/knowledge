@@ -638,7 +638,9 @@ class Engine:
             if status == "ok" and inc["end"] > inc["start"]:
                 # Consumed bytes held no public material; consume them visibly.
                 region_id = reserve(inc["start"], inc["end"], inc["digest"],
-                                    status="succeeded", detail="no public material")
+                                    status="succeeded", detail=canonical(dict(
+                                        note="no public material",
+                                        discarded_records=inc.get('discarded_records', []))))
                 if region_id is None:
                     self._defer_reread(row["id"])
                     return None
@@ -1497,7 +1499,7 @@ class Engine:
 
     def start(self):
         with self.store.lock, self.store.db:
-            self.store.db.execute("UPDATE transcript_tasks SET summary_status='failed', summary_detail='interrupted; body retained' WHERE summary_status='running'")
+            self.store.db.execute("UPDATE transcript_tasks SET summary_status='pending', summary_detail='interrupted; body retained', summary_due=? WHERE summary_status='running'", (time.time() + 30,))
             self.store.db.execute(
                 "UPDATE captures SET status='failed', "
                 "detail='service restarted after input reservation; not replaying' "

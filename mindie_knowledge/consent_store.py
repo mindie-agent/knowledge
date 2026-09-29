@@ -388,7 +388,8 @@ def _record(path, mutate):
             )
         document = dict(data) if state == "ok" else {}
         mutate(document)
-        _write_document(path, document)
+        if state != "ok" or document != data:
+            _write_document(path, document)
     return read(path)
 
 
@@ -404,6 +405,8 @@ def record_choice(path, choice):
         raise ValueError("choice must be contribute, read-only, later or disabled")
 
     def mutate(document):
+        if document.get("choice") == choice:
+            return
         document.pop("migrated_from", None)
         document.update(schema=SCHEMA, choice=choice, choice_at=time.time())
 

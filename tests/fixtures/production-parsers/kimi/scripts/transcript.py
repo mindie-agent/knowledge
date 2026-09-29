@@ -191,9 +191,11 @@ def _fork_boundary(path) -> float | None:
         state_path = Path(path).resolve().parents[2] / "state.json"
         data = json.loads(state_path.read_text(encoding='utf-8'))
     except (OSError, ValueError, IndexError):
-        return None
+        # Missing or partially written native state cannot prove that this
+        # is a root session. Keep the cursor until state is readable again.
+        raise OSError("native session state unavailable; inherited material not read") from None
     if not isinstance(data, dict):
-        return None
+        raise OSError("native session state invalid; inherited material not read")
     parent = data.get("forkedFrom") or data.get("forked_from")
     if not parent:
         return None
@@ -326,9 +328,14 @@ def read_material(
                 except (ValueError, UnicodeDecodeError):
                     record = None
                 if not isinstance(record, dict):
-                    result.update(status="invalid-record", coverage_note="invalid complete JSONL record; not consumed")
-                    result["coverage"].append(dict(start=offset, end=stream.tell(), reason="invalid record"))
-                    break
+                    # A corrupt complete record is isolated, never exported.
+                    # Its byte position is retained without copying raw content.
+                    result.setdefault("discarded_records", []).append(
+                        dict(start=offset, end=stream.tell(), reason="invalid record"))
+                    consumed.update(raw)
+                    result["end"] = stream.tell()
+                    result["skipped_records"] += 1
+                    continue
                 extracted = None
                 stamp = None
                 if isinstance(record, dict):
@@ -340,10 +347,14 @@ def read_material(
                         extracted = None
                 if extracted and extracted[1]:
                     if boundary is not None and stamp is None:
-                        result.update(status="invalid-record", timestamps_reliable=False,
-                                      coverage_note="public message timestamp unavailable; not consumed")
-                        result["coverage"].append(dict(start=offset, end=stream.tell(), reason="missing public timestamp"))
-                        break
+                        # Without a timestamp this record is not authorized.
+                        # Omit only this record; later dated messages can proceed.
+                        result.setdefault("discarded_records", []).append(
+                            dict(start=offset, end=stream.tell(), reason="missing public timestamp"))
+                        consumed.update(raw)
+                        result["end"] = stream.tell()
+                        result["skipped_records"] += 1
+                        continue
                     if boundary is not None and stamp < boundary:
                         extracted = None
                     else:
