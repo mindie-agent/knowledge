@@ -6,6 +6,7 @@ leaves the same input due. Summary calls are coalesced, once per body version,
 and their only write capability is the title/summary store method.
 """
 import json
+import re
 import time
 from pathlib import Path
 
@@ -19,14 +20,27 @@ SUMMARY_SETTLE_SECONDS = 3
 
 
 def excerpt(text, size):
-    return text.encode('utf-8')[:size].decode('utf-8', 'ignore').strip()
+    return text[:size].encode('utf-8')[:size].decode('utf-8', 'ignore').strip()
 
 
 def fallback_header(text):
     # Clearly an excerpt, not a claim that a semantic summary succeeded.
-    lines = [line.strip() for line in text.splitlines() if line.strip() and not line.startswith('### ')]
-    first = lines[0] if lines else 'Public conversation'
-    return excerpt(first, 240)[:120], 'Conversation excerpt: ' + excerpt('\n'.join(lines), 1500)
+    first = None
+    lines = []
+    remaining = 1500
+    for match in re.finditer(r'[^\n\r\v\f\x1c-\x1e\x85\u2028\u2029]+', text):
+        line = match.group()
+        if line.startswith('### ') or not line.strip():
+            continue
+        line = line.strip()
+        if first is None:
+            first = excerpt(line, 240)[:120]
+        piece = excerpt(line, remaining)
+        lines.append(piece)
+        remaining -= len(piece.encode('utf-8')) + 1
+        if remaining <= 0 or len(piece) < len(line):
+            break
+    return first or 'Public conversation', 'Conversation excerpt: ' + '\n'.join(lines).strip()
 
 
 def capture(engine, row, text, region):

@@ -63,60 +63,25 @@ def _own_windows_tree(process):
     process._mindie_windows_job = (kernel, job)
 
 def _resume_windows_process(process):
-    """Resume the suspended primary thread through documented Win32 APIs.
+    """Resume only the owned, suspended child after Job assignment.
 
-    Popen closes the thread handle returned by CreateProcess, so reopen this
-    process's sole suspended thread from a Toolhelp snapshot. Its process
-    handle stays owned throughout; no shell or system-wide process kill.
+    NtResumeProcess is also used by psutil's Windows resume implementation.
+    The retained Popen handle avoids PID reuse and system-wide thread scans.
+    NTSTATUS is converted explicitly; GetLastError is not its error channel.
     """
     import ctypes
     from ctypes import wintypes
 
-    class ThreadEntry(ctypes.Structure):
-        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
-                    ("th32ThreadID", wintypes.DWORD),
-                    ("th32OwnerProcessID", wintypes.DWORD),
-                    ("tpBasePri", wintypes.LONG), ("tpDeltaPri", wintypes.LONG),
-                    ("dwFlags", wintypes.DWORD)]
-
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
-    kernel.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-    kernel.Thread32First.argtypes = [wintypes.HANDLE, ctypes.POINTER(ThreadEntry)]
-    kernel.Thread32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(ThreadEntry)]
-    kernel.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-    kernel.OpenThread.restype = wintypes.HANDLE
-    kernel.ResumeThread.argtypes = [wintypes.HANDLE]
-    kernel.ResumeThread.restype = wintypes.DWORD
-    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-    snapshot = kernel.CreateToolhelp32Snapshot(0x4, 0)  # TH32CS_SNAPTHREAD
-    if snapshot == wintypes.HANDLE(-1).value:
-        raise ctypes.WinError(ctypes.get_last_error())
-    try:
-        entry = ThreadEntry()
-        entry.dwSize = ctypes.sizeof(entry)
-        more = kernel.Thread32First(snapshot, ctypes.byref(entry))
-        while more:
-            if entry.th32OwnerProcessID == process.pid:
-                thread = kernel.OpenThread(0x2, False, entry.th32ThreadID)  # SUSPEND_RESUME
-                if not thread:
-                    raise ctypes.WinError(ctypes.get_last_error())
-                try:
-                    previous = kernel.ResumeThread(thread)
-                    if previous == 0xFFFFFFFF:
-                        raise ctypes.WinError(ctypes.get_last_error())
-                finally:
-                    kernel.CloseHandle(thread)
-                if previous == 1:
-                    return
-                if previous > 1:
-                    raise OSError("owned primary thread has an unexpected suspend count")
-                # An injected, already-running thread is not the primary
-                # thread we created suspended. Continue to the owned one.
-            more = kernel.Thread32Next(snapshot, ctypes.byref(entry))
-        raise OSError("owned suspended process has no primary thread")
-    finally:
-        kernel.CloseHandle(snapshot)
+    native = ctypes.WinDLL("ntdll")
+    resume = native.NtResumeProcess
+    resume.argtypes = [wintypes.HANDLE]
+    resume.restype = wintypes.LONG
+    status = resume(int(process._handle))
+    if status < 0:
+        convert = native.RtlNtStatusToDosError
+        convert.argtypes = [wintypes.LONG]
+        convert.restype = wintypes.ULONG
+        raise ctypes.WinError(convert(status))
 
 def terminate_owned(process):
     owned = getattr(process, "_mindie_windows_job", None)

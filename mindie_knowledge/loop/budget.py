@@ -47,6 +47,10 @@ class MaintenanceBudget:
                 store.db.execute(
                     "ALTER TABLE maintenance_attempts ADD COLUMN apply_receipt TEXT"
                 )
+            store.db.execute(
+                "CREATE INDEX IF NOT EXISTS maintenance_apply "
+                "ON maintenance_attempts(started) WHERE status='apply' AND result IS NOT NULL"
+            )
 
     def reserve(self, ident, session, role):
         now = time.time()

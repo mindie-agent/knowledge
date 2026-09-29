@@ -20,7 +20,10 @@ Body, range, cursor and continuation commit together using the existing Store
 transaction. Body creation consumes no maintenance model budget. Existing
 authorization checks, revocation, fork filtering, receipt-based restoration,
 outbox, publication and query interfaces continue to apply. The database is
-authoritative; draft files and the search index are derived views.
+authoritative; the search index is a derived view. Capture does not also rewrite
+a full Markdown mirror on every turn. Publication renders the selected database
+revision into its staging file when needed. Old draft-file mirrors are inert;
+confirmed-publication cleanup still removes them.
 On migration, legacy organizer gaps remain failed and uncommitted legacy model
 results remain held for inspection. Neither recovery route can call a body
 model or apply its result in public-transcript mode. Appends refresh the source

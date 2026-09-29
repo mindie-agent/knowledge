@@ -14,7 +14,7 @@ authors = [
 ]
 dependencies = [
   "PyYAML>=6.0",
-  "mindie-diagnostics @ git+https://github.com/mindie-agent/diagnostics@7c56f6b510b48fa60f256b46f71805e3be61eed8",
+  "mindie-diagnostics @ git+https://github.com/mindie-agent/diagnostics@1f460de7d796b966d54201b3f852a33412803d9e",
 ]
 
 [project.optional-dependencies]
