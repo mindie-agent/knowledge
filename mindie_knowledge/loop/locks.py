@@ -75,14 +75,23 @@ class StartLock:
         self.acquired = False
         self._fd = None
 
-    def acquire(self):
+    def acquire(self, *, wait=0):
         if self.acquired:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        deadline = time.monotonic() + wait
         try:
             # Windows permits locking beyond EOF; acquire before any write.
-            _lock_file_nb(fd)
+            while True:
+                try:
+                    _lock_file_nb(fd)
+                    break
+                except OSError as exc:
+                    remaining = deadline - time.monotonic()
+                    if exc.errno not in (errno.EACCES, errno.EAGAIN) or remaining <= 0:
+                        raise
+                    time.sleep(min(.01, remaining))
         except OSError:
             os.close(fd)
             try:

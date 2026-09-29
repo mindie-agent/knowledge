@@ -8,7 +8,52 @@ import sys
 import threading
 import time
 
+import pytest
+
 import transcript_double
+
+
+def test_service_start_waits_for_a_transient_lock_observer(tmp_path):
+    from mindie_knowledge.loop.cli import connection_path, rpc
+    from mindie_knowledge.loop.locks import StartLock
+
+    config = dict(root=str(tmp_path / 'data'), domain='test')
+    path = tmp_path / 'engine.json'
+    path.write_text(json.dumps(config), encoding='utf-8')
+    attempted = tmp_path / 'attempted'
+    bootstrap = (
+        'import runpy; from pathlib import Path; from mindie_knowledge.loop import locks\n'
+        'real = locks._lock_file_nb\n'
+        'def observed(fd):\n'
+        f'    Path({str(attempted)!r}).write_text("attempted")\n'
+        '    return real(fd)\n'
+        'locks._lock_file_nb = observed\n'
+        'runpy.run_module("mindie_knowledge.loop.cli", run_name="__main__")\n'
+    )
+    process = None
+    try:
+        with StartLock(connection_path(config).with_name('consumer.lock')):
+            process = subprocess.Popen([sys.executable, '-c', bootstrap, 'serve', '--config', str(path)],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            deadline = time.monotonic() + 5
+            while not attempted.exists() and time.monotonic() < deadline:
+                assert process.poll() is None
+                time.sleep(.01)
+            assert attempted.exists()
+            with pytest.raises(subprocess.TimeoutExpired):
+                process.wait(timeout=.15)
+        deadline = time.monotonic() + 5
+        while not connection_path(config).exists() and time.monotonic() < deadline:
+            assert process.poll() is None
+            time.sleep(.01)
+        connection = json.loads(connection_path(config).read_text())
+        assert rpc(connection, 'status', timeout=1)['worker_alive']
+        assert rpc(connection, 'stop_if_idle', timeout=1)['idle']
+        assert process.wait(timeout=3) == 0
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=3)
 
 
 def test_cold_wake_spawn_failure_is_visible_and_releases_ownership(tmp_path, monkeypatch):

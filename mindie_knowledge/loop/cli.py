@@ -373,7 +373,10 @@ def _serve(config_path, config):
 
     consumer = StartLock(connection_path(config).with_name("consumer.lock"))
     try:
-        consumer.acquire()
+        # lock_held briefly acquires a free lock to observe it. An observer
+        # racing this startup is not proof of an existing service. Use the
+        # existing startup budget to wait for ownership, never spawn again.
+        consumer.acquire(wait=STARTUP_TIMEOUT)
     except StartInProgress:
         return 0
     stage = "store"
