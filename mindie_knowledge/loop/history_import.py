@@ -35,6 +35,13 @@ def _receipt(store, key):
     return dict(row) if row else None
 
 
+def _summary_state(store, key):
+    task = store.transcript_task(digest(['history-summary', key]))
+    if task is None:
+        return dict(status='missing', detail='summary task was not registered')
+    return dict(status=task['summary_status'], detail=task['summary_detail'])
+
+
 def import_transcript(engine, *, session_id, token, source, source_session,
                       source_scope, identity, namespace):
     """Contribute one user-selected snapshot, with no automatic history reads.
@@ -111,6 +118,7 @@ def import_transcript(engine, *, session_id, token, source, source_session,
             revision = (current['draft_revision'] or current['published_revision']) if current else None
         return dict(status='unchanged',
                     ref=store.ref(prior['entry_id'], revision) if revision else None,
+                    summary=_summary_state(store, key),
                     **coverage)
     if prior:
         if prior['generation'] != settings.generation:
@@ -154,9 +162,11 @@ def import_transcript(engine, *, session_id, token, source, source_session,
             '(task_key,entry_id,capture_id,body_digest,summary_status,summary_detail,updated,summary_due,authorization) '
             'VALUES(?,?,?,?,?,?,?,?,?)',
             (digest(['history-summary', key]), entry_id, '', digest(doc['content']),
-             'pending' if engine.summary_command else 'excerpt', '', now,
+             'pending' if engine.summary_command else 'failed',
+             '' if engine.summary_command else 'configuration: summary worker is not configured', now,
              now + SUMMARY_SETTLE_SECONDS, canonical(row)),
         )
     return dict(status='imported' if prior is None else 'extended',
                 ref=store.ref(entry_id, doc['revision']), redaction_rules=rules,
+                summary=_summary_state(store, key),
                 publication='pending', **coverage)

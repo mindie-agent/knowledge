@@ -77,10 +77,13 @@ no new Stop is required and no unredacted body is published. No model creates,
 shortens or rewrites the body. The GitHub ordinary-Git per-file 100 MiB limit
 remains a visible publication constraint, not a silent truncation rule.
 
-An optional separate worker reads the complete redacted body and returns only
+A required separate worker reads the complete redacted body and returns only
 title and summary. It never holds the body worker, and an old result cannot
 replace metadata after new body content arrives. One settled body version has
-one attempt. Failure keeps a labeled source excerpt and the full body usable.
+one attempt. Failure keeps the local body and unprocessed preview but prevents
+a new export batch from publishing it. Missing summary configuration is a failure,
+not a normal excerpt mode. The current full-input implementation still needs a
+token-aware incremental organization path for long source material.
 Disabling sharing cancels both workers and unsent publication; an unchanged
 enable does nothing. Consent lasts until the user changes it.
 

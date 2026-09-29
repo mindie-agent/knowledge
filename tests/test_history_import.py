@@ -55,7 +55,9 @@ def contribute(case, **overrides):
 
 
 def test_old_messages_are_explicitly_imported_redacted_and_exportable(case):
+    import sys
     engine, source = case
+    engine.summary_command = [sys.executable, '-c', 'print(\'{"title":"Synthetic history", "summary":"Reported public result."}\')']
     secret = 'ghp_' + 'AbCdEf0123456789' * 3
     append(source, message('Historical public result ' + secret),
            message('private reasoning canary', role='assistant', channel='analysis'),
@@ -65,6 +67,7 @@ def test_old_messages_are_explicitly_imported_redacted_and_exportable(case):
     raw = source.read_bytes()
     result = contribute(case)
     assert result['status'] == 'imported' and result['public_records'] == 2
+    assert result['summary']['status'] == 'pending'
     assert engine.admission.active_lease('old-unactivated') is None
     assert source.read_bytes() == raw
     docs = engine.store.drafts_changed(generation=engine._settings().generation)
@@ -74,6 +77,9 @@ def test_old_messages_are_explicitly_imported_redacted_and_exportable(case):
     assert all(s not in body for s in (secret, 'private reasoning', 'injected canary', 'tool canary'))
     from mindie_knowledge.loop.export import build_batch
     from mindie_knowledge.loop.documents import parse_entry
+    assert build_batch(engine.store, settings=engine._settings()) is None
+    summary_due(engine)
+    assert contribute(case)['summary']['status'] == 'complete'
     batch_id = build_batch(engine.store, settings=engine._settings())[0]
     payload = json.loads(engine.store.batch(batch_id)['batch'])
     assert parse_entry(payload['files'][0]['content'].encode())['content'] == body
@@ -287,3 +293,18 @@ def test_import_summary_does_not_spawn_after_contribution_revocation(case):
     assert not marker.exists()
     assert engine.store.db.execute('SELECT summary_status FROM transcript_tasks').fetchone()[0] == 'cancelled'
     assert 'saved result' in engine.store.drafts_changed()[0]['content']
+
+
+def test_missing_history_job_is_reported_and_not_exported(case):
+    from mindie_knowledge.loop.export import build_batch
+    engine, source = case
+    append(source, message('saved historical result'))
+    first = contribute(case)
+    assert first['summary']['status'] == 'failed'
+    with engine.store._write_txn():
+        engine.store.db.execute('DELETE FROM transcript_tasks')
+    result = contribute(case)
+    assert result['status'] == 'unchanged'
+    assert result['summary']['status'] == 'missing'
+    assert not engine.store.has_changed_drafts(generation=engine._settings().generation, ready_only=True)
+    assert build_batch(engine.store, settings=engine._settings()) is None

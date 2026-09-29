@@ -420,6 +420,8 @@ class Store:
             CREATE INDEX IF NOT EXISTS captures_by_status ON captures(status, created);
             CREATE INDEX IF NOT EXISTS summaries_pending ON transcript_tasks(summary_due, updated)
                 WHERE summary_status='pending';
+            CREATE INDEX IF NOT EXISTS summaries_by_entry ON transcript_tasks(entry_id);
+            CREATE INDEX IF NOT EXISTS imports_by_entry ON history_imports(entry_id);
             CREATE INDEX IF NOT EXISTS outbox_by_status ON outbox(status, next_attempt, created);
         """)
         self._init_search_index()
@@ -433,6 +435,10 @@ class Store:
         self.capture_floor = float(self.db.execute(
             "SELECT value FROM meta WHERE key='capture_floor'"
         ).fetchone()[0])
+        if self.db.execute("SELECT 1 FROM meta WHERE key='required-transcript-summary'").fetchone() is None:
+            self.db.execute("UPDATE transcript_tasks SET summary_status='failed', "
+                            "summary_detail='configuration: summary was not run' WHERE summary_status='excerpt'")
+            self.db.execute("INSERT INTO meta VALUES('required-transcript-summary', '1')")
         # Legacy one-time migration at the single atomic storage boundary:
         # the retired maintenance pause latch left captures parked with
         # reason='maintenance-paused', eligible=0. Clear the latch and re-due
@@ -1281,7 +1287,7 @@ class Store:
         "WHERE entry_quarantine.entry_id=entries.entry_id)"
     )
 
-    def _changed_draft_refs(self, generation, limit=None):
+    def _changed_draft_refs(self, generation, limit=None, *, ready_only=False):
         sql = "SELECT entries.entry_id, entries.draft_revision FROM entries "
         params = []
         if generation is not None:
@@ -1292,17 +1298,22 @@ class Store:
         sql += ("WHERE entries.draft_revision IS NOT NULL "
                 "AND entries.draft_revision != COALESCE(entries.batched_revision, '') "
                 f"AND {self._NOT_WITHDRAWN} AND {self._NOT_QUARANTINED}")
+        if ready_only:
+            sql += (" AND NOT EXISTS (SELECT 1 FROM transcript_tasks t "
+                    "WHERE t.entry_id=entries.entry_id AND t.summary_status!='complete')"
+                    " AND (NOT EXISTS (SELECT 1 FROM history_imports h WHERE h.entry_id=entries.entry_id)"
+                    " OR EXISTS (SELECT 1 FROM transcript_tasks t WHERE t.entry_id=entries.entry_id))")
         if limit is not None:
             sql += ' LIMIT ?'
             params.append(limit)
         return self.db.execute(sql, params)
 
-    def has_changed_drafts(self, *, generation=None):
+    def has_changed_drafts(self, *, generation=None, ready_only=False):
         """Check the same publication eligibility without loading any body."""
         with self.lock:
-            return self._changed_draft_refs(generation, limit=1).fetchone() is not None
+            return self._changed_draft_refs(generation, limit=1, ready_only=ready_only).fetchone() is not None
 
-    def drafts_changed(self, *, generation=None):
+    def drafts_changed(self, *, generation=None, ready_only=False):
         """Draft revision bodies not yet included in any outbox batch.
 
         Read from the revisions table, never the visible ``entries.doc``: for a
@@ -1315,9 +1326,22 @@ class Store:
         longer carries is never a new publication; a quarantined entry stays
         out of automatic batches."""
         with self.lock:
-            rows = self._changed_draft_refs(generation).fetchall()
+            rows = self._changed_draft_refs(generation, ready_only=ready_only).fetchall()
             return [self._revision_doc(r["entry_id"], r["draft_revision"])
                     for r in rows]
+
+    def summary_ready(self, doc):
+        """A transcript summary must describe the exact body being exported.
+
+        Other entry producers have no transcript job and keep their own
+        validation contract. A stale summary cannot authorize a newer body.
+        """
+        with self.lock:
+            tasks = self.db.execute('SELECT summary_status,body_digest FROM transcript_tasks WHERE entry_id=?',
+                                    (doc['entry_id'],)).fetchall()
+            if not tasks and self.db.execute('SELECT 1 FROM history_imports WHERE entry_id=?', (doc['entry_id'],)).fetchone():
+                return False
+        return all(t['summary_status'] == 'complete' and t['body_digest'] == digest(doc['content']) for t in tasks)
 
     def draft_headers(self, *, owner=None, limit=6, excerpt=1200,
                       generation=None, query=""):

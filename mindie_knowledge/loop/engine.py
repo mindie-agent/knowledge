@@ -1595,7 +1595,7 @@ class Engine:
             self.queue.task_done()
 
     def _summary_loop(self):
-        """Optional metadata never occupies the body capture worker."""
+        """Required transcript metadata runs outside the body capture worker."""
         from .transcript_capture import summarize_due
         while not self.stop.wait(0.5):
             if self._is_frozen():
@@ -1766,7 +1766,7 @@ class Engine:
                             finally:
                                 self.end_work()
                     material = self.store.has_changed_drafts(
-                        generation=generation
+                        generation=generation, ready_only=True
                     ) or self.store.unbatched_votes(generation=generation)
                     if material:
                         idle_for = time.monotonic() - self.last_activity
@@ -1864,7 +1864,8 @@ class Engine:
         return dict(
             **self.store.status(),
             capture_pipeline=self.capture_mode,
-            summary_mode="optional-model" if self.summary_command else "source-excerpt",
+            summary_mode=("required-model" if self.summary_command else "configuration-error")
+                         if self.capture_mode == "public-transcript" else "organizer",
             maintenance_pending=self.queue.unfinished_tasks,
             maintenance_budget=self.budget.status(),
             sharing=settings.public_status(),

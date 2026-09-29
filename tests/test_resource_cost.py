@@ -63,6 +63,7 @@ def test_latest_draft_survives_restart_without_mirror_or_history(tmp_path):
 
 def test_poll_work_does_not_scale_with_completed_history(store):
     MaintenanceBudget(store)
+    draft(store)
     with store.db:
         store.db.executemany(
             "INSERT INTO captures(id,root_session,session,turn,summary,status,detail,created) "
@@ -77,6 +78,7 @@ def test_poll_work_does_not_scale_with_completed_history(store):
     steps = []
     store.db.set_progress_handler(lambda: steps.append(1) or 0, 100)
     try:
+        assert store.has_changed_drafts(generation="allowed", ready_only=True)
         assert store.due_capture() is None
         assert store.due_application() is None
         assert store.db.execute("SELECT * FROM transcript_tasks WHERE summary_status='pending' "

@@ -57,8 +57,9 @@ def process(engine, path, turn, **kwargs):
     return row
 
 
-def test_body_is_saved_without_runner_and_export_preserves_it(pipeline):
+def test_capture_saves_body_but_export_waits_for_summary(pipeline):
     engine, store, path = pipeline
+    engine.summary_command = [sys.executable, '-c', 'print(\'{"title":"Synthetic case", "summary":"Reported eight-token result."}\')']
     append(path, 'Synthetic NPU case: eager inference returned 8 tokens. Reported result, not a readiness claim.')
     row = process(engine, path, 'first', summary='private raw native answer')
     assert row['summary'] == ''
@@ -68,12 +69,30 @@ def test_body_is_saved_without_runner_and_export_preserves_it(pipeline):
     assert store.db.execute('SELECT COUNT(*) FROM maintenance_attempts').fetchone()[0] == 0
     from mindie_knowledge.loop.export import build_batch
     from mindie_knowledge.loop.documents import parse_entry
+    assert build_batch(store, settings=engine._settings()) is None
+    engine.last_activity = time.monotonic() - 10
+    with store._write_txn():
+        store.db.execute('UPDATE transcript_tasks SET summary_due=0')
+    transcript_capture.summarize_due(engine)
     batch_id = build_batch(store, settings=engine._settings())[0]
     batch = store.batch(batch_id)
     payload = json.loads(batch['batch'])
     assert len(payload['files']) == 1
     public = parse_entry(payload['files'][0]['content'].encode())
     assert public['content'] == docs[0]['content']
+
+
+def test_missing_summary_is_configuration_failure_not_publishable_excerpt(pipeline):
+    from mindie_knowledge.loop.export import build_batch
+    engine, store, path = pipeline
+    append(path, 'Stored locally while the configured summary worker is missing.')
+    process(engine, path, 'first')
+    assert len(store.drafts_changed()) == 1
+    assert engine.status()['summary_mode'] == 'configuration-error'
+    task = dict(store.db.execute('SELECT * FROM transcript_tasks').fetchone())
+    assert task['summary_status'] == 'failed' and 'configuration' in task['summary_detail']
+    assert not store.has_changed_drafts(generation=engine._settings().generation, ready_only=True)
+    assert build_batch(store, settings=engine._settings()) is None
 
 
 def test_corrupt_only_page_keeps_a_diagnostic_and_allows_later_public_text(pipeline):
@@ -140,6 +159,8 @@ def test_summary_cannot_rewrite_body_and_failure_does_not_block(pipeline):
     assert store.drafts_changed()[0]['content'] == before
     task = dict(store.db.execute('SELECT * FROM transcript_tasks').fetchone())
     assert task['summary_status'] == 'failed'
+    from mindie_knowledge.loop.export import build_batch
+    assert build_batch(store, settings=engine._settings()) is None
     assert store.status()['transcript_summaries'] == {'failed': 1}
     engine.summary_command = [sys.executable, '-c', 'raise Exception("must not retry same version")']
     transcript_capture.summarize_due(engine)
@@ -497,3 +518,21 @@ def test_corrupt_record_does_not_lose_valid_neighbors(tmp_path, scanner, harness
         engine._process(second['id'])
         final = store.drafts_changed()[0]['content']
         assert final.count('before-bad-marker') == final.count('after-bad-marker') == final.count('later-marker') == 1
+
+
+def test_summary_of_previous_body_does_not_release_a_new_body(pipeline):
+    from mindie_knowledge.loop.export import build_batch
+    engine, store, path = pipeline
+    engine.summary_command = [sys.executable, '-c', 'print(\'{"title":"Synthetic case", "summary":"First reported result."}\')']
+    append(path, 'first result')
+    process(engine, path, 'first')
+    engine.last_activity = time.monotonic() - 10
+    with store._write_txn():
+        store.db.execute('UPDATE transcript_tasks SET summary_due=0')
+    transcript_capture.summarize_due(engine)
+    original = store.drafts_changed()[0]
+    assert store.summary_ready(original)
+    changed, _ = store.append_observation(original['entry_id'], 'new evidence', marker='b' * 32,
+                                           generation=engine._settings().generation)
+    assert not store.summary_ready(changed)
+    assert build_batch(store, settings=engine._settings()) is None

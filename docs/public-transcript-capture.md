@@ -29,18 +29,21 @@ results remain held for inspection. Neither recovery route can call a body
 model or apply its result in public-transcript mode. Appends refresh the source
 excerpt and excerpt title so retrieval does not keep showing an earlier superseded observation.
 
-Without `summary_command`, a clearly labeled source excerpt supplies the title
-and retrieval introduction. An optional summary argv receives redacted source
-text and `partial` (true for bounded first/last excerpts). It must return exactly
-`title` and `summary`. There is no body field. A compare-and-apply check retains
-the exact saved body and ignores a result for an obsolete body version. Attempts
-coalesce after body writes and are reserved before spawning, once per version;
-failure or restart retains the body and excerpt. Unavailable authority parks
-the pending metadata task; revoked tasks cannot starve later active tasks.
-The service reports summary states separately. Partial-source summaries receive
-an enforced excerpt label even if the model omits that qualification.
+Title/summary organization is required for a transcript contribution. A missing
+`summary_command` is a configuration failure. The local body can still be saved,
+but pending, failed, missing or stale summary work cannot enter a new export batch.
+An excerpt is only a local unprocessed preview, never a replacement for completion.
+The worker receives redacted source text and must return exactly `title` and
+`summary`; it cannot rewrite the body. Compare-and-apply preserves the exact saved
+body. Attempts are coalesced and reserved before spawning. Failure is visible in
+summary status, including safe process categories; source-bearing errors are not
+persisted. Unavailable authority parks work and revocation prevents application.
+
+The current implementation sends the complete body. It has no token-aware long
+input organization path. First/last excerpts are not a valid substitute for
+complete organization. Incremental semantic body organization remains unimplemented.
 
 The scanner detects rule-defined secrets and identifiers, not proprietary
 meaning. Existing project authorization is required. A downstream review bot
-is not a pre-upload secret boundary. Optional summary availability is reported
-separately from body capture and publication readiness.
+is not a pre-upload secret boundary. Body capture, required metadata organization and publication readiness are
+reported separately.
