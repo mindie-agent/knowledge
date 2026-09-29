@@ -130,11 +130,15 @@ class Engine:
         self.queue = queue.Queue(maxsize=8)
         self.stop = threading.Event()
         self._cancel = threading.Event()
+        self._summary_cancel = threading.Event()
         self.thread = threading.Thread(
             target=self.run, name="mindie-maintenance", daemon=True
         )
         self.outbox_thread = threading.Thread(
             target=self._outbox_loop, name="mindie-outbox", daemon=True
+        )
+        self.summary_thread = threading.Thread(
+            target=self._summary_loop, name="mindie-summary", daemon=True
         )
         self.errors = []
         self.last_activity = time.monotonic()
@@ -633,12 +637,14 @@ class Engine:
         if status in {"ok", "unchanged"}:
             if status == "ok" and inc["end"] > inc["start"]:
                 # Consumed bytes held no public material; consume them visibly.
+                detail = canonical(dict(note="no public material",
+                                        discarded_records=inc.get('discarded_records', [])))
                 region_id = reserve(inc["start"], inc["end"], inc["digest"],
-                                    status="succeeded", detail="no public material")
+                                    status="succeeded", detail=detail)
                 if region_id is None:
                     self._defer_reread(row["id"])
                     return None
-                self.store.finish_region(region_id, "succeeded")
+                self.store.finish_region(region_id, "succeeded", detail)
             if inc.get("more") and inc["end"] > inc["start"]:
                 self.store.defer_capture(row["id"], due=time.time()+1,
                                          reason="noise scanned; more authorized bytes remain")
@@ -1493,7 +1499,7 @@ class Engine:
 
     def start(self):
         with self.store.lock, self.store.db:
-            self.store.db.execute("UPDATE transcript_tasks SET summary_status='failed', summary_detail='interrupted; body retained' WHERE summary_status='running'")
+            self.store.db.execute("UPDATE transcript_tasks SET summary_status='pending', summary_detail='interrupted; body retained', summary_due=? WHERE summary_status='running'", (time.time() + 30,))
             self.store.db.execute(
                 "UPDATE captures SET status='failed', "
                 "detail='service restarted after input reservation; not replaying' "
@@ -1522,6 +1528,8 @@ class Engine:
         self.store.arm_apply_continuations()
         self.thread.start()
         self.outbox_thread.start()
+        if self.capture_mode == "public-transcript" and self.summary_command:
+            self.summary_thread.start()
 
     def revoke_stale(self):
         """Restart/poll-edge safety net: when sharing is enabled, pending
@@ -1555,9 +1563,6 @@ class Engine:
                             self.end_work()
                     elif not ident:
                         self._apply_due()
-                        if self.capture_mode == "public-transcript":
-                            from .transcript_capture import summarize_due
-                            summarize_due(self)
                 except (MaintenanceCancelled, AdmissionUnreadable, CursorConflict,
                         GateFault):
                     continue
@@ -1589,11 +1594,24 @@ class Engine:
                 break
             self.queue.task_done()
 
+    def _summary_loop(self):
+        """Optional metadata never occupies the body capture worker."""
+        from .transcript_capture import summarize_due
+        while not self.stop.wait(0.5):
+            if self._is_frozen():
+                continue
+            try:
+                summarize_due(self)
+            except Exception as exc:
+                self._unexpected("knowledge.summary", "run", exc)
+                return
+
     # ---------------------------------------------------------------- outbox
 
     def _cancel_unsent(self, reason):
         """Sharing revocation cancels pending timers and unsent contributions."""
         self._cancel.set()
+        self._summary_cancel.set()
         for batch in self.store.outbox_pending():
             self.store.mark_batch(batch["batch_id"], "disabled", detail=reason)
         with self.store._write_txn():
@@ -1774,12 +1792,15 @@ class Engine:
     def shutdown(self):
         self.stop.set()
         self._cancel.set()
+        self._summary_cancel.set()
         try:
             self.queue.put_nowait(None)
         except queue.Full:
             pass
         self.thread.join(timeout=10)
         self.outbox_thread.join(timeout=5)
+        if self.summary_thread.ident is not None:
+            self.summary_thread.join(timeout=10)
 
     # ---------------------------------------------------------------- status
 
@@ -1859,4 +1880,5 @@ class Engine:
             worker_alive=self.thread.is_alive() and not self._worker_failed,
             worker_failed=bool(self._worker_failed),
             outbox_alive=self.outbox_thread.is_alive(),
+            summary_alive=self.summary_thread.is_alive(),
         )

@@ -38,13 +38,6 @@ KINDS = ("knowledge", "experience")
 # whole (normalized doc interface); what must never happen is materializing
 # the whole LIBRARY or rejecting its growth.
 MAX_FILE_BYTES = 100 * 1024 * 1024
-# Frontmatter is small structured metadata; an oversized header is malformed.
-MAX_HEADER_BYTES = 64 * 1024
-MAX_TITLE = 240
-MAX_SUMMARY_BYTES = 2048
-MAX_CONDITION_KEY = 128
-MAX_CONDITION_VALUE = 512
-
 DOMAIN_RE = re.compile(r"[a-z][a-z0-9-]{0,63}")
 HEX_RE = re.compile(r"[0-9a-f]{64}")
 
@@ -98,14 +91,12 @@ def revision_of(doc: dict) -> str:
     return digest({key: doc[key] for key in FIELDS if key != "revision"})
 
 
-def _text(value, name, limit, *, nonempty=True):
+def _text(value, name, *, nonempty=True):
     if not isinstance(value, str):
         raise ValueError(f"{name} must be text")
     value = value.strip() if nonempty else value
     if nonempty and not value:
         raise ValueError(f"{name} must be nonempty")
-    if len(value) > limit:
-        raise ValueError(f"{name} exceeds {limit} characters")
     return value
 
 
@@ -145,22 +136,21 @@ def validate(doc: dict) -> dict:
         raise ValueError("invalid domain")
     if doc["kind"] not in KINDS:
         raise ValueError("kind must be knowledge or experience")
-    _text(doc["title"], "title", MAX_TITLE)
+    _text(doc["title"], "title")
     if doc["title"] != doc["title"].strip():
         raise ValueError("title must be canonical (no surrounding whitespace)")
     if not isinstance(doc["summary"], str):
         raise ValueError("summary must be text")
     if doc["summary"] != doc["summary"].strip():
         raise ValueError("summary must be canonical (no surrounding whitespace)")
-    _bytes(doc["summary"], "summary", MAX_SUMMARY_BYTES)
     if not doc["summary"]:
         raise ValueError("summary must be nonempty")
     conditions = doc["conditions"]
     if not isinstance(conditions, dict):
         raise ValueError("conditions must be an object")
     for key, value in conditions.items():
-        _text(key, "condition key", MAX_CONDITION_KEY)
-        _text(value, f"condition {key!r}", MAX_CONDITION_VALUE)
+        _text(key, "condition key")
+        _text(value, f"condition {key!r}")
         if key != key.strip() or value != value.strip():
             raise ValueError("conditions must be canonical text")
     if not isinstance(doc["content"], str) or not doc["content"].strip():
@@ -171,9 +161,6 @@ def validate(doc: dict) -> dict:
     # the canonical Markdown file must fit; there is no cumulative cap.
     if len(doc["content"].encode("utf-8")) > MAX_FILE_BYTES:
         raise DraftFull("content exceeds the per-file platform envelope")
-    # Structured metadata stays byte-bounded at create/render/parse alike.
-    if _header_bytes(doc) > MAX_HEADER_BYTES:
-        raise ValueError("entry frontmatter exceeds the metadata byte limit")
     if revision_of(doc) != doc["revision"]:
         raise ValueError("revision does not match the canonical fields")
     return doc
@@ -251,10 +238,6 @@ def parse_entry(markdown) -> dict:
     end = text.find("\n---\n", 4)
     if end == -1:
         raise ValueError("unterminated YAML frontmatter block")
-    if len(text[4:end].encode("utf-8")) > MAX_HEADER_BYTES:
-        # The frontmatter is bounded structured metadata; an oversized header
-        # is malformed, never handed to the YAML loader.
-        raise ValueError("entry frontmatter exceeds the metadata byte limit")
     try:
         header = yaml.load(text[4:end], Loader=_UniqueKeyLoader)
     except (yaml.YAMLError, TypeError):

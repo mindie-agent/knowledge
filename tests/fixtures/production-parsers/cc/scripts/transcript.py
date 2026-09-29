@@ -21,7 +21,6 @@ MAX_WINDOW = 256 * 1024
 MAX_TEXT = 48 * 1024
 MAX_RECORDS = 200
 ANCHOR_BYTES = 512
-RECORD_LIMIT = 1024 * 1024
 MS_THRESHOLD = 1e12
 PUBLIC_TYPES = {"user", "assistant"}
 SKIP_TYPES = {
@@ -131,17 +130,6 @@ def to_seconds(raw):
     return stamp.timestamp()
 
 
-def _clip(text, limit):
-    if not isinstance(text, str):
-        text = json.dumps(text, ensure_ascii=False) if text is not None else ""
-    raw = text.encode("utf-8")
-    if len(raw) <= limit:
-        return text
-    head = raw[: limit // 2].decode("utf-8", "ignore")
-    tail = raw[-limit // 2 :].decode("utf-8", "ignore")
-    return f"{head}\n[field truncated; {len(raw)} bytes]\n{tail}"
-
-
 def _session_in_path(path) -> str | None:
     match = SESSION_FILE.search(Path(path).name)
     return match.group(1) if match else None
@@ -155,29 +143,6 @@ def _block_text(block):
         return None
     if btype == "text" and isinstance(block.get("text"), str):
         return ("text", block["text"])
-    if btype == "tool_use":
-        name = block.get("name") if isinstance(block.get("name"), str) else ""
-        ident = block.get("id") if isinstance(block.get("id"), str) else ""
-        args = block.get("input")
-        return (
-            "tool",
-            f"{_clip(name, 120)} call_id={_clip(ident, 256)} {_clip(args, 8192)}",
-        )
-    if btype == "tool_result":
-        ident = block.get("tool_use_id") if isinstance(block.get("tool_use_id"), str) else ""
-        content = block.get("content")
-        output = ""
-        if isinstance(content, str):
-            output = content
-        elif isinstance(content, list):
-            chunks = []
-            for item in content:
-                if isinstance(item, dict) and item.get("type") == "text":
-                    text = item.get("text")
-                    if isinstance(text, str):
-                        chunks.append(text)
-            output = "\n".join(chunks)
-        return ("output", f"call_id={_clip(ident, 256)} {_clip(output, 8192)}")
     return None
 
 
@@ -207,7 +172,7 @@ def _extract(record):
         if not text or _is_command_only(text):
             return None
         kind = "user" if rtype == "user" else "assistant"
-        return (kind, _clip(text, 12288))
+        return (kind, text)
     if not isinstance(content, list):
         return None
     chunks = []
@@ -230,7 +195,7 @@ def _extract(record):
     if len(chunks) == 1:
         return chunks[0]
     joined = "\n".join(item[1] for item in chunks)
-    return (chunks[0][0], _clip(joined, 12288))
+    return (chunks[0][0], joined)
 
 
 def read_material(
@@ -247,13 +212,13 @@ def read_material(
 ):
     if type(start) is not int or start < 0:
         raise ValueError("start must be a nonnegative offset")
-    if not 1024 <= max_scan_bytes <= 64 * 1024 * 1024 or not 0 < max_seconds <= 30:
+    if max_scan_bytes <= 0 or max_seconds <= 0:
         raise ValueError("invalid scan budget")
     if scan_until is not None and (
         type(scan_until) is not int or scan_until < start
     ):
         raise ValueError("scan_until must be an exact byte boundary at or after start")
-    if not 16384 <= max_text_bytes <= MAX_TEXT:
+    if max_text_bytes <= 0:
         raise ValueError("invalid text budget")
     boundary = to_seconds(not_before) if not_before is not None else None
     result = dict(
@@ -327,39 +292,38 @@ def read_material(
                 return result
             stream.seek(max(0, start - 1))
             middle = start > 0 and stream.read(1) != b"\n"
+            if middle:
+                result.update(status="invalid-boundary", coverage_note="cursor is not a whole-record boundary")
+                return result
             stream.seek(start)
             end_limit = min(stat.st_size, start + max_scan_bytes)
             if scan_until is not None:
                 end_limit = min(end_limit, scan_until)
             while stream.tell() < end_limit and time.monotonic() - begun < max_seconds:
                 offset = stream.tell()
-                room = end_limit - offset
-                raw = stream.readline(min(RECORD_LIMIT + 1, room))
+                # Page targets apply between records; every message stays whole.
+                room = stat.st_size - offset
+                if scan_until is not None:
+                    room = min(room, scan_until - offset)
+                raw = stream.readline(room)
                 if not raw:
                     break
-                complete = raw.endswith(b"\n")
-                oversize = middle or len(raw) > RECORD_LIMIT or (
-                    not complete
-                    and offset == start
-                    and len(raw) == max_scan_bytes
-                    and end_limit < stat.st_size
-                )
-                if not complete and not oversize:
+                if not raw.endswith(b"\n"):
                     result["partial"] = offset + len(raw) == stat.st_size
                     break
-                if oversize:
-                    consumed.update(raw)
-                    result["end"] = stream.tell()
-                    result["oversize_records"] += 1
-                    result["coverage"].append(
-                        dict(start=offset, end=stream.tell(), reason="oversize record skipped")
-                    )
-                    middle = not complete
-                    continue
                 try:
                     record = json.loads(raw)
                 except (ValueError, UnicodeDecodeError):
                     record = None
+                if not isinstance(record, dict):
+                    # A corrupt complete record is isolated, never exported.
+                    # Its byte position is retained without copying raw content.
+                    result.setdefault("discarded_records", []).append(
+                        dict(start=offset, end=stream.tell(), reason="invalid record"))
+                    consumed.update(raw)
+                    result["end"] = stream.tell()
+                    result["skipped_records"] += 1
+                    continue
                 extracted = None
                 stamp = None
                 if isinstance(record, dict):
@@ -373,30 +337,26 @@ def read_material(
                     else:
                         extracted = _extract(record)
                 if extracted and extracted[1]:
-                    if boundary is not None and (stamp is None or stamp < boundary):
-                        if stamp is None:
-                            result["timestamps_reliable"] = False
+                    if boundary is not None and stamp is None:
+                        # Without a timestamp this record is not authorized.
+                        # Omit only this record; later dated messages can proceed.
+                        result.setdefault("discarded_records", []).append(
+                            dict(start=offset, end=stream.tell(), reason="missing public timestamp"))
+                        consumed.update(raw)
+                        result["end"] = stream.tell()
+                        result["skipped_records"] += 1
+                        continue
+                    if boundary is not None and stamp < boundary:
                         extracted = None
                     else:
                         kind, text = extracted
-                        label = (
-                            f"[{kind} timestamp={stamp if stamp is not None else 'unknown'} "
-                            f"bytes={offset}:{stream.tell()}]"
-                        )
-                        rendered = label + "\n" + text
+                        text = text.replace("\r\n", "\n").replace("\r", "\n")
+                        rendered = f"### {kind}\n{text}"
                         size = len(rendered.encode()) + 2
-                        if text_size + size > max_text_bytes or len(included) >= MAX_RECORDS:
+                        if included and (text_size + size > max_text_bytes or len(included) >= MAX_RECORDS):
                             break
                         included.append(rendered)
                         text_size += size
-                        if "[field truncated;" in text:
-                            result["coverage"].append(
-                                dict(
-                                    start=offset,
-                                    end=stream.tell(),
-                                    reason="field head/tail truncation",
-                                )
-                            )
                 if not extracted or not extracted[1]:
                     result["skipped_records"] += 1
                 consumed.update(raw)
@@ -411,6 +371,8 @@ def read_material(
         records=len(included),
     )
     established = expected is not None or result.get("session_match") is True
+    if result["status"] != "ok":
+        return result
     if result["end"] == start:
         result["status"] = "unchanged"
     elif not recognized and not (

@@ -87,6 +87,10 @@ def _replace(path, data):
         Path(name).unlink(missing_ok=True)
 
 
+class ScannerUnavailable(OSError):
+    """Retry local deterministic work after the scanner becomes available."""
+
+
 def redact(text, *, executable, key, private_paths=()):
     if not executable or not Path(executable).is_absolute():
         raise ValueError("transcript redaction requires an installed scanner")
@@ -106,9 +110,9 @@ def redact(text, *, executable, key, private_paths=()):
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except (OSError, subprocess.TimeoutExpired):
-            raise ValueError("transcript secret scanner unavailable") from None
+            raise ScannerUnavailable("transcript secret scanner unavailable") from None
     if result.returncode != 0:
-        raise ValueError("transcript secret scanner failed")
+        raise ScannerUnavailable("transcript secret scanner failed")
     try:
         findings = json.loads(result.stdout or b"[]")
         if not isinstance(findings, list):
@@ -135,7 +139,7 @@ def redact(text, *, executable, key, private_paths=()):
                 spans.append((start, start + len(secret), "secret-" + item["RuleID"]))
                 found = text.find(match, found + len(match), hi)
     except (ValueError, KeyError, TypeError, IndexError):
-        raise ValueError("transcript secret scanner returned invalid spans") from None
+        raise ScannerUnavailable("transcript secret scanner returned invalid spans") from None
     spans.extend((f.start, f.end, f.rule) for f in scan_text(text))
     for path in private_paths:
         if not isinstance(path, str) or len(path) < 3:

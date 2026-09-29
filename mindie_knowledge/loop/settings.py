@@ -29,8 +29,10 @@ install/upgrade/entry boundary.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import os
 import re
 import secrets
 import time
@@ -67,9 +69,11 @@ def normalized_roots(value):
         isinstance(item, str) and Path(item).is_absolute() for item in value
     ):
         raise ValueError("'project_roots' must be absolute paths")
-    return [
-        str(Path(item).expanduser().resolve(strict=False)) for item in value
-    ]
+    roots = {}
+    for item in value:
+        path = str(Path(item).expanduser().resolve(strict=False))
+        roots.setdefault(path.casefold() if os.name == 'nt' else path, path)
+    return list(roots.values())
 
 
 def bounded_idle(value):
@@ -380,11 +384,6 @@ def load(path) -> CommunitySettings:
         return CommunitySettings(
             path, {}, error="settings file is unreadable", state="unreadable",
         )
-    if len(raw) > 64 * 1024:
-        return CommunitySettings(
-            path, {}, error="settings file exceeds the byte limit",
-            state="corrupt",
-        )
     try:
         data = json.loads(raw)
     except ValueError:
@@ -412,6 +411,51 @@ _MANAGED_KEYS = frozenset({
     "schema", "enabled", "generation", "enabled_at", "repository",
     "branch", "project_roots", "idle_seconds",
 })
+
+
+def transition(previous, requested):
+    """Compare the current authority with a complete requested document.
+
+    Repeating a request is a no-op. Only a changed contribution policy starts
+    a new generation; runtime wiring and delivery preferences never revoke
+    accepted work. Caller-supplied generation/time values are not authority.
+    """
+    old = previous if isinstance(previous, dict) else {}
+    data = dict(requested)
+    data['schema'] = SCHEMA
+    data['project_roots'] = normalized_roots(data.get('project_roots', []))
+    policy = ('enabled', 'repository', 'branch', 'visibility', 'account', 'fork')
+    data['branch'] = data.get('branch') or 'main'
+    def roots(value):
+        return {str(Path(item).resolve()).casefold() if os.name == 'nt'
+                else str(Path(item).resolve()) for item in value.get('project_roots', [])}
+    try:
+        prior = normalize(old)
+    except (ValueError, TypeError):
+        prior = {}
+    changed = (not prior.get('generation')
+               or any(prior.get(key) != data.get(key) for key in policy)
+               or roots(prior) != roots(data))
+    if not changed:
+        # Scope order and path aliases do not express a new user choice.
+        data['project_roots'] = prior['project_roots']
+    # An enable interrupted between the settings and consent writes must
+    # resume the same boundary. The saved opt-out already has an identity
+    # (choice + choice_at); derive one generation for this policy/choice.
+    # A later explicit opt-out gets a new choice_at and a new generation.
+    resumed_generation = None
+    if data.get('enabled') and CONSENT_FIELD in data:
+        consent = CommunitySettings(None, data).consent or {}
+        if consent.get('state') == 'ok' and consent.get('choice') in {'read-only', 'later', 'disabled'}:
+            intent = [SCHEMA, data[CONSENT_FIELD], consent['choice'], consent.get('choice_at'),
+                      [data.get(key) for key in policy], sorted(roots(data))]
+            resumed_generation = hashlib.sha256(json.dumps(intent, ensure_ascii=True,
+                separators=(',', ':')).encode('utf-8')).hexdigest()[:32]
+            changed |= prior.get('generation') != resumed_generation
+    data['generation'] = (resumed_generation or secrets.token_hex(16)) if changed else old['generation']
+    data['enabled_at'] = ((time.time() if changed else old.get('enabled_at'))
+                          if data.get('enabled') else None)
+    return normalize(data)
 
 
 def _settings_lock_path(path):
@@ -467,10 +511,29 @@ class CommunityWriteContext:
         self._require_held()
         return load(path)
 
+    def configure(self, path, requested):
+        """Install/configure through the same transition as explicit toggles.
+
+        A default installation never overwrites an existing saved policy.
+        """
+        self._require_held()
+        state = load(path)
+        if state.state in ('corrupt', 'unreadable') and not state.schema_ok:
+            raise ValueError('existing community settings are damaged; bytes preserved')
+        if requested is None and state.schema_ok:
+            return state
+        data = dict(state.raw)
+        data.update(requested or dict(enabled=False, repository=None,
+                    project_roots=[], branch='main', idle_seconds=300))
+        data = transition(state.raw, data)
+        if data != state.raw:
+            _atomic_write(Path(path), data)
+        return load(path)
+
     def write(self, path, *, enabled, repository, project_roots, branch="main",
               idle_seconds=DEFAULT_IDLE_SECONDS, **extensions):
-        """Managed mutation: fresh ``generation`` per call, ``enabled_at`` on
-        the off->on edge. Field preservation merges over the CURRENT on-disk
+        """Managed mutation: transition only when authorization changes.
+        Field preservation merges over the CURRENT on-disk
         document read inside this lock — never over a caller's stale
         pre-lock snapshot. A corrupt or unreadable existing file fails with
         ValueError and is left byte-identical (no implicit repair); a missing
@@ -493,15 +556,9 @@ class CommunityWriteContext:
                 f"cannot write over a {state.state} community settings file"
             )
         data = dict(state.raw)
-        was_enabled = state.raw.get("enabled") is True
         data.update({
             "schema": SCHEMA,
             "enabled": bool(enabled),
-            "generation": secrets.token_hex(16),
-            "enabled_at": (
-                time.time() if enabled and not was_enabled
-                else state.raw.get("enabled_at") if enabled else None
-            ),
             "repository": repository,
             "branch": branch,
             "project_roots": [str(Path(root).expanduser().resolve(strict=False))
@@ -513,7 +570,9 @@ class CommunityWriteContext:
                 data.pop(key, None)
             else:
                 data[key] = value
-        _atomic_write(target, data)
+        data = transition(state.raw, data)
+        if data != state.raw:
+            _atomic_write(target, data)
         return load(target)
 
     def update_extensions(self, path, **fields):
@@ -569,8 +628,8 @@ def write(path, *, enabled, repository, project_roots, branch="main",
           idle_seconds=DEFAULT_IDLE_SECONDS, **extensions):
     """One-shot managed mutation: acquires the write boundary once.
 
-    Every mutation sets a fresh nonempty opaque string ``generation`` so
-    concurrent runtimes observe the change on their next read. Extension keys
+    Only a contribution policy change creates a new ``generation``.
+    Repeated enable/disable/configure calls preserve accepted work. Extension keys
     already present in the file (fork/bot/transaction/…) are preserved across
     toggles; one component must not silently delete another component's
     private configuration. Adapters migrating or writing across a

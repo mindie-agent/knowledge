@@ -1,13 +1,12 @@
 # MindIE domain loop
 
-`mindie-knowledge` is the single-domain runtime. Configuration requires `root`
-and `domain`; optional keys are `agent_command` (argv for the maintenance
-runner), `community_config` (shared `mindie-community-config/1` settings file),
-`admission_path` (the harness's explicit neutral admission SQLite file, owned
-by core's `Admission` API), `transcript_adapter` (absolute local parser module
-path exporting `FileIdentity`/`identify`/`read_material`; without it capture
-is honest summary-only) and `feeds`. The legacy `session_activation` adapter
-config indirection is rejected, not aliased.
+`mindie-knowledge` owns deterministic capture, local storage and contribution.
+Current adapters select `capture_mode: public-transcript`, their own
+`transcript_adapter`, an installed `redactor_executable`, and an optional
+`summary_command`. They also supply `root`, `domain`, `community_config` and
+`admission_path`. Model choice is adapter-owned implementation, not a user
+configuration step. Legacy `agent_command` is retained only for old installations
+and stored recovery records; current setup and update never select that path.
 
 ## Persistent choice and internal task binding
 
@@ -23,7 +22,10 @@ lock and reload the current document while holding it. A migration stamp
 uses core normalization; damaged, foreign or rejected documents keep their
 bytes and report a fault. A missing first-install document can be created;
 explicit managed configuration may repair parseable current-schema values.
-Ordinary reads do not migrate, repair or rewrite settings.
+Ordinary reads do not migrate, repair or rewrite settings. Repeating enable or
+configure preserves the generation, authorization time and accepted work. Only
+an actual contribution policy change starts a new generation; runtime wiring
+and delivery timing do not revoke authorization.
 
 ## The gate
 
@@ -54,94 +56,37 @@ backoff and unsent batches are held, all resuming once the authority is
 restored and revalidates. Repairing a damaged file is the user's explicit
 action and is never re-onboarding.
 
-## Capture and bounded increments
+## Public transcript capture
 
-The Stop hook (`capture_hook`, also `hook --config`) validates the bounded
-envelope and, when sharing and the current activation allow it, commits one
-capture row before it returns. That commit is local acceptance. The hook does
-not open the transcript. If the store is missing, locked, or not migrated, it
-returns unavailable and does not insert. A live worker is a separate stage:
-`worker_alive` on the status RPC, not a `processing` row. When the row is
-still unprocessed and the service process is absent, the hook requests one
-coalesced model-free wake. Hook stdout stays `{}`. Query startup remains
-`ensure_service`, which also prepares the store schema. Codex and Claude Code
-do not add a SessionStart hook for this.
+Stop forwards native identity and the transcript path. A duplicate final-answer
+copy in the hook is ignored and has no size veto. The hook commits the local
+notification before returning, then a worker reads the owning transcript. Hook
+and process deadlines bound a stalled caller; they are not text-size limits.
 
-The worker reads only the new byte region of the admitted task's own
-transcript through the configured `transcript_adapter` module (an absolute
-local path loaded once at service start; core ships no native record parser —
-the Codex parser is the adapter deliverable, the Kimi parser belongs to the
-Kimi adapter). A missing parser means honest summary-only behavior, never a
-format guess. The adapter parser applies its structural public-material
-allowlist; hidden reasoning, system/developer content, credential fields and
-other tasks' history are never extracted. File
-replacement, truncation, unknown formats and partial trailing records are
-handled explicitly (summary-only degradation within the same attempt, or a
-visible coverage gap); a nonzero cursor resumes exactly where the last region
-ended. Each region `(file identity, start, end, digest)` is durably reserved
-BEFORE the model call, so failures, crashes and cancellation all consume it;
-the attempted cursor and the last-successful cursor are separate, and failed
-regions stay visible as coverage gaps (`status` shows them). Local scans are
-bounded to 16 MiB / 2 seconds and a 48 KiB public text envelope. Noise advances
-the durable cursor without calling a model. A public record that does not fit
-stays at the next cursor; head/tail field clipping and oversized record skips
-are explicit coverage gaps. Reads validate task identity, inode and prefix on
-the same file handle, including nonzero offsets.
+Each harness owns its public-message projection. User input, visible assistant
+progress and final answers remain; tool calls/results, hidden reasoning,
+system/developer injections and foreign task history are excluded. A complete
+public message is read whole, even when larger than a page target. Paging
+limits work between records without discarding data. Malformed complete records
+and unverifiable ownership/timestamps do not advance the cursor.
 
-The initial organizer call for each accepted increment is bounded (input
-64 KiB, structured result 32 KiB, runner up to 300s/outer 305s, one concurrent call,
-6 per task-hour, 20 per domain-hour). Attempts are persisted before spawn;
-The shared lifetime constants also keep admission exclusive through process
-cleanup (315s). Codex consumes the core runner deadline; older adapters may
-impose a shorter native bound. A real 44 KiB GPT-6-Luna/max increment required
-140 seconds, exceeding the former 120s bound. Extending the supported lifetime
-does not increase input/output limits or the number of attempts.
-failure counts are diagnostic and never pause the domain. Quota-deferred material stays unattempted;
-its persisted continuation survives restart. A region that failed with an
-explicit deadline, or whose attempt was interrupted without landing an
-outcome, gets exactly one bounded delayed recovery — at most two model
-attempts per region in total, the per-region counter persisted across
-restarts. The recovery re-reads the SAME source range with the recorded
-transcript identity and verifies the persisted end offset and content digest
-before any model call; it never widens the range, never pads the input and
-never touches new material. A second failure or an unverifiable source keeps
-the locatable, non-complete gap while other captures continue. Succeeded
-regions are never re-organized and saved results are never re-applied.
-Failed runners retain only the exit status, a trusted adapter category and
-elapsed seconds in the existing diagnostic. The adapter exit contract is
-`78=configuration`, `124=deadline`, `70=native`, `65=invalid_result`, and
-`75=output_limit`. An older or unrecognized exit remains `unknown`; elapsed
-time alone never proves a timeout. Raw stderr is counted against the output
-bound but discarded because it may contain task material or credentials.
-The core's own deadline/output bound report their directly observed category.
-These diagnostics neither change attempt ownership nor permit replay.
-A deterministic redaction mask runs before
-the model, and every candidate entry is scanned again before becoming a
-draft. The organizer records actual actions and observations from the supplied
-material. It preserves useful commands, numbers, errors and source-stated
-uncertainty without extracting lessons, inventing causes or forcing a
-failure-fix-success story. Unmentioned details are omitted, not listed as
-unknown. Title and summary are neutral retrieval introductions.
-Organizer output is at most three entries: `entry_id: null` creates a
-draft owned by the producing task's opaque identity; a non-null id appends a
-self-contained observation to that draft, deduplicated by the increment
-marker. Corrections append to the body and update the current retrieval header;
-previous pinned revisions remain unchanged. Context selection includes recent
-correction tails and matches task-owned headers to the current material.
-A saved organizer result that hits a transient local/remote read failure is
-applied later with persisted backoff (no model replay, no terminal attempt
-count); only deterministic content failures park dormant. Bodies grow by
-accumulated observations with no cumulative business cap; the only size bound
-is the real per-file platform envelope (GitHub rejects ordinary files beyond
-100 MiB), which parks just that entry's append as `draft full` while keeping
-the checkpointed material.
+Gitleaks and deterministic privacy rules redact locally before storage. Body,
+cursor and continuation commit together. A scanner launch failure or timeout
+leaves the same notification pending and automatically retries after recovery;
+no new Stop is required and no unredacted body is published. No model creates,
+shortens or rewrites the body. The GitHub ordinary-Git per-file 100 MiB limit
+remains a visible publication constraint, not a silent truncation rule.
 
-For explicit local historical experiments, `python -m
-mindie_knowledge.loop.history plan --source FILE --session-id ID --output DIR`
-creates bounded public-material packets and a resumable source snapshot.
-These are private local planning files, not experiences: this command never
-starts a model/service, creates a publication grant or uploads anything.
-Normal capture never invokes historical planning or backfills sharing-off time.
+An optional separate worker reads the complete redacted body and returns only
+title and summary. It never holds the body worker, and an old result cannot
+replace metadata after new body content arrives. One settled body version has
+one attempt. Failure keeps a labeled source excerpt and the full body usable.
+Disabling sharing cancels both workers and unsent publication; an unchanged
+enable does nothing. Consent lasts until the user changes it.
+
+Old model-authored checkpoints and failed regions are preserved as historical
+recovery evidence. Switching to public-transcript mode never silently applies
+their model-authored body as new deterministic material.
 
 ## Entries, drafts, publication
 

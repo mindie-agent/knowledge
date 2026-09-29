@@ -71,6 +71,19 @@ def _bytes(path):
     return path.read_bytes() if path.exists() else None
 
 
+def test_repeating_contribution_choice_is_a_byte_identical_noop(api, tmp_path):
+    path = tmp_path / 'consent.json'
+    api.record_choice(path, 'contribute')
+    before = path.read_bytes(), path.stat().st_mtime_ns
+    api.record_choice(path, 'contribute')
+    assert (path.read_bytes(), path.stat().st_mtime_ns) == before
+    api.record_choice(path, 'disabled')
+    assert api.read(path)['choice'] == 'disabled'
+    api.record_choice(path, 'contribute')
+    assert api.read(path)['choice'] == 'contribute'
+    assert path.read_bytes() != before[0]
+
+
 def _load(path):
     return json.loads(path.read_text())
 
@@ -112,7 +125,6 @@ def test_read_distinguishes_missing_unreadable_and_corrupt_without_writing(api, 
         "schema": b'{"schema":"other/1","choice":"contribute"}\n',
         "choice": b'{"schema":"mindie-consent/1","choice":"public"}\n',
         "reporting": b'{"schema":"mindie-consent/1","choice":"later","reporting":"always"}\n',
-        "huge": b'{"schema":"mindie-consent/1","choice":"later","pad":"' + (b"x" * 70000) + b'"}\n',
     }
     for name, raw in samples.items():
         path = tmp_path / f"{name}.json"

@@ -1,4 +1,4 @@
-"""Codex's public-transcript path. Body commit is independent of all models.
+"""Public-transcript path. Body commit is independent of all models.
 
 The caller supplies the harness parser and existing authority/cursor machinery.
 Body, cursor and continuation commit together; a process crash before commit
@@ -11,10 +11,9 @@ from pathlib import Path
 
 from .process import bounded_run
 from .store import canonical, digest, new_identity
-from .transcript_redaction import redact
+from .transcript_redaction import ScannerUnavailable, redact
 
 MODE = "public-transcript"
-SUMMARY_INPUT_BYTES = 24 * 1024
 SUMMARY_SECONDS = 45
 SUMMARY_SETTLE_SECONDS = 3
 
@@ -26,7 +25,7 @@ def excerpt(text, size):
 def fallback_header(text):
     # Clearly an excerpt, not a claim that a semantic summary succeeded.
     lines = [line.strip() for line in text.splitlines() if line.strip() and not line.startswith('### ')]
-    first = lines[0] if lines else 'Codex public conversation'
+    first = lines[0] if lines else 'Public conversation'
     return excerpt(first, 240)[:120], 'Conversation excerpt: ' + excerpt('\n'.join(lines), 1500)
 
 
@@ -67,7 +66,8 @@ def capture(engine, row, text, region):
                          (task_key, entry_id, row['id'], digest(doc['content']),
                           'pending' if engine.summary_command else 'excerpt', '', time.time(), time.time() + SUMMARY_SETTLE_SECONDS))
         detail = canonical(dict(pipeline=MODE, refs=[store.ref(entry_id, doc['revision'])],
-                                redaction_rules=rules, body_model_calls=0))
+                                redaction_rules=rules, body_model_calls=0,
+                                discarded_records=inc.get('discarded_records', [])))
         store.mark_capture(row['id'], 'organized', detail)
         if inc.get('more'):
             store.defer_capture(row['id'], due=time.time(), reason='more public transcript bytes')
@@ -89,7 +89,7 @@ def summarize_due(engine):
     status, detail = 'failed', ''
     try:
         row = store.capture_row(task['capture_id'])
-        engine._cancel.clear()
+        engine._summary_cancel.clear()
         engine._gate_live()
         engine._revalidate(row)
         with store._write_txn():
@@ -104,13 +104,8 @@ def summarize_due(engine):
             reserved = True
         body, _ = redact(doc['content'], executable=engine.redactor_executable, key=store.redaction_key(),
                          private_paths=(row['scope'], str(Path.home())))
-        encoded = body.encode('utf-8')
-        partial = len(encoded) > SUMMARY_INPUT_BYTES
-        if partial:
-            half = SUMMARY_INPUT_BYTES // 2
-            body = encoded[:half].decode('utf-8', 'ignore') + '\n[Middle omitted from summary input; full body is stored.]\n' + encoded[-half:].decode('utf-8', 'ignore')
-        payload = canonical(dict(role='summarize', text=body, partial=partial))
-        raw = bounded_run(engine.summary_command, payload, timeout=SUMMARY_SECONDS, max_output=8192, cancel=engine._cancel)
+        payload = canonical(dict(role='summarize', text=body))
+        raw = bounded_run(engine.summary_command, payload, timeout=SUMMARY_SECONDS, max_output=8192, cancel=engine._summary_cancel)
         result = json.loads(raw)
         if not isinstance(result, dict) or set(result) != {'title', 'summary'}:
             raise ValueError('summary must contain only title and summary')
@@ -120,18 +115,20 @@ def summarize_due(engine):
         for field, value in result.items():
             clean[field], _ = redact(value.strip(), executable=engine.redactor_executable, key=store.redaction_key(),
                                       private_paths=(row['scope'], str(Path.home())))
-        if partial:
-            # This boundary is enforced by code, not left to model obedience.
-            clean['summary'] = 'Excerpt summary (partial source): ' + excerpt(clean['summary'], 1900)
         engine._gate_live()
         engine._revalidate(row)
         applied = store.update_draft_header(task['entry_id'], expected_body=task['body_digest'], generation=row['generation'], **clean)
         status = 'complete' if applied else 'superseded'
     except MaintenanceCancelled:
-        status, detail = 'cancelled', 'authority revoked or service stopped'
+        status = 'pending' if engine.stop.is_set() else 'cancelled'
+        detail = 'service stopped; body retained' if status == 'pending' else 'authority revoked'
+    except ScannerUnavailable:
+        # No model was needed to retry local redaction. Keep this body version
+        # due even if it is the final Stop; do not wait for another user turn.
+        status, detail = 'pending', 'scanner unavailable; body retained'
     except (AdmissionUnreadable, GateFault):
         if reserved:
-            status, detail = 'failed', 'authority unavailable after metadata reservation'
+            status, detail = 'pending', 'authority unavailable; body retained'
         else:
             with store._write_txn():
                 store.db.execute('UPDATE transcript_tasks SET summary_due=? WHERE task_key=? AND body_digest=?',
@@ -142,6 +139,6 @@ def summarize_due(engine):
     finally:
         if reserved or status in {'superseded', 'cancelled'}:
             with store._write_txn():
-                store.db.execute('UPDATE transcript_tasks SET summary_status=?, summary_detail=? WHERE task_key=? AND body_digest=?',
-                                 (status, detail, task['task_key'], task['body_digest']))
+                store.db.execute('UPDATE transcript_tasks SET summary_status=?, summary_detail=?, summary_due=? WHERE task_key=? AND body_digest=?',
+                                 (status, detail, time.time() + 30, task['task_key'], task['body_digest']))
         engine.end_work()

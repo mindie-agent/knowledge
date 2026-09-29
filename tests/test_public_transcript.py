@@ -7,6 +7,7 @@ live with the Codex adapter. No fake model can prove the body was preserved.
 import json
 import sys
 import time
+from contextlib import closing
 from datetime import datetime, timezone
 
 import pytest
@@ -18,6 +19,7 @@ from mindie_knowledge.loop.store import Store, digest
 from mindie_knowledge.loop.transcript_redaction import install_scanner, redact
 from mindie_knowledge.loop import transcript_capture
 import transcript_double
+from lane_support import load_parser, transcript_path, write_transcript, SESSIONS
 
 
 @pytest.fixture(scope='module')
@@ -32,7 +34,7 @@ def pipeline(tmp_path, scanner):
     admission = Admission(make_admission(tmp_path, project_root=tmp_path))
     store = Store(tmp_path / 'store', 'test')
     engine = Engine(store, settings_path=settings, admission=admission,
-                    transcript_adapter=transcript_double, capture_mode='public-transcript',
+                    transcript_adapter=load_parser('codex'), capture_mode='public-transcript',
                     redactor_executable=scanner)
     path = tmp_path / 'native.jsonl'
     path.write_text(json.dumps(dict(type='session_meta', payload=dict(id='manual-A'))) + '\n', encoding='utf-8')
@@ -74,6 +76,21 @@ def test_body_is_saved_without_runner_and_export_preserves_it(pipeline):
     assert public['content'] == docs[0]['content']
 
 
+def test_corrupt_only_page_keeps_a_diagnostic_and_allows_later_public_text(pipeline):
+    engine, store, path = pipeline
+    with path.open('ab') as stream:
+        stream.write(b'{broken-record}\n')
+    event = engine.capture(session_id='manual-A', turn_id='corrupt-only', transcript_path=str(path))
+    engine._process(event['id'])
+    assert store.drafts_changed() == []
+    assert store.cursor(str(path.resolve()))['ok_finish'] == path.stat().st_size
+    detail = json.loads(store.db.execute('SELECT detail FROM regions').fetchone()[0])
+    assert detail['discarded_records'][0]['reason'] == 'invalid record'
+    append(path, 'public-after-corrupt-only-page')
+    process(engine, path, 'later')
+    assert store.drafts_changed()[0]['content'] == '### user\npublic-after-corrupt-only-page'
+
+
 def test_restart_and_duplicate_stop_append_one_task_record(pipeline):
     engine, store, path = pipeline
     append(path, 'first-public-marker')
@@ -81,7 +98,7 @@ def test_restart_and_duplicate_stop_append_one_task_record(pipeline):
     engine._process(row['id'])
     append(path, 'second-public-marker')
     resumed = Engine(store, settings_path=engine.settings_path, admission=engine.admission,
-                     transcript_adapter=transcript_double, capture_mode='public-transcript',
+                     transcript_adapter=load_parser('codex'), capture_mode='public-transcript',
                      redactor_executable=engine.redactor_executable)
     process(resumed, path, 'second')
     docs = store.drafts_changed()
@@ -153,6 +170,40 @@ def test_real_scanner_secrets_unicode_overlap_and_technical_negative_controls(sc
     assert redact(masked, executable=scanner, key=b'a' * 32)[0] == masked
 
 
+@pytest.mark.parametrize('failure', ['scanner', 'interrupted'])
+def test_metadata_recovers_the_same_body_without_another_stop(pipeline, failure):
+    engine, store, path = pipeline
+    engine.summary_command = [sys.executable, '-c',
+        'print(\'{"title":"Recovered title", "summary":"Recovered public observations."}\')']
+    append(path, 'body-survives-metadata-interruption')
+    process(engine, path, 'last-stop')
+    before = store.drafts_changed()[0]['content']
+    engine.last_activity = time.monotonic() - 10
+    with store._write_txn():
+        store.db.execute('UPDATE transcript_tasks SET summary_due=0')
+    if failure == 'scanner':
+        scanner = engine.redactor_executable
+        engine.redactor_executable = str(path.parent / 'unavailable-scanner')
+        transcript_capture.summarize_due(engine)
+        task = dict(store.db.execute('SELECT * FROM transcript_tasks').fetchone())
+        assert task['summary_status'] == 'pending'
+        assert task['summary_due'] > time.time()
+        assert store.drafts_changed()[0]['content'] == before
+        engine.redactor_executable = scanner
+    else:
+        with store._write_txn():
+            store.db.execute("UPDATE transcript_tasks SET summary_status='running'")
+    engine.start()
+    try:
+        with store._write_txn():
+            store.db.execute('UPDATE transcript_tasks SET summary_due=0')
+        wait_until(lambda: store.drafts_changed()[0]['title'] == 'Recovered title')
+        assert store.drafts_changed()[0]['content'] == before
+        assert store.db.execute('SELECT COUNT(*) FROM captures').fetchone()[0] == 1
+    finally:
+        engine.shutdown()
+
+
 def test_dense_private_addresses_and_unicode_line_separators(scanner):
     public = '中文\u2028still one scanner line\n'
     source = public + 'password = "Hk8Pm7Wz9Rq2Vt6S"\n' + ('10.88.0.9 BF16 shape=(1, 4096)\n' * 4000)
@@ -218,15 +269,34 @@ def test_upgrade_retains_legacy_gap_and_checkpoint_without_body_model(pipeline):
     assert store.drafts_changed() == []
 
 
-def test_scanner_failure_never_consumes_input(pipeline):
+@pytest.mark.parametrize('failure', ['missing', 'exit', 'invalid-report'])
+def test_scanner_recovers_same_notification_without_new_stop(pipeline, monkeypatch, failure):
     engine, store, path = pipeline
-    engine.redactor_executable = str(path.parent / 'missing-scanner')
+    scanner = engine.redactor_executable
+    if failure == 'missing':
+        engine.redactor_executable = str(path.parent / 'missing-scanner')
     append(path, 'Authorization: Bearer AbCdEf1234567890')
     event = engine.capture(session_id='manual-A', turn_id='bad', transcript_path=str(path))
-    engine._process(event['id'])
+    with monkeypatch.context() as patcher:
+        if failure in {'exit', 'invalid-report'}:
+            import subprocess
+            patcher.setattr('mindie_knowledge.loop.transcript_redaction.subprocess.run',
+                lambda *args, **kwargs: subprocess.CompletedProcess(
+                    args, 2 if failure == 'exit' else 0, b'not-json', b''))
+        engine._process(event['id'])
     assert store.drafts_changed() == []
     assert store.cursor(str(path.resolve())) is None
     assert 'AbCdEf1234567890' not in store.capture_row(event['id'])['detail']
+    assert store.continuation_reason(event['id']).startswith('public-io:')
+    engine.redactor_executable = scanner
+    engine.start()
+    try:
+        wait_until(lambda: bool(store.drafts_changed()))
+        assert 'AbCdEf1234567890' not in store.drafts_changed()[0]['content']
+        assert store.cursor(str(path.resolve()))['ok_finish'] == path.stat().st_size
+        assert store.capture_row(event['id'])['status'] == 'organized'
+    finally:
+        engine.shutdown()
 
 
 def test_revoked_pending_summary_does_not_block_next_task(pipeline):
@@ -244,17 +314,186 @@ def test_revoked_pending_summary_does_not_block_next_task(pipeline):
     assert store.drafts_changed()[0]['content'].count('original public marker') == 1
 
 
-def test_partial_summary_is_labeled_by_code_and_retains_whole_body(pipeline, monkeypatch):
+def test_summary_receives_whole_body_without_an_input_cap(pipeline, monkeypatch):
     engine, store, path = pipeline
     engine.summary_command = [sys.executable, '-c', 'print(\'{"title":"Case", "summary":"Model claimed full coverage."}\')']
-    monkeypatch.setattr(transcript_capture, 'SUMMARY_INPUT_BYTES', 64)
-    append(path, 'first marker ' + 'public middle observation ' * 30 + 'last marker')
+    append(path, 'first marker ' + 'public middle observation ' * 3000 + 'last marker')
     process(engine, path, 'partial')
     before = store.drafts_changed()[0]['content']
     engine.last_activity = time.monotonic() - 10
     with store._write_txn():
         store.db.execute('UPDATE transcript_tasks SET summary_due=0')
+    inputs = []
+    def model(command, payload, **kwargs):
+        inputs.append(json.loads(payload)['text'])
+        return json.dumps(dict(title='Case', summary='Public observations.'))
+    monkeypatch.setattr(transcript_capture, 'bounded_run', model)
     transcript_capture.summarize_due(engine)
     doc = store.drafts_changed()[0]
     assert doc['content'] == before
-    assert doc['summary'].startswith('Excerpt summary (partial source): ')
+    assert inputs == [before]
+    assert doc['summary'] == 'Public observations.'
+
+
+def wait_until(predicate, seconds=8):
+    until = time.monotonic() + seconds
+    while time.monotonic() < until:
+        if predicate():
+            return
+        time.sleep(.05)
+    assert predicate(), 'expected pipeline outcome did not arrive'
+
+
+def test_slow_summary_does_not_hold_new_body_and_stale_result_is_discarded(pipeline):
+    engine, store, path = pipeline
+    marker, release = path.parent / 'summary-started', path.parent / 'summary-release'
+    engine.summary_command = [sys.executable, '-c',
+        'import pathlib,time; '
+        f'pathlib.Path({str(marker)!r}).touch(); '
+        f'exec("while not pathlib.Path({str(release)!r}).exists(): time.sleep(.05)"); '
+        'print(\'{"title":"Stale result", "summary":"Old observation."}\')']
+    append(path, 'first-public-marker')
+    process(engine, path, 'first')
+    engine.last_activity = time.monotonic() - 10
+    with store._write_txn():
+        store.db.execute('UPDATE transcript_tasks SET summary_due=0')
+    engine.start()
+    try:
+        wait_until(marker.exists)
+        append(path, 'second-public-marker')
+        engine.capture(session_id='manual-A', turn_id='second', transcript_path=str(path))
+        wait_until(lambda: 'second-public-marker' in store.drafts_changed()[0]['content'], seconds=3)
+        assert not release.exists()
+        assert store.cursor(str(path.resolve()))['ok_finish'] == path.stat().st_size
+        # Settle is long enough to inspect completion of the old version alone.
+        engine.last_activity = time.monotonic() + 30
+        release.touch()
+        wait_until(lambda: engine.status()['activity'] == 0)
+        assert store.drafts_changed()[0]['title'] != 'Stale result'
+    finally:
+        release.touch()
+        engine.shutdown()
+
+
+def test_repeated_enable_keeps_pending_material_and_authorization(pipeline):
+    from mindie_knowledge.loop.settings import CommunityWriteContext
+    engine, store, path = pipeline
+    append(path, 'accepted-before-repeated-enable')
+    event = engine.capture(session_id='manual-A', turn_id='pending', transcript_path=str(path))
+    settings_path = engine.settings_path
+    with CommunityWriteContext(settings_path) as context:
+        original = context.read(settings_path)
+        current = context.configure(settings_path, dict(original.raw, enabled=True))
+    before = settings_path.read_bytes()
+    with CommunityWriteContext(settings_path) as context:
+        repeated = context.configure(settings_path, dict(current.raw, enabled=True))
+    assert repeated.generation == original.generation
+    assert repeated.enabled_at == original.enabled_at
+    assert settings_path.read_bytes() == before
+    engine.revoke_stale()
+    engine._process(event['id'])
+    assert 'accepted-before-repeated-enable' in store.drafts_changed()[0]['content']
+
+
+@pytest.mark.parametrize('harness', ['codex', 'kimi', 'cc'])
+@pytest.mark.parametrize('size', [129 * 1024, 1024 * 1024, 10 * 1024 * 1024])
+def test_production_parsers_preserve_large_public_messages_through_export(tmp_path, scanner, harness, size):
+    session = SESSIONS[harness]
+    settings = tmp_path / 'community.json'
+    write_settings(settings, roots=[tmp_path])
+    admission = Admission(make_admission(tmp_path, project_root=tmp_path, session=session))
+    path = transcript_path(harness, tmp_path, session)
+    # Distinct head/middle/tail and total bytes catch clipping, skipped records,
+    # and dropped multibyte data. The only injected private value is the token.
+    text = 'begin-public\n' + ('公开进度。\n' * (size // 16)) + '\nend-public'
+    write_transcript(harness, path, session, [text], time.time() + 2)
+    with closing(Store(tmp_path / 'store', 'test')) as store:
+        engine = Engine(store, settings_path=settings, admission=admission,
+                        transcript_adapter=load_parser(harness), capture_mode='public-transcript',
+                        redactor_executable=scanner)
+        event = engine.capture(session_id=session, turn_id='long-public', transcript_path=str(path))
+        # The worker may yield between pages or defer a temporary scanner
+        # failure. Acceptance is eventual complete persistence from this one
+        # Stop, not an assumption that the first synchronous tick finishes.
+        engine.start()
+        try:
+            wait_until(lambda: store.capture_row(event['id'])['status'] == 'organized')
+        except AssertionError:
+            pytest.fail(str(store.capture_row(event['id'])))
+        finally:
+            engine.shutdown()
+        assert store.cursor(str(path.resolve()))['ok_finish'] == path.stat().st_size
+        doc = store.drafts_changed()[0]
+        assert doc['content'] == '### user\n' + text
+        from mindie_knowledge.loop.documents import render_entry, parse_entry
+        assert parse_entry(render_entry(doc))['content'] == doc['content']
+
+
+def test_kimi_lineage_recovers_without_exporting_inherited_history(tmp_path, scanner):
+    session = SESSIONS['kimi']
+    settings = tmp_path / 'community.json'
+    write_settings(settings, roots=[tmp_path])
+    admission = Admission(make_admission(tmp_path, project_root=tmp_path, session=session))
+    path = transcript_path('kimi', tmp_path, session)
+    from lane_support import encode_record
+    when = time.time() + 2
+    path.write_bytes(encode_record('kimi', session, 'inherited-parent-marker', when)
+                     + encode_record('kimi', session, 'new-child-marker', when + 2))
+    state = path.parents[2] / 'state.json'
+    state.unlink()
+    with closing(Store(tmp_path / 'store', 'test')) as store:
+        engine = Engine(store, settings_path=settings, admission=admission,
+                        transcript_adapter=load_parser('kimi'), capture_mode='public-transcript',
+                        redactor_executable=scanner)
+        event = engine.capture(session_id=session, turn_id='lineage', transcript_path=str(path))
+        engine._process(event['id'])
+        assert store.drafts_changed() == []
+        assert store.cursor(str(path.resolve())) is None
+        assert store.continuation_reason(event['id']).startswith('public-io:')
+        state.write_text(json.dumps(dict(forkedFrom='parent', createdAt=int((when + 1) * 1000))), encoding='utf-8')
+        engine.start()
+        try:
+            wait_until(lambda: bool(store.drafts_changed()))
+            body = store.drafts_changed()[0]['content']
+            assert 'new-child-marker' in body
+            assert 'inherited-parent-marker' not in body
+            assert store.capture_row(event['id'])['status'] == 'organized'
+        finally:
+            engine.shutdown()
+
+
+@pytest.mark.parametrize('harness', ['codex', 'kimi', 'cc'])
+@pytest.mark.parametrize('bad', [b'{"bad":broken}\n', b'null\n', b'\xff\n'])
+def test_corrupt_record_does_not_lose_valid_neighbors(tmp_path, scanner, harness, bad):
+    from lane_support import encode_record
+    session = SESSIONS[harness]
+    settings = tmp_path / 'community.json'
+    write_settings(settings, roots=[tmp_path])
+    admission = Admission(make_admission(tmp_path, project_root=tmp_path, session=session))
+    path = transcript_path(harness, tmp_path, session)
+    when = time.time() + 2
+    write_transcript(harness, path, session, ['before-bad-marker'], when)
+    with path.open('ab') as stream:
+        stream.write(bad)
+        stream.write(encode_record(harness, session, 'after-bad-marker', when + 2))
+    with closing(Store(tmp_path / 'store', 'test')) as store:
+        engine = Engine(store, settings_path=settings, admission=admission,
+                        transcript_adapter=load_parser(harness), capture_mode='public-transcript',
+                        redactor_executable=scanner)
+        event = engine.capture(session_id=session, turn_id='broken-line', transcript_path=str(path))
+        engine._process(event['id'])
+        row = store.capture_row(event['id'])
+        assert row['status'] == 'organized', row
+        discarded = json.loads(row['detail'])['discarded_records']
+        assert len(discarded) == 1 and discarded[0]['reason'] == 'invalid record'
+        assert discarded[0]['end'] - discarded[0]['start'] == len(bad)
+        assert store.cursor(str(path.resolve()))['ok_finish'] == path.stat().st_size
+        body = store.drafts_changed()[0]['content']
+        assert body == '### user\nbefore-bad-marker\n\n### user\nafter-bad-marker'
+        # A later Stop must also continue, not reread either neighbor.
+        with path.open('ab') as stream:
+            stream.write(encode_record(harness, session, 'later-marker', when + 3))
+        second = engine.capture(session_id=session, turn_id='later', transcript_path=str(path))
+        engine._process(second['id'])
+        final = store.drafts_changed()[0]['content']
+        assert final.count('before-bad-marker') == final.count('after-bad-marker') == final.count('later-marker') == 1
