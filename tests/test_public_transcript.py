@@ -220,13 +220,20 @@ def test_upgrade_retains_legacy_gap_and_checkpoint_without_body_model(pipeline):
     assert store.drafts_changed() == []
 
 
-def test_scanner_recovers_same_notification_without_new_stop(pipeline):
+@pytest.mark.parametrize('failure', ['missing', 'exit'])
+def test_scanner_recovers_same_notification_without_new_stop(pipeline, monkeypatch, failure):
     engine, store, path = pipeline
     scanner = engine.redactor_executable
-    engine.redactor_executable = str(path.parent / 'missing-scanner')
+    if failure == 'missing':
+        engine.redactor_executable = str(path.parent / 'missing-scanner')
     append(path, 'Authorization: Bearer AbCdEf1234567890')
     event = engine.capture(session_id='manual-A', turn_id='bad', transcript_path=str(path))
-    engine._process(event['id'])
+    with monkeypatch.context() as patcher:
+        if failure == 'exit':
+            import subprocess
+            patcher.setattr('mindie_knowledge.loop.transcript_redaction.subprocess.run',
+                lambda *args, **kwargs: subprocess.CompletedProcess(args, 2, b'', b''))
+        engine._process(event['id'])
     assert store.drafts_changed() == []
     assert store.cursor(str(path.resolve())) is None
     assert 'AbCdEf1234567890' not in store.capture_row(event['id'])['detail']

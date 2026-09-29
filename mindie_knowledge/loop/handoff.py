@@ -394,17 +394,17 @@ def accept_stop(config_path, event):
             return _result(stage="rejected", reason="invalid-envelope")
     if event.get("identity_kind") is not None and not isinstance(event.get("identity_kind"), str):
         return _result(stage="rejected", reason="invalid-envelope")
-    for key, limit in (("transcript_path", 4096), ("cwd", 4096)):
+    for key in ("transcript_path", "cwd"):
         value = event.get(key)
         if value is None:
             continue
-        if not isinstance(value, str) or len(value) > limit or "\x00" in value:
+        if not isinstance(value, str) or "\x00" in value:
             return _result(stage="rejected", reason="invalid-envelope")
     harness = event.get("harness") or ""
     if harness and (not isinstance(harness, str) or not _HARNESS.fullmatch(harness)):
         return _result(stage="rejected", reason="invalid-envelope")
     raw_summary = event.get("last_assistant_message")
-    transcript = event.get("transcript_path") if _text(event.get("transcript_path"), 4096) else None
+    transcript = event.get("transcript_path") or None
     if raw_summary is not None and not isinstance(raw_summary, str):
         return _result(stage="rejected", reason="invalid-envelope")
     deadline = time.monotonic() + _budget(event)

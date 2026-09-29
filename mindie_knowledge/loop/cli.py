@@ -470,9 +470,8 @@ def main(argv=None):
         return run_wake(args.config, args.event)
     if args.operation == "hook":
         try:
-            raw = sys.stdin.buffer.read(128 * 1024 + 1)
-            if len(raw) <= 128 * 1024:
-                capture_hook(args.config, json.loads(raw))
+            raw = sys.stdin.buffer.read()
+            capture_hook(args.config, json.loads(raw))
         except (ValueError, TypeError, AttributeError, OSError, RecursionError):
             pass
         print("{}")

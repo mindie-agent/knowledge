@@ -112,7 +112,7 @@ def redact(text, *, executable, key, private_paths=()):
         except (OSError, subprocess.TimeoutExpired):
             raise ScannerUnavailable("transcript secret scanner unavailable") from None
     if result.returncode != 0:
-        raise ValueError("transcript secret scanner failed")
+        raise ScannerUnavailable("transcript secret scanner failed")
     try:
         findings = json.loads(result.stdout or b"[]")
         if not isinstance(findings, list):
