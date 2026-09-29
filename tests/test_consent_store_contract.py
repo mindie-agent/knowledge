@@ -112,7 +112,6 @@ def test_read_distinguishes_missing_unreadable_and_corrupt_without_writing(api, 
         "schema": b'{"schema":"other/1","choice":"contribute"}\n',
         "choice": b'{"schema":"mindie-consent/1","choice":"public"}\n',
         "reporting": b'{"schema":"mindie-consent/1","choice":"later","reporting":"always"}\n',
-        "huge": b'{"schema":"mindie-consent/1","choice":"later","pad":"' + (b"x" * 70000) + b'"}\n',
     }
     for name, raw in samples.items():
         path = tmp_path / f"{name}.json"

@@ -139,20 +139,7 @@ def test_malformed_files_fail_loudly():
         parse_entry("# no frontmatter\n")
 
 
-def test_frontmatter_metadata_envelope_is_utf8_bytes_everywhere():
-    # A header under 64 Ki CHARACTERS but over 64 KiB in UTF-8 (non-BMP) is
-    # refused at parse, create AND render — one byte envelope, all surfaces.
-    padded = "é" * (64 * 1024)  # 2 bytes per char: 128 KiB of bytes
-    raw = (
-        "---\nconditions: {}\ndomain: vllm-ascend\nentry_id: " + "b" * 64
-        + "\nkind: experience\nsummary: s\ntitle: " + padded + "\n---\n\nbody\n"
-    )
-    with pytest.raises(ValueError, match="metadata byte limit"):
-        parse_entry(raw)
-    # Over the byte envelope even in pure ASCII: create/render refuse what
-    # parse would refuse (the old 75 KB ASCII gap).
-    big_conditions = {f"key_{i:04d}": "v" * 500 for i in range(140)}
-    with pytest.raises(ValueError, match="metadata byte limit"):
-        entry(conditions=big_conditions)
-    # A normal header stays well within the envelope.
-    assert parse_entry(render_entry(entry())) == entry()
+def test_valid_metadata_has_no_artificial_byte_envelope():
+    doc = entry(title=chr(233) * (64 * 1024), summary=chr(20013) * 4096,
+                conditions={f'key_{i:04d}': 'v' * 600 for i in range(140)})
+    assert parse_entry(render_entry(doc)) == doc

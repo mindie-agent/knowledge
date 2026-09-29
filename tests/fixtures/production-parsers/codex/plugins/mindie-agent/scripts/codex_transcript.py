@@ -2,19 +2,17 @@
 
 This is the per-Harness version adapter the design requires: it recognizes
 only a structural signature whitelist of the Codex rollout JSONL format and
-extracts only public task content — user messages, assistant public messages,
-and bounded tool call input/output that explains the problem. Hidden
-reasoning, system/developer instructions, credential fields and other tasks'
-history are never extracted. An unrecognized format is reported honestly as
-``unknown-format`` so the caller degrades to the already-present bounded
-summary in the same attempt; there is no format guessing and no filesystem
-scanning — the caller names exactly one file and one byte range.
+extracts user messages and public assistant progress/final messages. Tools,
+hidden reasoning, injected system/developer instructions and other tasks'
+history are excluded. An unrecognized format is reported as ``unknown-format``;
+the public-transcript path never substitutes a model-written summary for it.
+There is no filesystem scanning: the caller names one file and byte range.
 
 Byte accounting is precise: every call reports the consumed range
 ``[start, end)`` and its SHA256 so the engine can durably reserve
-``(file identity, start, end, digest)`` before any model call. File
-replacement, truncation and oversized records stop or skip visibly instead of
-silently rereading old history.
+``(file identity, start, end, digest)`` with the saved body. Public messages are
+never clipped to a model envelope. Replacement and unsupported oversized input
+stop visibly instead of silently consuming or rereading history.
 """
 
 from __future__ import annotations
@@ -29,7 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 MAX_WINDOW = 256 * 1024          # one read window per increment
-MAX_TEXT = 48 * 1024             # extracted increment text cap
+MAX_TEXT = 4 * 1024 * 1024       # page target, never clips a public message
 MAX_RECORDS = 200                # extracted records per increment
 
 _TEXT_CONTENT = {"input_text", "output_text"}
@@ -144,18 +142,6 @@ def same_file(identity: FileIdentity | None, current: FileIdentity | None) -> bo
     return current.anchor_for(identity.anchor_len) == identity.anchor_digest
 
 
-def _clip(value, limit):
-    """UTF-8 byte cap preserving both the cause and the last observed outcome."""
-    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
-    raw = text.encode("utf-8")
-    if len(raw) <= limit:
-        return text
-    marker = "\n…[field truncated; head and tail retained]…\n"
-    budget = max(0, limit - len(marker.encode()))
-    head = budget * 2 // 3
-    return raw[:head].decode("utf-8", "ignore") + marker + raw[-(budget-head):].decode("utf-8", "ignore")
-
-
 def _timestamp(record):
     raw = record.get("timestamp")
     if not isinstance(raw, str):
@@ -171,7 +157,12 @@ def _timestamp(record):
 
 PUBLIC = {None, "final", "final_answer", "commentary"}
 KNOWN = {"session_meta", "turn_context", "response_item", "event_msg", "compacted"}
-RECORD_LIMIT = 1024 * 1024
+INJECTED_PREFIXES = (
+    "<recommended_plugins>", "<environment_context>",
+    "# AGENTS.md instructions", "<permissions instructions>",
+    "<skills_instructions>", "<app-context>",
+)
+ATTACHMENTS = {"input_image": "Image", "image": "Image", "input_audio": "Audio", "input_file": "File"}
 
 
 def _extract(record):
@@ -194,33 +185,26 @@ def _extract(record):
         if role not in {"user", "assistant"}:
             return None
         if ptype == "agent_message" and isinstance(payload.get("text"), str):
-            return (role, _clip(payload["text"], 12288))
-        content = payload.get("content")
-        if not isinstance(content, list):
-            return None
-        parts = [item["text"] for item in content if isinstance(item, dict)
-                 and item.get("type") in _TEXT_CONTENT
-                 and isinstance(item.get("text"), str)
-                 and item.get("channel") in PUBLIC]
+            parts = [payload['text']]
+        else:
+            content = payload.get("content")
+            if not isinstance(content, list):
+                return None
+            parts = []
+            for item in content:
+                if not isinstance(item, dict) or item.get('channel') not in PUBLIC:
+                    continue
+                if item.get('type') in _TEXT_CONTENT and isinstance(item.get('text'), str):
+                    parts.append(item['text'])
+                elif item.get('type') in ATTACHMENTS:
+                    parts.append('[' + ATTACHMENTS[item['type']] + ' attachment omitted]')
+        if role == 'user':
+            parts = [part for part in parts if not part.lstrip().startswith(INJECTED_PREFIXES)]
         text = "\n".join(parts)
-        if role == "user" and text.lstrip().startswith((
-            "<recommended_plugins>", "<environment_context>",
-            "# AGENTS.md instructions", "<permissions instructions>",
-            "<skills_instructions>", "<app-context>",
-        )):
-            return None
         text = re.sub(r"<oai-mem-citation>.*?</oai-mem-citation>", "", text, flags=re.S)
-        return (role, _clip(text, 12288)) if text.strip() else None
-    if ptype in {"function_call", "custom_tool_call"}:
-        name = payload.get("name")
-        if not isinstance(name, str) or not name.strip():
-            return None
-        value = payload.get("input", "") if ptype == "custom_tool_call" else payload.get("arguments", "")
-        call = _clip(payload.get("call_id", ""), 256)
-        return ("tool", f"{_clip(name, 120)} call_id={call} {_clip(value, 8192)}")
-    if ptype in {"function_call_output", "custom_tool_call_output"}:
-        call = _clip(payload.get("call_id", ""), 256)
-        return ("output", f"call_id={call} {_clip(payload.get('output', ''), 8192)}")
+        phase = payload.get("phase") or payload.get("channel")
+        label = role + (":" + phase if role == "assistant" and phase else "")
+        return (label, text) if text.strip() else None
     return None
 
 
@@ -232,7 +216,7 @@ def _session_of(record):
 
 
 def read_material(path, start, *, session_id=None, not_before=None, expected=None,
-                  max_scan_bytes=16777216, max_seconds=2.0, max_text_bytes=49152,
+                  max_scan_bytes=16777216, max_seconds=2.0, max_text_bytes=MAX_TEXT,
                   scan_until=None):
     """Scan noise without model work, stopping BEFORE the next public record
     would exceed the text envelope. Every consumed byte is hashed exactly.
@@ -241,13 +225,13 @@ def read_material(path, start, *, session_id=None, not_before=None, expected=Non
     """
     if type(start) is not int or start < 0:
         raise ValueError("start must be a nonnegative offset")
-    if not 1024 <= max_scan_bytes <= 64*1024*1024 or not 0 < max_seconds <= 30:
+    if max_scan_bytes <= 0 or max_seconds <= 0:
         raise ValueError("invalid scan budget")
     if scan_until is not None and (
         type(scan_until) is not int or scan_until < start
     ):
         raise ValueError("scan_until must be an exact byte boundary at or after start")
-    if not 16384 <= max_text_bytes <= MAX_TEXT:
+    if max_text_bytes <= 0:
         raise ValueError("invalid text budget")
     result = dict(status="ok", start=start, end=start, digest=hashlib.sha256(b"").hexdigest(),
                   text="", records=0, skipped_records=0, oversize_records=0,
@@ -279,11 +263,11 @@ def read_material(path, start, *, session_id=None, not_before=None, expected=Non
                 result.update(status="replaced", coverage_note="transcript truncated")
                 return result
             # Task identity is checked even at a nonzero cursor. The metadata
-            # line alone is bounded; no foreign public material is returned.
+            # identifies ownership; no foreign public material is returned.
             stream.seek(0)
-            header = stream.readline(RECORD_LIMIT + 1)
+            header = stream.readline()
             try:
-                meta = json.loads(header) if len(header) <= RECORD_LIMIT else {}
+                meta = json.loads(header)
                 owner = _session_of(meta) if isinstance(meta, dict) else None
             except ValueError:
                 owner = None
@@ -305,36 +289,37 @@ def read_material(path, start, *, session_id=None, not_before=None, expected=Non
                     return result
             stream.seek(max(0, start-1))
             middle = start > 0 and stream.read(1) != b"\n"
+            if middle:
+                result.update(status="invalid-boundary", coverage_note="cursor is not on a whole-record boundary")
+                return result
             stream.seek(start)
             end_limit = min(stat.st_size, start + max_scan_bytes)
             if scan_until is not None:
                 end_limit = min(end_limit, scan_until)
             while stream.tell() < end_limit and time.monotonic()-begun < max_seconds:
                 offset = stream.tell()
-                room = end_limit - offset
-                raw = stream.readline(min(RECORD_LIMIT+1, room))
+                # A page target limits work between records. One complete
+                # public message may exceed it; never clip or consume half.
+                room = stat.st_size - offset
+                if scan_until is not None:
+                    room = min(room, scan_until - offset)
+                raw = stream.readline(room)
                 if not raw:
                     break
                 complete = raw.endswith(b"\n")
-                oversize = (middle or len(raw) > RECORD_LIMIT or
-                            (not complete and offset == start and len(raw) == max_scan_bytes
-                             and end_limit < stat.st_size))
-                if not complete and not oversize:
+                if not complete:
                     # A budget boundary or incomplete append must not consume
-                    # a record that fits our record bound on the next call.
+                    # a record that can be completed on the next call.
                     result["partial"] = offset+len(raw) == stat.st_size
                     break
-                if oversize:
-                    consumed.update(raw)
-                    result["end"] = stream.tell()
-                    result["oversize_records"] += 1
-                    result["coverage"].append(dict(start=offset,end=stream.tell(),reason="oversize record skipped"))
-                    middle = not complete
-                    continue
                 try:
                     record = json.loads(raw)
                 except (ValueError, UnicodeDecodeError):
                     record = None
+                if not isinstance(record, dict):
+                    result.update(status="invalid-record", coverage_note="invalid complete JSONL record; not consumed")
+                    result["coverage"].append(dict(start=offset, end=stream.tell(), reason="invalid record"))
+                    break
                 extracted = None
                 if isinstance(record, dict):
                     if record.get("type") in KNOWN:
@@ -353,21 +338,23 @@ def read_material(path, start, *, session_id=None, not_before=None, expected=Non
                             extracted = None  # inherited parent context, never a new experience
                 if extracted and extracted[1]:
                     stamp = _timestamp(record)
-                    if not_before is not None and (stamp is None or stamp < not_before):
-                        if stamp is None:
-                            result["timestamps_reliable"] = False
+                    if not_before is not None and stamp is None:
+                        result.update(status='invalid-record', timestamps_reliable=False,
+                                      coverage_note='public message timestamp unavailable; not consumed')
+                        result['coverage'].append(dict(start=offset, end=stream.tell(), reason='missing public timestamp'))
+                        break
+                    if not_before is not None and stamp < not_before:
                         extracted = None
                     else:
                         kind, text = extracted
-                        label = f"[{kind} timestamp={record.get('timestamp','unknown')} turn={turn or 'unknown'} bytes={offset}:{stream.tell()}]"
+                        text = text.replace("\r\n", "\n").replace("\r", "\n")
+                        label = f"### {kind}"
                         rendered = label + "\n" + text
                         size = len(rendered.encode()) + 2
-                        if text_size + size > max_text_bytes or len(included) >= MAX_RECORDS:
+                        if included and (text_size + size > max_text_bytes or len(included) >= MAX_RECORDS):
                             break  # cursor remains before this unadmitted record
                         included.append(rendered)
                         text_size += size
-                        if "[field truncated;" in text:
-                            result["coverage"].append(dict(start=offset,end=stream.tell(),reason="field head/tail truncation"))
                 if not extracted or not extracted[1]:
                     result["skipped_records"] += 1
                 consumed.update(raw)
@@ -378,6 +365,8 @@ def read_material(path, start, *, session_id=None, not_before=None, expected=Non
         return result
     result.update(digest=consumed.hexdigest(),text="\n\n".join(included),records=len(included))
     established = expected is not None or result.get("session_match") is True
+    if result["status"] != "ok":
+        return result
     if result["end"] == start:
         result["status"] = "unchanged"
     elif not recognized and not (

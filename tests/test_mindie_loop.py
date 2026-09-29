@@ -537,6 +537,7 @@ def test_old_pending_batch_disabled_after_restart(gated, tmp_path):
     built = build_batch(store, settings=current, revision_fn=_revision_double)
     batch_id = built[0]
     assert store.batch(batch_id)["status"] == "pending"
+    write_settings(tmp_path / "community.json", enabled=False, roots=[tmp_path / "proj"])
     write_settings(tmp_path / "community.json", enabled=True, roots=[tmp_path / "proj"])
     restarted = Engine(store, agent_command=None,
                        settings_path=tmp_path / "community.json",
@@ -554,6 +555,7 @@ def test_old_generation_update_id_cannot_republish(gated, tmp_path):
     store, engine, _, _ = gated
     gen_a = settings_mod.load(tmp_path / "community.json").generation
     doc = draft(store, generation=gen_a)
+    write_settings(tmp_path / "community.json", enabled=False, roots=[tmp_path / "proj"])
     write_settings(tmp_path / "community.json", enabled=True, roots=[tmp_path / "proj"])
     gen_c = settings_mod.load(tmp_path / "community.json").generation
     # A (malicious or confused) organizer result naming the old draft as an

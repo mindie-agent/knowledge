@@ -19,7 +19,6 @@ from pathlib import Path
 MAX_TEXT = 48 * 1024
 MAX_RECORDS = 200
 ANCHOR_BYTES = 512
-RECORD_LIMIT = 1024 * 1024
 MS_THRESHOLD = 1e12
 KNOWN = {
     "metadata",
@@ -115,17 +114,6 @@ def to_seconds(raw):
     return value
 
 
-def _clip(text, limit):
-    if not isinstance(text, str):
-        text = json.dumps(text, ensure_ascii=False) if text is not None else ""
-    raw = text.encode("utf-8")
-    if len(raw) <= limit:
-        return text
-    head = raw[: limit // 2].decode("utf-8", "ignore")
-    tail = raw[-limit // 2 :].decode("utf-8", "ignore")
-    return f"{head}\n[field truncated; {len(raw)} bytes]\n{tail}"
-
-
 def _session_in_path(path) -> str | None:
     parts = Path(path).resolve().parts
     if "sessions" not in parts:
@@ -138,20 +126,6 @@ def _session_in_path(path) -> str | None:
 
 def _timestamp(record):
     return to_seconds(record.get("time")) or to_seconds(record.get("created_at"))
-
-
-def _record_turn_id(record):
-    """This record's own native turnId (loop events carry it on the event).
-    Body-evidence label only; never carried across records, never guessed."""
-    ident = record.get("turnId")
-    if type(ident) is int and 0 <= ident < 10**15:
-        return ident
-    event = record.get("event")
-    if isinstance(event, dict):
-        ident = event.get("turnId")
-        if type(ident) is int and 0 <= ident < 10**15:
-            return ident
-    return None
 
 
 def _text_parts(content):
@@ -187,10 +161,10 @@ def _extract(record):
             if _origin_kind(message) not in USER_ORIGINS:
                 return None
             text = _text_parts(message.get("content"))
-            return ("user", _clip(text, 12288)) if text.strip() else None
+            return ("user", text) if text.strip() else None
         if role == "assistant":
             text = _text_parts(message.get("content"))
-            return ("assistant", _clip(text, 12288)) if text.strip() else None
+            return ("assistant", text) if text.strip() else None
         return None
     if rtype == "context.append_loop_event":
         event = record.get("event")
@@ -205,24 +179,8 @@ def _extract(record):
                 return None
             if part.get("type") == "text" and isinstance(part.get("text"), str):
                 text = part["text"].strip()
-                return ("assistant", _clip(text, 12288)) if text else None
+                return ("assistant", text) if text else None
             return None
-        if etype == "tool.call":
-            name = event.get("name")
-            if not isinstance(name, str) or not name.strip():
-                return None
-            call = _clip(event.get("toolCallId") or event.get("tool_call_id") or "", 256)
-            args = event.get("args")
-            return ("tool", f"{_clip(name, 120)} call_id={call} {_clip(args, 8192)}")
-        if etype == "tool.result":
-            call = _clip(event.get("toolCallId") or event.get("tool_call_id") or "", 256)
-            result = event.get("result")
-            output = ""
-            if isinstance(result, dict):
-                output = result.get("output")
-            elif isinstance(result, str):
-                output = result
-            return ("output", f"call_id={call} {_clip(output, 8192)}")
         return None
     return None
 
@@ -231,7 +189,7 @@ def _fork_boundary(path) -> float | None:
     """Inherited material ends at the fork session's createdAt (seconds)."""
     try:
         state_path = Path(path).resolve().parents[2] / "state.json"
-        data = json.loads(state_path.read_text())
+        data = json.loads(state_path.read_text(encoding='utf-8'))
     except (OSError, ValueError, IndexError):
         return None
     if not isinstance(data, dict):
@@ -259,13 +217,13 @@ def read_material(
 ):
     if type(start) is not int or start < 0:
         raise ValueError("start must be a nonnegative offset")
-    if not 1024 <= max_scan_bytes <= 64 * 1024 * 1024 or not 0 < max_seconds <= 30:
+    if max_scan_bytes <= 0 or max_seconds <= 0:
         raise ValueError("invalid scan budget")
     if scan_until is not None and (
         type(scan_until) is not int or scan_until < start
     ):
         raise ValueError("scan_until must be an exact byte boundary at or after start")
-    if not 16384 <= max_text_bytes <= MAX_TEXT:
+    if max_text_bytes <= 0:
         raise ValueError("invalid text budget")
     boundary = to_seconds(not_before) if not_before is not None else None
     result = dict(
@@ -344,39 +302,33 @@ def read_material(
                 return result
             stream.seek(max(0, start - 1))
             middle = start > 0 and stream.read(1) != b"\n"
+            if middle:
+                result.update(status="invalid-boundary", coverage_note="cursor is not a whole-record boundary")
+                return result
             stream.seek(start)
             end_limit = min(stat.st_size, start + max_scan_bytes)
             if scan_until is not None:
                 end_limit = min(end_limit, scan_until)
             while stream.tell() < end_limit and time.monotonic() - begun < max_seconds:
                 offset = stream.tell()
-                room = end_limit - offset
-                raw = stream.readline(min(RECORD_LIMIT + 1, room))
+                # Page targets apply between records; every message stays whole.
+                room = stat.st_size - offset
+                if scan_until is not None:
+                    room = min(room, scan_until - offset)
+                raw = stream.readline(room)
                 if not raw:
                     break
-                complete = raw.endswith(b"\n")
-                oversize = middle or len(raw) > RECORD_LIMIT or (
-                    not complete
-                    and offset == start
-                    and len(raw) == max_scan_bytes
-                    and end_limit < stat.st_size
-                )
-                if not complete and not oversize:
+                if not raw.endswith(b"\n"):
                     result["partial"] = offset + len(raw) == stat.st_size
                     break
-                if oversize:
-                    consumed.update(raw)
-                    result["end"] = stream.tell()
-                    result["oversize_records"] += 1
-                    result["coverage"].append(
-                        dict(start=offset, end=stream.tell(), reason="oversize record skipped")
-                    )
-                    middle = not complete
-                    continue
                 try:
                     record = json.loads(raw)
                 except (ValueError, UnicodeDecodeError):
                     record = None
+                if not isinstance(record, dict):
+                    result.update(status="invalid-record", coverage_note="invalid complete JSONL record; not consumed")
+                    result["coverage"].append(dict(start=offset, end=stream.tell(), reason="invalid record"))
+                    break
                 extracted = None
                 stamp = None
                 if isinstance(record, dict):
@@ -387,32 +339,22 @@ def read_material(
                     if fork_time is not None and (stamp is None or stamp < fork_time):
                         extracted = None
                 if extracted and extracted[1]:
-                    if boundary is not None and (stamp is None or stamp < boundary):
-                        if stamp is None:
-                            result["timestamps_reliable"] = False
+                    if boundary is not None and stamp is None:
+                        result.update(status="invalid-record", timestamps_reliable=False,
+                                      coverage_note="public message timestamp unavailable; not consumed")
+                        result["coverage"].append(dict(start=offset, end=stream.tell(), reason="missing public timestamp"))
+                        break
+                    if boundary is not None and stamp < boundary:
                         extracted = None
                     else:
                         kind, text = extracted
-                        turn_id = _record_turn_id(record)
-                        label = (
-                            f"[{kind} timestamp={stamp if stamp is not None else 'unknown'} "
-                            f"turn={turn_id if turn_id is not None else 'unknown'} "
-                            f"bytes={offset}:{stream.tell()}]"
-                        )
-                        rendered = label + "\n" + text
+                        text = text.replace("\r\n", "\n").replace("\r", "\n")
+                        rendered = f"### {kind}\n{text}"
                         size = len(rendered.encode()) + 2
-                        if text_size + size > max_text_bytes or len(included) >= MAX_RECORDS:
+                        if included and (text_size + size > max_text_bytes or len(included) >= MAX_RECORDS):
                             break
                         included.append(rendered)
                         text_size += size
-                        if "[field truncated;" in text:
-                            result["coverage"].append(
-                                dict(
-                                    start=offset,
-                                    end=stream.tell(),
-                                    reason="field head/tail truncation",
-                                )
-                            )
                 if not extracted or not extracted[1]:
                     result["skipped_records"] += 1
                 consumed.update(raw)
@@ -426,6 +368,8 @@ def read_material(
         text="\n\n".join(included),
         records=len(included),
     )
+    if result["status"] != "ok":
+        return result
     if result["end"] == start:
         # A trailing half-written record is pending material, not proof of
         # no-new-material: report partial/more and leave the cursor unmoved

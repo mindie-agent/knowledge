@@ -243,8 +243,6 @@ def _read_raw(path):
         return "missing", None
     except OSError:
         return "unreadable", None
-    if len(raw) > MAX_BYTES:
-        return "corrupt", None
     try:
         data = json.loads(raw)
     except ValueError:
