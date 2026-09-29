@@ -490,7 +490,7 @@ def test_transport_loopback_and_identity(tmp_path):
         )
         assert queued["status"] == "queued"  # admission passes; runner is absent
         engine._process(queued["id"])
-        assert store.capture_row(queued["id"])["status"] == "discarded"
+        assert store.capture_row(queued["id"])["status"] == "failed"
         assert engine.budget.status()["calls_last_hour"] == 0  # no model attempt
         from mindie_knowledge.loop.transport import rpc
 

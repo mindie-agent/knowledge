@@ -15,7 +15,7 @@ from pathlib import Path
 
 from .activation import activation_epoch
 from .store import canonical, digest, new_identity, session_key
-from .transcript_capture import fallback_header, SUMMARY_SETTLE_SECONDS
+from .transcript_capture import pending_header, SUMMARY_SETTLE_SECONDS
 from .transcript_redaction import redact
 
 
@@ -83,7 +83,7 @@ def import_transcript(engine, *, session_id, token, source, source_session,
         inc = parser.read_material(source, cursor, session_id=source_session,
                                    not_before=None, expected=identity,
                                    scan_until=identity.size)
-        if inc['status'] not in {'ok', 'unchanged'} or inc.get('coverage'):
+        if inc['status'] not in {'ok', 'unchanged'} or inc.get('coverage') or inc.get('discarded_records'):
             raise HistoryImportError('source could not be completely parsed')
         if inc['end'] <= cursor or inc['end'] > identity.size:
             raise HistoryImportError('source has an incomplete record or changed snapshot')
@@ -136,7 +136,7 @@ def import_transcript(engine, *, session_id, token, source, source_session,
                 raise HistoryImportError('previously published entry cannot be extended')
     else:
         addition, entry_id = body, new_identity()
-    title, summary = fallback_header(addition)
+    title, summary = pending_header(addition)
     with store._write_txn():
         gate()
         if _receipt(store, key) != prior:

@@ -382,11 +382,10 @@ class FileTransport(Transport):
     # -- state file plumbing ------------------------------------------------ #
 
     def _read(self) -> dict:
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {"repos": {}}
-        return data if isinstance(data, dict) else {"repos": {}}
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or not isinstance(data.get("repos"), dict):
+            raise ValueError("invalid file transport state")
+        return data
 
     def _write(self, data: Mapping[str, Any]) -> None:
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")

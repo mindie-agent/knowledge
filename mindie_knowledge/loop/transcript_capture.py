@@ -23,7 +23,7 @@ def excerpt(text, size):
     return text[:size].encode('utf-8')[:size].decode('utf-8', 'ignore').strip()
 
 
-def fallback_header(text):
+def pending_header(text):
     # Clearly an excerpt, not a claim that a semantic summary succeeded.
     first = None
     lines = []
@@ -47,7 +47,7 @@ def capture(engine, row, text, region):
     from .engine import CursorConflict
     store = engine.store
     inc = region.get('inc') or {}
-    if not inc or inc.get('coverage'):
+    if not inc or inc.get('coverage') or inc.get('discarded_records'):
         raise ValueError('public transcript is incomplete; body not saved as complete')
     masked, rules = redact(text, executable=engine.redactor_executable, key=store.redaction_key(),
                            private_paths=(row['scope'], str(Path.home())))
@@ -68,11 +68,11 @@ def capture(engine, row, text, region):
         if reserved is None:
             raise CursorConflict('cursor changed before local body commit')
         if task:
-            title, summary = fallback_header(masked)
+            title, summary = pending_header(masked)
             doc, _ = store.append_observation(entry_id, masked, marker=inc['digest'], producer=owner,
                                               generation=row['generation'], header=dict(title=title, summary='Latest conversation excerpt: ' + summary.removeprefix('Conversation excerpt: ')))
         else:
-            title, summary = fallback_header(masked)
+            title, summary = pending_header(masked)
             doc = store.create_draft(kind='experience', title=title, summary=summary, content=masked,
                                      owner=owner, entry_id=entry_id, generation=row['generation'])
         store.finish_region(reserved, 'succeeded', 'public messages saved; model calls=0')

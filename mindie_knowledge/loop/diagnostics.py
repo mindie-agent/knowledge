@@ -27,7 +27,7 @@ _SAFE_CLASSES = frozenset({
     "ConnectionRefusedError", "ConnectionResetError", "URLError", "HTTPError",
     "DatabaseError", "OperationalError", "IntegrityError", "JSONDecodeError",
     "ImportError", "ModuleNotFoundError", "SyntaxError", "BudgetExceeded",
-    "MaintenanceCancelled", "CommandTimedOut", "OutputLimitExceeded",
+    "MaintenanceCancelled", "CommandTimedOut", "OutputLimitExceeded", "AdmissionUnavailable",
 })
 _NATIVE_FAILURE = re.compile(
     r"RuntimeError: maintenance agent exited (-?\d{1,5}); "
@@ -304,10 +304,23 @@ def _service(config):
                 or not isinstance(connection.get("token"), str) or not 1 <= len(connection["token"]) <= 512):
             raise ValueError("invalid existing loopback connection")
         status = rpc(connection, "status", timeout=0.4)
+        if not isinstance(status, dict):
+            raise ValueError("invalid knowledge service status")
         result = dict(status="running")
-        if isinstance(status, dict) and "worker_alive" in status:
+        if "worker_alive" in status:
             result["worker_failed"] = status.get("worker_failed") is True
             result["worker_alive"] = status.get("worker_alive") is True and not result["worker_failed"]
+            for field in ("summary_alive", "outbox_alive"):
+                if field in status:
+                    result[field] = status[field] is True
+            failures = status.get("background_errors")
+            result["background_errors"] = {
+                key: value if value in _SAFE_CLASSES else "UnknownError"
+                for key, value in failures.items() if key in {"summary", "index"} and isinstance(value, str)
+            } if isinstance(failures, dict) else {}
+            if (any(result.get(key) is False for key in ("worker_alive", "summary_alive", "outbox_alive"))
+                    or result["background_errors"]):
+                result["status"] = "degraded"
         return result
     except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
         return dict(status="unavailable", stage="probe", error_class=error_class(exc))
@@ -362,6 +375,25 @@ def _store(config, session, result):
             )
             result["captures"] = [dict(id=row["id"], status=row["status"] if row["status"] in _CAPTURE_STATUSES else "unknown", **failure(row["detail"]))
                                    for row in rows if isinstance(row["id"], str) and _SAFE_ID.fullmatch(row["id"])]
+            if "transcript_tasks" in tables:
+                rows = db.execute(f"""
+                    SELECT t.summary_status, substr(t.summary_detail,1,200) AS detail
+                    FROM transcript_tasks t LEFT JOIN captures c ON c.id=t.capture_id
+                    WHERE c.session=? OR c.root_session IN ({placeholders})
+                       OR json_extract(CASE WHEN json_valid(t.authorization)
+                                       THEN t.authorization ELSE '{{}}' END, '$.session')=?
+                    ORDER BY t.updated DESC LIMIT 5
+                """, (session, *roots, session))
+                for row in rows:
+                    state = row["summary_status"]
+                    detail = row["detail"]
+                    category = detail.removeprefix("category=")
+                    if detail == "configuration: summary worker is not configured":
+                        category = "configuration"
+                    result["summaries"].append(dict(
+                        status=state if state in {"pending", "running", "complete", "failed", "cancelled", "superseded"} else "unknown",
+                        **({"category": category} if category in AGENT_ERROR_EXIT_CODES else failure(detail)),
+                    ))
             # JSON is inspected inside SQLite, not copied into Python. The time
             # progress handler bounds history scans; invalid/oversized payloads
             # cannot prove ownership through entry_refs. Votes remain independent.
@@ -402,7 +434,7 @@ def snapshot(config_path, *, session=None):
     """Read existing local state, scoped to the caller's established native task."""
     result = dict(configuration=dict(status="unavailable"), service=dict(status="unknown"),
                   store=dict(status="unknown"), admission=dict(status="missing", enabled=False),
-                  maintenance=dict(status="unknown", scope="shared"), captures=[], contributions=[],
+                  maintenance=dict(status="unknown", scope="shared"), captures=[], contributions=[], summaries=[],
                   startup=dict(status="absent"), delivery=dict(status="absent"), hints=[])
     try:
         if session is not None:
@@ -444,6 +476,8 @@ def snapshot(config_path, *, session=None):
         result["hints"].append("Use this task's contributions batch_id for recover inspect; reconcile unknown writes before any explicit retry.")
     if result["startup"].get("status") == "failed":
         result["hints"].append("Inspect the reported configured startup component and installation.")
+    if any(row["status"] in {"failed", "unknown"} for row in result["summaries"]):
+        result["hints"].append("Required experience organization failed; the local body is retained and publication is blocked.")
     if result["service"].get("status") != "running" or result["store"].get("status") == "unavailable":
         result["hints"].append("Knowledge is unavailable; continue native/local or independent remote business work while inspecting the reported stage and class. Status does not retry work.")
     return result

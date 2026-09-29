@@ -215,3 +215,23 @@ def test_connection_write_failure_cancels_real_child_and_workers(tmp_path, monke
         time.sleep(.02)
     assert not alive, "owned controlled child or grandchild survived startup failure"
     assert diagnostics.snapshot(path)["startup"]["stage"] == "service"
+
+
+def test_summary_failure_is_scoped_visible_and_read_only(tmp_path):
+    path, data = config(tmp_path)
+    store = Store(data['root'], 'test')
+    try:
+        with store._write_txn():
+            for session in ('task-A', 'task-B'):
+                store.db.execute('INSERT INTO transcript_tasks '
+                    '(task_key,entry_id,capture_id,body_digest,summary_status,summary_detail,updated,summary_due,authorization) '
+                    'VALUES(?,?,?,?,?,?,?,?,?)',
+                    (session, session, '', 'digest', 'failed', 'configuration: summary worker is not configured', 1, 0,
+                     json.dumps({'session': session})))
+        result = diagnostics.snapshot(path, session='task-A')
+        assert result['summaries'] == [{'status': 'failed', 'category': 'configuration'}]
+        assert any('publication is blocked' in hint for hint in result['hints'])
+        assert 'task-B' not in json.dumps(result)
+        assert store.db.execute('SELECT COUNT(*) FROM transcript_tasks').fetchone()[0] == 2
+    finally:
+        store.close()

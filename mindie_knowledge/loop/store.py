@@ -56,6 +56,17 @@ def canonical(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _stored_json(raw, expected, name):
+    """Corrupt persisted state cannot become a new empty authority."""
+    try:
+        value = json.loads(raw)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"invalid stored {name}: JSON unreadable") from exc
+    if not isinstance(value, expected):
+        raise ValueError(f"invalid stored {name}: expected {expected.__name__}")
+    return value
+
+
 def digest(value):
     return hashlib.sha256(canonical(value).encode()).hexdigest()
 
@@ -550,11 +561,7 @@ class Store:
         ).fetchone()
         if row is None:
             return {"next_rowid": 0, "complete": False}
-        try:
-            value = json.loads(row[0])
-        except ValueError:
-            return {"next_rowid": 0, "complete": False}
-        return value if isinstance(value, dict) else {"next_rowid": 0, "complete": False}
+        return _stored_json(row[0], dict, "search backfill")
 
     def _search_requeue_read(self):
         row = self.db.execute(
@@ -562,13 +569,10 @@ class Store:
         ).fetchone()
         if row is None:
             return []
-        try:
-            value = json.loads(row[0])
-        except ValueError:
-            return []
-        if not isinstance(value, list):
-            return []
-        return [item for item in value if isinstance(item, str)][:256]
+        value = _stored_json(row[0], list, "search requeue")
+        if not all(isinstance(item, str) for item in value):
+            raise ValueError("invalid stored search requeue: expected entry IDs")
+        return value
 
     @staticmethod
     def _doc_source_text(doc):
@@ -1876,10 +1880,7 @@ class Store:
                     ),
                 )
                 return True
-            try:
-                record = json.loads(row[0])
-            except ValueError:
-                record = {"status": "attempted"}
+            record = _stored_json(row[0], dict, "export attempt")
             status = record.get("status")
             if status == "staged":
                 return False
@@ -1919,10 +1920,7 @@ class Store:
             ).fetchone()
             record = {}
             if row is not None:
-                try:
-                    record = json.loads(row[0])
-                except ValueError:
-                    record = {}
+                record = _stored_json(row[0], dict, "export attempt")
             attempts = int(record.get("attempts") or 0)
             next_check = None
             if status == "failed":
@@ -2048,10 +2046,7 @@ class Store:
                     "SELECT * FROM outbox WHERE batch_id=?", (batch_id,)
                 ).fetchone()
                 if row is not None:
-                    try:
-                        batch = json.loads(row["batch"])
-                    except ValueError:
-                        batch = {}
+                    batch = _stored_json(row["batch"], dict, "outbox batch")
                     self._record_sent_receipts(row, batch, actual_files=actual_files)
             if status == "rejected":
                 # A proven closed-unmerged PR retires exactly this batch's
@@ -2060,10 +2055,7 @@ class Store:
                 row = self.db.execute(
                     "SELECT batch FROM outbox WHERE batch_id=?", (batch_id,)
                 ).fetchone()
-                try:
-                    refs = json.loads(row[0]).get("entry_refs", []) if row else []
-                except ValueError:
-                    refs = []
+                refs = _stored_json(row[0], dict, "outbox batch").get("entry_refs", []) if row else []
                 for ref in refs:
                     parsed = _exact_revision_ref(ref)
                     if parsed is None:
@@ -2382,12 +2374,9 @@ class Store:
             ).fetchone()
             prior = []
             if prior_row is not None and prior_row[0]:
-                try:
-                    parsed_markers = json.loads(prior_row[0])
-                except ValueError:
-                    parsed_markers = []
-                if isinstance(parsed_markers, list):
-                    prior = [m for m in parsed_markers if isinstance(m, str)]
+                prior = _stored_json(prior_row[0], list, "sent markers")
+                if not all(isinstance(marker, str) for marker in prior):
+                    raise ValueError("invalid stored sent markers: expected strings")
             if payload_markers is None and prior_row is None:
                 markers_value = None
             else:
@@ -2430,14 +2419,9 @@ class Store:
         raw = receipt.get("markers")
         if not raw:
             return None
-        try:
-            value = json.loads(raw)
-        except ValueError:
-            return None
-        if not isinstance(value, list) or not all(
-            isinstance(marker, str) for marker in value
-        ):
-            return None
+        value = _stored_json(raw, list, "sent markers")
+        if not all(isinstance(marker, str) for marker in value):
+            raise ValueError("invalid stored sent markers: expected strings")
         return set(value)
 
     def rebase_draft_on_published(self, entry_id):

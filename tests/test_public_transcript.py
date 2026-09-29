@@ -95,19 +95,17 @@ def test_missing_summary_is_configuration_failure_not_publishable_excerpt(pipeli
     assert build_batch(store, settings=engine._settings()) is None
 
 
-def test_corrupt_only_page_keeps_a_diagnostic_and_allows_later_public_text(pipeline):
+def test_corrupt_page_fails_without_advancing_or_publishing(pipeline):
     engine, store, path = pipeline
     with path.open('ab') as stream:
         stream.write(b'{broken-record}\n')
+    append(path, 'public-after-corrupt-page')
     event = engine.capture(session_id='manual-A', turn_id='corrupt-only', transcript_path=str(path))
     engine._process(event['id'])
+    row = store.capture_row(event['id'])
+    assert row['status'] == 'failed' and 'incomplete transcript page' in row['detail']
     assert store.drafts_changed() == []
-    assert store.cursor(str(path.resolve()))['ok_finish'] == path.stat().st_size
-    detail = json.loads(store.db.execute('SELECT detail FROM regions').fetchone()[0])
-    assert detail['discarded_records'][0]['reason'] == 'invalid record'
-    append(path, 'public-after-corrupt-only-page')
-    process(engine, path, 'later')
-    assert store.drafts_changed()[0]['content'] == '### user\npublic-after-corrupt-only-page'
+    assert store.cursor(str(path.resolve())) is None
 
 
 def test_restart_and_duplicate_stop_append_one_task_record(pipeline):
@@ -485,7 +483,7 @@ def test_kimi_lineage_recovers_without_exporting_inherited_history(tmp_path, sca
 
 @pytest.mark.parametrize('harness', ['codex', 'kimi', 'cc'])
 @pytest.mark.parametrize('bad', [b'{"bad":broken}\n', b'null\n', b'\xff\n'])
-def test_corrupt_record_does_not_lose_valid_neighbors(tmp_path, scanner, harness, bad):
+def test_corrupt_record_blocks_incomplete_page_without_losing_source(tmp_path, scanner, harness, bad):
     from lane_support import encode_record
     session = SESSIONS[harness]
     settings = tmp_path / 'community.json'
@@ -504,20 +502,14 @@ def test_corrupt_record_does_not_lose_valid_neighbors(tmp_path, scanner, harness
         event = engine.capture(session_id=session, turn_id='broken-line', transcript_path=str(path))
         engine._process(event['id'])
         row = store.capture_row(event['id'])
-        assert row['status'] == 'organized', row
-        discarded = json.loads(row['detail'])['discarded_records']
+        assert row['status'] == 'failed', row
+        discarded = json.loads(row['detail'])['records']
         assert len(discarded) == 1 and discarded[0]['reason'] == 'invalid record'
         assert discarded[0]['end'] - discarded[0]['start'] == len(bad)
-        assert store.cursor(str(path.resolve()))['ok_finish'] == path.stat().st_size
-        body = store.drafts_changed()[0]['content']
-        assert body == '### user\nbefore-bad-marker\n\n### user\nafter-bad-marker'
-        # A later Stop must also continue, not reread either neighbor.
-        with path.open('ab') as stream:
-            stream.write(encode_record(harness, session, 'later-marker', when + 3))
-        second = engine.capture(session_id=session, turn_id='later', transcript_path=str(path))
-        engine._process(second['id'])
-        final = store.drafts_changed()[0]['content']
-        assert final.count('before-bad-marker') == final.count('after-bad-marker') == final.count('later-marker') == 1
+        assert store.cursor(str(path.resolve())) is None
+        assert store.drafts_changed() == []
+        assert bad in path.read_bytes()
+        assert b'before-bad-marker' in path.read_bytes() and b'after-bad-marker' in path.read_bytes()
 
 
 def test_summary_of_previous_body_does_not_release_a_new_body(pipeline):

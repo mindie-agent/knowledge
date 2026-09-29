@@ -7,7 +7,7 @@ import pytest
 from mindie_knowledge.loop.budget import MaintenanceBudget
 from mindie_knowledge.loop.documents import render_entry
 from mindie_knowledge.loop.store import Store
-from mindie_knowledge.loop.transcript_capture import fallback_header
+from mindie_knowledge.loop.transcript_capture import pending_header
 from mindie_knowledge.retrieval import index_text, tokens
 
 
@@ -106,7 +106,7 @@ def test_token_stream_keeps_order_aliases_and_large_identifiers():
 def test_fallback_excerpt_matches_original_format(body):
     lines = [s.strip() for s in body.splitlines() if s.strip() and not s.startswith('### ')]
     excerpt = lambda s, n: s.encode()[:n].decode('utf-8', 'ignore').strip()
-    assert fallback_header(body) == (excerpt(lines[0] if lines else 'Public conversation', 240)[:120],
+    assert pending_header(body) == (excerpt(lines[0] if lines else 'Public conversation', 240)[:120],
                                      'Conversation excerpt: ' + excerpt('\n'.join(lines), 1500))
 
 
