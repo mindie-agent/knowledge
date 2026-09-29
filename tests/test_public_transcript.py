@@ -397,8 +397,16 @@ def test_production_parsers_preserve_large_public_messages_through_export(tmp_pa
                         transcript_adapter=load_parser(harness), capture_mode='public-transcript',
                         redactor_executable=scanner)
         event = engine.capture(session_id=session, turn_id='long-public', transcript_path=str(path))
-        engine._process(event['id'])
-        assert store.capture_row(event['id'])['status'] == 'organized'
+        # The worker may yield between pages or defer a temporary scanner
+        # failure. Acceptance is eventual complete persistence from this one
+        # Stop, not an assumption that the first synchronous tick finishes.
+        engine.start()
+        try:
+            wait_until(lambda: store.capture_row(event['id'])['status'] == 'organized')
+        except AssertionError:
+            pytest.fail(str(store.capture_row(event['id'])))
+        finally:
+            engine.shutdown()
         assert store.cursor(str(path.resolve()))['ok_finish'] == path.stat().st_size
         doc = store.drafts_changed()[0]
         assert doc['content'] == '### user\n' + text
