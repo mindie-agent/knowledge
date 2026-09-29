@@ -382,7 +382,9 @@ def _store(config, session, result):
                     WHERE c.session=? OR c.root_session IN ({placeholders})
                        OR json_extract(CASE WHEN json_valid(t.authorization)
                                        THEN t.authorization ELSE '{{}}' END, '$.session')=?
-                    ORDER BY t.updated DESC LIMIT 5
+                    ORDER BY (t.summary_status NOT IN
+                              ('pending','running','complete','cancelled','superseded')) DESC,
+                             t.updated DESC LIMIT 5
                 """, (session, *roots, session))
                 for row in rows:
                     state = row["summary_status"]

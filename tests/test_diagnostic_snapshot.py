@@ -233,5 +233,15 @@ def test_summary_failure_is_scoped_visible_and_read_only(tmp_path):
         assert any('publication is blocked' in hint for hint in result['hints'])
         assert 'task-B' not in json.dumps(result)
         assert store.db.execute('SELECT COUNT(*) FROM transcript_tasks').fetchone()[0] == 2
+        with store._write_txn():
+            for index in range(6):
+                store.db.execute('INSERT INTO transcript_tasks '
+                    '(task_key,entry_id,capture_id,body_digest,summary_status,summary_detail,updated,summary_due,authorization) '
+                    'VALUES(?,?,?,?,?,?,?,?,?)',
+                    (f'complete-{index}', f'complete-{index}', '', 'digest', 'complete', '', 2+index, 0,
+                     json.dumps({'session': 'task-A'})))
+        newer = diagnostics.snapshot(path, session='task-A')
+        assert newer['summaries'][0] == {'status': 'failed', 'category': 'configuration'}
+        assert any('publication is blocked' in hint for hint in newer['hints'])
     finally:
         store.close()
