@@ -176,3 +176,37 @@ def test_invalid_parent_is_not_a_never_initialized_read(tmp_path):
     with pytest.raises(NotADirectoryError):
         open_database(parent / 'state.sqlite3', schema='test/1', required={},
                       initialize=lambda db: None, initialize_missing=False)
+
+
+def test_partial_index_with_same_shape_wrong_predicate_is_not_valid_state(tmp_path):
+    with closing(Store(tmp_path, 'demo')) as store:
+        store.create_draft(kind='experience', title='Preserved', summary='Uncertain', content='Synthetic full body')
+        root = store.root
+    original = bodies(root)
+    path = root / 'state-v4.sqlite3'
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute('DROP INDEX material_summary_window')
+        db.execute("CREATE INDEX material_summary_window ON material_summary_attempts(created) WHERE status='prepared'")
+    damaged = path.read_bytes()
+    with pytest.raises(ValueError, match='material_summary_attempts'):
+        Store(tmp_path, 'demo')
+    assert path.read_bytes() == damaged and bodies(root) == original
+
+
+def test_step_table_without_declared_autoincrement_preserves_receipts_and_fails(tmp_path):
+    with closing(Ledger(tmp_path)) as ledger:
+        ledger.record_intent(batch_id='known', revision='a' * 64, domain='demo', repository='o/r', branch='known')
+        ledger.record_step('known', 'a' * 64, 'git:push')
+    path = tmp_path / LEDGER_NAME
+    with closing(sqlite3.connect(path)) as db, db:
+        sql = db.execute("SELECT sql FROM sqlite_master WHERE name='publication_step'").fetchone()[0]
+        db.execute('ALTER TABLE publication_step RENAME TO original_step')
+        db.execute(sql.replace('AUTOINCREMENT', ''))
+        db.execute('INSERT INTO publication_step SELECT * FROM original_step')
+        db.execute('DROP TABLE original_step')
+    damaged = path.read_bytes()
+    with pytest.raises(ValueError, match='publication_step'):
+        Ledger(tmp_path)
+    assert path.read_bytes() == damaged
+    with closing(sqlite3.connect(path)) as db:
+        assert db.execute('SELECT step FROM publication_step').fetchone()[0] == 'git:push'

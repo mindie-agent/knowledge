@@ -7,11 +7,24 @@ before any CREATE, so lost receipt tables never become permission to replay.
 from functools import lru_cache
 import os
 from pathlib import Path
+import re
 import sqlite3
 import stat
 import threading
 
 from .loop.locks import StartLock
+
+_SQL_TOKENS = re.compile(r'''--[^\n]*|/\*.*?\*/|'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[[^]]*\]|[A-Za-z_][A-Za-z_0-9]*|[^\s]''', re.S)
+
+
+def _sql_contract(sql):
+    if sql is None:
+        return None
+    # Ignore formatting/comments, retaining literal bytes and predicate
+    # operators. Lowercasing the whole SQL would hide changed string values.
+    return tuple(token if token[0] in "'\"`[" else token.casefold()
+                 for token in _SQL_TOKENS.findall(sql)
+                 if token != ';' and not token.startswith(('--', '/*')))
 
 
 def require_columns(db, required):
@@ -27,11 +40,13 @@ def _table_contract(db, table):
     indexes = {}
     for row in db.execute(f'PRAGMA index_list({table})'):
         name = row[1]
+        sql = db.execute('SELECT sql FROM sqlite_master WHERE type=\'index\' AND name=?', (name,)).fetchone()
         indexes[name] = (tuple(row[2:]), tuple(tuple(value[2:]) for value in
-                         db.execute(f'PRAGMA index_xinfo({name})')))
+                         db.execute(f'PRAGMA index_xinfo({name})')), _sql_contract(sql[0]) if sql else None)
     foreign = tuple(tuple(row) for row in db.execute(f'PRAGMA foreign_key_list({table})'))
-    kind = db.execute('SELECT type FROM sqlite_master WHERE name=?', (table,)).fetchone()
-    return columns, indexes, foreign, kind[0] if kind else None
+    kind = db.execute('SELECT type,sql FROM sqlite_master WHERE name=?', (table,)).fetchone()
+    autoincrement = kind is not None and 'autoincrement' in (_sql_contract(kind[1]) or ())
+    return columns, indexes, foreign, kind[0] if kind else None, autoincrement
 
 
 @lru_cache(maxsize=None)
@@ -50,7 +65,8 @@ def require_schema(db, initialize):
     for table, expected in _declared_contract(initialize).items():
         actual = _table_contract(db, table)
         if (actual[3] != 'table' or any(actual[0].get(name) != value for name, value in expected[0].items())
-                or actual[1] != expected[1] or actual[2] != expected[2]):
+                or actual[1] != expected[1] or actual[2] != expected[2]
+                or expected[4] and not actual[4]):
             raise ValueError(f'authoritative state table {table} schema or constraints are invalid; state was not rebuilt')
 
 
