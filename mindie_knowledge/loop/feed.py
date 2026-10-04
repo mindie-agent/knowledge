@@ -1,48 +1,22 @@
-"""Model-free knowledge sync from the canonical Git publication.
+"""Model-free Git synchronization of complete current task file packages.
 
-The configured content repository's branch is followed as one immutable Git
-commit whose tree holds canonical ``mindie-entry/2`` documents under
-``cases/`` and ``topics/`` (``feedback/*.json`` belongs to the repository
-side and is ignored here). Every candidate commit is fully verified before
-the atomic switch: layout, per-file platform envelope, UTF-8/LF bytes,
-schema, revisions, domain and entry identities. There is no whole-feed
-entry-count or total-byte business cap: blobs are read one at a time through
-a bounded persistent ``git cat-file --batch`` process, and each verified blob
-is checkpointed against the exact candidate commit in short local
-transactions, so an attempt that hits the per-attempt deadline resumes after
-the last staged blob — never restarting at item zero, never holding a SQLite
-write transaction across Git reads — and the visible feed switches atomically
-only once the candidate is complete. A structurally
-incompatible candidate is quarantined permanently against its immutable
-commit; a transient failure (OSError/timeout) persists its attempt count and
-a backoff ``next_check`` and is retried automatically once due — never a
-permanent exhaustion after three attempts. A bad candidate always keeps the
-old cache. An empty tree is valid and empties ordinary search — withdrawal
-is deletion from the tree — while every historical revision body stays
-readable by pinned reference with an explicit withdrawn flag.
-
-Remote discovery never latches permanently: each sync makes one bounded
-discovery pass, and after three consecutive transport failures it defers
-ordinary calls for one hour (the updater's established post-failure
-cadence). Once that time is due, an ordinary call discovers again; a
-successful discovery clears the transient failure state. An explicit
-``sync --resume`` skips both deferrals and rechecks now, but never
-revalidates an invalid candidate.
-
-Unsupported old layouts (e.g. ``corpus/``) fail loudly instead of looking
-like a valid empty new feed. Sync runs standalone (``sync --config``) with
-community contribution off; it never starts the maintenance service or a
-model, and it is bounded to 30 seconds per attempt.
+Candidate bytes are ordinary temporary files, bound to one immutable commit.
+All packages validate before the material store switches its current snapshot.
+SQLite keeps progress and receipts only. Superseded references expire; neither
+sync nor index installation calls a model or republishes consumer material.
 """
 
 from __future__ import annotations
 
 import re
+import hashlib
+import shutil
 import os
 import time
 from pathlib import Path
 
 from . import documents
+from mindie_knowledge.materials.store import MaterialCleanupError
 from .locks import StartInProgress, StartLock
 from .store import _backoff_seconds, digest
 from mindie_knowledge.community.common import CommunityError, run_argv
@@ -67,7 +41,7 @@ DISCOVERY_FAILURE_LIMIT = 3
 # (one minute doubling to one hour), persisted across restarts.
 CANDIDATE_BACKOFF_BASE = 60
 CANDIDATE_BACKOFF_CAP = 3600
-_ENTRY_RE = re.compile(r"^(cases|topics)/[^/]+\.md$")
+_ENTRY_RE = re.compile(r"^tasks/[0-9a-f]{64}/(?:index\.md|blocks/[A-Za-z0-9_-]{1,128}\.md)$")
 _FEEDBACK_RE = re.compile(r"^feedback/[^/]+\.json$")
 _METADATA_FILES = {"README.md", "README", "AGENTS.md", "LICENSE", "LICENSE.md",
                    "CONTRIBUTING.md", "CODE_OF_CONDUCT.md", "SECURITY.md"}
@@ -134,7 +108,7 @@ class Feed:
             url = Path(url).resolve().as_uri()
         try:
             completed = run_argv(
-                ["git", "clone", "--bare", "--quiet", "--depth=1", "--single-branch",
+                ["git", "clone", "--bare", "--quiet", "--depth=1", "--single-branch", "--no-tags",
                  "--branch", self.ref, url, str(self.repo)],
                 timeout=min(remaining, 25), max_output=65536, input_bytes=b"",
                 env=_feed_git_env(),
@@ -150,6 +124,27 @@ class Feed:
 
     # ----------------------------------------------------------------- sync
 
+    def _retain_tip(self, commit, deadline):
+        """Prune history in this private read cache, under the sync lock.
+
+        The installed database does not depend on old Git objects. Keep only
+        the candidate tip, including when a candidate later fails validation.
+        Interrupted cleanup is retried on the next sync, not in a busy loop.
+        """
+        key = 'feed-git-tip:' + self.ident
+        if self.store.feed_get(key) == {'commit': commit}:
+            return
+        tip = 'refs/heads/mindie-current'
+        self._git('update-ref', tip, commit, deadline=deadline)
+        self._git('symbolic-ref', 'HEAD', tip, deadline=deadline)
+        refs = self._git('for-each-ref', '--format=%(refname)', deadline=deadline)
+        for ref in refs.decode().splitlines():
+            if ref != tip:
+                self._git('update-ref', '-d', ref, deadline=deadline)
+        self._git('reflog', 'expire', '--expire=now', '--all', deadline=deadline)
+        self._git('gc', '--prune=now', '--quiet', deadline=deadline)
+        self.store.feed_set(key, {'commit': commit})
+
     def _candidate(self):
         return self.store.feed_get(f"feed-candidate:{self.ident}") or {}
 
@@ -159,7 +154,7 @@ class Feed:
     def _validate_listing(self, commit, deadline):
         """Eager metadata pass: paths, modes, per-file sizes, layout.
 
-        Returns ``[(path, size), ...]`` (small per-entry metadata, not
+        Returns ``[(path, size, Git object identity), ...]`` (small per-entry metadata, not
         bodies). Raises ValueError for incompatible content (quarantined, no
         retry) and OSError/TimeoutError for transient failures. The listing
         itself is written to a scratch file and parsed in bounded chunks, so
@@ -169,14 +164,14 @@ class Feed:
 
         listing_path = self.dir / "listing.tmp"
         run_stdout_to_file(
-            ["git", "-C", str(self.repo), "ls-tree", "-r", "--long", commit,
+            ["git", "-C", str(self.repo), "ls-tree", "-r", "-z", "--long", commit,
              "--", self.prefix or "."],
             listing_path,
             timeout=max(1.0, deadline - time.monotonic()),
             env=_feed_git_env(),
         )
         try:
-            records = iter_file_records(listing_path, separator=b"\n")
+            records = iter_file_records(listing_path)
             entries = []
             for raw_record in records:
                 line = raw_record.decode("utf-8", "strict")
@@ -194,7 +189,7 @@ class Feed:
                 if not size.isdigit():
                     raise ValueError("git tree entry without a size")
                 size_i = int(size)
-                if _ENTRY_RE.match(path):
+                if _ENTRY_RE.fullmatch(path):
                     if mode != "100644":
                         raise ValueError(
                             f"entry {path} has unsafe Git mode {mode}; only regular "
@@ -202,8 +197,10 @@ class Feed:
                         )
                     if size_i > documents.MAX_FILE_BYTES:
                         raise ValueError(f"entry {path} exceeds the byte limit")
-                    entries.append((path, size_i))
-                elif _FEEDBACK_RE.match(path) or not path.endswith(".md"):
+                    entries.append((path, size_i, _sha))
+                elif path.startswith("tasks/"):
+                    raise ValueError(f"unsupported task package path {path!r}")
+                elif _FEEDBACK_RE.fullmatch(path) or not path.endswith(".md"):
                     # Feedback belongs to the repository side; non-Markdown files
                     # (workflows, scripts) are not knowledge content.
                     continue
@@ -211,69 +208,127 @@ class Feed:
                     # Repository metadata Markdown is never knowledge content.
                     continue
                 else:
-                    # Markdown outside cases/topics — e.g. the old corpus/ layout —
+                    # Markdown outside task packages — e.g. the old corpus/ layout —
                     # is an unsupported tree, never a valid empty new feed.
                     raise ValueError(
                         f"unsupported content layout at {path!r}; not a canonical feed"
                     )
-        finally:
+        except (ValueError, OSError, TimeoutError) as exc:
             try:
-                listing_path.unlink()
-            except OSError:
-                pass
+                listing_path.unlink(missing_ok=True)
+            except OSError as cleanup:
+                # No feed switch has happened. Keep its original invalid or
+                # unavailable outcome and both reasons if scratch cleanup fails.
+                error = ValueError if isinstance(exc, ValueError) else OSError
+                raise error(f"{exc}; listing cleanup also failed: {type(cleanup).__name__}: {cleanup}") from exc
+            raise
+        else:
+            listing_path.unlink(missing_ok=True)
         return sorted(entries)
 
+    def _staging_dir(self, commit):
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit):
+            raise ValueError("invalid feed commit identity")
+        return self.dir / "staging" / commit
+
+    @staticmethod
+    def _matches_blob(raw, size, object_id):
+        if len(raw) != size:
+            return False
+        hashing = hashlib.sha1 if len(object_id) == 40 else hashlib.sha256
+        return hashing(b"blob " + str(size).encode("ascii") + b"\0" + raw).hexdigest() == object_id
+
     def _stage_tree_docs(self, commit, entries, deadline):
-        """Fetch and validate candidate blobs, checkpointing per blob.
-
-        Verified progress is persisted per blob against the exact candidate
-        commit, so an attempt that hits the 30-second deadline (or any
-        transient failure) resumes after the last staged blob instead of
-        restarting at item zero. Reads go through one bounded persistent
-        ``git cat-file --batch`` process — never a per-blob spawn and never a
-        whole-library materialization. Raises ValueError for incompatible
-        content (quarantined, no retry) and OSError/TimeoutError for
-        transient failures (backoff, progress kept). The derived retrieval
-        token stream is precomputed per blob here, off the switch, so the
-        atomic visibility switch never retokenizes under a write transaction.
-        """
+        """Checkpoint checked blobs as files, without any database body mirror."""
         from mindie_knowledge.gitread import CatFileBatch
-        from mindie_knowledge.retrieval import index_text
 
-        staged_paths, seen_ids = self.store.feed_staging_state(self.ident, commit)
+        staging = self._staging_dir(commit)
         reader = None
         staged = 0
         try:
-            for path, size in entries:
-                if path in staged_paths:
+            for path, size, object_id in entries:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("task package staging exceeded the sync deadline")
+                target = staging / path
+                if target.is_symlink():
+                    raise ValueError("feed staging contains an unsafe symlink")
+                if target.is_file() and self._matches_blob(target.read_bytes(), size, object_id):
+                    staged += 1
                     continue
                 if reader is None:
                     reader = CatFileBatch(self.repo, env=_feed_git_env())
-                raw = reader.read(
-                    f"{commit}:{self.prefix + '/' if self.prefix else ''}{path}",
-                    deadline=deadline, max_bytes=documents.MAX_FILE_BYTES,
-                )
+                raw = reader.read(object_id, deadline=deadline, max_bytes=documents.MAX_FILE_BYTES)
                 if raw is None:
                     raise OSError(f"listed blob is unreadable in the local clone: {path}")
-                if len(raw) != size:
-                    raise ValueError(f"blob size mismatch for {path}")
-                doc = documents.parse_entry(raw)
-                if doc["domain"] != self.store.domain:
-                    raise ValueError(f"entry {path} belongs to another domain")
-                if doc["entry_id"] in seen_ids:
-                    raise ValueError("duplicate entry identity in feed")
-                seen_ids.add(doc["entry_id"])
-                text = doc["title"] + "\n" + doc["summary"] + "\n" + doc["content"]
-                self.store.feed_stage_doc(
-                    self.ident, commit, path, doc["entry_id"], doc,
-                    tokens=index_text(text),
-                    text_digest=self.store._doc_state_digest(doc),
-                )
+                if not self._matches_blob(raw, size, object_id):
+                    raise ValueError(f"blob identity mismatch for {path}")
+                text = raw.decode("utf-8", "strict")
+                if "\r" in text or "\x00" in text:
+                    raise ValueError(f"task package is not canonical UTF-8/LF text: {path}")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                temporary = target.with_name(target.name + ".tmp")
+                temporary.write_bytes(raw)
+                temporary.replace(target)
                 staged += 1
         finally:
             if reader is not None:
                 reader.close()
         return staged
+
+    def _packages(self, commit, entries):
+        from mindie_knowledge.materials import validate_package_files
+
+        grouped = {}
+        for path, _size, _object_id in entries:
+            _, task_id, relative = path.split("/", 2)
+            grouped.setdefault(task_id, []).append(relative)
+        staging = self._staging_dir(commit)
+        for task_id, names in sorted(grouped.items()):
+            files = {relative: (staging / "tasks" / task_id / relative).read_text(encoding="utf-8")
+                     for relative in names}
+            checked = validate_package_files(files, self.store.domain)
+            package = checked
+            if not package["ready"]:
+                raise ValueError("published task package has unfinished material indexes")
+            if package["task_id"] != task_id:
+                raise ValueError("task package identity differs from its directory")
+            yield package
+
+    def _clear_staging(self):
+        staging = self.dir / "staging"
+        if staging.exists():
+            shutil.rmtree(staging)
+
+    def _staged_count(self, commit):
+        directory = self._staging_dir(commit)
+        return sum(1 for _ in directory.rglob("*.md")) if directory.exists() else 0
+
+    def _cleanup_receipt(self, receipt, *, retry_material=False):
+        errors = []
+        if retry_material and receipt.get("material_cleanup_error"):
+            try:
+                self.store.retry_feed_cleanup()
+                receipt.pop("material_cleanup_error", None)
+            except (OSError, MaterialCleanupError) as exc:
+                receipt["material_cleanup_error"] = str(exc)[:300]
+        if receipt.get("material_cleanup_error"):
+            errors.append("material cleanup: " + receipt["material_cleanup_error"])
+        try:
+            self._clear_staging()
+        except OSError as exc:
+            errors.append("staging cleanup: " + str(exc)[:300])
+        if errors:
+            receipt.update(cleanup_status="failed", cleanup_error="; ".join(errors), cleanup_errors=errors)
+        else:
+            for key in ("cleanup_status", "cleanup_error", "cleanup_errors"):
+                receipt.pop(key, None)
+        return receipt
+
+    @staticmethod
+    def _partial_promotion(commit, repository, exc):
+        return dict(status="partial", repository=repository, commit=commit,
+                    metadata_committed=True, failed_stage="material-promotion",
+                    detail=f"Task metadata committed; material promotion failed: {type(exc).__name__}: {exc}"[:500])
 
     @staticmethod
     def _candidate_backoff(attempts):
@@ -317,11 +372,12 @@ class Feed:
             try:
                 if not self.repo.is_dir():
                     self._clone(deadline)
-                self._git("fetch", "--quiet", "origin", self.ref, deadline=deadline)
+                self._git("fetch", "--quiet", "--depth=1", "--no-tags", "origin", self.ref, deadline=deadline)
                 commit = self._git("rev-parse", "FETCH_HEAD", deadline=deadline)
                 commit = commit.decode().strip()
-                if not re.fullmatch(r"[0-9a-f]{40}", commit):
+                if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit):
                     raise OSError("remote ref did not resolve to a commit")
+                self._retain_tip(commit, deadline)
             except (OSError, TimeoutError) as exc:
                 self.store.feed_set(receipt_key, dict(
                     receipt, status="unavailable", repository=self.repository,
@@ -336,8 +392,9 @@ class Feed:
                 cleaned.pop("retained_commit", None)
                 cleaned["status"] = "unchanged"
                 cleaned["checked"] = time.time()
+                self._cleanup_receipt(cleaned, retry_material=True)
                 self.store.feed_set(receipt_key, cleaned)
-                return self.store.feed_get(receipt_key)
+                return cleaned
             candidate = self._candidate()
             if candidate.get("commit") != commit:
                 candidate = {"commit": commit, "attempts": 0, "status": "new"}
@@ -365,21 +422,30 @@ class Feed:
                 # The candidate switched atomically only when every blob of
                 # the exact commit was verified and staged; the switch itself
                 # is a short local transaction with no Git IO inside.
-                installed = self.store.install_feed(
-                    self.store.feed_staged_docs(self.ident, commit),
-                    feed_ident=self.ident,
-                )
-                self.store.feed_staging_clear(self.ident)
+                packages = list(self._packages(commit, listing))
+                installed = self.store.install_feed(packages, feed_ident=self.ident, source_revision=commit)
+            except MaterialCleanupError as exc:
+                # The new pointers and metadata are already committed. Preserve
+                # this outcome separately from retiring superseded local files.
+                installed = dict(entries=len(packages), cleanup_error=str(exc)[:300])
             except ValueError as exc:
+                if getattr(exc, "metadata_committed", False):
+                    return self._partial_promotion(commit, self.repository, exc)
                 candidate.update(status="invalid", detail=str(exc)[:300])
                 candidate.pop("next_check", None)
                 self._save_candidate(candidate)
-                self.store.feed_staging_clear(self.ident)
-                return dict(status="invalid", repository=self.repository,
-                            commit=commit, detail=str(exc)[:300],
-                            retained_commit=receipt.get("commit"))
+                result = dict(status="invalid", repository=self.repository,
+                              commit=commit, detail=str(exc)[:300],
+                              retained_commit=receipt.get("commit"))
+                try:
+                    self._clear_staging()
+                except OSError as cleanup:
+                    result.update(cleanup_status="failed", cleanup_error=str(cleanup)[:300])
+                return result
             except (OSError, TimeoutError) as exc:
-                remaining = self.store.feed_staging_count(self.ident, commit)
+                if getattr(exc, "metadata_committed", False):
+                    return self._partial_promotion(commit, self.repository, exc)
+                remaining = self._staged_count(commit)
                 candidate.update(
                     status="unavailable", detail=str(exc)[:300],
                     staged=remaining,
@@ -393,13 +459,25 @@ class Feed:
                     staged=remaining, checked=time.time(),
                 ))
                 return self.store.feed_get(receipt_key)
+            except Exception as exc:
+                if getattr(exc, "metadata_committed", False):
+                    return self._partial_promotion(commit, self.repository, exc)
+                raise
             receipt = dict(
                 status="synced", repository=self.repository, ref=self.ref,
                 prefix=self.prefix, commit=commit, entries=installed["entries"],
                 attempts=candidate["attempts"], checked=time.time(),
             )
-            self.store.feed_set(receipt_key, receipt)
-            self._save_candidate({"commit": commit, "attempts": 0, "status": "ok"})
+            if installed.get("cleanup_error"):
+                receipt["material_cleanup_error"] = installed["cleanup_error"]
+            self._cleanup_receipt(receipt)
+            try:
+                self.store.feed_set(receipt_key, receipt)
+                self._save_candidate({"commit": commit, "attempts": 0, "status": "ok"})
+            except Exception as exc:
+                # The file snapshot is already installed. Report its known
+                # outcome even when saving the secondary sync receipt fails.
+                receipt.update(receipt_status="failed", receipt_error=f"{type(exc).__name__}: {exc}"[:300])
             return receipt
         finally:
             lock.release()

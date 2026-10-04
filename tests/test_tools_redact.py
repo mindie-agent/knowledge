@@ -1,4 +1,4 @@
-"""tools/redact.py — ruleset r2, scanner and allowlist."""
+"""tools/redact.py — ruleset r3, scanner and allowlist."""
 
 from __future__ import annotations
 
@@ -41,9 +41,9 @@ def rules_hit(text: str, allow: redact.Allowlist | None = None) -> set[str]:
 class ProfileTests(unittest.TestCase):
     def test_profile_is_declared_once_and_matches_schema_pattern(self):
         self.assertRegex(redact.REDACTION_PROFILE, r"^r[0-9]+$")
-        self.assertEqual(redact.REDACTION_PROFILE, "r2")
+        self.assertEqual(redact.REDACTION_PROFILE, "r3")
         proc = run_tool("redact", "--profile")
-        self.assertEqual(proc.stdout.strip(), "r2")
+        self.assertEqual(proc.stdout.strip(), "r3")
 
     def test_rule_ids_unique(self):
         self.assertEqual(len(redact.RULE_IDS), len(set(redact.RULE_IDS)))
@@ -136,7 +136,7 @@ class DetectionTests(unittest.TestCase):
     def test_credentials(self):
         self.assertIn("credential-assignment", rules_hit(synthetic_credential()))
         self.assertIn("credential-known-format", rules_hit("ghp_" + "A" * 36))
-        self.assertIn("credential-known-format", rules_hit(pem_header()))
+        self.assertIn("credential-private-key", rules_hit(pem_header()))
         self.assertIn("credential-url-userinfo", rules_hit("https://" + "u:p" + "@" + "example.com/x"))
         self.assertIn("credential-bearer", rules_hit("Authorization: Bearer " + "abcdEFGH1234"))
         blob = "Zq9" * 12
@@ -259,7 +259,7 @@ class CliTests(unittest.TestCase):
             proc = run_tool("redact", "--check", "--format", "json", str(path))
         self.assertEqual(proc.returncode, 1)
         payload = json.loads(proc.stdout)
-        self.assertEqual(payload["redaction_profile"], "r2")
+        self.assertEqual(payload["redaction_profile"], "r3")
         self.assertEqual({f["rule"] for f in payload["findings"]}, {"ipv4-address", "user-path"})
 
     def test_cli_findings_are_utf8_stdio(self):

@@ -60,7 +60,10 @@ def test_exited_leader_keeps_descendants_owned(tmp_path, caller, inherited_pipes
     parent.write_text(
         "import pathlib, subprocess, sys\n"
         f"p=subprocess.Popen([sys.executable, sys.argv[1]]{redirect})\n"
-        "pathlib.Path(sys.argv[2]).write_text(str(p.pid))\n", encoding="utf-8")
+        "pid_path=pathlib.Path(sys.argv[2])\n"
+        "pending=pid_path.with_suffix('.tmp')\n"
+        "pending.write_text(str(p.pid))\n"
+        "pending.replace(pid_path)\n", encoding="utf-8")
     runner = tmp_path / "runner.py"
     repository = Path(__file__).resolve().parents[1]
     runner.write_text(

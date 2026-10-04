@@ -1,0 +1,34 @@
+{
+  "project": "ReMe",
+  "repository": "https://github.com/agentscope-ai/ReMe",
+  "revision": "4c54c2b650038eff2a5d0d77aaa61b3e836f1b18",
+  "package_version": "0.4.1.13",
+  "license": "Apache-2.0",
+  "integration": "Installed pinned package; no copied general framework or daemon",
+  "runtime_components": [
+    "ApplicationContext",
+    "RegexTokenizer",
+    "MarkdownFileChunker",
+    "BM25Index",
+    "LocalFileGraph",
+    "LocalFileStore"
+  ],
+  "disabled_by_construction": [
+    "Default Application and YAML configuration",
+    "ReMe service and jobs",
+    "Raw session and transcript ingestion",
+    "Agent wrappers and model calls",
+    "Embeddings and tags",
+    "Automatic memory, dream and proactive evolution",
+    "Background file watchers"
+  ],
+  "narrow_overrides": {
+    "mindie_knowledge/materials/reme_index.py:StrictFileGraph": "Read/write the upstream graph format while propagating errors swallowed by upstream load/dump.",
+    "mindie_knowledge/materials/reme_index.py:StrictBM25Index": "Use upstream restore/load primitives but propagate corrupt-cache errors instead of clearing silently.",
+    "mindie_knowledge/materials/reme_index.py:StrictFileStore": "Use upstream chunk decoding and keyword synchronization, fail visibly on inconsistent graph/chunk checkpoints. Explicit rebuild removes only derived files.",
+    "mindie_knowledge/materials/reme_index.py:TechnicalTokenizerV1": "Uses the project technical tokenizer for qualified API components, intact version numbers and Chinese bigrams inside ReMe BM25. Class version changes invalidate the upstream tokenizer fingerprint."
+  },
+  "public_contract": "Current Markdown files and small manifest pointers are authoritative. ReMe chunks, graph, BM25 and file snapshots are derived and discardable. Search cards include the current task navigation and matching block, including failed or uncertain material.",
+  "dependency_note": "Upstream __init__ imports AgentScope despite its optional declaration; the as extra is therefore required to import file components. No AgentScope model or agent is instantiated. Dependency reduction would need an upstream import-boundary change, not an untracked import shim.",
+  "validation": "tests/test_material_packages.py uses actual pinned ReMe components and anonymized orthogonal fixtures derived from long K3 task failure shapes; it does not contain user transcripts."
+}

@@ -1,4 +1,4 @@
-"""Canonical mindie-entry/2 document mechanics."""
+"""Canonical mindie-entry/3 document mechanics."""
 
 import pytest
 
@@ -53,7 +53,7 @@ def test_rendered_data_carries_no_private_or_legacy_fields():
         assert f"{leaked}:" not in rendered
     with pytest.raises(ValueError, match="unknown entry fields"):
         parse_entry(rendered.replace("kind:", "owner: " + "a" * 64 + "\nkind:", 1))
-    legacy = rendered.replace("schema: mindie-entry/2", "schema: mindie-entry/1")
+    legacy = rendered.replace("schema: mindie-entry/3", "schema: mindie-entry/1")
     with pytest.raises(ValueError, match="unsupported entry schema"):
         parse_entry(legacy)  # unknown schema fails loudly
 
@@ -78,16 +78,14 @@ def test_required_fields_missing_fail_with_a_validation_error():
         parse_entry(raw)
 
 
-def test_noncanonical_body_is_rejected_not_silently_rewritten():
+def test_k3_material_body_preserves_page_whitespace_in_material_store(tmp_path):
+    from mindie_knowledge.materials.store import MaterialStore
+    from material_worker_fixture import package_body
     doc = entry()
-    bad = dict(doc, content=doc["content"] + "\n")
-    with pytest.raises(ValueError, match="canonical"):
-        documents.validate(bad)
-    bad["revision"] = revision_of(bad)
-    with pytest.raises(ValueError, match="canonical"):
-        documents.validate(bad)  # even a self-consistent digest cannot rescue it
-    # make_entry normalizes at admission, so its output always round-trips.
-    assert parse_entry(render_entry(doc)) == doc
+    with __import__('contextlib').closing(MaterialStore(tmp_path, domain='vllm-ascend')) as store:
+        body = 'first observation\n\nlast correction\n\n'
+        result = store.append_batch(doc['entry_id'], [dict(block_id='c'*64, text=body, source_range={})], 'Pending reference', title='K3 correction')
+        assert package_body(store.export_task(doc['entry_id'], revision=result['entry']['revision'])) == body
 
 
 def test_revision_is_deterministic_and_tracks_the_body():

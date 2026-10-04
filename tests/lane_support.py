@@ -206,8 +206,8 @@ def append_record(name, path, session, text, when):
 
 def entry_documents(store):
     with store.lock:
-        rows = store.db.execute("SELECT doc FROM entries").fetchall()
-    return [row[0] for row in rows]
+        rows = store.db.execute("SELECT entry_id FROM entries").fetchall()
+        return [json.dumps(store.get(store.ref(row[0])), ensure_ascii=False) for row in rows]
 
 
 def unfinished_captures(store):

@@ -184,217 +184,125 @@ def _git(args, cwd):
     return result.stdout.strip()
 
 
-def _bare_remote(tmp_path):
-    """Real bare remote with one contribution file on a branch; returns
-    (bare, head_sha, body, path) with the branch DELETED afterwards."""
-    bare = tmp_path / "remote.git"
-    work = tmp_path / "seed"
-    _git(["init", "--bare", str(bare)], tmp_path)
-    _git(["init", str(work)], tmp_path)
-    _git(["config", "user.email", "t@t"], work)
-    _git(["config", "user.name", "t"], work)
-    entry_id = "d" * 64
-    doc = documents.make_entry(entry_id=entry_id, domain="test",
-                               kind="experience", title="Sent case",
-                               summary="s", content="the sent body")
-    from mindie_knowledge.loop.documents import render_entry
+def _import_pipeline(tmp_path):
+    from conftest import make_admission
+    from lane_support import load_parser
+    from mindie_knowledge.loop.activation import Admission
+    from mindie_knowledge.loop.transcript_redaction import install_scanner
+    from material_worker_fixture import command
+    from test_history_import import append, message
 
-    body = render_entry(doc)
-    path = f"cases/{entry_id}.md"
-    (work / "cases").mkdir()
-    (work / path).write_bytes(body.encode("utf-8"))
-    _git(["add", "."], work)
-    _git(["commit", "-m", "base"], work)
-    _git(["branch", "-M", "main"], work)
-    _git(["remote", "add", "origin", str(bare)], work)
-    _git(["push", "origin", "main"], work)
-    _git(["checkout", "-b", "mindie/test/batch-z"], work)
-    _git(["push", "origin", "mindie/test/batch-z"], work)
-    head = _git(["rev-parse", "HEAD"], work)
-    _git(["push", "origin", "--delete", "mindie/test/batch-z"], work)
-    _git(["config", "uploadpack.allowAnySHA1InWant", "true"], bare)
-    return bare, head, body, path, doc
-
-
-def _seed_merged_pr(store, bare, head):
-    """The receipt's PR is merged. Main, not the deleted branch, is the body."""
-    from mindie_knowledge.community.transport import FileTransport
-
-    FileTransport(store.root / "outbox" / "dev-github.json", {REPO: str(bare)}).seed(
-        REPO,
-        pulls={
-            "9": {
-                "number": 9,
-                "state": "closed",
-                "merged": True,
-                "html_url": "https://x/pull/9",
-                "head": {
-                    "ref": "mindie/test/batch-z",
-                    "sha": head,
-                    "repo": {"full_name": REPO},
-                },
-                "base": {"ref": "main", "repo": {"full_name": REPO}},
-            }
-        },
-    )
-
-
-def _restore_diagnostics(engine, entry_id):
-    """Expose the real Git error for platform-specific receipt failures."""
-    from mindie_knowledge.community import gitops
-    from mindie_knowledge.community.common import run_argv
-
-    receipt = engine.store.sent_receipt(entry_id)
-    settings = engine._settings()
-    repo = settings.as_dict().get("fork") or settings.repository
-    work = engine.state_dir / "git" / repo.replace("/", "_")
-    result = run_argv(
-        ["git", "show", f"{receipt['head_sha']}:{receipt['path']}", "--"],
-        cwd=work, env=gitops.git_env(settings.as_dict()), timeout=5,
-        max_output=8192,
-    )
-    return {"errors": engine.errors, "git_exit": result.code,
-            "git_error": result.err_text[:1200], "work_path_length": len(str(work))}
-
-
-def test_restore_uses_current_remote_body_after_branch_deletion(tmp_path):
-    bare, head, body, path, doc = _bare_remote(tmp_path)
-    settings = write_settings(
-        tmp_path / "community.json", enabled=True, roots=[tmp_path],
-        repository=REPO, dev_remotes={REPO: str(bare)}, transport="file",
-    )
+    repo = tmp_path / "main"
+    repo.mkdir()
+    _git(["init", "-q", "-b", "main"], repo)
+    _git(["config", "user.email", "fixture@example.invalid"], repo)
+    _git(["config", "user.name", "fixture"], repo)
+    (repo / "README.md").write_text("# Public package fixture\n")
+    _git(["add", "."], repo)
+    _git(["commit", "-qm", "initialize"], repo)
+    settings = write_settings(tmp_path / "community.json", enabled=True, roots=[tmp_path],
+                              repository=REPO, transport="file", dev_remotes={REPO: str(repo)})
     store = Store(tmp_path / "store", "test")
-    local = store.create_draft(kind="experience", title="Sent case", summary="s",
-                               content="the sent body", owner=PRODUCER,
-                               entry_id=doc["entry_id"],
-                               generation=settings.generation)
-    assert local["revision"] == doc["revision"]
-    from mindie_knowledge.loop.export import lineage_of
-
-    batch_id = lineage_of("test", settings.generation)
-    receipt = {
-        "schema": "mindie-contribution-receipt/1", "batch_id": batch_id,
-        "revision": "r" * 64, "domain": "test",
-        "entry_refs": [store.ref(doc["entry_id"], doc["revision"])],
-        "files": [{"path": path,
-                   "sha256": hashlib.sha256(body.encode()).hexdigest()}],
-        "summary": "test",
-    }
-    with store._write_txn():
-        store.db.execute(
-            "INSERT INTO outbox VALUES(?,?,?,?,?,?,?,1.0,NULL,1.0,0,NULL,?)",
-            (batch_id, "r" * 64, json.dumps(receipt), "submitted", "",
-             "https://x/pull/9", head, settings.generation),
-        )
-    store.compact_confirmed(batch_id)
-    assert store._row(doc["entry_id"])["draft_revision"] is None
-    _seed_merged_pr(store, bare, head)
-
-    engine = Engine(store, settings_path=tmp_path / "community.json")
-    assert engine._restore_sent_draft(doc["entry_id"], settings.generation), _restore_diagnostics(engine, doc["entry_id"])
-    row = store._row(doc["entry_id"])
-    assert row["draft_revision"] == doc["revision"]
-    restored = store.get(store.ref(doc["entry_id"]))
-    # The current remote body (merged main) is the append base, not an old
-    # confirmed-head draft.
-    assert restored["content"] == "the sent body"
-    updated, appended = store.append_observation(
-        doc["entry_id"], "second observation", marker="ef" * 32,
-        producer=PRODUCER, generation=settings.generation,
-    )
-    assert appended and "the sent body" in updated["content"]
-    assert "second observation" in updated["content"]
-
-    # A tampered receipt path never seeds a base from mismatched content:
-    # restore reads the CURRENT remote body and requires the entry identity.
-    store2 = Store(tmp_path / "store2", "test")
-    store2.create_draft(kind="experience", title="Sent case", summary="s",
-                        content="the sent body", owner=PRODUCER,
-                        entry_id=doc["entry_id"],
-                        generation=settings.generation)
-    bad = dict(receipt, files=[{"path": "cases/" + "0" * 64 + ".md",
-                                "sha256": hashlib.sha256(body.encode()).hexdigest()}])
-    with store2._write_txn():
-        store2.db.execute(
-            "INSERT INTO outbox VALUES(?,?,?,?,?,?,?,1.0,NULL,1.0,0,NULL,?)",
-            (batch_id, "r" * 64, json.dumps(bad), "submitted", "",
-             "https://x/pull/9", head, settings.generation),
-        )
-    store2.compact_confirmed(batch_id)
-    engine2 = Engine(store2, settings_path=tmp_path / "community.json")
-    # The wrong path means no receipt was ever recorded for this entry.
-    assert not engine2._restore_sent_draft(doc["entry_id"], settings.generation), engine2.errors
-    assert any("no matching receipt" in err for err in engine2.errors), engine2.errors
-    store.close()
-    store2.close()
+    engine = Engine(store, settings_path=settings.path,
+                    admission=Admission(make_admission(tmp_path, project_root=tmp_path)),
+                    transcript_adapter=load_parser("codex"), capture_mode="public-transcript",
+                    redactor_executable=install_scanner(), summary_command=command(title="Imported task"))
+    source = tmp_path / "history.jsonl"
+    append(source, dict(type="session_meta", payload=dict(id="old-unactivated", cwd=str(tmp_path))),
+           message("Original imported evidence before publication."))
+    return engine, source, repo
 
 
-def test_aba_continuation_after_lineage_replace_and_branch_removal(tmp_path):
-    """Real local Git: confirm A, compact, later B-only batch replaces the
-    lineage outbox; A still restores from the per-entry receipt after the
-    contribution branch is gone. Sent bodies leave the DB; B's unsent draft
-    stays."""
-    from mindie_knowledge.loop.export import build_batch, lineage_of
+def _publish_imported_current(engine, source, repo):
+    from test_history_import import contribute, summary_due
+    from mindie_knowledge.loop.export import build_batch
+    from mindie_knowledge.loop.feed import Feed
+    from package_fixture import write_package
 
-    bare, head, body, path, doc = _bare_remote(tmp_path)
-    settings = write_settings(
-        tmp_path / "community.json", enabled=True, roots=[tmp_path],
-        repository=REPO, dev_remotes={REPO: str(bare)}, transport="file",
-    )
-    store = Store(tmp_path / "store", "test")
-    local = store.create_draft(kind="experience", title="Sent case", summary="s",
-                               content="the sent body", owner=PRODUCER,
-                               entry_id=doc["entry_id"],
-                               generation=settings.generation)
-    assert local["revision"] == doc["revision"]
-    batch_id = lineage_of("test", settings.generation)
-    receipt = {
-        "schema": "mindie-contribution-receipt/1", "batch_id": batch_id,
-        "revision": "r" * 64, "domain": "test",
-        "entry_refs": [store.ref(doc["entry_id"], doc["revision"])],
-        "files": [{"path": path,
-                   "sha256": hashlib.sha256(body.encode()).hexdigest()}],
-        "summary": "test",
-    }
-    with store._write_txn():
-        store.db.execute(
-            "INSERT INTO outbox VALUES(?,?,?,?,?,?,?,1.0,NULL,1.0,0,NULL,?)",
-            (batch_id, "r" * 64, json.dumps(receipt), "submitted", "",
-             "https://x/pull/9", head, settings.generation),
-        )
-    store.compact_confirmed(batch_id)
-    assert store._row(doc["entry_id"])["draft_revision"] is None
-    assert store._revision_doc(doc["entry_id"], doc["revision"]) is None
-    hash_a = store.sent_file_hash(doc["entry_id"])
-    assert hash_a and store.sent_receipt(doc["entry_id"])["head_sha"] == head
+    imported = contribute((engine, source))
+    summary_due(engine)
+    store = engine.store
+    entry_id = store.get(imported["ref"].split("@", 1)[0])["entry_id"]
+    package = store.materials.export_task(entry_id)
+    assert package["ready"]
+    built = build_batch(store, settings=engine._settings())
+    write_package(repo, package)
+    _git(["add", "-A"], repo)
+    _git(["commit", "-qm", "publish current task package"], repo)
+    commit = _git(["rev-parse", "HEAD"], repo)
+    store.mark_batch(built[0], "submitted", head_sha=commit, pr_url="https://example.invalid/pull/9")
+    feed = Feed(store, dict(repository=REPO, ref="main", domain="test", url=str(repo)))
+    assert feed.sync()["status"] == "synced"
+    store.compact_confirmed(built[0])
+    assert store._row(entry_id)["draft_revision"] is None
+    return entry_id, package, built[0], feed
 
-    store.create_draft(kind="experience", title="Entry B", summary="b",
-                       content="b-only later batch", owner=PRODUCER,
-                       generation=settings.generation)
-    built = build_batch(store, settings=settings,
-                        revision_fn=lambda *a: "s" * 64)
-    assert built is not None
-    replaced = json.loads(store.batch(batch_id)["batch"])
-    assert replaced.get("schema") == "mindie-contribution/1"
-    assert all("the sent body" not in f.get("content", "") for f in replaced["files"])
-    assert store.sent_file_hash(doc["entry_id"]) == hash_a
 
-    assert store._revision_doc(doc["entry_id"], doc["revision"]) is None
-    assert any("b-only later batch" in json.loads(row[0]).get("content", "")
-               for row in store.db.execute("SELECT doc FROM revisions"))
-    _seed_merged_pr(store, bare, head)
+def test_import_continues_from_current_feed_after_publication_compaction(tmp_path):
+    """Actual import -> Git main -> current feed -> compact -> incremental import.
 
-    engine = Engine(store, settings_path=tmp_path / "community.json")
-    assert engine._restore_sent_draft(doc["entry_id"], settings.generation), _restore_diagnostics(engine, doc["entry_id"])
-    restored = store.get(store.ref(doc["entry_id"]))
-    assert restored["content"] == "the sent body"
-    updated, appended = store.append_observation(
-        doc["entry_id"], "A continued after B", marker="ab" * 32,
-        producer=PRODUCER, generation=settings.generation,
-    )
-    assert appended and "the sent body" in updated["content"]
-    assert "A continued after B" in updated["content"]
-    store.close()
+    Earlier blocks and their completed indexes survive; only new blocks need
+    indexing. Neither a deleted contribution branch nor old body DB rows are
+    needed to continue the task.
+    """
+    from test_history_import import append, message, contribute
+    from mindie_knowledge.loop.export import build_batch
+    engine, source, repo = _import_pipeline(tmp_path)
+    store = engine.store
+    try:
+        entry_id, package, _, _ = _publish_imported_current(engine, source, repo)
+        old_files = dict(package["files"])
+        append(source, message("Later evidence after the task seemed finished."))
+        result = contribute((engine, source))
+        assert result["status"] == "extended"
+        task = store.materials.read_task(entry_id)
+        body = store.materials.get_document(entry_id, source="draft")["content"]
+        assert body.count("Original imported evidence") == 1
+        assert body.count("Later evidence after the task") == 1
+        current = store.materials.export_task(entry_id)
+        assert all(current["files"][path] == text for path, text in old_files.items() if path != "index.md")
+        assert task["blocks"][0]["indexed"] is True
+        assert task["blocks"][-1]["indexed"] is False
+        assert build_batch(store, settings=engine._settings()) is None
+        assert "Original imported evidence" not in "\n".join(store.db.iterdump())
+    finally:
+        store.close()
+
+
+def test_aba_continuation_uses_current_files_after_lineage_replacement(tmp_path):
+    """A's task and receipt survive an unrelated B publication, with no DB bodies."""
+    from test_history_import import append, message, contribute
+    from mindie_knowledge.loop.export import build_batch
+    engine, source, repo = _import_pipeline(tmp_path)
+    store = engine.store
+    try:
+        entry_id, _, batch_id, feed = _publish_imported_current(engine, source, repo)
+        hash_a = store.sent_file_hash(entry_id)
+        second = store.create_draft(kind="experience", title="Unrelated task B", summary="Second task",
+            content="Unrelated new material.", owner=PRODUCER, generation=engine._settings().generation)
+        built = build_batch(store, settings=engine._settings())
+        assert built[0] == batch_id and built[3] == [second["entry_id"]]
+        assert store.sent_file_hash(entry_id) == hash_a
+        assert all("content" not in item for item in json.loads(store.batch(batch_id)["batch"])["files"])
+        append(source, message("A continued after B arrived."))
+        assert contribute((engine, source))["status"] == "extended"
+        body = store.materials.get_document(entry_id, source="draft")["content"]
+        assert "Original imported evidence" in body and "A continued after B" in body
+        # Main withdrawal is current source authority. A later local increment
+        # must not recreate it or advance the source cursor.
+        import shutil
+        shutil.rmtree(repo / "tasks" / entry_id)
+        _git(["add", "-A"], repo)
+        _git(["commit", "-qm", "withdraw task"], repo)
+        assert feed.sync()["entries"] == 0
+        before = dict(store.db.execute("SELECT * FROM material_streams").fetchone())
+        append(source, message("This increment must remain uncommitted after withdrawal."))
+        with pytest.raises((ValueError, RuntimeError), match="withdrawn|resurrect"):
+            contribute((engine, source))
+        assert dict(store.db.execute("SELECT * FROM material_streams").fetchone()) == before
+        assert store.get(store.ref(entry_id))["withdrawn"] is True
+    finally:
+        store.close()
 
 
 def _clone_workdir_in_windows_max_path_window(tmp_path):

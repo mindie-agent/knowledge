@@ -1,5 +1,6 @@
 """Diagnostic safety checks; controlled local mechanisms, not native host acceptance."""
 import json
+from contextlib import closing
 import os
 import sqlite3
 import sys
@@ -16,8 +17,11 @@ from mindie_knowledge.loop.store import Store, session_key
 
 def config(tmp_path, **extra):
     path = tmp_path / "engine.json"
+    from lane_support import parser_path
     data = dict(root=str(tmp_path / "state"), domain="test",
-                admission_path=str(tmp_path / "admission.sqlite3"), **extra)
+                admission_path=str(tmp_path / "admission.sqlite3"),
+                transcript_adapter=str(parser_path('codex')),
+                redactor_executable=str(tmp_path / 'configured-scanner'), **extra)
     path.write_text(json.dumps(data))
     return path, data
 
@@ -80,7 +84,7 @@ def test_snapshot_parses_config_once_and_startup_record_is_bound(tmp_path, monke
     diagnostics.record_startup_failure(path, data, "engine", RuntimeError("private exception"))
     assert diagnostics.snapshot(path)["startup"]["error_class"] == "RuntimeError"
     assert len(reads) == 1
-    data["agent_command"] = [sys.executable, "different-installation"]
+    data["summary_command"] = [sys.executable, "different-installation"]
     path.write_text(json.dumps(data))
     assert diagnostics.snapshot(path)["startup"]["status"] == "absent"
     diagnostics.record_startup_failure(path, data, "service", ValueError("private exception"))
@@ -114,20 +118,21 @@ def test_scoped_records_and_failure_counts_are_diagnostic_only(tmp_path):
         opaque = store.opaque_for(session_key("root-A"))
         doc = store.create_draft(kind="experience", title="Local fixture", summary="Diagnostic fixture.", content="private body", owner=opaque)
         ref = store.ref(doc["entry_id"], doc["revision"])
-        for i in range(6):
-            store.create_batch(batch_id=f"own-{i}", revision="r", batch={"entry_refs": [ref]}, entry_ids=[doc["entry_id"]], vote_keys=[])
-            store.mark_batch(f"own-{i}", "failed", detail="ValueError: private exception")
-        store.create_batch(batch_id="foreign", revision="r", batch={"entry_refs": []}, entry_ids=[], vote_keys=[])
-        store.create_batch(batch_id="vote-only", revision="r", batch={"entry_refs": []}, entry_ids=[], vote_keys=[])
+        # This read-only projection fixture writes only small metadata. No send
+        # candidate or remote operation is involved.
+        with store._write_txn():
+            for ident in [*(f'own-{i}' for i in range(6)), 'foreign', 'vote-only']:
+                store.db.execute("INSERT INTO outbox(batch_id,revision,batch,status,detail,created,updated) "
+                                 "VALUES(?,?,?,'failed',?,?,?)", (ident, 'a' * 64,
+                                 json.dumps({'entry_refs': [ref] if ident.startswith('own-') else []}),
+                                 'ValueError: private exception', time.time(), time.time()))
         with store.db:
             store.db.execute("INSERT INTO votes VALUES(?,?,?,?,?,?,?,?)", (opaque, "not-owned", "r", "down", "private body", 1, "vote-only", time.time()))
-            # Legacy retired latch residue: never reported, never pausing.
-            store.db.execute("INSERT OR REPLACE INTO state VALUES('maintenance_paused','private pause reason')")
     finally:
         store.close()
     for _ in range(3):
         admission.finish("task-A", lease["token"], False)
-    dbpath = tmp_path / "state/test/store-v3.sqlite3"
+    dbpath = tmp_path / "state/test/state-v4.sqlite3"
     before = dbpath.read_bytes()
     result = diagnostics.snapshot(path, session="task-A")
     assert before == dbpath.read_bytes()
@@ -137,10 +142,8 @@ def test_scoped_records_and_failure_counts_are_diagnostic_only(tmp_path):
     assert len(result["contributions"]) == 5
     assert "vote-only" in {row["batch_id"] for row in result["contributions"]}
     assert "foreign" not in {row["batch_id"] for row in result["contributions"]}
-    # Failure counts are observability only: the binding stays active and the
-    # retired maintenance latch is neither reported nor honored.
+    # Failure counts are observability only: the binding stays active.
     assert result["admission"]["status"] == "active" and result["admission"]["failures"] == 3
-    assert "paused" not in result["maintenance"]
     raw = json.dumps(result)
     assert all(secret not in raw for secret in ("private body", "private exception", "private pause reason", lease["token"], other["token"], "task-B", ref))
     assert admission.active_lease("task-A")["failures"] == 3
@@ -150,7 +153,7 @@ def test_scoped_records_and_failure_counts_are_diagnostic_only(tmp_path):
 def test_actual_database_lock_is_bounded(tmp_path):
     path, data = config(tmp_path)
     store = Store(data["root"], "test"); store.close()
-    db = sqlite3.connect(tmp_path / "state/test/store-v3.sqlite3", isolation_level=None)
+    db = sqlite3.connect(tmp_path / "state/test/state-v4.sqlite3", isolation_level=None)
     try:
         db.execute("PRAGMA journal_mode=DELETE")
         db.execute("BEGIN EXCLUSIVE")
@@ -215,3 +218,214 @@ def test_connection_write_failure_cancels_real_child_and_workers(tmp_path, monke
         time.sleep(.02)
     assert not alive, "owned controlled child or grandchild survived startup failure"
     assert diagnostics.snapshot(path)["startup"]["stage"] == "service"
+
+
+def test_summary_failure_is_scoped_visible_and_read_only(tmp_path):
+    path, data = config(tmp_path)
+    store = Store(data['root'], 'test')
+    try:
+        with store._write_txn():
+            for session in ('task-A', 'task-B'):
+                store.db.execute('INSERT INTO transcript_tasks '
+                    '(task_key,entry_id,capture_id,body_digest,summary_status,summary_detail,updated,summary_due,authorization) '
+                    'VALUES(?,?,?,?,?,?,?,?,?)',
+                    (session, session, '', 'digest', 'failed', 'configuration: summary worker is not configured', 1, 0,
+                     json.dumps({'session': session})))
+        result = diagnostics.snapshot(path, session='task-A')
+        assert result['summaries'] == [{'status': 'failed', 'category': 'configuration'}]
+        assert any('publication is blocked' in hint for hint in result['hints'])
+        assert 'task-B' not in json.dumps(result)
+        assert store.db.execute('SELECT COUNT(*) FROM transcript_tasks').fetchone()[0] == 2
+        with store._write_txn():
+            for index in range(6):
+                store.db.execute('INSERT INTO transcript_tasks '
+                    '(task_key,entry_id,capture_id,body_digest,summary_status,summary_detail,updated,summary_due,authorization) '
+                    'VALUES(?,?,?,?,?,?,?,?,?)',
+                    (f'complete-{index}', f'complete-{index}', '', 'digest', 'complete', '', 2+index, 0,
+                     json.dumps({'session': 'task-A'})))
+        newer = diagnostics.snapshot(path, session='task-A')
+        assert newer['summaries'][0] == {'status': 'failed', 'category': 'configuration'}
+        assert any('publication is blocked' in hint for hint in newer['hints'])
+    finally:
+        store.close()
+
+
+def test_missing_material_batch_diagnostic_is_scoped_and_read_only(tmp_path):
+    path, data = config(tmp_path)
+    with closing(Store(data['root'], 'test')) as store:
+        with store._write_txn():
+            for key, session in [('missing', 'task-A'), ('valid', 'task-A'), ('foreign', 'task-B')]:
+                store.db.execute('INSERT INTO transcript_tasks VALUES(?,?,?,?,?,?,?,?,?)',
+                    (key, key, '', 'digest', 'pending', '', 1, 0, json.dumps({'session': session})))
+            store.db.execute('INSERT INTO material_batches VALUES(?,?,?,?,?,?,?,?)',
+                             ('batch', 'valid', 'valid', '[]', 'pending', '', '{}', 1))
+        changes = store.db.total_changes
+        result = diagnostics.snapshot(path, session='task-A')
+        assert store.db.total_changes == changes
+        assert [row['status'] for row in result['summaries']] == ['missing', 'pending']
+        missing = result['summaries'][0]
+        assert missing['stage'] == 'index-queue' and missing['reason'] == 'missing-material-batch'
+        assert 'batch job is missing' in missing['message']
+        assert any('publication is blocked' in hint for hint in result['hints'])
+        assert 'task-B' not in json.dumps(result)
+        assert store.db.execute('SELECT COUNT(*) FROM material_batches').fetchone()[0] == 1
+        assert store.db.execute("SELECT COUNT(*) FROM transcript_tasks WHERE summary_status='pending'").fetchone()[0] == 3
+
+
+@pytest.mark.parametrize('capture_status', ['organized', 'failed'])
+@pytest.mark.parametrize('receipt_state', ['valid', 'bad-json', 'bad-reference', 'oversize'])
+def test_capture_material_receipt_reaches_read_only_adapter_snapshot(tmp_path, monkeypatch, capture_status, receipt_state):
+    path, data = config(tmp_path)
+    ref = 'mindie://test/' + 'a' * 64 + '@' + 'b' * 64
+    receipt = dict(pipeline='public-transcript', refs=[ref], body_model_calls=0,
+                   redaction_rules=['private-scanner-label-canary'])
+    # Synthetic small metadata only; no parser, model, service or body is run.
+    with closing(Store(data['root'], 'test')) as store:
+        own = store.add_capture(root_session=session_key('task-A'), session='task-A',
+                                turn='one', transcript=None, summary='')
+        other = store.add_capture(root_session=session_key('task-B'), session='task-B',
+                                  turn='two', transcript=None, summary='')
+        store.record_capture_material(own['id'], receipt)
+        if capture_status == 'failed':
+            store.mark_capture(own['id'], 'failed', 'RuntimeError: private-parser-error-canary')
+        with store._write_txn():
+            store.db.execute('INSERT INTO state VALUES(?,?)',
+                             ('capture-material:' + other['id'], 'foreign-receipt-canary'))
+            if receipt_state != 'valid':
+                raw = ('{private-receipt-canary' if receipt_state == 'bad-json' else
+                       json.dumps(dict(receipt, refs=['mindie://other/' + 'a' * 64 + '@' + 'b' * 64]))
+                       if receipt_state == 'bad-reference' else 'private-receipt-canary' * diagnostics.MAX_JSON)
+                store.db.execute('UPDATE state SET value=? WHERE key=?',
+                                 (raw, 'capture-material:' + own['id']))
+    dbpath = tmp_path / 'state/test/state-v4.sqlite3'
+    before = dbpath.read_bytes()
+    def no_store_initialization(*args, **kwargs):
+        raise AssertionError('diagnostics must not initialize a writable Store')
+    monkeypatch.setattr(Store, '__init__', no_store_initialization)
+    result = diagnostics.snapshot(path, session='task-A')
+    assert dbpath.read_bytes() == before
+    assert [row['id'] for row in result['captures']] == [own['id']]
+    row = result['captures'][0]
+    assert row['status'] == capture_status
+    if capture_status == 'failed':
+        assert row['error_class'] == 'RuntimeError'
+    if receipt_state == 'valid':
+        assert row['material_receipt'] == {key: receipt[key] for key in ('pipeline', 'refs', 'body_model_calls')}
+        assert result['maintenance']['status'] == 'ok'
+    else:
+        assert 'material_receipt' not in row
+        assert row['material_receipt_error']['stage'] == 'capture-receipt'
+        assert row['material_receipt_error']['reason'] == 'invalid-material-receipt'
+        assert result['maintenance']['status'] == 'degraded'
+        assert any('capture-receipt fault' in hint for hint in result['hints'])
+    raw = json.dumps(result)
+    assert all(secret not in raw for secret in ('private-scanner-label-canary', 'private-parser-error-canary',
+                                                'private-receipt-canary', 'foreign-receipt-canary', other['id']))
+
+
+def test_summary_ledger_scopes_usage_and_unknown_without_loading_private_outputs(tmp_path, monkeypatch):
+    from mindie_knowledge.materials.summarizer import SummaryLedger
+    from test_material_summarizer import request, returned
+    path, data = config(tmp_path)
+    admission = Admission(data['admission_path'])
+    admission.activate('task-A', project_root=str(tmp_path), root_session='root-A')
+    with closing(Store(data['root'], 'test')) as store:
+        with store._write_txn():
+            ledger = SummaryLedger(store.db)
+            for case, authorization in [('K3-01', {'session': 'task-A'}),
+                                        ('K3-02', {'session': 'child-A', 'root_session': session_key('root-A')}),
+                                        ('K3-03', {'session': 'task-B'})]:
+                req = request(case)
+                store.db.execute('INSERT INTO transcript_tasks '
+                    '(task_key,entry_id,capture_id,body_digest,summary_status,summary_detail,updated,summary_due,authorization) '
+                    'VALUES(?,?,?,?,?,?,?,?,?)',
+                    (case, req['task_id'], '', 'digest', 'outcome_unknown' if case == 'K3-02' else 'complete', '', 1, 0,
+                     json.dumps(authorization)))
+                attempt = ledger.prepare(req)
+                ledger.claim(attempt['attempt_id'])
+                if case == 'K3-02':
+                    ledger.uncertain(attempt['attempt_id'], 'deadline')
+                else:
+                    response = returned(req)
+                    response['raw_result'] = 'private-model-output-canary'
+                    ledger.record(attempt['attempt_id'], response)
+            expected = dict(scope='task', model_calls=2, unknown_calls=1,
+                            input_tokens=120, cached_input_tokens=20, output_tokens=30)
+        queries = []
+        read = diagnostics._ro
+        def traced(file):
+            db = read(file)
+            db.set_trace_callback(queries.append)
+            return db
+        monkeypatch.setattr(diagnostics, '_ro', traced)
+        before = store.db.total_changes
+        result = diagnostics.snapshot(path, session='task-A')
+        assert store.db.total_changes == before
+        assert result['summary_usage'] == expected
+        assert [x['status'] for x in result['summary_attempts']] == ['outcome_unknown', 'returned']
+        assert result['summary_attempts'][0]['category'] == 'deadline'
+        assert result['summaries'][0]['status'] == 'outcome_unknown'
+        assert 'private-model-output-canary' not in json.dumps(result)
+        assert 'task-B' not in json.dumps(result)
+        assert any('billing remains uncertain' in x for x in result['hints'])
+        receipt_queries = [query for query in queries if 'FROM material_summary_attempts' in query]
+        assert receipt_queries and all('json_extract(m.response' in query for query in receipt_queries)
+        assert all('SELECT *' not in query for query in receipt_queries)
+        assert diagnostics.snapshot(path)['summary_usage'] is None
+        # Observing an unknown paid call must not prepare, claim, or complete it.
+        assert ledger.usage_totals()['model_calls'] == 3
+        assert store.db.execute("SELECT count(*) FROM material_summary_attempts WHERE status='outcome_unknown'").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize('receipt', ['{broken', '{"model_calls":1,"billing_status":"reported","usage_known":true,"usage":{"input_tokens":-1}}'])
+def test_corrupt_summary_usage_is_unavailable_not_zero(tmp_path, receipt):
+    from mindie_knowledge.materials.summarizer import SummaryLedger
+    from test_material_summarizer import request
+    path, data = config(tmp_path)
+    with closing(Store(data['root'], 'test')) as store:
+        with store._write_txn():
+            ledger = SummaryLedger(store.db)
+            req = request('K3-01')
+            attempt = ledger.prepare(req)
+            ledger.claim(attempt['attempt_id'])
+            store.db.execute('INSERT INTO transcript_tasks '
+                '(task_key,entry_id,capture_id,body_digest,summary_status,summary_detail,updated,summary_due,authorization) '
+                'VALUES(?,?,?,?,?,?,?,?,?)',
+                ('one', req['task_id'], '', 'digest', 'failed', '', 1, 0, json.dumps({'session': 'task-A'})))
+            store.db.execute("UPDATE material_summary_attempts SET status='complete',response=?", (receipt,))
+        result = diagnostics.snapshot(path, session='task-A')
+        assert result['store'] == dict(status='unavailable', error_class='ValueError')
+        assert result['summary_usage'] is None
+        assert store.db.execute('SELECT response FROM material_summary_attempts').fetchone()[0] == receipt
+
+
+def test_summary_duplicate_block_failure_has_safe_stage_and_reason(tmp_path):
+    from mindie_knowledge.materials.summarizer import SummaryLedger, outcome, failure_detail
+    from test_material_summarizer import request
+    path, data = config(tmp_path)
+    with closing(Store(data['root'], 'test')) as store:
+        with store._write_txn():
+            ledger = SummaryLedger(store.db)
+            req = request('K3-02')
+            attempt = ledger.prepare(req)
+            ledger.claim(attempt['attempt_id'])
+            response = outcome(req, status='failed', error='invalid_result',
+                error_reason='block_count_mismatch', model_calls=1, usage_known=True,
+                usage=dict(input_tokens=100, cached_input_tokens=10, output_tokens=20),
+                raw_result='private duplicate model output')
+            ledger.record(attempt['attempt_id'], response)
+            store.db.execute('INSERT INTO transcript_tasks '
+                '(task_key,entry_id,capture_id,body_digest,summary_status,summary_detail,updated,summary_due,authorization) '
+                'VALUES(?,?,?,?,?,?,?,?,?)',
+                ('one', req['task_id'], '', 'digest', 'failed', json.dumps(failure_detail(response)), 1, 0, json.dumps({'session': 'task-A'})))
+        result = diagnostics.snapshot(path, session='task-A')
+        projected = result['summary_attempts'][0]
+        assert projected['category'] == 'invalid_result'
+        assert projected['reason'] == 'block_count_mismatch'
+        assert projected['stage'] == 'index-validation'
+        assert projected['message'] == 'returned block count differs from the admitted batch'
+        assert result['summaries'][0]['reason'] == 'block_count_mismatch'
+        assert result['summaries'][0]['stage'] == 'index-validation'
+        assert result['summary_usage']['model_calls'] == 1
+        assert result['summary_usage']['output_tokens'] == 20
+        assert 'private duplicate model output' not in json.dumps(result)

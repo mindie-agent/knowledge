@@ -46,7 +46,6 @@ from .common import (
 from .ledger import Ledger
 from .settings import live_gate, sharing_enabled
 from .transport import Transport, transport_from_settings
-from mindie_knowledge.loop import documents
 
 RECEIPT_STATUSES = (
     "submitted",
@@ -289,37 +288,54 @@ def _publish(checked, settings, state_dir, ledger, deadline, transport, *,
     _settings_gate(settings)
     resumed = False
     own_resume = False
+    resumed_files = {}
     if updating:
         # No checkout, commit, push, or PR write until the API head and the
         # upstream PR ref are the same commit. A retained fork branch is not
         # a substitute, for a fork or for a same-repository PR.
-        proven = _proven_open_head(
+        checkout_ref = _proven_open_head(
             work_dir, prior, branch, settings, read_url, deadline, genv
         )
-        gitops.checkout_new(work_dir, branch, proven, deadline, env=genv)
     elif checked["explicit_retry"] and gitops.remote_tip(remote_url, f"refs/heads/{branch}", deadline, env=genv):
         # Explicit retry with the branch already pushed: resume from the remote
         # tip and its recorded steps instead of re-pushing earlier commits.
-        gitops.checkout_existing(work_dir, branch, deadline, env=genv)
+        checkout_ref = f"origin/{branch}"
         resumed = True
-        ledger.record_step(batch_id, revision, "git:resumed-branch", branch)
     else:
         # A prior attempt of THIS lineage may have pushed the branch before
         # failing (e.g. auth refused the PR creation). Building on top of our
         # own proven pushed tip keeps the write fast-forward; a tip that is
         # not ours is a real divergence and parks as needs_review on push.
         tip = gitops.remote_tip(remote_url, f"refs/heads/{branch}", deadline, env=genv)
-        if tip is not None and any(
-            _expected_head(ledger, row) == tip
-            for row in ledger.all_for_batch(batch_id)
-        ):
-            gitops.checkout_existing(work_dir, branch, deadline, env=genv)
+        prior_push = next((row for row in ledger.all_for_batch(batch_id)
+                           if tip is not None and _expected_head(ledger, row) == tip), None)
+        if prior_push is not None:
+            resumed_files = {item["path"]: item.get("sha256")
+                             for item in Ledger.parse_actual_files(prior_push) or []}
+            checkout_ref = f"origin/{branch}"
             own_resume = True
-            ledger.record_step(batch_id, revision, "git:resume-own-branch", tip)
         else:
-            gitops.checkout_new(work_dir, branch, base_tip, deadline, env=genv)
+            checkout_ref = base_tip
 
-    files, conflict = _prepare_files(checked, work_dir, own_branch_resume=own_resume)
+    # Inspect Git objects before asking the host to materialize them. A path
+    # or mode conflict must stay needs_review even when checkout cannot create
+    # that path (for example a newline filename or symlink on Windows).
+    tree_modes = (gitops.ls_tree(work_dir, checkout_ref, deadline, env=genv,
+                                  task_ids=set(checked["task_revisions"]))
+                  if checked["task_revisions"] else {})
+    conflict = _task_tree_conflict(checked, tree_modes, own_branch_resume=own_resume,
+                                   resumed_files=resumed_files)
+    if conflict:
+        raise CommunityError(conflict, status="needs_review")
+    if resumed or own_resume:
+        gitops.checkout_existing(work_dir, branch, deadline, env=genv)
+        ledger.record_step(batch_id, revision,
+                           "git:resumed-branch" if resumed else "git:resume-own-branch",
+                           branch if resumed else tip)
+    else:
+        gitops.checkout_new(work_dir, branch, checkout_ref, deadline, env=genv)
+    files, conflict = _prepare_files(checked, work_dir, own_branch_resume=own_resume,
+                                     resumed_files=resumed_files, tree_modes=tree_modes)
     if conflict:
         raise CommunityError(conflict, status="needs_review")
 
@@ -344,7 +360,7 @@ def _publish(checked, settings, state_dir, ledger, deadline, transport, *,
             return {"status": "unchanged", "detail": "no content change; PR metadata refreshed",
                     "pr_number": prior["number"], "pr_url": prior.get("html_url"), "head_sha": head_sha,
                     "files": actual_files}
-        if resumed:
+        if resumed or own_resume:
             # The exact commits are already on the remote branch; only the PR
             # step is outstanding. Skip the push entirely and create the PR.
             pass
@@ -393,90 +409,88 @@ def _actual_entry_files(checked, work_dir):
 
     After apply/commit the worktree IS what the branch holds, for written,
     identical-skipped and merge-no-change paths alike — never the candidate
-    payload. Observation identity stays the marker set; these hashes and
-    revisions are only its committed-content evidence.
+    payload. Hashes bind each exact file and the complete task revision.
     """
     actual = []
     for item in checked["files"]:
         path = item["path"]
         if path.startswith("feedback/"):
             continue
-        text = gitops.read_tree_file(work_dir, path)
-        if text is None:
+        if item.get("delete") is True:
+            if gitops.read_tree_file(work_dir, path) is not None:
+                raise CommunityError(f"deleted task block is still present: {path}")
+            actual.append({"path": path, "sha256": None, "revision": None, "delete": True})
             continue
-        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-        try:
-            revision = documents.parse_entry(normalized)["revision"]
-        except ValueError:
-            revision = None
+        text = gitops.read_tree_file(work_dir, path)
+        if text is None or sha256_text(text) != item["sha256"]:
+            raise CommunityError(f"committed task file differs from its validated package: {path}")
+        task_id = path.split("/")[1]
+        revision = checked["task_revisions"][task_id]
         actual.append({
             "path": path,
-            "sha256": sha256_text(normalized),
+            "sha256": sha256_text(text),
             "revision": revision,
         })
     return actual
 
 
-def _merge_observations(current_body, our_content, sent_markers, path):
-    """Apply only the not-yet-sent observation delta onto the current body.
-
-    ``current_body`` is the actual current remote content (possibly
-    bot/maintainer edited) and stays authoritative — header, base text and
-    every remotely-present block included; only observation blocks whose
-    marker identity is neither confirmed-sent (``sent_markers``, the durable
-    sending history) nor already present remotely are appended. A block the
-    remote removed stays removed: its marker is in ``sent_markers``, so it is
-    never re-attached. Returns the merged content, or None when either side
-    does not parse as the same entry — the caller parks the batch instead of
-    overwriting. No Git-history search: confirmed observation identities plus
-    the current remote body are the whole mechanism.
-    """
-    try:
-        current_doc = documents.parse_entry(current_body)
-        our_doc = documents.parse_entry(our_content)
-    except ValueError:
-        return None
-    expected_id = path.rsplit("/", 1)[-1].removesuffix(".md")
-    if current_doc["entry_id"] != expected_id or our_doc["entry_id"] != expected_id:
-        return None
-    our_split = documents.split_observations(our_doc["content"])
-    if our_split is None:
-        return None  # opaque observation tail: never guess a delta
-    _base, our_blocks = our_split
-    confirmed = set(sent_markers)
-    remote_markers = set(documents.observation_markers(current_doc["content"]))
-    merged = current_doc["content"].rstrip()
-    for marker, addition in our_blocks:
-        if marker in confirmed or marker in remote_markers:
-            continue  # already submitted (possibly removed upstream) or present
-        merged = documents.append_observation_text(merged, addition, marker)
-    merged_doc = dict(current_doc, content=merged)
-    merged_doc["revision"] = documents.revision_of(merged_doc)
-    # Canonical render: for an unchanged body this reproduces the exact remote
-    # bytes, so the caller's hash comparison cleanly detects "nothing to do".
-    return documents.render_entry(merged_doc)
+def _task_tree_conflict(checked, tree_modes, *, own_branch_resume=False, resumed_files=None):
+    """Reject unsupported package shape from object metadata before checkout."""
+    expected = {item["path"] for item in checked["files"]}
+    for path, mode in tree_modes.items():
+        if mode != "100644":
+            return f"{path!r} is not a regular task material file; not overwriting"
+        try:
+            check_path(path)
+        except CommunityError:
+            return f"{path!r} is an unsupported task material path; not checking out"
+        if path not in expected:
+            parts = path.split("/", 2)
+            if (own_branch_resume and path.startswith(f"tasks/{parts[1]}/blocks/")
+                    and (resumed_files or {}).get(path) is not None):
+                # Exact byte identity is still checked after checkout before
+                # deleting a file from our own unconfirmed earlier push.
+                continue
+            return f"{path!r} is outside the new package and has no proven deletion base; not deleting"
+    return None
 
 
-def _prepare_files(checked, work_dir, *, own_branch_resume=False):
-    """Decide per-file content, merging votes and refusing silent overwrites.
+def _prepare_files(checked, work_dir, *, own_branch_resume=False, resumed_files=None, tree_modes=None):
+    """Write complete packages only over exact declared bases.
 
-    Returns (files, conflict_detail). A file whose remote content moved away
-    from the declared base (bot edits, maintainer fixes) is reconciled by
-    applying only the not-yet-sent observation delta onto the CURRENT remote
-    body — the remote content (header included) stays authoritative and an
-    old full submitted draft is never restored over it; feedback files merge
-    votes by vote_id deterministically. Without confirmed observation
-    identities for the entry the batch parks as a conflict instead of
-    guessing a delta. ``own_branch_resume`` means the checkout is proven (by
-    durable ledger push receipts) to hold only this lineage's own
-    never-confirmed push and no PR was ever created for it, so a differing
-    existing file is our own earlier content and the fuller candidate simply
-    replaces it.
+    Remote corrections stay authoritative. A changed or withdrawn task file
+    makes the candidate a visible conflict. Feedback votes can merge by their
+    durable identity. An own unconfirmed branch can resume only after the
+    caller proves that lineage from its ledger and no PR exists.
     """
     out = []
+    expected = {item["path"] for item in checked["files"]}
+    for path, mode in (tree_modes or {}).items():
+        parts = path.split("/", 2)
+        if len(parts) < 3 or parts[0] != "tasks" or parts[1] not in checked["task_revisions"]:
+            continue
+        if mode != "100644":
+            return None, f"{path} is not a regular task material file; not overwriting"
+        if path in expected:
+            continue
+        current_sha = gitops.tree_sha256(work_dir, path)
+        if (own_branch_resume and path.startswith(f"tasks/{parts[1]}/blocks/")
+                and current_sha is not None and (resumed_files or {}).get(path) == current_sha):
+            out.append(dict(path=path, content=None, sha256=None,
+                            base_sha256=current_sha, delete=True))
+        else:
+            return None, f"{path} is outside the new package and has no proven deletion base; not deleting"
+
     for item in checked["files"]:
         path = item["path"]
         current_sha = gitops.tree_sha256(work_dir, path)
+        if item.get("delete") is True:
+            if current_sha is None:
+                continue
+            if current_sha != item["base_sha256"]:
+                return None, f"{path} changed away from the declared deletion base; not deleting"
+            out.append(item)
+            continue
         if current_sha is None:
             if item["base_sha256"] is not None and not path.startswith("feedback/"):
                 return None, f"{path} was deleted from the remote; not restoring withdrawn content"
@@ -493,13 +507,8 @@ def _prepare_files(checked, work_dir, *, own_branch_resume=False):
         if (
             item["base_sha256"] is not None
             and current_sha == item["base_sha256"]
-            and item.get("sent_markers") is None
         ):
-            # Declared-base update with no confirmed observation history:
-            # the direct batch contract writes the full candidate content.
-            # Core-produced updates always carry marker history and merge
-            # below instead, so a bot-edited remote body is never overwritten
-            # by an old full draft.
+            # Each task file is bound to the complete package and exact base.
             out.append(item)
             continue
         if path.startswith("feedback/"):
@@ -510,29 +519,9 @@ def _prepare_files(checked, work_dir, *, own_branch_resume=False):
             if sha256_text(merged) != current_sha:
                 out.append({**item, "content": merged, "sha256": sha256_text(merged)})
             continue
-        # Entry file whose remote moved from the declared base (or whose base
-        # proof predates marker receipts): apply only the unsent observation
-        # delta onto the current remote content.
-        if item["base_sha256"] is not None and item.get("sent_markers") is not None:
-            current = gitops.read_tree_file(work_dir, path)
-            if current is None:
-                return None, f"{path} became unreadable on the remote; not overwriting"
-            current = current.replace("\r\n", "\n").replace("\r", "\n")
-            merged = _merge_observations(
-                current, item["content"], item["sent_markers"], path
-            )
-            if merged is not None:
-                # Write even when the merge reproduces the current bytes:
-                # the staged diff is then empty and the commit step reports
-                # "no change" instead of misreading an empty file list as a
-                # commit. The receipt identity is read from the worktree.
-                out.append({**item, "content": merged,
-                            "sha256": sha256_text(merged)})
-                continue
         return None, (
             f"{path} changed away from the declared base on the remote "
-            "(possible bot or maintainer edit) and no verifiable observation "
-            "delta could be applied; not overwriting"
+            "(possible bot or maintainer edit); not overwriting"
         )
     return out, None
 

@@ -5,8 +5,8 @@ Current adapters select `capture_mode: public-transcript`, their own
 `transcript_adapter`, an installed `redactor_executable`, and an optional
 `summary_command`. They also supply `root`, `domain`, `community_config` and
 `admission_path`. Model choice is adapter-owned implementation, not a user
-configuration step. Legacy `agent_command` is retained only for old installations
-and stored recovery records; current setup and update never select that path.
+configuration step. `public-transcript` is the only capture pipeline. The removed
+`agent_command` and `organize` configuration values are rejected explicitly.
 
 ## Persistent choice and internal task binding
 
@@ -42,7 +42,7 @@ permission by itself: explicit `enabled=false` always wins, and a config
 without the field keeps its previous read behavior until the owning adapter
 wires it at install/upgrade/entry. When community contribution is off — the
 default — there is no automatic capture, extraction or sanitization at all:
-the Hook short-circuits and creates no capture, cursor, draft or organizer
+the Hook short-circuits and creates no capture, cursor, draft or model
 call. Read-only retrieval, plugin updates and knowledge sync keep working; an
 existing service or local retrieval cache does not imply capture is enabled.
 Disabling mid-task cancels queued and running maintenance, the idle batch
@@ -50,8 +50,8 @@ timer and unsent batches; it never deletes drafts or published data, and
 re-enabling never backfills the disabled period. An *unknown* authority state
 — the settings file or the named consent document missing, unreadable,
 corrupt or malformed — is a fault, not a revocation: no new read, model call
-or outbound write happens, but already-received captures, pending gap
-recoveries and saved apply results are parked with a persisted bounded
+or outbound write happens, but already-received captures, pending material
+indexing and returned model results are parked with a persisted bounded
 backoff and unsent batches are held, all resuming once the authority is
 restored and revalidates. Repairing a damaged file is the user's explicit
 action and is never re-onboarding.
@@ -77,76 +77,64 @@ no new Stop is required and no unredacted body is published. No model creates,
 shortens or rewrites the body. The GitHub ordinary-Git per-file 100 MiB limit
 remains a visible publication constraint, not a silent truncation rule.
 
-An optional separate worker reads the complete redacted body and returns only
-title and summary. It never holds the body worker, and an old result cannot
-replace metadata after new body content arrives. One settled body version has
-one attempt. Failure keeps a labeled source excerpt and the full body usable.
-Disabling sharing cancels both workers and unsent publication; an unchanged
-enable does nothing. Consent lasts until the user changes it.
+A required separate worker indexes complete new blocks and a short prior
+navigation using LangMem 0.0.30. Its metadata cannot rewrite the body. A batch is
+bounded to 64 KiB of rendered user prompt and eight complete blocks; no block is
+sampled away and there is no final whole-history model call. The native system
+prompt is additional to that byte cap. The Codex adapter selects the verified
+`gpt-5.6-luna` / `low` native route internally, with no automatic model fallback.
 
-Old model-authored checkpoints and failed regions are preserved as historical
-recovery evidence. Switching to public-transcript mode never silently applies
-their model-authored body as new deterministic material.
+The durable summary ledger distinguishes prepared, invoking, returned, complete,
+failed and outcome-unknown attempts. Returned output and usage commit before
+metadata redaction or application. Scanner, authority and local-apply failures
+reuse that output; interrupted invocations never automatically repeat. Explicit
+retry retains previous usage. Status reports invocation attempts, known input,
+cached-input and output tokens, and unknown usage; it does not infer monetary
+pricing. Missing configuration and incomplete, failed or uncertain indexing block
+new export batches. A saved body is not yet an indexed contribution.
 
-## Entries, drafts, publication
+Explicit selected-history import uses the same writer and queue, validates its
+previously consumed source prefix and admits only the new suffix. Its package
+stays quarantined until the selected snapshot has been completely admitted.
+Disabling sharing cancels running work and unsent publication. Unknown authority
+parks work; an unchanged enable does not revoke or restart it.
 
-`loop/documents.py` owns the canonical `mindie-entry/2` format: YAML
-frontmatter with `schema`, `entry_id`, `domain`, `kind`, `title`, `summary`
-and optional `conditions`; the detailed body as Markdown. There is no public
-`revision`, `producers`, `sources`, `status` or `retirement_reason` — the
-internal content `revision` is computed at parse/write as the SHA256 of the
-canonical JSON of the public semantic fields (body included), and draft
-ownership lives in a private entry-owner relation. Text fields are canonical
-(stripped) at admission — noncanonical documents are rejected, never silently
-rewritten, so render/parse/revision always agree. Duplicate YAML keys and
-unknown fields fail loudly.
+## Task packages, drafts and publication
 
-`title` names the case and `summary` is its short retrieval abstract.
-`conditions` contains only observed software versions or source commit IDs
-(for example `torch_version` or `vllm_ascend_commit`); use an empty map when
-unknown. Hardware, topology, configuration, shape, seed, epsilon, device
-mapping, tolerances and applicability limits belong in the detailed body.
-Observed versions do not establish universal compatibility. Experience
-queries return this context without excluding a case
-because a requested condition differs. Reference `knowledge` entries can be
-filtered by conflicting caller-supplied conditions. Neither path replaces the
-agent's assessment of the detailed evidence and limits.
+The canonical package contains `tasks/<task-id>/index.md` and the exact referenced
+`blocks/<block-id>.md` set. Its navigation manifest has a `mindie-entry/3` header,
+ordered block hashes and fallible metadata. Stable blocks contain all mechanically
+redacted public material; each is at most 16 KiB, without a whole-task body cap.
+The complete package validator rejects missing, extra, changed or noncanonical
+files. Corrections change the current navigation while earlier observations
+remain in the detailed source blocks. A reference is evidence to assess, not a
+certification of correctness or task completion.
 
-Search folds draft and published lineage: the published revision wins and
-the returned `origin` describes that visible revision (`feed`), including
-the author's own contribution after synchronization. A local-only hit is
-`draft`. A draft that advances beyond its published revision is labeled `supplemental`,
-never a second hit. Withdrawal is deletion from the upstream main tree: after
-a successful sync the entry leaves ordinary search and is never resurrected
-by its local draft, while retained pinned reads return an explicit
-`withdrawn` flag with a readable note. Query references pin short 16-hex
-entry/revision prefixes (`mindie://<domain>/<entry>@<revision>`, full hashes
-only on the rare collision) and always read the exact historical body;
-ambiguous prefixes fail instead of guessing.
+Ordinary Markdown in `materials/` is the body authority. `state-v4.sqlite3` holds
+small headers, pointers, cursors, permissions, queue state and receipts. Candidate
+files are staged before the body-pointer/cursor transaction; promotion and cleanup
+follow. A post-commit cleanup failure reports that metadata already committed.
+Current draft and feed revisions remain available, while obsolete manifests and
+unreferenced blocks are retired. Pending publication owns an immutable staging
+package and a small descriptor, not a second database body.
+
+Search follows the visible current revision and folds draft/feed lineage.
+Withdrawal comes from a successful public-feed refresh: the entry leaves search
+and a local draft cannot resurrect it. Query references pin short entry/revision
+prefixes; an exact current reference reads that package, and superseded revisions
+expire instead of returning a different body. Conditions describe observed
+versions or commits; they do not make an experience universally applicable.
 
 ### Local retrieval index
 
-The existing `store-v3.sqlite3` contains a derived FTS5 index. Entries and
-their revisions remain authoritative; the index does not store a second
-copy of the body. Tokenization retains qualified identifiers, their aliases
-and Chinese bigrams. Search uses the index, filters current visibility and
-knowledge conditions before limiting results, then reads the matching
-entries. Scores rank retrieval usefulness and do not measure factual
-confidence.
-
-Content changes update the derived index. An older cache builds its index in
-resumable slices through the existing background worker, including when
-community contribution is off. This local work does not capture a task,
-call a model or submit a contribution. While a complete index is unavailable,
-queries return an explicit readiness rejection instead of an empty or
-partially searched corpus. The background work continues without a user
-command or repeated queries; optional retrieval context must not prevent
-an otherwise valid capture from being processed. The existing RPC deadline
-remains unchanged.
-
-The runtime requires SQLite 3.43.0 or newer with FTS5 and
-`contentless_delete` support. The SQLite library used by the selected Python
-interpreter determines this capability; a Python version alone does not.
+The embedded ReMe Markdown chunker, file graph and BM25 index derive their data
+from current material files. They search every current block, not only the short
+navigation. Technical identifiers and Chinese token boundaries retain the
+repository's established tokenization. The index is replaceable and explicitly
+reports load/build failures; a failed refresh does not become an empty result.
+There is no ReMe agent, provider, watcher, service, separate transcript store or
+model invocation in consumer retrieval. The SQLite runtime must still satisfy
+the package's supported runtime prerequisite checks.
 
 ## Optional feedback
 
@@ -163,7 +151,7 @@ capture or the outbox.
 One coalescing outbox per domain: the idle timer (default 300 s from the
 settings file; task deactivation flushes early) packs every changed draft
 revision and unbatched publishable vote into a single `mindie-contribution/1`
-batch — canonical entry Markdown under `cases/`/`topics/`, one
+batch — complete canonical task packages under `tasks/` plus
 `feedback/*.json` — staged as already-scanned bytes in a private staging
 directory. A batch is an internal delivery record, not a user-managed unit or
 an extra approval step. One flush is one bounded in-memory operation (per-flush envelope);
@@ -190,16 +178,15 @@ new PR, while unrelated material keeps flowing on a fresh branch. Failed
 revisions are never automatically resent; `unavailable` (transient
 environment) revisions are resubmitted with persisted backoff. An update's
 expected base comes only from confirmed per-entry send receipts, and a
-remote body that moved (bot/maintainer edits) receives only the
-not-yet-confirmed observation blocks — the current remote body, header
-included, stays authoritative. The model is never involved in batching,
+remote file that moved (bot/maintainer edits) is an explicit exact-base
+conflict. Publication does not text-merge or overwrite that changed file. The model is never involved in batching,
 commit messages or PR text.
 
 ## Knowledge sync
 
 `sync --config` is standalone and model-free (30 s per attempt): it follows
 the configured content repository branch as an immutable Git commit,
-validates the candidate tree (canonical layout under `cases/`+`topics/`,
+validates the candidate tree (canonical complete task packages under `tasks/`,
 per-file platform envelope, UTF-8/LF, schema, revisions, domain) and switches
 atomically. There is no whole-feed entry-count or total-byte cap: blobs are
 read one at a time through a bounded persistent `git cat-file --batch`
@@ -248,17 +235,16 @@ read-only remote inspection and updates both stores (always available;
 automatic checks are spaced by persisted backoff, never exhausted); retry
 resubmits exactly one confirmed failed or rejected stored payload with
 `explicit_retry` (unknown outcomes are refused); compact removes the
-sent private payload (draft bodies/history, raw capture summaries, staging)
-of a confirmed batch while keeping IDs, hashes, the retrieval header and
-PR/head receipts. None of them reruns the organizer, resets a capture cursor
+resolved staging of a confirmed batch while keeping the candidate until
+the same revision is present in the public feed. IDs, hashes and PR/head receipts
+remain. None of these operations reruns a model, resets a capture cursor
 or replays failed model attempts.
 
 Shutdown cancels in-flight maintenance through the shared cancel event,
 drains the queue as never-attempted, and joins workers with bounded waits.
-Process bounding is portable on POSIX (process groups); on Windows the Job
-Object assignment races the already-running child, so reliable tree ownership
-there is NOT proven and awaits an atomic create/assign/resume sequence plus
-real Windows acceptance.
+Process bounding uses POSIX process groups and Windows suspended creation
+followed by Job assignment and resume. The Windows mechanism has separate
+component evidence; this change does not claim new native Windows acceptance.
 
 ### Deferred discovery and trusted publication validation
 
@@ -293,47 +279,28 @@ Candidate repository Python is never imported or executed.
 
 ### Pre-release format boundary
 
-The v2 public format uses a fresh `store-v3.sqlite3`; old private database and
-Markdown files are not imported, opened as active records, or deleted. Its
-persisted capture floor is combined with sharing and activation timestamps,
-so a fresh store cannot backfill transcript material from the previous format.
-Entry filenames use the stable entry ID, so correcting a misleading title
-updates the same file. Pending contributions are rechecked for withdrawal,
-and a remote deletion of an expected base is a conflict, never permission to
-restore the removed body. Existing failed or unknown publication receipts stay
-non-replayable within this format.
-
+The current material format uses fresh `state-v4.sqlite3` metadata and Markdown
+packages. Old private databases and organizer checkpoints are not imported or
+used for recovery. The persisted capture floor combines sharing and activation
+timestamps, so normal Stop capture does not backfill earlier material. Explicit
+selected-history import is a separately authorized source operation. Existing
+failed/unknown current-format publication receipts remain non-replayable.
 
 ## Confirmed payload cleanup and idle updates
 
-Confirmation requires a matching remote PR head or Git ancestry proof that
-the expected commit reached our PR. Uncertain writes stay `unknown`,
-preserving inspection material and preventing blind replay; persisted backoff
-spaces the read-only checks without ever latching. Automatic cleanup removes
-exactly the sent draft payload and staging. Capture summaries are cleared only
-when all recorded entry-and-revision references are covered by that confirmed
-batch; newer unsent and ambiguous observations remain available.
+Publication confirmation requires the expected remote head or verified ancestry.
+Uncertain writes retain their exact frozen package and use read-only reconciliation;
+they never authorize a blind repeated write. An open confirmed PR permits staging
+cleanup but keeps the current local candidate readable. The draft pointer is
+compacted only when its exact revision is present in the synchronized public feed.
 
-Tiny per-entry receipts are sending history: the content identity actually
-committed (as reported by the publisher, which can differ from the candidate
-payload after a bot/maintainer merge edit), the cumulative confirmed
-observation-marker set, the confirmed head, path, revision, PR and
-contribution generation — kept independently of the latest coalescing batch.
-After A is sent and compacted, a later B-only batch does not erase A's
-receipt. A future A update checks the linked PR's actual state and re-reads
-the current upstream main body after a merge, or the verified upstream PR
-head while it is open, and appends only there. Squash and rebase merges use
-the same rule. Closed-unmerged PRs are not restored. A cached published body
-or retained contribution branch cannot prove that a remote entry still
-exists; an old confirmed head is never reseeded over a remote correction, and
-confirmed marker identities prevent re-attaching a submitted observation the
-remote removed. Normal organizer context includes the compacted entry's
-title, summary and sent revision with an empty excerpt, restricted to the same
-task and contribution generation. Reading this header neither fetches the
-body nor makes it a pending draft; restoration happens only when the organizer
-actually extends that entry. Withdrawn entries remain excluded.
-This does not retain redundant local body history or authorize
-publishing into a different contribution scope.
+Per-entry receipts retain the confirmed file identities, head, revision, PR and
+contribution generation independently of the latest coalescing batch. Replacing a
+lineage batch cannot erase another task's sending history. A later continuation
+uses its current draft or retained current feed package as the base, preserving
+all earlier blocks. There is no organizer-triggered remote restoration path.
+Successful upstream withdrawal blocks resurrection, and exact-base publication
+checks surface remote edits instead of silently merging them.
 
 The authenticated local `stop_if_idle` RPC freezes admission and initiates
 shutdown only when no actual call, worker or admitted capture work remains.

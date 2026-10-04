@@ -1,0 +1,332 @@
+{
+  "schema": "mindie-k3-acceptance/1",
+  "date": "2026-10-04",
+  "host": "macOS arm64",
+  "model": "gpt-5.6-luna",
+  "effort": "low",
+  "source_policy": "Four explicitly selected real K3 development transcripts, read locally; only anonymous measurements are committed.",
+  "cases": [
+    {
+      "case": "k3-01",
+      "snapshot_bytes": 28739258,
+      "consumed": 28739258,
+      "pages": 5,
+      "public_records": 945,
+      "skipped_records": 14664,
+      "public_bytes": 306267,
+      "max_page_bytes": 101526,
+      "coverage": [],
+      "last_status": "ok",
+      "body_bytes": 306221,
+      "blocks": 22,
+      "indexed": 22,
+      "status": "complete",
+      "usage": {
+        "model_calls": 8,
+        "unknown_calls": 0,
+        "input_tokens": 168539,
+        "cached_input_tokens": 0,
+        "output_tokens": 8540
+      },
+      "model_elapsed_ms": 204992,
+      "final_scan_rules": []
+    },
+    {
+      "case": "k3-02",
+      "snapshot_bytes": 11986851,
+      "consumed": 11986851,
+      "pages": 2,
+      "public_records": 320,
+      "skipped_records": 8754,
+      "public_bytes": 102083,
+      "max_page_bytes": 68136,
+      "coverage": [],
+      "last_status": "ok",
+      "body_bytes": 101818,
+      "blocks": 8,
+      "indexed": 8,
+      "status": "complete",
+      "usage": {
+        "model_calls": 3,
+        "unknown_calls": 0,
+        "input_tokens": 57351,
+        "cached_input_tokens": 0,
+        "output_tokens": 2808
+      },
+      "model_elapsed_ms": 72684,
+      "final_scan_rules": []
+    },
+    {
+      "case": "k3-03",
+      "snapshot_bytes": 110260348,
+      "consumed": 110260348,
+      "pages": 7,
+      "public_records": 643,
+      "skipped_records": 24990,
+      "public_bytes": 283102,
+      "max_page_bytes": 75825,
+      "coverage": [],
+      "last_status": "ok",
+      "body_bytes": 280960,
+      "blocks": 20,
+      "indexed": 20,
+      "status": "complete",
+      "usage": {
+        "model_calls": 10,
+        "unknown_calls": 0,
+        "input_tokens": 167864,
+        "cached_input_tokens": 0,
+        "output_tokens": 8414
+      },
+      "model_elapsed_ms": 210665,
+      "final_scan_rules": []
+    },
+    {
+      "case": "k3-04",
+      "snapshot_bytes": 97668302,
+      "consumed": 97668302,
+      "pages": 7,
+      "public_records": 1195,
+      "skipped_records": 39186,
+      "public_bytes": 461158,
+      "max_page_bytes": 76991,
+      "coverage": [],
+      "last_status": "ok",
+      "body_bytes": 459814,
+      "blocks": 31,
+      "indexed": 31,
+      "status": "complete",
+      "usage": {
+        "model_calls": 14,
+        "unknown_calls": 0,
+        "input_tokens": 264670,
+        "cached_input_tokens": 0,
+        "output_tokens": 13457
+      },
+      "model_elapsed_ms": 338168,
+      "final_scan_rules": []
+    }
+  ],
+  "usage": {
+    "model_calls": 35,
+    "unknown_calls": 0,
+    "input_tokens": 658424,
+    "cached_input_tokens": 0,
+    "output_tokens": 33219
+  },
+  "retrieval": [
+    {
+      "case": "k3-01",
+      "query": "197/198",
+      "found": true,
+      "hits": [
+        "k3-01"
+      ],
+      "elapsed": 1.4224,
+      "has_excerpt": true
+    },
+    {
+      "case": "k3-01",
+      "query": "175/198",
+      "found": true,
+      "hits": [
+        "k3-01"
+      ],
+      "elapsed": 0.0484,
+      "has_excerpt": true
+    },
+    {
+      "case": "k3-01",
+      "query": "TextVQA-lite",
+      "found": true,
+      "hits": [
+        "k3-01"
+      ],
+      "elapsed": 0.048,
+      "has_excerpt": true
+    },
+    {
+      "case": "k3-02",
+      "query": "cfaebdd6",
+      "found": true,
+      "hits": [
+        "k3-02",
+        "k3-03"
+      ],
+      "elapsed": 0.0479,
+      "has_excerpt": true
+    },
+    {
+      "case": "k3-02",
+      "query": "Kimi-K3-DSpark-GQA-20260801",
+      "found": true,
+      "hits": [
+        "k3-02",
+        "k3-03",
+        "k3-04",
+        "k3-01"
+      ],
+      "elapsed": 0.0485,
+      "has_excerpt": true
+    },
+    {
+      "case": "k3-02",
+      "query": "9d442fb1",
+      "found": true,
+      "hits": [
+        "k3-02"
+      ],
+      "elapsed": 0.0487,
+      "has_excerpt": true
+    },
+    {
+      "case": "k3-03",
+      "query": "all-gather",
+      "found": true,
+      "hits": [
+        "k3-01",
+        "k3-03",
+        "k3-04"
+      ],
+      "elapsed": 0.0478,
+      "has_excerpt": true
+    },
+    {
+      "case": "k3-03",
+      "query": "L2 L3 GQA",
+      "found": true,
+      "hits": [
+        "k3-03",
+        "k3-04",
+        "k3-02"
+      ],
+      "elapsed": 0.0484,
+      "has_excerpt": true
+    },
+    {
+      "case": "k3-03",
+      "query": "zeroer",
+      "found": true,
+      "hits": [
+        "k3-03",
+        "k3-04"
+      ],
+      "elapsed": 0.0479,
+      "has_excerpt": true
+    },
+    {
+      "case": "k3-04",
+      "query": "129408",
+      "found": true,
+      "hits": [
+        "k3-04",
+        "k3-02"
+      ],
+      "elapsed": 0.0479,
+      "has_excerpt": true
+    },
+    {
+      "case": "k3-04",
+      "query": "384/385",
+      "found": true,
+      "hits": [
+        "k3-04"
+      ],
+      "elapsed": 0.0482,
+      "has_excerpt": true
+    },
+    {
+      "case": "k3-04",
+      "query": "avg_accept_length",
+      "found": true,
+      "hits": [
+        "k3-04",
+        "k3-02",
+        "k3-01",
+        "k3-03"
+      ],
+      "elapsed": 0.0481,
+      "has_excerpt": true
+    }
+  ],
+  "independent_consumer": {
+    "transport": "local Git file protocol; not GitHub acceptance",
+    "elapsed": 0.519,
+    "repeat": "unchanged",
+    "tasks": 4,
+    "queries": [
+      {
+        "query": "197/198",
+        "found": true
+      },
+      {
+        "query": "175/198",
+        "found": true
+      },
+      {
+        "query": "TextVQA-lite",
+        "found": true
+      },
+      {
+        "query": "cfaebdd6",
+        "found": true
+      },
+      {
+        "query": "Kimi-K3-DSpark-GQA-20260801",
+        "found": true
+      },
+      {
+        "query": "9d442fb1",
+        "found": true
+      },
+      {
+        "query": "all-gather",
+        "found": true
+      },
+      {
+        "query": "L2 L3 GQA",
+        "found": true
+      },
+      {
+        "query": "zeroer",
+        "found": true
+      },
+      {
+        "query": "129408",
+        "found": true
+      },
+      {
+        "query": "384/385",
+        "found": true
+      },
+      {
+        "query": "avg_accept_length",
+        "found": true
+      }
+    ],
+    "model_calls": 0
+  },
+  "failures": [
+    {
+      "case": "k3-04",
+      "attempt": 34,
+      "stage": "model-result-validation",
+      "expected_blocks": 3,
+      "returned_indexes": 4,
+      "duplicate_indexes": 1,
+      "model_calls": 1,
+      "input_tokens": 22077,
+      "output_tokens": 1483,
+      "known_billing": true,
+      "automatic_retry": false,
+      "fix": "Native output schema constrains exact array length; identity/order validation still required.",
+      "explicit_retry": "Attempt 35 completed; all prior usage retained."
+    }
+  ],
+  "limitations": [
+    "Rule scanning is not a semantic confidentiality guarantee.",
+    "Twelve task-target retrieval checks do not establish general benchmark recall.",
+    "Local Git consumer result is distinct from later GitHub/Grok acceptance.",
+    "Usage is native reported token counts; no currency price inferred."
+  ]
+}

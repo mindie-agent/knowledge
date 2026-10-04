@@ -382,11 +382,10 @@ class FileTransport(Transport):
     # -- state file plumbing ------------------------------------------------ #
 
     def _read(self) -> dict:
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {"repos": {}}
-        return data if isinstance(data, dict) else {"repos": {}}
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or not isinstance(data.get("repos"), dict):
+            raise ValueError("invalid file transport state")
+        return data
 
     def _write(self, data: Mapping[str, Any]) -> None:
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
@@ -584,39 +583,42 @@ class FileTransport(Transport):
             return ""
         self._ensure_mirror(repo, url, deadline)
         work = self.path.parent / "merge-work" / repo.replace("/", "_")
-        deadline.step("dev merge worktree")
+
+        def git(operation, *args):
+            # This disposable checkout must materialize the same package bytes
+            # as the publisher, including full task paths on Windows.
+            result = run_argv(
+                ["git", "-c", "core.longpaths=true", "-c", "core.autocrlf=false",
+                 "-c", "core.eol=lf", *args],
+                timeout=min(60, deadline.step(f"dev merge {operation}")),
+                max_output=128 * 1024,
+            )
+            if result.timed_out:
+                error = UnknownOutcome if operation == "push" else TransientError
+                raise error(f"dev merge {operation} timed out")
+            if result.code != 0:
+                raise CommunityError(f"dev merge {operation} failed: {result.err_text[:200]}")
+            return result.out_text.strip()
+
         if (work / ".git").is_dir():
-            run_argv(["git", "-C", str(work), "fetch", "origin", "--prune"],
-                     timeout=min(60, deadline.remaining()), max_output=128 * 1024)
+            git("fetch", "-C", str(work), "fetch", "origin", "--prune")
         else:
             work.parent.mkdir(parents=True, exist_ok=True)
-            result = run_argv(["git", "clone", "--quiet", url, str(work)],
-                              timeout=min(60, deadline.remaining()), max_output=128 * 1024)
-            if result.code != 0:
-                raise CommunityError(f"dev merge clone failed: {result.err_text[:200]}")
+            git("clone", "clone", "--quiet", url, str(work))
         base = pr["base"]["ref"]
         head = pr["head"]["ref"]
-        sequence = [
-            ["git", "-C", str(work), "checkout", "--quiet", "-B", base, f"origin/{base}"],
-            ["git", "-C", str(work), "merge", "--squash", "--quiet", f"origin/{head}"],
-            [
-                "git", "-C", str(work),
-                "-c", "user.name=mindie-dev-transport",
-                "-c", "user.email=dev-transport@example.invalid",
-                "commit", "--quiet", "-m", f"merge {head} into {base}",
-            ],
-            ["git", "-C", str(work), "push", "origin", f"HEAD:refs/heads/{base}"],
-        ]
-        for argv in sequence:
-            result = run_argv(argv, timeout=min(60, deadline.remaining()), max_output=128 * 1024)
-            if result.code != 0:
-                raise CommunityError(f"dev merge failed at {argv[2]}: {result.err_text[:200]}")
-        result = run_argv(
-            ["git", "-C", str(work), "rev-parse", "HEAD"],
-            timeout=10,
-            max_output=4096,
-        )
-        return result.out_text.strip()
+        git("checkout", "-C", str(work), "checkout", "--quiet", "-B", base, f"origin/{base}")
+        git("merge", "-C", str(work), "merge", "--squash", "--quiet", f"origin/{head}")
+        git("commit", "-C", str(work), "-c", "user.name=mindie-dev-transport",
+            "-c", "user.email=dev-transport@example.invalid",
+            "commit", "--quiet", "-m", f"merge {head} into {base}")
+        # Resolve before the external write, so a read failure cannot disguise
+        # a completed push or produce a successful receipt with an empty SHA.
+        commit = git("rev-parse", "-C", str(work), "rev-parse", "HEAD")
+        if not re.fullmatch(r"[0-9a-f]{40}", commit):
+            raise CommunityError("dev merge rev-parse returned an invalid commit")
+        git("push", "-C", str(work), "push", "origin", f"HEAD:refs/heads/{base}")
+        return commit
 
 
 

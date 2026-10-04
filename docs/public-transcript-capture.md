@@ -1,46 +1,74 @@
-# Deterministic public transcript capture
+# Public transcript material and incremental indexing
 
-An adapter may explicitly select `capture_mode: public-transcript`, provide its
-own `transcript_adapter`, and name an installed `redactor_executable`. Existing
-adapters retain their current organizer path; the core never infers a harness
-format or silently switches other clients.
+`public-transcript` is the only capture pipeline. The adapter provides its own
+`transcript_adapter`, an installed absolute `redactor_executable`, and the
+`summary_command` used for required retrieval metadata. The removed
+`agent_command` and `organize` configuration values fail explicitly. The core
+never guesses a harness format.
 
-The handoff queue retains only the native transcript reference, not an extra
-raw copy of the final answer. The parser supplies authorized public messages and exact source-byte ranges.
-The core uses a checksum-pinned Gitleaks 8.30.1 release plus its existing privacy
-rules before saving the messages. Setup calls
-`python -m mindie_knowledge.loop.transcript_redaction` to install the supported
-platform binary and MIT license; runtime capture never downloads a component.
-A scanner failure leaves the source cursor unchanged and an explicit failure.
-Known task/home prefixes and Windows, WSL and file-URI profile paths are masked
-as well as rule-defined credentials. Installer output is UTF-8 on every OS.
+The handoff queue stores only the native transcript reference. The parser selects
+authorized visible user and assistant messages with exact source-byte ranges;
+hidden reasoning, system/developer messages, tool traffic and foreign tasks are
+excluded. Gitleaks 8.30.1 plus the deterministic privacy rules run before storage.
+The installer verifies the pinned binary and license; capture never downloads a
+scanner. Private-key redaction state crosses page boundaries. Scanner failure
+leaves the source cursor unchanged and schedules only local deterministic work.
+The scanner detects rule-defined secrets and identifiers, not proprietary meaning.
 
-One native session within one sharing generation owns one appendable entry.
-Body, range, cursor and continuation commit together using the existing Store
-transaction. Body creation consumes no maintenance model budget. Existing
-authorization checks, revocation, fork filtering, receipt-based restoration,
-outbox, publication and query interfaces continue to apply. The database is
-authoritative; the search index is a derived view. Capture does not also rewrite
-a full Markdown mirror on every turn. Publication renders the selected database
-revision into its staging file when needed. Old draft-file mirrors are inert;
-confirmed-publication cleanup still removes them.
-On migration, legacy organizer gaps remain failed and uncommitted legacy model
-results remain held for inspection. Neither recovery route can call a body
-model or apply its result in public-transcript mode. Appends refresh the source
-excerpt and excerpt title so retrieval does not keep showing an earlier superseded observation.
+One authorized task owns stable material blocks and a current navigation file.
+Bodies live in ordinary Markdown files under the local `materials/` directory.
+The existing SQLite `state-v4.sqlite3` stores pointers, source cursors, authority,
+queue state and outcome receipts; it does not keep another transcript body.
+A complete new public message is divided into lossless UTF-8 blocks of at most
+16 KiB. Candidate files are prepared before the pointer/cursor transaction;
+current-file promotion and cleanup follow that committed transaction. A cleanup
+failure remains a separate visible fault and cannot claim that the body write
+never happened. Superseded manifests and unreferenced blocks are retired while
+current draft/feed versions remain readable.
 
-Without `summary_command`, a clearly labeled source excerpt supplies the title
-and retrieval introduction. An optional summary argv receives redacted source
-text and `partial` (true for bounded first/last excerpts). It must return exactly
-`title` and `summary`. There is no body field. A compare-and-apply check retains
-the exact saved body and ignores a result for an obsolete body version. Attempts
-coalesce after body writes and are reserved before spawning, once per version;
-failure or restart retains the body and excerpt. Unavailable authority parks
-the pending metadata task; revoked tasks cannot starve later active tasks.
-The service reports summary states separately. Partial-source summaries receive
-an enforced excerpt label even if the model omits that qualification.
+Stop capture and explicit selected-history import use this same material writer
+and summary queue. An import validates the consumed prefix before extending its
+cursor and quarantines its package until the selected snapshot is fully admitted.
+Repeating an unchanged import makes no new model call. The fresh format does not
+migrate old organizer bodies, checkpoints or paid recovery work.
 
-The scanner detects rule-defined secrets and identifiers, not proprietary
-meaning. Existing project authorization is required. A downstream review bot
-is not a pre-upload secret boundary. Optional summary availability is reported
-separately from body capture and publication readiness.
+LangMem 0.0.30 indexes complete new blocks together with short prior navigation.
+It returns exactly one title/summary pair per admitted block and a current task
+navigation summary. It cannot rewrite source material. A batch contains at most
+eight blocks and at most 64 KiB of the rendered user prompt; partitioning retains
+every block, without head/tail selection or a final whole-history model merge.
+Native Harness system tokens are additional and are included in measured usage.
+The Codex worker explicitly uses `gpt-5.6-luna` with `low` effort; the selected
+native CLI route was verified during this implementation's acceptance work.
+There is no runtime model fallback or separate provider credential.
+
+A durable `SummaryLedger` reserves each invocation before launch. The worker
+returns a bound envelope identifying the task, batch, policy and outcome.
+Returned output and known token usage are committed **before** metadata scanning
+or application. A later scanner, authority or local-apply fault reuses that saved
+result and cannot trigger another paid call. A failed or interrupted invocation
+is respectively failed or outcome-unknown; it needs explicit repair/retry.
+Retry keeps the previous attempt and its usage. Missing usage stays unknown,
+never zero. `model_calls` counts native invocation attempts, not independently
+observed provider-internal requests. Token counters are reported; no monetary
+price or dollar cost is inferred from them.
+
+The 90-second invocation deadline, bounded process output and strict schema guard
+one invocation. Rolling call/input-token admission limits constrain new work;
+local recovery of returned output needs no fresh budget. Missing worker
+configuration, incomplete indexing and failed/unknown batches block publication.
+They do not turn a saved body or an excerpt into an indexed contribution.
+
+ReMe's embedded Markdown chunker, file graph and BM25 index search all current
+material blocks, including middle-of-task evidence absent from the short
+navigation. The derived index can be rebuilt from those files. Retrieval and
+consumer sync make no model calls and start no ReMe service or background agent.
+
+Publication sends the entire canonical package as `tasks/<task-id>/index.md`
+and its exactly referenced `blocks/<block-id>.md` files. A confirmed open PR
+retires staging but keeps the local candidate. Once the same revision is present
+in the public feed, its duplicate draft pointer may be compacted. A later task
+continuation appends to the retained current feed package. Upstream withdrawal
+prevents continuation from resurrecting removed content. Navigation and retrieved
+experience remain fallible reference material, including incomplete work and
+later corrections; neither publication nor retrieval certifies an outcome.

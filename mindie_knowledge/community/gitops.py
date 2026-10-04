@@ -25,6 +25,7 @@ from .common import (
 from mindie_knowledge.gitread import with_windows_longpaths
 
 MAX_GIT_OUTPUT = 256 * 1024
+_CANONICAL_CHECKOUT = ["-c", "core.autocrlf=false", "-c", "core.eol=lf"]
 
 # stderr shapes that mean the environment (network/DNS/rate limit), not the
 # content or the authorization. Only these make an attempt retryable as
@@ -107,7 +108,11 @@ def _git(
     env: Mapping[str, str] | None = None,
     input_bytes: bytes | None = None,
 ) -> str:
-    remaining = deadline.step(f"git {argv[0]}")
+    command_index = 0
+    while argv[command_index] == "-c":
+        command_index += 2
+    operation = argv[command_index]
+    remaining = deadline.step(f"git {operation}")
     result = run_argv(
         ["git", *argv],
         timeout=min(DEFAULT_GIT_OP_SECONDS, remaining),
@@ -118,13 +123,13 @@ def _git(
     )
     if result.timed_out:
         if unknown_on_timeout:
-            raise UnknownOutcome(f"git {argv[0]} timed out; remote outcome unknown")
-        raise TransientError(f"git {argv[0]} timed out")
+            raise UnknownOutcome(f"git {operation} timed out; remote outcome unknown")
+        raise TransientError(f"git {operation} timed out")
     if result.code != 0:
         detail = result.err_text.strip()[:300]
         if _is_transient_git_error(detail):
-            raise TransientError(f"git {argv[0]} failed: {detail}")
-        raise CommunityError(f"git {argv[0]} failed: {detail}")
+            raise TransientError(f"git {operation} failed: {detail}")
+        raise CommunityError(f"git {operation} failed: {detail}")
     return result.out_text
 
 
@@ -134,32 +139,34 @@ def remote_tip(remote_url: str, ref: str, deadline: Deadline, *, env=None) -> st
 
 
 def ensure_clone(remote_url: str, work_dir: Path, deadline: Deadline, *, env=None) -> Path:
-    """Clone once, fetch afterwards; the clone lives under the private state dir."""
+    """Fetch objects into the private clone, without materializing unvalidated paths."""
     if (work_dir / ".git").is_dir():
         _git(["fetch", "origin", "--prune"], deadline, cwd=work_dir, env=env)
     else:
         work_dir.parent.mkdir(parents=True, exist_ok=True)
-        _git(["clone", "--quiet", remote_url, str(work_dir)], deadline, env=env)
+        # Package hashes describe repository LF bytes. A host's checkout
+        # conversion must not look like an independent maintainer edit.
+        _git([*_CANONICAL_CHECKOUT, "clone", "--no-checkout", "--quiet", remote_url, str(work_dir)], deadline, env=env)
     return work_dir
 
 
 def checkout_new(work_dir: Path, branch: str, base_ref: str, deadline: Deadline, *, env=None) -> None:
-    _git(["checkout", "--quiet", "-B", branch, base_ref], deadline, cwd=work_dir, env=env)
+    # This is the private publication clone, reconstructed from the proven
+    # remote revision. Force also rematerializes an older clone's CRLF files;
+    # merely changing autocrlf can leave Git's cached worktree bytes untouched.
+    _git([*_CANONICAL_CHECKOUT, "checkout", "--force", "--quiet", "-B", branch, base_ref],
+         deadline, cwd=work_dir, env=env)
 
 
 def checkout_existing(work_dir: Path, branch: str, deadline: Deadline, *, env=None) -> bool:
-    """Check out our existing remote branch tip. False when it does not exist."""
-    remaining = deadline.step("git checkout existing branch")
-    from .common import run_argv as _run
-
-    result = _run(
-        ["git", "checkout", "--quiet", "-B", branch, f"origin/{branch}"],
-        timeout=min(DEFAULT_GIT_OP_SECONDS, remaining),
-        max_output=MAX_GIT_OUTPUT,
+    """Check out the already-proven remote branch; every failure is visible."""
+    _git(
+        [*_CANONICAL_CHECKOUT, "checkout", "--force", "--quiet", "-B", branch, f"origin/{branch}"],
+        deadline,
         cwd=work_dir,
-        env=_resolve_git_env(env),
+        env=env,
     )
-    return result.code == 0
+    return True
 
 
 def tree_sha256(work_dir: Path, path: str) -> str | None:
@@ -169,7 +176,7 @@ def tree_sha256(work_dir: Path, path: str) -> str | None:
     raw = target.read_bytes()
     if len(raw) > MAX_FILE_BYTES:
         raise CommunityError(f"{path} in the remote branch exceeds the per-file platform envelope")
-    return hashlib.sha256(raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")).hexdigest()
+    return hashlib.sha256(raw).hexdigest()
 
 
 def read_tree_file(work_dir: Path, path: str) -> str | None:
@@ -188,6 +195,12 @@ def apply_files(work_dir: Path, files: Sequence[Mapping[str, Any]]) -> list[str]
     for item in files:
         path = item["path"]
         target = work_dir / path
+        if item.get("delete") is True:
+            if target.is_symlink():
+                raise CommunityError(f"refusing to delete symlink {path}")
+            target.unlink(missing_ok=True)
+            written.append(path)
+            continue
         target.parent.mkdir(parents=True, exist_ok=True)
         raw = lf_bytes(item["content"])
         tmp = target.with_name(target.name + ".tmp")
@@ -208,14 +221,14 @@ def stage_and_commit(
     Git never starts.
     """
     if not paths:
-        return current_head(work_dir, deadline)
+        return None
     spec = b"\0".join(path.encode("utf-8") for path in paths) + b"\0"
     _git(
         # apply_files writes canonical LF bytes. Inheriting a developer's
         # autocrlf=true emits a warning for every LF file on staging, which can
         # exhaust the output budget for a valid large batch. Scope this policy
         # to this command; do not rewrite repository or user Git settings.
-        ["-c", "core.autocrlf=false", "add", "--pathspec-from-file=-", "--pathspec-file-nul"],
+        [*_CANONICAL_CHECKOUT, "add", "--pathspec-from-file=-", "--pathspec-file-nul"],
         deadline,
         cwd=work_dir,
         env=env,
@@ -231,8 +244,15 @@ def stage_and_commit(
         cwd=work_dir,
         env=_resolve_git_env(env),
     )
+    if diff.timed_out:
+        raise TransientError("git diff cached timed out")
     if diff.code == 0:
         return None
+    if diff.code != 1:
+        detail = diff.err_text.strip()[:300]
+        if _is_transient_git_error(detail):
+            raise TransientError(f"git diff cached failed: {detail}")
+        raise CommunityError(f"git diff cached failed with exit {diff.code}: {detail}")
     _commit(work_dir, message, deadline, env=env)
     return current_head(work_dir, deadline)
 
@@ -304,15 +324,40 @@ def fetch_pr_head(
     return fetch_ref(work_dir, remote, f"refs/pull/{int(number)}/head", deadline, env=env)
 
 
-def ls_tree(work_dir: Path, commit: str, deadline: Deadline, *, env=None) -> dict[str, str]:
-    """Map path -> git mode for one commit; catches symlinks/exec/submodules."""
-    out = _git(["ls-tree", "-r", commit], deadline, cwd=work_dir, env=env)
-    modes: dict[str, str] = {}
-    for line in out.splitlines():
-        meta, _, path = line.partition("\t")
-        parts = meta.split()
-        if len(parts) >= 1 and path:
-            modes[path] = parts[0]
+def ls_tree(work_dir: Path, commit: str, deadline: Deadline, *, env=None,
+            task_ids: set[str] | None = None) -> dict[str, str]:
+    """Read exact path/mode metadata without a whole-catalogue output cap.
+
+    NUL framing preserves unusual filenames so they cannot hide from package
+    validation through Git's quoted display format. Only requested task modes
+    stay in memory when the publisher supplies task_ids.
+    """
+    import tempfile
+    from mindie_knowledge.gitread import iter_file_records, run_stdout_to_file
+
+    remaining = deadline.step("git ls-tree")
+    modes = {}
+    with tempfile.TemporaryDirectory(prefix="mindie-git-tree-") as temporary:
+        target = Path(temporary) / "tree"
+        argv = ["git", "-C", str(work_dir), "ls-tree", "-r", "-z", commit]
+        if task_ids is not None:
+            argv += ["--", "tasks/"]
+        try:
+            run_stdout_to_file(argv, target, timeout=min(DEFAULT_GIT_OP_SECONDS, remaining),
+                               env=_resolve_git_env(env))
+        except (OSError, TimeoutError) as exc:
+            raise TransientError(f"git ls-tree failed: {exc}") from exc
+        for raw in iter_file_records(target):
+            try:
+                meta, path = raw.decode("utf-8", "strict").split("\t", 1)
+                mode, _kind, _oid = meta.split()
+            except (UnicodeDecodeError, ValueError) as exc:
+                raise CommunityError("unreadable Git tree metadata") from exc
+            if task_ids is not None:
+                parts = path.split("/", 2)
+                if len(parts) < 3 or parts[0] != "tasks" or parts[1] not in task_ids:
+                    continue
+            modes[path] = mode
     return modes
 
 

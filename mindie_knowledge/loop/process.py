@@ -128,7 +128,7 @@ def terminate_tree(process):
         pass
 
 
-def _reader(stream, tag, chunks, cancel):
+def _reader(stream, tag, chunks, cancel, errors):
     try:
         while True:
             chunk = os.read(stream.fileno(), 4096)
@@ -144,8 +144,8 @@ def _reader(stream, tag, chunks, cancel):
                 except queue.Full:
                     if cancel is not None and cancel.is_set():
                         return
-    except OSError:
-        pass
+    except OSError as exc:
+        errors.append(exc)
     finally:
         try:
             chunks.put((tag, None), timeout=0.5)
@@ -161,9 +161,10 @@ def bounded_run(command, payload, *, timeout, max_output, cancel=None):
         process = _spawn(command, input_file)
         chunks = queue.Queue(maxsize=max(2, max_output // 4096 + 1))
         readers_stop = threading.Event()
+        read_errors = []
         readers = [
             threading.Thread(
-                target=_reader, args=(stream, tag, chunks, readers_stop), daemon=True
+                target=_reader, args=(stream, tag, chunks, readers_stop, read_errors), daemon=True
             )
             for stream, tag in ((process.stdout, "out"), (process.stderr, "err"))
         ]
@@ -175,6 +176,9 @@ def bounded_run(command, payload, *, timeout, max_output, cancel=None):
         deadline = started + timeout
         try:
             while open_streams:
+                if read_errors:
+                    raise annotated_error(RuntimeError("maintenance output read failed"),
+                                          "invalid_result", started) from read_errors[0]
                 if cancel is not None and cancel.is_set():
                     raise MaintenanceCancelled("maintenance cancelled by shutdown")
                 remaining = deadline - time.monotonic()
@@ -206,6 +210,9 @@ def bounded_run(command, payload, *, timeout, max_output, cancel=None):
                     )
                 if tag == "out":
                     output.extend(chunk)
+            if read_errors:
+                raise annotated_error(RuntimeError("maintenance output read failed"),
+                                      "invalid_result", started) from read_errors[0]
             try:
                 code = process.wait(timeout=max(0.01, deadline - time.monotonic()))
             except subprocess.TimeoutExpired:

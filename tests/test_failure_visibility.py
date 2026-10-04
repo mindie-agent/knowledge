@@ -1,0 +1,127 @@
+"""Failures must preserve work and remain distinguishable from empty success."""
+from contextlib import closing
+import sqlite3
+import pytest
+from mindie_knowledge.loop.activation import Admission, AdmissionUnavailable
+from mindie_knowledge.loop.store import Store
+from mindie_knowledge.community.transport import FileTransport
+
+
+@pytest.mark.parametrize('operation', ['leases', 'active_lease', 'check', 'resolve'])
+def test_corrupt_admission_is_not_inactive(tmp_path, operation):
+    path = tmp_path / 'admission.sqlite3'
+    path.write_bytes(b'broken database')
+    gate = Admission(path)
+    args = [] if operation == 'leases' else ['session']
+    with pytest.raises(AdmissionUnavailable):
+        getattr(gate, operation)(*args)
+    assert path.read_bytes() == b'broken database'
+
+
+def test_locked_admission_is_not_empty(tmp_path):
+    gate = Admission(tmp_path / 'admission.sqlite3')
+    gate.activate('active', project_root=str(tmp_path))
+    db = sqlite3.connect(gate.path)
+    try:
+        db.execute('BEGIN EXCLUSIVE')
+        with pytest.raises(AdmissionUnavailable):
+            gate.leases()
+    finally:
+        db.rollback(); db.close()
+    assert len(gate.leases()) == 1
+
+
+@pytest.mark.parametrize('bad', ['{broken', '[]'])
+def test_corrupt_material_pointer_is_not_empty_success(tmp_path, bad):
+    with closing(Store(tmp_path / 'store', 'test')) as store:
+        store.create_draft(kind='experience', title='Preserved', summary='Observation', content='material canary')
+        path = store.materials.root / 'current.json'
+        path.write_text(bad)
+        with pytest.raises(ValueError):
+            store.query('material')
+        assert path.read_text() == bad
+
+
+def test_corrupt_export_attempt_cannot_be_retried_as_new(tmp_path):
+    with closing(Store(tmp_path / 'store', 'test')) as store:
+        with store._write_txn():
+            store.db.execute('INSERT INTO state VALUES (?,?)', ('export:fixture', '{broken'))
+        with pytest.raises(ValueError, match='invalid stored export'):
+            store.reserve_export('fixture')
+        assert store.db.execute("SELECT value FROM state WHERE key='export:fixture'").fetchone()[0] == '{broken'
+
+
+@pytest.mark.parametrize('bad', ['{broken', '[]', '{"repos":[]}'])
+def test_file_transport_never_overwrites_corrupt_state(tmp_path, bad):
+    path = tmp_path / 'remote.json'
+    api = FileTransport(path)
+    path.write_text(bad)
+    with pytest.raises(ValueError):
+        api.seed('owner/repo', permissions=True)
+    assert path.read_text() == bad
+
+
+def test_corrupt_batch_cannot_receive_a_success_receipt(tmp_path):
+    with closing(Store(tmp_path / 'store', 'test')) as store:
+        from mindie_knowledge.materials.publication import freeze_batch
+        descriptor = freeze_batch(store.root, dict(batch_id='batch', revision='a' * 64, files=[], entry_refs=[]))
+        store.create_batch(batch_id='batch', revision='a' * 64, batch=descriptor, entry_ids=[], vote_keys=[])
+        with store._write_txn():
+            store.db.execute("UPDATE outbox SET batch='{broken' WHERE batch_id='batch'")
+        with pytest.raises(ValueError, match='invalid stored outbox batch'):
+            store.mark_batch('batch', 'submitted', head_sha='a' * 40)
+        row = store.batch('batch')
+        assert row['batch'] == '{broken' and row['status'] == 'pending'
+
+
+@pytest.mark.parametrize('module_name', ['loop.process', 'community.common'])
+def test_process_reader_error_is_not_eof(monkeypatch, module_name):
+    import importlib
+    import sys
+    module = importlib.import_module('mindie_knowledge.' + module_name)
+    original = module._reader
+    def broken(stream, tag, chunks, stop, errors):
+        errors.append(OSError('private read failure'))
+        chunks.put((tag, None))
+    monkeypatch.setattr(module, '_reader', broken)
+    command = [sys.executable, '-c', "print('fixture')"]
+    if module_name == 'loop.process':
+        with pytest.raises(RuntimeError, match='output read failed') as caught:
+            module.bounded_run(command, '', timeout=2, max_output=4096)
+        assert caught.value.mindie_category == 'invalid_result'
+    else:
+        with pytest.raises(module.UnknownOutcome, match='output read failed'):
+            module.run_argv(command, timeout=2)
+
+
+def test_summary_worker_failure_is_visible_in_status(tmp_path, monkeypatch):
+    from mindie_knowledge.loop.engine import Engine
+    from mindie_knowledge.loop import transcript_capture
+    with closing(Store(tmp_path / 'store', 'test')) as store:
+        engine = Engine(store)
+        monkeypatch.setattr(engine.stop, 'wait', lambda _: False)
+        def broken(_):
+            raise OSError('private filesystem detail')
+        monkeypatch.setattr(transcript_capture, 'summarize_due', broken)
+        engine._summary_loop()
+        status = engine.status()
+        assert status['background_errors'] == {'summary': 'OSError'}
+        assert status['errors'] == ['summary worker stopped: OSError']
+
+
+def test_store_close_preserves_committed_effect_error_over_cleanup(tmp_path, monkeypatch):
+    store = Store(tmp_path / 'store', 'test')
+    original = OSError('pointer promotion failed after metadata commit')
+    original.metadata_committed = True
+    def promotion_failed():
+        raise original
+    def index_close_failed():
+        raise ValueError('derived cleanup failed')
+    monkeypatch.setattr(store, '_finish_material_writes', promotion_failed)
+    monkeypatch.setattr(store.materials, 'close', index_close_failed)
+    with pytest.raises(OSError) as caught:
+        store.close()
+    assert caught.value is original and caught.value.metadata_committed
+    assert 'ValueError' in ' '.join(caught.value.__notes__)
+    with pytest.raises(sqlite3.ProgrammingError):
+        store.db.execute('SELECT 1')

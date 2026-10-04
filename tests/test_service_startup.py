@@ -13,11 +13,17 @@ import pytest
 import transcript_double
 
 
+def _configuration(root):
+    return dict(root=str(root), domain="test", capture_mode="public-transcript",
+                transcript_adapter=transcript_double.__file__,
+                redactor_executable=str(root.parent / "gitleaks"))
+
+
 def test_service_start_waits_for_a_transient_lock_observer(tmp_path):
     from mindie_knowledge.loop.cli import connection_path, rpc
     from mindie_knowledge.loop.locks import StartLock
 
-    config = dict(root=str(tmp_path / 'data'), domain='test')
+    config = _configuration(tmp_path / 'data')
     path = tmp_path / 'engine.json'
     path.write_text(json.dumps(config), encoding='utf-8')
     attempted = tmp_path / 'attempted'
@@ -62,7 +68,7 @@ def test_cold_wake_spawn_failure_is_visible_and_releases_ownership(tmp_path, mon
 
     config = tmp_path / 'engine.json'
     root = tmp_path / 'data'
-    config.write_text(json.dumps(dict(root=str(root), domain='test')), encoding='utf-8')
+    config.write_text(json.dumps(_configuration(root)), encoding='utf-8')
     event = 'a' * 64
 
     def denied(*args, **kwargs):
@@ -84,7 +90,7 @@ def test_cold_wake_uses_its_existing_startup_budget(tmp_path, monkeypatch):
     from mindie_knowledge.loop.cli import connect
     from mindie_knowledge.loop.transport import rpc
     config = tmp_path / 'engine.json'
-    value = dict(root=str(tmp_path / 'data'), domain='test')
+    value = _configuration(tmp_path / 'data')
     config.write_text(json.dumps(value), encoding='utf-8')
     original = process.spawn_service
     owned = []
@@ -117,11 +123,18 @@ def test_serve_starts_with_actual_configured_parser(tmp_path):
     config.write_text(json.dumps(dict(
         root=str(root), domain="test",
         admission_path=str(tmp_path / "admission.sqlite3"),
-        transcript_adapter=str(adapter),
+        transcript_adapter=str(adapter), redactor_executable=str(tmp_path / "gitleaks"),
+        capture_mode="public-transcript",
     )))
     diagnostics = tmp_path / "service.log"
     bootstrap = (
-        "import faulthandler, runpy, socket; "
+        "import builtins, faulthandler, runpy, socket\n"
+        "original_import = builtins.__import__\n"
+        "def without_retrieval(name, *args, **kwargs):\n"
+        "    if name == 'reme' or name.startswith('reme.'):\n"
+        "        raise RuntimeError('startup must not initialize retrieval')\n"
+        "    return original_import(name, *args, **kwargs)\n"
+        "builtins.__import__ = without_retrieval\n"
         "socket.getfqdn = lambda *a, **k: (_ for _ in ()).throw("
         "RuntimeError('loopback bind must not reverse-DNS')); "
         "faulthandler.dump_traceback_later(8, repeat=False); "
@@ -145,6 +158,7 @@ def test_serve_starts_with_actual_configured_parser(tmp_path):
             connection = json.loads(connection_path.read_text())
             status = rpc(connection, "status", timeout=5)
             assert status["domain"] == "test"
+            assert status["background_errors"] == {}
             result = rpc(connection, "stop_if_idle", timeout=5)
             assert result["idle"] is True
             assert result["status"] == "stopping"

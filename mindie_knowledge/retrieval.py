@@ -1,15 +1,13 @@
-"""Retrieval tokenization for the derived search index.
+"""Technical identifier and CJK token boundaries for ReMe BM25.
 
-Document tokenization happens at content-change time (``index_text`` feeds
-the FTS index); a query tokenizes only the query itself. Scores rank
-retrieval usefulness, never confidence in a document's claims.
+ReMe owns indexing, persistence and ranking; these tokens retain exact
+qualified identifiers and their searchable components. Ranking scores
+measure retrieval relevance, never factual confidence.
 """
 from __future__ import annotations
 
 import re
 from functools import lru_cache
-from io import StringIO
-from itertools import islice
 
 _WORDS = re.compile(r"[a-z0-9_]+(?:[./+:-][a-z0-9_]+)*|[\u3400-\u9fff]+", re.I)
 _CJK = re.compile(r"^[\u3400-\u9fff]+$")
@@ -47,24 +45,3 @@ def tokens(text: str) -> list[str]:
     """Keep exact identifiers and their components searchable, without
     turning software versions into common numeric aliases."""
     return list(_tokens(text))
-
-
-def index_text(text: str) -> str:
-    """The derived retrieval token stream for one document's source text.
-
-    This is the single tokenization of the document — qualified identifiers,
-    their underscore/namespace aliases and CJK bigrams — stored in the FTS
-    index at content-change time, so a query tokenizes only the query itself.
-    Tokenizer semantics are identical to ``tokens()`` by construction.
-    """
-    # Joining a whole token list keeps millions of Python strings alive for
-    # a large public conversation. Assemble the identical stream in chunks.
-    stream = StringIO()
-    iterator = _tokens(text)
-    first = True
-    while chunk := list(islice(iterator, 4096)):
-        if not first:
-            stream.write(' ')
-        stream.write(' '.join(chunk))
-        first = False
-    return stream.getvalue()

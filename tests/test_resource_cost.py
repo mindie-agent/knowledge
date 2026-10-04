@@ -4,11 +4,10 @@ from contextlib import closing
 
 import pytest
 
-from mindie_knowledge.loop.budget import MaintenanceBudget
 from mindie_knowledge.loop.documents import render_entry
 from mindie_knowledge.loop.store import Store
-from mindie_knowledge.loop.transcript_capture import fallback_header
-from mindie_knowledge.retrieval import index_text, tokens
+from mindie_knowledge.retrieval import tokens
+from mindie_knowledge.materials.publication import freeze_batch
 
 
 def draft(store, generation='allowed'):
@@ -30,8 +29,9 @@ def test_idle_eligibility_does_not_read_bodies_and_keeps_consent(store, monkeypa
 
 def test_retry_limit_applies_after_due_filter_and_cancel_preserves_uncertain_receipt(store):
     for i in range(5):
-        store.create_batch(batch_id=str(i), revision=str(i), batch={'body': 'x' * 100000},
-                           entry_ids=[], vote_keys=[])
+        revision = f'{i:064x}'
+        descriptor = freeze_batch(store.root, dict(batch_id=str(i), revision=revision, files=[], entry_refs=[]))
+        store.create_batch(batch_id=str(i), revision=revision, batch=descriptor, entry_ids=[], vote_keys=[])
         if i < 4:
             store.mark_batch(str(i), 'unknown', attempted=True)
     with store.db:
@@ -43,7 +43,7 @@ def test_retry_limit_applies_after_due_filter_and_cancel_preserves_uncertain_rec
     assert all(store.batch(str(i))['status'] == 'unknown' for i in range(4))
 
 
-def test_no_mirror_needed_for_restart_export_or_pinned_history(tmp_path):
+def test_latest_draft_survives_restart_without_mirror_or_history(tmp_path):
     root = tmp_path / 'store'
     with closing(Store(root, 'test')) as store:
         original = draft(store)
@@ -54,28 +54,29 @@ def test_no_mirror_needed_for_restart_export_or_pinned_history(tmp_path):
         expected = render_entry(current)
         assert not list((root / 'drafts').glob('*.md'))
     with closing(Store(root, 'test')) as reopened:
-        assert reopened.get(old_ref)['content'] == original['content']
+        with pytest.raises(ValueError, match='unknown pinned revision'):
+            reopened.get(old_ref)
         restored = reopened.get(new_ref)
         assert restored.pop('withdrawn') is False
         assert render_entry(restored) == expected
 
 
 def test_poll_work_does_not_scale_with_completed_history(store):
-    MaintenanceBudget(store)
+    draft(store)
     with store.db:
         store.db.executemany(
             "INSERT INTO captures(id,root_session,session,turn,summary,status,detail,created) "
             "VALUES(?,'r','s','t','','organized','',0)", ((str(i),) for i in range(20000)))
-        store.db.executemany("INSERT INTO transcript_tasks VALUES(?,?,'c','d','complete','',0,0)",
+        store.db.executemany("INSERT INTO transcript_tasks "
+                             "(task_key,entry_id,capture_id,body_digest,summary_status,summary_detail,updated,summary_due) "
+                             "VALUES(?,?,'c','d','complete','',0,0)",
                              ((str(i), str(i)) for i in range(20000)))
-        store.db.executemany("INSERT INTO maintenance_attempts(id,session,role,started,status) "
-                             "VALUES(?,'s','organize',0,'succeeded')", ((str(i),) for i in range(20000)))
     # SQLite's VM instructions count actual query work, independent of hardware.
     steps = []
     store.db.set_progress_handler(lambda: steps.append(1) or 0, 100)
     try:
+        assert store.has_changed_drafts(generation="allowed", ready_only=True)
         assert store.due_capture() is None
-        assert store.due_application() is None
         assert store.db.execute("SELECT * FROM transcript_tasks WHERE summary_status='pending' "
                                 "AND summary_due<=? ORDER BY updated LIMIT 1", (time.time(),)).fetchone() is None
     finally:
@@ -88,18 +89,6 @@ def test_token_stream_keeps_order_aliases_and_large_identifiers():
     expected = ['torch_npu.npu_rms_norm', 'torch_npu', 'torch', 'npu',
                 'npu_rms_norm', 'rms', 'norm', '2.10.0+cpu', 'cpu', '显存', '存泄', '泄漏']
     assert tokens(phrase) == expected
-    assert index_text((phrase + ' ') * 1000) == ' '.join(expected * 1000)
     long_name = 'namespace.' + 'a' * 20000
     assert long_name in tokens(long_name)
     assert 'a' * 20000 in tokens(long_name)
-
-
-@pytest.mark.parametrize('body', ['  \n### User\r\n公开说明\u2028Final answer\n',
-                                '字' * 100000, '### Heading\n' * 10000 + 'Last line',
-                                'a' * 1498 + '\n字后文', ''],
-                         ids=['unicode-lines', 'large-line', 'headers', 'utf8-boundary', 'empty'])
-def test_fallback_excerpt_matches_original_format(body):
-    lines = [s.strip() for s in body.splitlines() if s.strip() and not s.startswith('### ')]
-    excerpt = lambda s, n: s.encode()[:n].decode('utf-8', 'ignore').strip()
-    assert fallback_header(body) == (excerpt(lines[0] if lines else 'Public conversation', 240)[:120],
-                                     'Conversation excerpt: ' + excerpt('\n'.join(lines), 1500))

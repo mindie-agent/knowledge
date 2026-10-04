@@ -7,7 +7,7 @@ import unittest
 from test_tools_support import synthetic_ipv4, synthetic_ipv6
 
 from mindie_knowledge import redact
-from mindie_knowledge.loop.engine import mask_text
+from mindie_knowledge.loop.transcript_redaction import redact as public_redact, install_scanner
 
 
 def rules_hit(text: str) -> set[str]:
@@ -137,11 +137,11 @@ class FindingOffsetsAndMaskTests(unittest.TestCase):
 
     def test_mask_text_replaces_only_protected_span(self):
         text = "取 w[::2] 与 http://[::2]:8080"
-        masked, rules = mask_text(text)
+        masked, rules = public_redact(text, executable=install_scanner(), key=b"synthetic-redaction-test-key")
         self.assertIn("ipv6-address", rules)
         self.assertIn("w[::2]", masked)
         self.assertNotIn("http://[::2]:8080", masked)
-        self.assertIn("[redacted:ipv6-address]", masked)
+        self.assertIn("<redacted:ipv6-address:", masked)
         self.assertTrue(masked.startswith("取 "))
 
 
@@ -199,11 +199,11 @@ class PackageVersionIpv4Tests(unittest.TestCase):
         self.assertEqual(hit.start, host_at)
         self.assertEqual(hit.end, host_at + len("5.0.0.93"))
         self.assertEqual(text[hit.start:hit.end], "5.0.0.93")
-        masked, rules = mask_text(text)
+        masked, rules = public_redact(text, executable=install_scanner(), key=b"synthetic-redaction-test-key")
         self.assertIn("ipv4-address", rules)
         self.assertIn("opencv-python-headless 5.0.0.93 requires", masked)
         self.assertNotIn("http://5.0.0.93/", masked)
-        self.assertIn("[redacted:ipv4-address]", masked)
+        self.assertIn("<redacted:ipv4-address:", masked)
 
 
 if __name__ == "__main__":

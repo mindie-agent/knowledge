@@ -24,7 +24,7 @@ from mindie_knowledge.loop.process import terminate_tree
 SCHEMA_BATCH = "mindie-contribution/1"
 SCHEMA_FEEDBACK = "mindie-feedback/1"
 SCHEMA_CONFIG = "mindie-community-config/1"
-SCHEMA_ENTRY = "mindie-entry/2"
+SCHEMA_ENTRY = "mindie-entry/3"
 
 MAX_DETAIL = 800
 # The per-file envelope is the real external platform rejection point, not a
@@ -215,7 +215,7 @@ class ProcessResult:
         return self.err.decode("utf-8", "replace")
 
 
-def _reader(stream, tag: str, chunks: "queue.Queue", stop: threading.Event) -> None:
+def _reader(stream, tag: str, chunks: "queue.Queue", stop: threading.Event, errors) -> None:
     try:
         while not stop.is_set():
             chunk = os.read(stream.fileno(), 4096)
@@ -227,8 +227,8 @@ def _reader(stream, tag: str, chunks: "queue.Queue", stop: threading.Event) -> N
                     break
                 except queue.Full:
                     continue
-    except OSError:
-        pass
+    except OSError as exc:
+        errors.append(exc)
     finally:
         try:
             chunks.put((tag, None), timeout=0.2)
@@ -306,8 +306,9 @@ def run_argv(
     # Bounded in-flight buffer: producers block instead of outgrowing max_output.
     chunks: "queue.Queue" = queue.Queue(maxsize=max(8, max_output // 4096 + 8))
     stop = threading.Event()
+    read_errors = []
     readers = [
-        threading.Thread(target=_reader, args=(stream, tag, chunks, stop), daemon=True)
+        threading.Thread(target=_reader, args=(stream, tag, chunks, stop, read_errors), daemon=True)
         for stream, tag in ((process.stdout, "out"), (process.stderr, "err"))
     ]
     for reader in readers:
@@ -319,6 +320,8 @@ def run_argv(
     timed_out = False
     try:
         while open_streams:
+            if read_errors:
+                raise UnknownOutcome("subprocess output read failed; reconcile read-only") from read_errors[0]
             if cancel is not None:
                 is_set = getattr(cancel, "is_set", None)
                 if callable(is_set) and is_set():
@@ -342,6 +345,8 @@ def run_argv(
                 timed_out = False
                 raise CommunityError("process output exceeds limit")
             target.extend(chunk)
+        if read_errors:
+            raise UnknownOutcome("subprocess output read failed; reconcile read-only") from read_errors[0]
         if timed_out:
             return ProcessResult(-1, bytes(out), bytes(err), True)
         code = process.wait(timeout=max(0.01, deadline - time.monotonic()))

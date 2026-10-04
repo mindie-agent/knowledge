@@ -38,7 +38,7 @@ def test_submit_happy_path_real_git(settings, state_dir, transport, remote_url):
     # Real commit content check: the file bytes on the branch are canonical.
     clone = state_dir / "verify"
     git(["clone", "--quiet", "-b", branch, remote_url, str(clone)])
-    committed = (clone / "cases" / f"{doc['entry_id']}.md").read_text(encoding="utf-8")
+    committed = (clone / entry_file(doc)["path"]).read_text(encoding="utf-8")
     assert committed == entry_file(doc)["content"]
 
     ledger = Ledger(state_dir)
@@ -113,6 +113,41 @@ def test_failed_revision_never_resent(settings, state_dir, transport):
     # An explicit retry is the only way to re-attempt the same revision.
     retried = submit_batch({**batch, "explicit_retry": True}, settings, state_dir, transport=transport)
     assert retried["status"] == "submitted"
+
+
+@pytest.mark.parametrize("timed_out", [False, True])
+def test_existing_branch_checkout_failure_stops_all_writes(
+    settings, state_dir, transport, remote_url, monkeypatch, timed_out,
+):
+    from mindie_knowledge.community import gitops
+    from mindie_knowledge.community.common import ProcessResult
+
+    class RefusedPullRequest(type(transport)):
+        def create_pull_request(self, repo, **kwargs):
+            raise CommunityError("synthetic PR permission refusal")
+
+    batch = make_batch("checkout-failure", [entry_file(make_entry())])
+    first = submit_batch(batch, settings, state_dir,
+                         transport=RefusedPullRequest(transport.path, transport.remotes))
+    assert first["status"] == "failed", first
+    branch = "mindie-contrib/npu/checkout-failure"
+    before = git(["ls-remote", remote_url, f"refs/heads/{branch}"])
+    assert before
+    real_run = gitops.run_argv
+
+    def failed_checkout(argv, **kwargs):
+        if "checkout" in argv:
+            return ProcessResult(128, b"", b"synthetic existing checkout failure", timed_out)
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(gitops, "run_argv", failed_checkout)
+    for name in ("apply_files", "stage_and_commit", "push_branch"):
+        monkeypatch.setattr(gitops, name, lambda *_args, **_kwargs: pytest.fail("write after failed checkout"))
+    result = submit_batch({**batch, "explicit_retry": True}, settings, state_dir, transport=transport)
+    assert result["status"] == ("unavailable" if timed_out else "failed"), result
+    assert ("timed out" if timed_out else "synthetic existing checkout failure") in result["detail"]
+    assert git(["ls-remote", remote_url, f"refs/heads/{branch}"]) == before
+    assert transport.list_open_pull_requests(settings["repository"], deadline=_deadline()) == []
 
 
 def test_missing_publication_executable_resumes_identical_batch_after_repair(
@@ -202,7 +237,7 @@ def test_conflict_divergence_parks_needs_review(settings, state_dir, transport, 
     # Someone else edits the file on our PR branch (simulating a bot/maintainer edit).
     work = state_dir / "intruder"
     git(["clone", "--quiet", "-b", "mindie-contrib/npu/batch-i", remote_url, str(work)])
-    path = work / "cases" / f"{doc['entry_id']}.md"
+    path = work / entry_file(doc)["path"]
     path.write_text(path.read_text() + "\nMaintainer note appended.\n", encoding="utf-8")
     git(["add", "-A"], cwd=work)
     git(["-c", "user.name=maintainer", "-c", "user.email=m@example.invalid",
@@ -218,7 +253,7 @@ def test_conflict_divergence_parks_needs_review(settings, state_dir, transport, 
     # The maintainer edit is still the remote tip: we did not overwrite it.
     check = state_dir / "check"
     git(["clone", "--quiet", "-b", "mindie-contrib/npu/batch-i", remote_url, str(check)])
-    assert "Maintainer note" in (check / "cases" / f"{doc['entry_id']}.md").read_text()
+    assert "Maintainer note" in (check / entry_file(doc)["path"]).read_text()
 
 
 def test_vote_merge_on_branch_update(settings, state_dir, transport, remote_url):
@@ -297,7 +332,7 @@ def test_deleted_entry_is_not_restored_by_a_pending_correction(settings, state_d
     assert first['status'] == 'submitted'
     work = state_dir / 'withdraw'
     git(['clone', '--quiet', '-b', 'mindie-contrib/npu/batch-delete', remote_url, str(work)])
-    path = f"cases/{doc['entry_id']}.md"
+    path = entry_file(doc)["path"]
     git(['rm', path], cwd=work)
     git(['-c', 'user.name=maintainer', '-c', 'user.email=m@example.invalid',
          'commit', '-m', 'Withdraw incorrect entry'], cwd=work)
