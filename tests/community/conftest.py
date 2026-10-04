@@ -101,6 +101,7 @@ def make_entry(entry_id="entry-1", domain="npu", title="Container device numberi
                content="Map the physical device, then number logically from zero.",
                revision=None, kind="experience", conditions=None,
                summary="How device numbering works"):
+    from contextlib import closing
     import hashlib
     import re
     import tempfile
@@ -111,8 +112,8 @@ def make_entry(entry_id="entry-1", domain="npu", title="Container device numberi
     doc = documents.make_entry(entry_id=entry_id, domain=domain, kind=kind,
                               title=title, summary=summary, content=content,
                               conditions=conditions or {"driver": "cann 8.0"})
-    with tempfile.TemporaryDirectory(prefix="mindie-package-fixture-") as directory:
-        materials = MaterialStore(Path(directory), domain)
+    with tempfile.TemporaryDirectory(prefix="mindie-package-fixture-") as directory, \
+            closing(MaterialStore(Path(directory), domain)) as materials:
         doc = materials.put_document(doc)
         package = materials.export_task(entry_id, revision=doc["revision"])
     _PACKAGES[doc["revision"]] = package

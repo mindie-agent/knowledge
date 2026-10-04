@@ -299,7 +299,7 @@ def test_existing_catalog_corruption_never_resets_as_first_use(tmp_path, corrupt
     if corruption == "database":
         (root / ".current-catalog.sqlite3").unlink()
     else:
-        with sqlite3.connect(root / ".current-catalog.sqlite3") as db:
+        with closing(sqlite3.connect(root / ".current-catalog.sqlite3")) as db, db:
             if corruption == "tasks":
                 db.execute("DROP TABLE tasks")
             else:

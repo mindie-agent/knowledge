@@ -1,4 +1,5 @@
 """Exact-commit package validation from orthogonal long-task publication cases."""
+from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import json
@@ -39,8 +40,7 @@ def task_files(number=1, *, domain='vllm-ascend', body='Complete public evidence
     doc = make_entry(entry_id=entry_id, domain=domain, kind=kind,
                      title=f'Inference task {number}', summary=f'Case {number}; evidence remains reference material.',
                      content=body)
-    with TemporaryDirectory() as root:
-        store = MaterialStore(root, domain)
+    with TemporaryDirectory() as root, closing(MaterialStore(root, domain)) as store:
         saved = store.put_document(doc)
         store.retain_current(entry_id, {'draft': saved['revision']})
         package = store.export_task(entry_id)
@@ -103,8 +103,7 @@ def test_whole_same_commit_package_is_required(tmp_path, damage):
 
 
 def test_pending_block_index_cannot_be_published(tmp_path):
-    with TemporaryDirectory() as root:
-        store = MaterialStore(root, 'vllm-ascend')
+    with TemporaryDirectory() as root, closing(MaterialStore(root, 'vllm-ascend')) as store:
         task = store.append_batch('a' * 64, [dict(block_id='b' * 64, text='Unindexed observation.',
                                                  source_range={}, title='', summary='')],
                                   'Pending indexing.', title='Unfinished task')

@@ -1,5 +1,6 @@
 """Neutral admission store: canonical SessionGate semantics."""
 
+from contextlib import closing
 import os
 import sqlite3
 import time
@@ -88,7 +89,7 @@ def test_scope_change_rotates_token_and_boundary(tmp_path):
 
 def test_authorization_has_no_wallclock_expiry(tmp_path):
     path = make_admission(tmp_path, project_root=tmp_path)
-    with sqlite3.connect(path) as db:
+    with closing(sqlite3.connect(path)) as db, db:
         db.execute("UPDATE leases SET activated_at=?", (time.time() - 10 * 86400,))
     assert Admission(path).active_lease("manual-A")
 
@@ -127,7 +128,7 @@ def test_claim_consumes_exactly_once_and_finish_is_diagnostic_only(tmp_path):
 
 def test_old_lease_schema_reads_for_status_but_capture_fails_closed(tmp_path):
     path = tmp_path / "admission.sqlite3"
-    with sqlite3.connect(path) as db:
+    with closing(sqlite3.connect(path)) as db, db:
         db.execute(
             "CREATE TABLE leases(session TEXT, token TEXT, enabled INTEGER, "
             "failures INTEGER)"
