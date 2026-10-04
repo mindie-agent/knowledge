@@ -2,6 +2,7 @@
 empty generations, invalid layouts and persisted attempt budgets."""
 
 import json
+import os
 import subprocess
 import time
 
@@ -11,6 +12,7 @@ from mindie_knowledge.loop.documents import make_entry
 from package_fixture import package_for, write_package
 from mindie_knowledge.loop.feed import Feed
 from mindie_knowledge.loop.store import Store
+from mindie_knowledge.gitread import with_windows_longpaths
 
 PRODUCER = "a" * 64
 
@@ -344,12 +346,17 @@ def test_sync_discards_old_git_objects_and_old_database_bodies(env):
     assert feed.sync()['status'] == 'synced'
     for i in range(3):
         current = entry_doc('c' * 64, f'current only marker {i}')
-        commit_docs(git, repo, [current])
+        current_commit = commit_docs(git, repo, [current])
         assert feed.sync()['status'] == 'synced'
         assert store.db.execute('SELECT count(*) FROM revisions').fetchone()[0] == 1
-    count = subprocess.check_output(['git', '-C', str(feed.repo), 'rev-list', '--all', '--count'], text=True)
+    git_env = with_windows_longpaths(os.environ)
+    count = subprocess.check_output(['git', '-C', str(feed.repo), 'rev-list', '--all', '--count'],
+                                    text=True, env=git_env)
     assert count.strip() == '1'
-    missing = subprocess.run(['git', '-C', str(feed.repo), 'cat-file', '-e', old_blob], capture_output=True)
+    subprocess.run(['git', '-C', str(feed.repo), 'cat-file', '-e', current_commit],
+                   capture_output=True, check=True, env=git_env)
+    missing = subprocess.run(['git', '-C', str(feed.repo), 'cat-file', '-e', old_blob],
+                             capture_output=True, env=git_env)
     assert missing.returncode != 0
     assert store.get(store.ref('c' * 64))['title'] == current['title']
     assert not (feed.dir / 'staging').exists()
