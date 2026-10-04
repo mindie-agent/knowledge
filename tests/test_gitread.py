@@ -83,6 +83,7 @@ def test_owner_cancel_stops_a_silent_file_process(tmp_path, monkeypatch):
     import threading
     import mindie_knowledge.gitread as gitread
     cancel, spawned = threading.Event(), []
+    command = [sys.executable, '-c', 'import time; time.sleep(60)']
     popen = subprocess.Popen
     def observed(*args, **kwargs):
         process = popen(*args, **kwargs)
@@ -93,8 +94,12 @@ def test_owner_cancel_stops_a_silent_file_process(tmp_path, monkeypatch):
     timer.start()
     try:
         with pytest.raises(InterruptedError, match='cancelled by its owner'):
-            run_stdout_to_file([sys.executable, '-c', 'import time; time.sleep(60)'], tmp_path / 'out', cancel=cancel)
-        assert len(spawned) == 1 and spawned[0].poll() is not None
+            run_stdout_to_file(command, tmp_path / 'out', cancel=cancel)
+        # Windows cleanup also launches taskkill through the shared module.
+        # Only the requested operation must start once; every observed helper
+        # must still finish before cancellation returns.
+        assert len([process for process in spawned if process.args == command]) == 1
+        assert all(process.poll() is not None for process in spawned)
     finally:
         timer.cancel()
         timer.join()
@@ -106,8 +111,10 @@ def test_owner_cancel_interrupts_silent_cat_file_protocol(tmp_path, monkeypatch)
     import mindie_knowledge.gitread as gitread
     cancel = threading.Event()
     popen = subprocess.Popen
-    def silent(_argv, **kwargs):
-        return popen([sys.executable, '-c', 'import time; time.sleep(60)'], **kwargs)
+    def silent(argv, **kwargs):
+        if argv == ['git', '-C', str(tmp_path), 'cat-file', '--batch']:
+            argv = [sys.executable, '-c', 'import time; time.sleep(60)']
+        return popen(argv, **kwargs)
     monkeypatch.setattr(gitread.subprocess, 'Popen', silent)
     reader = CatFileBatch(tmp_path)
     timer = threading.Timer(.2, cancel.set)
