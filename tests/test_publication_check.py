@@ -15,18 +15,20 @@ def git(repo, *args, timeout=10):
     return subprocess.check_output(['git', '-C', str(repo), *args], text=True, timeout=timeout).strip()
 
 
-def publish(tmp_path, files, *, add_timeout=10):
+def publish(tmp_path, files, *, write_timeout=10):
     repo = tmp_path / 'repo'
     repo.mkdir()
     git(repo, 'init', '-q', '-b', 'main')
     git(repo, 'config', 'user.name', 'check')
     git(repo, 'config', 'user.email', 'check@example.invalid')
+    git(repo, 'config', 'core.autocrlf', 'false')
+    git(repo, 'config', 'core.eol', 'lf')
     for name, text in files.items():
         path = repo / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding='utf-8', newline='\n')
-    git(repo, 'add', '.', timeout=add_timeout)
-    git(repo, 'commit', '-qm', 'publication')
+    git(repo, 'add', '.', timeout=write_timeout)
+    git(repo, 'commit', '-qm', 'publication', timeout=write_timeout)
     return repo, git(repo, 'rev-parse', 'HEAD')
 
 
@@ -114,7 +116,7 @@ def test_more_than_1024_tasks_validate(tmp_path):
     files = {}
     for i in range(1027):
         files.update(task_files(i, body=f'Full evidence in task {i}.'))
-    repo, sha = publish(tmp_path, files, add_timeout=60)
+    repo, sha = publish(tmp_path, files, write_timeout=60)
     assert validate(repo, sha, 'vllm-ascend')['entries'] == 1027
 
 
