@@ -149,9 +149,9 @@ def test_http_method_aware_classification(tmp_path, monkeypatch, method, case, e
         "repository": "review-owner/knowledge",
         "fork": "review-contributor/knowledge",
     })
-    api.op_seconds = 0.15 if case == "timeout" else 3
+    seconds = 0.15 if case == "timeout" else 3
     with pytest.raises(CommunityError) as caught:
-        api._api(method, "/repos/review-owner/knowledge/pulls", Deadline(5, 5))
+        api._api(method, "/repos/review-owner/knowledge/pulls", Deadline(seconds, 5))
     assert caught.value.status == expected
 
 

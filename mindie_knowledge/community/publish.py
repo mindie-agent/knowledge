@@ -123,8 +123,8 @@ def _submit(batch, settings, state_dir, ledger, *, cancel, transport) -> dict[st
                         detail="community sharing is disabled or unconfigured")
     checked = validate_batch(batch)
     deadline = Deadline(
-        settings.get("transaction_seconds", 120),
-        settings.get("operation_limit", 60),
+        settings.get("transaction_seconds"),
+        settings.get("operation_limit"),
         cancel=cancel,
     )
     transport = transport or transport_from_settings(settings, state_dir)
@@ -297,7 +297,7 @@ def _publication_base(checked, settings, state_dir, deadline, *, repository, wri
     contract = read_git_contract(
         work_dir, base_tip, checked["domain"],
         expected_sha256=settings.get("publication_contract_sha256"),
-        deadline=time.monotonic() + deadline.remaining(), env=genv,
+        deadline=deadline.limit, env=genv, cancel=deadline.cancel,
     )
     return dict(work_dir=work_dir, genv=genv, base_tip=base_tip,
                 read_url=read_url, base_branch=base_branch, contract=contract)
@@ -357,7 +357,7 @@ def _publish(checked, settings, state_dir, ledger, deadline, transport, *,
     try:
         read_git_contract(work_dir, selected_commit, checked["domain"],
                           expected_sha256=prepared["contract"]["sha256"],
-                          deadline=time.monotonic() + deadline.remaining(), env=genv)
+                          deadline=deadline.limit, env=genv, cancel=deadline.cancel)
     except ContractMismatch as exc:
         raise CommunityError(f"contribution head contract differs from its upstream base: {exc}",
                              status="needs_review") from exc
@@ -963,8 +963,8 @@ def inspect_batch(batch_id: str, settings: dict, state_dir: Path, *, transport: 
                     "pr_url": None, "head_sha": None,
                     "detail": "community sharing is disabled or unconfigured"}
         transport = transport or transport_from_settings(settings, state_dir)
-        deadline = Deadline(settings.get("transaction_seconds", 120),
-                            settings.get("operation_limit", 60))
+        deadline = Deadline(settings.get("transaction_seconds"),
+                            settings.get("operation_limit"))
         rows = [
             row for row in ledger.all_for_batch(batch_id)
             if row["status"] in ("intent", "unknown", "failed", "rejected")
@@ -994,8 +994,8 @@ def reconcile_batch(batch_id: str, settings: dict, state_dir: Path, *, transport
                     "pr_url": None, "head_sha": None,
                     "detail": "community sharing is disabled or unconfigured"}
         transport = transport or transport_from_settings(settings, state_dir)
-        deadline = Deadline(settings.get("transaction_seconds", 120),
-                            settings.get("operation_limit", 60))
+        deadline = Deadline(settings.get("transaction_seconds"),
+                            settings.get("operation_limit"))
         unresolved = ledger.unresolved_for_batch(batch_id)
         if not unresolved:
             latest = ledger.latest_for_batch(batch_id)

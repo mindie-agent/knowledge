@@ -10,22 +10,15 @@ file parsed in bounded chunks, and each blob is validated against the real
 per-file platform envelope as it is read through one bounded persistent
 ``git cat-file --batch`` process (at most one body in memory at a time).
 
-One normal call advances in bounded slices and never restarts a large fixed
-commit at item zero: fully verified blobs are checkpointed per PATH (content
-checks are path-scoped, so the same blob under another path is re-examined)
-bound to the exact commit and the exact validation context (domain, pinned
-validator version, privacy-rule set, schemas) — a changed commit, domain or
-validator never trusts stale entries, and candidate input never supplies
-trusted cache entries. The checkpoint lives in the candidate repo's Git
-metadata dir by default (``--state FILE`` overrides), so an interrupted or
-slow first run resumes where it stopped inside the same invocation and
-across invocations, without the host rerunning anything; the host's own job
-budget still bounds the total. Content checks keep whole-record semantics —
-the privacy scanner runs on the complete file text, preserving cross-line
-detection exactly.
+One normal call streams the fixed commit and checkpoints verified blobs per
+path, bound to the exact commit and validation context. Interruption preserves
+completed checkpoints for a later invocation. There is no elapsed-time slice
+or stalled-time heuristic: quiet, healthy validation continues. Privacy scans
+always see complete records, including cross-line matches.
 """
 from __future__ import annotations
-import argparse,importlib.metadata,json,os,re,tempfile,time
+import argparse,importlib.metadata,json,os,re,sys,tempfile
+from contextlib import closing
 from pathlib import Path
 from .community.batch import check_path,validate_feedback
 from .community.common import SCHEMA_FEEDBACK,CommunityError,run_argv,sha256_text
@@ -40,14 +33,8 @@ def _git_env():
     return with_windows_longpaths({'GIT_TERMINAL_PROMPT':'0','GIT_CONFIG_COUNT':'1',
         'GIT_CONFIG_KEY_0':'core.hooksPath','GIT_CONFIG_VALUE_0':os.devnull})
 
-# One bounded validation slice; the host (CI job, CLI caller) bounds the
-# total across automatically continued slices.
-SLICE_SECONDS=25
 _CHECKPOINT_EVERY=64
 _STATE_NAME='mindie-validator-state.json'
-
-class _SliceExhausted(Exception):
-    """The bounded slice expired; verified progress is already persisted."""
 
 # The trusted validation implementation whose checkpoints may be reused:
 # the installed package's own Python sources (never read from the candidate
@@ -142,12 +129,9 @@ def _save_checkpoint(path,revision,context,verified):
                                'verified':verified},sort_keys=True),encoding='utf-8')
     os.replace(tmp,target)
 
-def _git(repo,args,maximum,deadline):
-    remaining=deadline-time.monotonic()
-    if remaining<=0:raise _SliceExhausted()
-    result=run_argv(['git','-C',str(repo),*args],timeout=min(25,remaining),max_output=maximum,input_bytes=b'',
+def _git(repo,args,maximum):
+    result=run_argv(['git','-C',str(repo),*args],timeout=None,max_output=maximum,input_bytes=b'',
                     env=_git_env())
-    if result.timed_out:raise _SliceExhausted()
     if result.code:raise ValueError('Cannot read the candidate Git publication')
     return result.out
 
@@ -188,85 +172,84 @@ def _validate_task_sets(stats):
         if not all(block['indexed'] for block in header['blocks']):
             raise ValueError(f'tasks/{task_id}: public material indexing is incomplete')
 
-def _validate_slice(repo,revision,domain,state_path,context,verified,stats):
-    """One bounded slice over the candidate tree; resumes from ``verified``.
+def _validate_tree(repo,revision,domain,state_path,context,verified,stats):
+    """Stream the candidate tree; reuse verified per-path checkpoints.
 
     Cheap per-path checks (layout, path allowlist, mode, size, directory/kind
     consistency, duplicate identity) always run against the current listing,
     even for checkpointed paths; only the expensive body read/parse/scan is
     skipped for a path already verified under the exact same commit and
     validation context."""
-    deadline=time.monotonic()+SLICE_SECONDS
     fd,listing_name=tempfile.mkstemp(prefix='mindie-ls-tree-')
     os.close(fd)  # the name is reopened by path; the descriptor never leaks
     listing_file=Path(listing_name)
     try:
         run_stdout_to_file(
             ['git','-C',str(repo),'ls-tree','-r','-z','--long',revision],
-            listing_file,timeout=min(25,max(1.0,deadline-time.monotonic())),
+            listing_file,timeout=None,
             env=_git_env())
         reader=None
         pending=0
         try:
-            for raw in iter_file_records(listing_file,separator=b'\0'):
-                if not raw:continue
-                head,path=raw.decode('utf-8','strict').split('\t',1)
-                mode,kind,sha,size=head.split()
-                if not path.startswith(('tasks/','feedback/')):
-                    if path.startswith(('cases/','topics/','corpus/','generations/')):
-                        raise ValueError('Retired knowledge layout is not supported')
-                    continue
-                if path in stats['done_paths']:
-                    continue  # fully processed in an earlier slice of this call
-                check_path(path)
-                if mode!='100644' or kind!='blob' or not size.isdigit():
-                    raise ValueError(f'{path}: publication requires a plain data blob')
-                if int(size)>MAX_FILE_BYTES:
-                    raise ValueError(f'{path}: exceeds the per-file platform envelope')
-                prior=verified.get(path)
-                if prior is not None and prior.get('sha')==sha:
-                    stats['count']+=1;stats['bytes']+=int(size)
-                    _record_verified(path,prior,stats)
+            with closing(iter_file_records(listing_file,separator=b'\0')) as records:
+                for raw in records:
+                    if not raw:continue
+                    head,path=raw.decode('utf-8','strict').split('\t',1)
+                    mode,kind,sha,size=head.split()
+                    if not path.startswith(('tasks/','feedback/')):
+                        if path.startswith(('cases/','topics/','corpus/','generations/')):
+                            raise ValueError('Retired knowledge layout is not supported')
+                        continue
+                    if path in stats['done_paths']:
+                        continue  # fully processed in an earlier slice of this call
+                    check_path(path)
+                    if mode!='100644' or kind!='blob' or not size.isdigit():
+                        raise ValueError(f'{path}: publication requires a plain data blob')
+                    if int(size)>MAX_FILE_BYTES:
+                        raise ValueError(f'{path}: exceeds the per-file platform envelope')
+                    prior=verified.get(path)
+                    if prior is not None and prior.get('sha')==sha:
+                        stats['count']+=1;stats['bytes']+=int(size)
+                        _record_verified(path,prior,stats)
+                        stats['done_paths'].add(path)
+                        continue
+                    if reader is None:
+                        reader=CatFileBatch(repo,env=_git_env())
+                    blob=reader.read(sha,deadline=None,max_bytes=MAX_FILE_BYTES)
+                    if blob is None:raise ValueError(f'{path}: cannot read the candidate blob')
+                    text=blob.decode('utf-8','strict')
+                    if '\r' in text:raise ValueError(f'{path}: canonical LF bytes required')
+                    if scan_text(text):raise ValueError(f'{path}: public data fails the privacy scan')
+                    if path.startswith('feedback/'):
+                        validate_feedback(text,path)
+                        value={'type':'feedback','sha':sha}
+                    elif path.endswith('/index.md'):
+                        header=_parse_manifest(text,domain)
+                        value={'type':'task','sha':sha,'header':header}
+                    else:
+                        header,_body=_parse(text)
+                        if set(header)!={'schema','block_id','source_range'} or header['schema']!=BLOCK_SCHEMA:
+                            raise ValueError(f'{path}: invalid material block header')
+                        value={'type':'block','sha':sha,'block_id':header['block_id'],
+                               'source_range':header['source_range'],'sha256':_sha(text)}
+                        _parse_block(text,value)
+                    _record_verified(path,value,stats)
+                    verified[path]=value
                     stats['done_paths'].add(path)
-                    continue
-                if time.monotonic()>=deadline:
-                    raise _SliceExhausted()
-                if reader is None:
-                    reader=CatFileBatch(repo,env=_git_env())
-                try:
-                    blob=reader.read(sha,deadline=deadline,max_bytes=MAX_FILE_BYTES)
-                except TimeoutError:
-                    raise _SliceExhausted() from None
-                if blob is None:raise ValueError(f'{path}: cannot read the candidate blob')
-                text=blob.decode('utf-8','strict')
-                if '\r' in text:raise ValueError(f'{path}: canonical LF bytes required')
-                if scan_text(text):raise ValueError(f'{path}: public data fails the privacy scan')
-                if path.startswith('feedback/'):
-                    validate_feedback(text,path)
-                    value={'type':'feedback','sha':sha}
-                elif path.endswith('/index.md'):
-                    header=_parse_manifest(text,domain)
-                    value={'type':'task','sha':sha,'header':header}
-                else:
-                    header,_body=_parse(text)
-                    if set(header)!={'schema','block_id','source_range'} or header['schema']!=BLOCK_SCHEMA:
-                        raise ValueError(f'{path}: invalid material block header')
-                    value={'type':'block','sha':sha,'block_id':header['block_id'],
-                           'source_range':header['source_range'],'sha256':_sha(text)}
-                    _parse_block(text,value)
-                _record_verified(path,value,stats)
-                verified[path]=value
-                stats['done_paths'].add(path)
-                stats['count']+=1;stats['bytes']+=int(size)
-                pending+=1
-                if pending%_CHECKPOINT_EVERY==0:
-                    _save_checkpoint(state_path,revision,context,verified)
+                    stats['count']+=1;stats['bytes']+=int(size)
+                    pending+=1
+                    if pending%_CHECKPOINT_EVERY==0:
+                        _save_checkpoint(state_path,revision,context,verified)
         finally:
             if reader is not None:
                 reader.close()
     finally:
+        pending_error=sys.exc_info()[1]
         try:listing_file.unlink()
-        except OSError:pass
+        except OSError as cleanup_error:
+            if pending_error is None:
+                raise
+            pending_error.add_note('Scratch cleanup also failed: '+str(cleanup_error))
     _save_checkpoint(state_path,revision,context,verified)
     return stats
 
@@ -284,22 +267,25 @@ def classify_changes(repo, base_revision, revision):
         listing = Path(directory) / "paths"
         run_stdout_to_file(
             ["git", "-C", str(repo), "diff", "--no-renames", "--name-status", "-z", base_revision, revision, "--"],
-            listing, timeout=SLICE_SECONDS, env=_git_env(),
+            listing, timeout=None, env=_git_env(),
         )
         count, development = 0, []
-        records = iter(iter_file_records(listing, separator=b"\0"))
-        for raw in records:
-            if not raw:
-                continue
-            status = raw.decode("ascii", "strict")
-            path = next(records).decode("utf-8", "strict")
-            count += 1
-            if status == "M" and re.fullmatch(r"tasks/[0-9a-f]{64}/blocks/[0-9a-f]{64}\.md", path):
-                raise ValueError(f"{path}: immutable block changed under the same identity; replace it with a new block")
-            try:
-                check_path(path)
-            except (ValueError, CommunityError):
-                development.append(path)
+        # A rejected transition may leave unread records. Close the generator
+        # before deleting its file, including on Windows, preserving the
+        # actual validation failure rather than a later cleanup error.
+        with closing(iter_file_records(listing, separator=b"\0")) as records:
+            for raw in records:
+                if not raw:
+                    continue
+                status = raw.decode("ascii", "strict")
+                path = next(records).decode("utf-8", "strict")
+                count += 1
+                if status == "M" and re.fullmatch(r"tasks/[0-9a-f]{64}/blocks/[0-9a-f]{64}\.md", path):
+                    raise ValueError(f"{path}: immutable block changed under the same identity; replace it with a new block")
+                try:
+                    check_path(path)
+                except (ValueError, CommunityError):
+                    development.append(path)
     return {"base_commit": base_revision, "changed_files": count,
             "content_only": bool(count) and not development,
             "review_mode": "development" if development else "content",
@@ -309,27 +295,17 @@ def classify_changes(repo, base_revision, revision):
 def validate(repo,revision,domain,state=None,*,base_revision=None,expected_contract_sha256=None):
     if not re.fullmatch(r'[0-9a-f]{40}',revision):
         raise ValueError('revision must be a full immutable Git commit SHA')
-    if _git(repo,['cat-file','-t',revision],4096,time.monotonic()+SLICE_SECONDS).strip()!=b'commit':
+    if _git(repo,['cat-file','-t',revision],4096).strip()!=b'commit':
         raise ValueError('revision must identify a commit')
     contract = read_git_contract(repo, revision, domain,
                                  expected_sha256=expected_contract_sha256,
-                                 deadline=time.monotonic()+SLICE_SECONDS, env=_git_env())
+                                 env=_git_env())
     context=_validator_context(domain)
     context['publication_contract_sha256'] = contract['sha256']
     state_path=state if state is not None else _default_state_path(repo)
     verified=_load_checkpoint(state_path,revision,context)
     stats={'count':0,'bytes':0,'entries':{},'blocks':{},'feedback':0,'done_paths':set()}
-    stalled=0
-    while True:
-        before=len(verified)
-        try:
-            stats=_validate_slice(repo,revision,domain,state_path,context,verified,stats)
-            break
-        except _SliceExhausted:
-            # Verified progress was persisted; continue with a fresh slice.
-            stalled=0 if len(verified)>before else stalled+1
-            if stalled>=2:
-                raise ValueError('no validation progress across bounded slices') from None
+    stats=_validate_tree(repo,revision,domain,state_path,context,verified,stats)
     _validate_task_sets(stats)
     result = {'commit':revision,'entries':len(stats['entries']),
               'feedback_files':stats['feedback'],'bytes':stats['bytes'],

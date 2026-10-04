@@ -275,10 +275,10 @@ def test_scanner_recovers_same_notification_without_new_stop(pipeline, monkeypat
     event = engine.capture(session_id='manual-A', turn_id='bad', transcript_path=str(path))
     with monkeypatch.context() as patcher:
         if failure in {'exit', 'invalid-report'}:
-            import subprocess
-            patcher.setattr('mindie_knowledge.loop.transcript_redaction.subprocess.run',
-                lambda *args, **kwargs: subprocess.CompletedProcess(
-                    args, 2 if failure == 'exit' else 0, b'not-json', b''))
+            from mindie_knowledge.community.common import ProcessResult
+            patcher.setattr('mindie_knowledge.loop.transcript_redaction.run_argv',
+                lambda *args, **kwargs: ProcessResult(
+                    2 if failure == 'exit' else 0, b'not-json', b'', False))
         engine._process(event['id'])
     assert store.drafts_changed() == []
     assert store.cursor(str(path.resolve())) is None
@@ -308,6 +308,30 @@ def test_revoked_pending_summary_does_not_block_next_task(pipeline):
     state = store.db.execute('SELECT summary_status FROM transcript_tasks').fetchone()[0]
     assert state == 'cancelled'
     assert store.drafts_changed()[0]['content'].count('original public marker') == 1
+
+
+def test_scanner_shutdown_keeps_same_capture_pending_without_advancing_cursor(pipeline, monkeypatch):
+    from mindie_knowledge.loop.process import MaintenanceCancelled
+    engine, store, path = pipeline
+    append(path, 'Complete public material must survive scanner cancellation.')
+    event = engine.capture(session_id='manual-A', turn_id='scanner-shutdown', transcript_path=str(path))
+    def cancelled(**options):
+        assert options['cancel'] is engine._cancel
+        engine.stop.set()
+        engine._cancel.set()
+        raise MaintenanceCancelled('scanner cancelled by owner')
+    with monkeypatch.context() as patcher:
+        patcher.setattr(transcript_capture, 'prepare_increment', cancelled)
+        engine._process(event['id'])
+    assert store.cursor(str(path.resolve())) is None
+    assert store.drafts_changed() == []
+    assert store.capture_row(event['id'])['status'] in {'pending', 'deferred'}
+    assert store.continuation_reason(event['id']) == 'service stopped; local work retained'
+    engine.stop.clear()
+    engine._cancel.clear()
+    engine._process(event['id'])
+    assert store.capture_row(event['id'])['status'] == 'organized'
+    assert 'Complete public material must survive scanner cancellation.' in store.drafts_changed()[0]['content']
 
 
 def test_k3_long_task_batches_cover_every_byte_without_old_body_replay(pipeline, monkeypatch):
@@ -421,7 +445,7 @@ def test_production_parsers_preserve_large_public_messages_through_export(tmp_pa
         # Stop, not an assumption that the first synchronous tick finishes.
         engine.start()
         try:
-            # A scanner attempt alone may take 30 seconds. This checks eventual
+            # The scanner has no product deadline. This watchdog checks eventual
             # complete persistence of large messages, not an eight-second SLA;
             # allow bounded time for parsing and durable material writes too.
             wait_until(lambda: store.capture_row(event['id'])['status'] == 'organized', seconds=60)

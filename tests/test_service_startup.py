@@ -84,8 +84,8 @@ def test_cold_wake_spawn_failure_is_visible_and_releases_ownership(tmp_path, mon
     assert lock_held(root / 'test/start.lock') is False
 
 
-def test_cold_wake_uses_its_existing_startup_budget(tmp_path, monkeypatch):
-    """A real 2.4 s interpreter startup used to be killed after 3 x .5 s."""
+def test_cold_wake_waits_for_healthy_initialization_past_the_old_deadline(tmp_path, monkeypatch):
+    """A silent initializer may take longer than the removed five-second cap."""
     from mindie_knowledge.loop import handoff, process
     from mindie_knowledge.loop.cli import connect
     from mindie_knowledge.loop.transport import rpc
@@ -96,7 +96,7 @@ def test_cold_wake_uses_its_existing_startup_budget(tmp_path, monkeypatch):
     owned = []
     def delayed(command, **options):
         child = original([sys.executable, '-c',
-            "import time,runpy; time.sleep(2.4); runpy.run_module('mindie_knowledge.loop.cli', run_name='__main__')",
+            "import time,runpy; time.sleep(6.2); runpy.run_module('mindie_knowledge.loop.cli', run_name='__main__')",
             *command[3:]], **options)
         owned.append(child)
         return child
@@ -104,7 +104,7 @@ def test_cold_wake_uses_its_existing_startup_budget(tmp_path, monkeypatch):
     try:
         handoff.run_wake(config)
         assert len(owned) == 1
-        assert owned[0].poll() is None, 'starter killed its owned service before the configured deadline'
+        assert owned[0].poll() is None, 'starter killed healthy initialization based on elapsed time'
         assert rpc(connect(value), 'status', timeout=1)['worker_alive']
         assert rpc(connect(value), 'stop_if_idle', timeout=1)['idle']
         owned[0].wait(timeout=5)
@@ -213,7 +213,7 @@ def test_loopback_bind_skips_reverse_dns(tmp_path, monkeypatch):
     service = Service(engine, connection_path=tmp_path / "connection.json")
     assert service.http.server_name == "127.0.0.1"
     assert service.http.server_port == int(service.connection["url"].rsplit(":", 1)[-1])
-    assert service.http.slots is not None and service.http.slot_wait > 0
+    assert service.http.slots is not None and service.http.slot_wait == 0
     thread = threading.Thread(target=service.serve, daemon=True)
     thread.start()
     try:
@@ -292,3 +292,19 @@ def test_stop_if_idle_rpc_refuses_in_flight_outbox(tmp_path):
         service.close()
         thread.join(timeout=5)
     store.close()
+
+
+def test_service_start_fails_on_real_exit_without_restarting(tmp_path, monkeypatch):
+    from mindie_knowledge.loop import cli, process
+    config = tmp_path / 'engine.json'
+    config.write_text(json.dumps(_configuration(tmp_path / 'data')), encoding='utf-8')
+    spawn = process.spawn_service
+    children = []
+    def failed_start(_argv, **kwargs):
+        child = spawn([sys.executable, '-c', 'raise SystemExit(7)'], **kwargs)
+        children.append(child)
+        return child
+    monkeypatch.setattr(process, 'spawn_service', failed_start)
+    with pytest.raises(RuntimeError, match='exited during startup; no retry'):
+        cli.ensure_service(config)
+    assert len(children) == 1 and children[0].returncode == 7

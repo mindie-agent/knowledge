@@ -70,3 +70,54 @@ def test_iter_file_records_bounded_chunks(tmp_path):
     records = [b"a" * 100, b"b" * 100, b""]
     path.write_bytes(b"\0".join(records))
     assert list(iter_file_records(path, chunk_size=64)) == records[:-1]
+
+
+def test_default_file_wait_has_no_execution_timeout(tmp_path):
+    out = tmp_path / 'out'
+    run_stdout_to_file([sys.executable, '-c', "import time; time.sleep(.2); print('complete')"], out)
+    assert out.read_bytes().strip() == b'complete'
+
+
+def test_owner_cancel_stops_a_silent_file_process(tmp_path, monkeypatch):
+    import subprocess
+    import threading
+    import mindie_knowledge.gitread as gitread
+    cancel, spawned = threading.Event(), []
+    popen = subprocess.Popen
+    def observed(*args, **kwargs):
+        process = popen(*args, **kwargs)
+        spawned.append(process)
+        return process
+    monkeypatch.setattr(gitread.subprocess, 'Popen', observed)
+    timer = threading.Timer(.2, cancel.set)
+    timer.start()
+    try:
+        with pytest.raises(InterruptedError, match='cancelled by its owner'):
+            run_stdout_to_file([sys.executable, '-c', 'import time; time.sleep(60)'], tmp_path / 'out', cancel=cancel)
+        assert len(spawned) == 1 and spawned[0].poll() is not None
+    finally:
+        timer.cancel()
+        timer.join()
+
+
+def test_owner_cancel_interrupts_silent_cat_file_protocol(tmp_path, monkeypatch):
+    import subprocess
+    import threading
+    import mindie_knowledge.gitread as gitread
+    cancel = threading.Event()
+    popen = subprocess.Popen
+    def silent(_argv, **kwargs):
+        return popen([sys.executable, '-c', 'import time; time.sleep(60)'], **kwargs)
+    monkeypatch.setattr(gitread.subprocess, 'Popen', silent)
+    reader = CatFileBatch(tmp_path)
+    timer = threading.Timer(.2, cancel.set)
+    timer.start()
+    try:
+        with pytest.raises(InterruptedError, match='cancelled by its owner'):
+            reader.read('a' * 40, max_bytes=1024, cancel=cancel)
+    finally:
+        reader.close()
+        timer.cancel()
+        timer.join()
+    assert reader._process.poll() is not None
+    assert not reader._reader.is_alive()

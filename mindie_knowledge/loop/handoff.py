@@ -22,7 +22,6 @@ from .store import (
 )
 
 SUMMARY_LIMIT = 32768
-HOOK_BUDGET = 1.5
 _HARNESS = __import__("re").compile(r"[a-z][a-z0-9_-]{0,31}\Z")
 _TERMINAL = {
     "organized": "organized",
@@ -58,15 +57,6 @@ def _result(**kwargs):
     )
     value.update(kwargs)
     return {key: value[key] for key in _KEYS}
-
-
-def _budget(event):
-    raw = event.get("budget_seconds", 0.4) if isinstance(event, dict) else 0.4
-    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-        return 0.4
-    if raw <= 0 or raw != raw or raw == float("inf"):
-        return 0.4
-    return min(HOOK_BUDGET, float(raw))
 
 
 def _event_hash(harness, kind, session, key):
@@ -171,12 +161,13 @@ def _probe(config, timeout):
     # Windows may report a closed loopback port as a timeout for ~2 seconds;
     # a released lifetime lock is stronger evidence than a short TCP probe.
     consumer = Path(config["root"]) / config["domain"] / "consumer.lock"
-    if lock_held(consumer) is False:
+    owner = lock_held(consumer)
+    if owner is False:
         return "absent"
     try:
         connection = connect(config)
     except FileNotFoundError:
-        return "absent"
+        return "starting" if owner is True else "absent"
     except (OSError, ValueError):
         return "unknown"
     try:
@@ -188,7 +179,7 @@ def _probe(config, timeout):
     except OSError as exc:
         reason = getattr(exc, "reason", None)
         if isinstance(exc, ConnectionRefusedError) or isinstance(reason, ConnectionRefusedError):
-            return "absent"
+            return "starting" if owner is True else "absent"
         return "unknown"
     except (ValueError, RuntimeError):
         return "unknown"
@@ -215,7 +206,7 @@ def _read_wake(config):
     return raw if isinstance(raw, dict) else {}
 
 
-def request_wake(config_path, *, budget_seconds=0.4, session_id, event=None):
+def request_wake(config_path, *, session_id, event=None):
     """Spawn at most one detached service starter. Does not create a capture."""
     from . import settings as settings_mod
     from .cli import config_at
@@ -250,11 +241,7 @@ def request_wake(config_path, *, budget_seconds=0.4, session_id, event=None):
             return out
         out.update(wake="not-applicable", reason="not-activated")
         return out
-    remaining = _budget(dict(budget_seconds=budget_seconds))
-    if remaining < 0.05:
-        out.update(runtime="unknown", reason="budget-exhausted")
-        return out
-    state = _probe(config, min(0.15, remaining / 2))
+    state = _probe(config, None)
     if state == "ready":
         out.update(wake="running", runtime="ready", reason="worker-ready")
         return out
@@ -296,73 +283,22 @@ def request_wake(config_path, *, budget_seconds=0.4, session_id, event=None):
 
 
 def run_wake(config_path, event=None):
-    """Detached one-shot starter. Not a retry loop and not an installer."""
-    from .cli import config_at, STARTUP_TIMEOUT, MAX_STARTUP_PROBES
+    """Detached owner of the same readiness operation used by normal calls."""
+    from .cli import config_at, ensure_service
     from .diagnostics import clear_delivery_event, record_delivery_failure
-    from .locks import StartInProgress, StartLock
-    from .process import terminate_tree
 
     try:
         config = config_at(config_path)
     except (OSError, ValueError):
         return 0
-    lock = StartLock(_store_path(config).with_name("start.lock"))
     try:
-        lock.acquire()
-    except StartInProgress:
-        return 0
-    process = None
-    ready = False
-    try:
-        state = _probe(config, 0.3)
-        if state == "ready":
-            ready = True
-            if event:
-                clear_delivery_event(config, event)
-            return 0
-        if state != "absent":
-            if state == "worker-dead":
-                record_delivery_failure(
-                    config, stage="runtime", cause="worker-unavailable", event=event,
-                )
-            return 0
-        from .process import spawn_service
-        try:
-            process = spawn_service(
-                [sys.executable, "-m", "mindie_knowledge.loop.cli", "serve",
-                 "--config", str(Path(config_path).resolve())],
-                from_detached_starter=True,
-            )
-        except OSError:
-            record_delivery_failure(config, stage="wake", cause="wake-failed", event=event)
-            return 0
-        holder = _read_wake(config)
-        holder["service_pid"] = process.pid
-        _wake_file(config).write_text(json.dumps(holder))
-        deadline = time.monotonic() + STARTUP_TIMEOUT
-        interval = max(0, STARTUP_TIMEOUT - .3) / MAX_STARTUP_PROBES
-        for _ in range(MAX_STARTUP_PROBES):
-            if process.poll() is not None:
-                break
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            time.sleep(min(interval, remaining))
-            if _probe(config, min(0.3, max(0.05, deadline - time.monotonic()))) == "ready":
-                ready = True
-                if event:
-                    clear_delivery_event(config, event)
-                return 0
+        ensure_service(config_path, _from_detached_starter=True)
+    except (OSError, ValueError, RuntimeError):
         record_delivery_failure(config, stage="wake", cause="wake-failed", event=event)
         return 0
-    finally:
-        if process is not None and not ready:
-            terminate_tree(process)
-            try:
-                process.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                process.kill()
-        lock.release()
+    if event:
+        clear_delivery_event(config, event)
+    return 0
 
 
 def _record(config, **kwargs):
@@ -408,7 +344,6 @@ def accept_stop(config_path, event):
     transcript = event.get("transcript_path") or None
     if raw_summary is not None and not isinstance(raw_summary, str):
         return _result(stage="rejected", reason="invalid-envelope")
-    deadline = time.monotonic() + _budget(event)
     try:
         config = config_at(config_path)
     except (OSError, ValueError):
@@ -468,17 +403,12 @@ def accept_stop(config_path, event):
     resolve_lease = kind == "notification" and token in (None, "")
     if not resolve_lease and not _text(token, 512):
         return _result(stage="inert", reason="not-activated", summary_dropped=dropped)
-    if time.monotonic() >= deadline:
-        _record(config, stage="accept", cause="budget-exhausted", event=event_id)
-        return _result(stage="unavailable", reason="budget-exhausted", cause="budget-exhausted",
-                       summary_dropped=dropped,
-                       recovery=_RECOVERY["budget-exhausted"])
     admission_path = config.get("admission_path")
     if not isinstance(admission_path, str):
         return _result(stage="inert", reason="not-activated", summary_dropped=dropped)
     try:
         admission = Admission(admission_path)
-        auth_timeout = min(0.25, max(0.05, deadline - time.monotonic()))
+        auth_timeout = 0.25  # SQLite lock contention is a resource-busy refusal.
         if resolve_lease:
             auth = admission.resolve_capture_lease(session, timeout=auth_timeout)
         else:
@@ -506,7 +436,7 @@ def accept_stop(config_path, event):
             summary_dropped=dropped,
             recovery=_RECOVERY["store-not-ready"],
         )
-    timeout = min(0.25, max(0.05, (deadline - time.monotonic()) / 2))
+    timeout = 0.25
     try:
         db = sqlite3.connect(path, timeout=timeout)
     except sqlite3.Error:
@@ -561,7 +491,7 @@ def accept_stop(config_path, event):
             reason="stored", summary_dropped=dropped,
         )
     if status == "processing":
-        state = _probe(config, min(0.15, max(0.05, deadline - time.monotonic()))) if time.monotonic() < deadline else "unknown"
+        state = _probe(config, None)
         return _result(
             stage="processing", capture_id=capture_id, duplicate=duplicate,
             wake="not-applicable",
@@ -574,9 +504,7 @@ def accept_stop(config_path, event):
         stage_name = "accepted-local"
     else:
         stage_name = "accepted-local"
-    state = "unknown"
-    if time.monotonic() < deadline:
-        state = _probe(config, min(0.15, max(0.05, deadline - time.monotonic())))
+    state = _probe(config, None)
     if state == "ready" and status in _UNPROCESSED_CAPTURE | {"pending", "deferred", "queued"}:
         clear_delivery_event(config, event_id)
         return _result(
@@ -590,10 +518,9 @@ def accept_stop(config_path, event):
             wake="running", runtime="ready", reason="apply-pending", summary_dropped=dropped,
         )
     wake = dict(wake="not-requested", runtime="unknown" if state == "unknown" else "unavailable", reason="duplicate" if duplicate else "committed")
-    if state == "absent" and time.monotonic() < deadline:
+    if state == "absent":
         wake = request_wake(
-            config_path, budget_seconds=max(0.05, deadline - time.monotonic()),
-            session_id=session, event=event_id,
+            config_path, session_id=session, event=event_id,
         )
     elif state == "worker-dead":
         _record(config, stage="runtime", cause="worker-unavailable", capture_id=capture_id, event=event_id)

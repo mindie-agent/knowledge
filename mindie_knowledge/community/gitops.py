@@ -1,7 +1,7 @@
-"""Real local Git writer: bounded argv against a clone of the write remote.
+"""Real local Git writer: owned argv against a clone of the write remote.
 
-Everything here is a real ``git`` subprocess with a deadline, output cap and
-owned process-tree cleanup. Push is always a fast-forward to our own
+Everything here is a real ``git`` subprocess with optional caller deadlines,
+output caps, owner cancellation and process-tree cleanup. Push is always a fast-forward to our own
 contribution branch — never a force push, never a write to the base branch.
 """
 
@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .common import (
-    DEFAULT_GIT_OP_SECONDS,
     MAX_FILE_BYTES,
     CommunityError,
     Deadline,
@@ -115,11 +114,12 @@ def _git(
     remaining = deadline.step(f"git {operation}")
     result = run_argv(
         ["git", *argv],
-        timeout=min(DEFAULT_GIT_OP_SECONDS, remaining),
+        timeout=remaining,
         max_output=MAX_GIT_OUTPUT,
         input_bytes=input_bytes,
         cwd=cwd,
         env=_resolve_git_env(env),
+        cancel=deadline.cancel,
     )
     if result.timed_out:
         if unknown_on_timeout:
@@ -239,10 +239,11 @@ def stage_and_commit(
 
     diff = _run(
         ["git", "diff", "--cached", "--quiet"],
-        timeout=min(DEFAULT_GIT_OP_SECONDS, remaining),
+        timeout=remaining,
         max_output=4096,
         cwd=work_dir,
         env=_resolve_git_env(env),
+        cancel=deadline.cancel,
     )
     if diff.timed_out:
         raise TransientError("git diff cached timed out")
@@ -268,11 +269,12 @@ def _commit(work_dir: Path, message: str, deadline: Deadline, *, env=None) -> No
             "-c", "user.email=mindie-community-bot@localhost.invalid",
             "commit", "--quiet", "-F", "-",
         ],
-        timeout=min(DEFAULT_GIT_OP_SECONDS, remaining),
+        timeout=remaining,
         max_output=MAX_GIT_OUTPUT,
         input_bytes=message.encode("utf-8"),
         cwd=work_dir,
         env=_resolve_git_env(env),
+        cancel=deadline.cancel,
     )
     if result.code != 0:
         raise CommunityError(f"git commit failed: {result.err_text.strip()[:300]}")
@@ -295,10 +297,11 @@ def fetch_ref(
 
     result = _run(
         ["git", "fetch", "--quiet", remote, ref],
-        timeout=min(DEFAULT_GIT_OP_SECONDS, remaining),
+        timeout=remaining,
         max_output=MAX_GIT_OUTPUT,
         cwd=work_dir,
         env=_resolve_git_env(env),
+        cancel=deadline.cancel,
     )
     if result.timed_out:
         raise TransientError(f"git fetch {ref} timed out")
@@ -343,8 +346,8 @@ def ls_tree(work_dir: Path, commit: str, deadline: Deadline, *, env=None,
         if task_ids is not None:
             argv += ["--", "tasks/"]
         try:
-            run_stdout_to_file(argv, target, timeout=min(DEFAULT_GIT_OP_SECONDS, remaining),
-                               env=_resolve_git_env(env))
+            run_stdout_to_file(argv, target, timeout=remaining,
+                               env=_resolve_git_env(env), cancel=deadline.cancel)
         except (OSError, TimeoutError) as exc:
             raise TransientError(f"git ls-tree failed: {exc}") from exc
         for raw in iter_file_records(target):
@@ -379,10 +382,11 @@ def show_file(work_dir: Path, commit: str, path: str, deadline: Deadline, *, env
     remaining = deadline.step("git show")
     present = _run(
         ["git", "cat-file", "-e", f"{commit}^{{commit}}"],
-        timeout=min(DEFAULT_GIT_OP_SECONDS, remaining),
+        timeout=remaining,
         max_output=64 * 1024,
         cwd=work_dir,
         env=env,
+        cancel=deadline.cancel,
     )
     if present.timed_out:
         raise TransientError("git show timed out; the blob was not read")
@@ -397,10 +401,11 @@ def show_file(work_dir: Path, commit: str, path: str, deadline: Deadline, *, env
     remaining = deadline.step("git show")
     result = _run(
         ["git", "show", f"{commit}:{path}", "--"],
-        timeout=min(DEFAULT_GIT_OP_SECONDS, remaining),
+        timeout=remaining,
         max_output=MAX_FILE_BYTES + 64 * 1024,
         cwd=work_dir,
         env=env,
+        cancel=deadline.cancel,
     )
     if result.timed_out:
         raise TransientError("git show timed out; the blob was not read")
@@ -430,19 +435,21 @@ def fetch_commit(work_dir: Path, sha: str, deadline: Deadline, *, env=None) -> b
 
     have = _run(
         ["git", "cat-file", "-e", sha],
-        timeout=min(DEFAULT_GIT_OP_SECONDS, remaining),
+        timeout=remaining,
         max_output=4096,
         cwd=work_dir,
         env=_resolve_git_env(env),
+        cancel=deadline.cancel,
     )
     if have.code == 0:
         return True
     result = _run(
         ["git", "fetch", "--quiet", "origin", sha],
-        timeout=min(DEFAULT_GIT_OP_SECONDS, deadline.remaining()),
+        timeout=deadline.step("git fetch exact commit"),
         max_output=MAX_GIT_OUTPUT,
         cwd=work_dir,
         env=_resolve_git_env(env),
+        cancel=deadline.cancel,
     )
     return result.code == 0
 
@@ -454,10 +461,11 @@ def is_ancestor(work_dir: Path, old: str, new: str, deadline: Deadline, *, env=N
 
     result = _run(
         ["git", "merge-base", "--is-ancestor", old, new],
-        timeout=min(DEFAULT_GIT_OP_SECONDS, remaining),
+        timeout=remaining,
         max_output=MAX_GIT_OUTPUT,
         cwd=work_dir,
         env=_resolve_git_env(env),
+        cancel=deadline.cancel,
     )
     if result.code == 0:
         return True
@@ -473,11 +481,11 @@ def push_branch(work_dir: Path, branch: str, deadline: Deadline, *, env=None, ca
 
     result = _run(
         ["git", "push", "--no-force-with-lease", "origin", f"HEAD:refs/heads/{branch}"],
-        timeout=min(DEFAULT_GIT_OP_SECONDS, remaining),
+        timeout=remaining,
         max_output=MAX_GIT_OUTPUT,
         cwd=work_dir,
         env=_resolve_git_env(env),
-        cancel=cancel,
+        cancel=cancel if cancel is not None else deadline.cancel,
     )
     if result.timed_out:
         raise UnknownOutcome("git push timed out; remote outcome unknown")

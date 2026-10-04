@@ -93,7 +93,7 @@ def parse_contract(raw, domain, expected_sha256=None):
     return {"contract": validate_contract(value, domain), "sha256": digest}
 
 
-def read_git_contract(repo, revision, domain, *, expected_sha256=None, deadline=None, prefix="", env=None):
+def read_git_contract(repo, revision, domain, *, expected_sha256=None, deadline=None, prefix="", env=None, cancel=None):
     """Read one plain Git blob at an exact commit, never a checkout or symlink."""
     from .community.common import run_argv
     from .gitread import CatFileBatch
@@ -103,13 +103,12 @@ def read_git_contract(repo, revision, domain, *, expected_sha256=None, deadline=
     if prefix and (prefix.startswith("/") or any(part in {"", ".", ".."} for part in prefix.split("/"))):
         raise ContractMismatch("invalid publication contract prefix")
     path = (prefix + "/" if prefix else "") + CONTRACT_FILE
-    deadline = deadline if deadline is not None else time.monotonic() + 25
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
+    remaining = None if deadline is None else deadline - time.monotonic()
+    if remaining is not None and remaining <= 0:
         raise TimeoutError("publication contract read exceeded its deadline")
     result = run_argv(["git", "-C", str(Path(repo)), "ls-tree", "-z", "--long", revision, "--", path],
-                      timeout=min(25, remaining), max_output=MAX_CONTRACT_BYTES,
-                      input_bytes=b"", env=env)
+                      timeout=remaining, max_output=MAX_CONTRACT_BYTES,
+                      input_bytes=b"", env=env, cancel=cancel)
     if result.timed_out:
         raise TimeoutError("publication contract tree read timed out")
     if result.code:
@@ -130,7 +129,7 @@ def read_git_contract(repo, revision, domain, *, expected_sha256=None, deadline=
         raise ContractMismatch("publication contract exceeds its byte envelope")
     reader = CatFileBatch(repo, env=env)
     try:
-        raw = reader.read(oid, deadline=deadline, max_bytes=MAX_CONTRACT_BYTES)
+        raw = reader.read(oid, deadline=deadline, max_bytes=MAX_CONTRACT_BYTES, cancel=cancel)
     finally:
         reader.close()
     if raw is None:

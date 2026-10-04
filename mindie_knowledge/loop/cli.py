@@ -114,118 +114,50 @@ def connect(config):
     return connection
 
 
-STARTUP_TIMEOUT = 5.0
-MAX_STARTUP_PROBES = 3
-
-
-def _existing_service(config_path, config, timeout):
-    """Return a live connection, None when the process is absent, or raise.
-
-    Timeout and any other ambiguous probe must not lead to a second service.
-    A missing connection file or a refused connection is absent.
-    """
+def ensure_service(config_path, *, _from_detached_starter=False):
+    """Own one startup until ready or a real failure; elapsed time is no fault."""
     from .handoff import _probe
+    from .locks import StartLock
+    from .process import spawn_service, terminate_tree
+    from .diagnostics import clear_startup_failure
 
-    state = _probe(config, timeout)
-    if state == "unknown":
-        raise RuntimeError(
-            "knowledge service probe was ambiguous; not starting a second service"
-        )
-    if state == "absent":
-        return None
-    if state == "ready":
-        from .diagnostics import clear_startup_failure
-
-        clear_startup_failure(config_path, config)
-    return connect(config)
-
-
-def ensure_service(config_path):
-    """One start attempt, at most three readiness probes, absolute startup budget."""
     config = config_at(config_path)
-    deadline = time.monotonic() + STARTUP_TIMEOUT
-
-    def probe():
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise RuntimeError("knowledge startup deadline exceeded")
-        found = _existing_service(config_path, config, min(0.5, remaining))
-        if found is None:
-            raise FileNotFoundError("knowledge service is absent")
-        return found
-
-    try:
-        return probe()
-    except FileNotFoundError:
-        pass
-    from .handoff import prepare_schema
-
-    prepare_schema(config_path)
-    from .locks import StartInProgress, StartLock
-
+    state = _probe(config, None)
+    if state == "ready":
+        clear_startup_failure(config_path, config)
+        return connect(config)
+    if state in {"unknown", "worker-dead"}:
+        raise RuntimeError("knowledge service is " + state + "; not starting a second service")
     lock = StartLock(connection_path(config).with_name("start.lock"))
-    acquired = False
     process = None
     ready = False
+    # Other starters retain this OS lock for their complete readiness handshake.
+    # A slow initializer remains the sole owner for any duration.
+    lock.acquire(wait=None)
     try:
-        try:
-            lock.acquire()
-            acquired = True
-        except StartInProgress:
-            pass
-        if acquired:
-            try:
-                return probe()
-            except FileNotFoundError:
-                pass
-            from .process import spawn_service
-            process = spawn_service(
-                [
-                    sys.executable,
-                    "-m",
-                    "mindie_knowledge.loop.cli",
-                    "serve",
-                    "--config",
-                    str(Path(config_path).resolve()),
-                ],
-            )
-        interval = max(0, STARTUP_TIMEOUT - .3) / MAX_STARTUP_PROBES
-        for _attempt in range(MAX_STARTUP_PROBES):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            time.sleep(min(interval, remaining))
+        while True:
             if process is not None and process.poll() is not None:
                 raise RuntimeError("knowledge service exited during startup; no retry")
-            try:
-                connection = probe()
-            except FileNotFoundError:
-                continue
-            except RuntimeError as exc:
-                # The process we just started may not answer yet. That timeout
-                # is not a second service, and it is not a reason to spawn again.
-                if "ambiguous" not in str(exc) and "deadline" not in str(exc):
-                    raise
-                continue
-            except (OSError, ValueError):
-                continue
-            ready = True
-            return connection
-        raise RuntimeError(
-            "knowledge service unavailable after bounded readiness probes; no restart"
-        )
+            state = _probe(config, None)
+            if state == "ready":
+                ready = True
+                clear_startup_failure(config_path, config)
+                return connect(config)
+            if state in {"unknown", "worker-dead"}:
+                raise RuntimeError("knowledge service is " + state + "; startup failed")
+            if state == "absent" and process is None:
+                process = spawn_service(
+                    [sys.executable, "-m", "mindie_knowledge.loop.cli", "serve",
+                     "--config", str(Path(config_path).resolve())],
+                    from_detached_starter=_from_detached_starter,
+                )
+            # This is scheduling cadence, never an operation deadline.
+            time.sleep(.1)
     finally:
-        if process is not None and not ready:
-            from .process import terminate_tree
-
+        if process is not None and not ready and process.poll() is None:
+            # Only cancellation/known failure reaches cleanup of our own child.
             terminate_tree(process)
-            try:
-                process.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=1)
-        if acquired:
-            lock.release()
+        lock.release()
 
 
 def capture_hook(config_path, event):
@@ -373,8 +305,8 @@ def _serve(config_path, config):
     try:
         # lock_held briefly acquires a free lock to observe it. An observer
         # racing this startup is not proof of an existing service. Use the
-        # existing startup budget to wait for ownership, never spawn again.
-        consumer.acquire(wait=STARTUP_TIMEOUT)
+        # OS lock to wait for ownership, never spawn again.
+        consumer.acquire(wait=None)
     except StartInProgress:
         return 0
     stage = "store"
@@ -524,7 +456,7 @@ def main(argv=None):
         return 0
     if args.operation == "status":
         try:
-            result = rpc(connect(config), "status", timeout=10)
+            result = rpc(connect(config), "status")
         except (OSError, ValueError):
             result = dict(status="not-running")
             store = _open_existing_store(config)
@@ -536,7 +468,7 @@ def main(argv=None):
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     # stop
-    result = rpc(connect(config), "stop", timeout=10)
+    result = rpc(connect(config), "stop")
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 

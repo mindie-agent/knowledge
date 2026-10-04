@@ -188,18 +188,18 @@ def test_real_reme_finds_early_middle_late_and_returns_current_correction(tmp_pa
 
 
 def test_reme_failures_are_visible_and_explicit_rebuild_recovers(tmp_path, monkeypatch):
-    from mindie_knowledge.materials.reme_index import StrictFileGraph
+    from mindie_knowledge.materials.reme_checkpoint import ReMeCheckpoint
     store = MaterialStore(tmp_path, "demo")
     append(store, [block(0, "Searchable calibration failure.")])
-    original = StrictFileGraph.dump
+    original = ReMeCheckpoint.commit
 
-    async def fail(_self):
-        raise OSError("derived graph write failed")
+    def fail(_self, *_args):
+        raise OSError("derived graph/chunk checkpoint write failed")
 
-    monkeypatch.setattr(StrictFileGraph, "dump", fail)
-    with pytest.raises(OSError, match="derived graph write failed"):
+    monkeypatch.setattr(ReMeCheckpoint, "commit", fail)
+    with pytest.raises(OSError, match="derived graph/chunk checkpoint write failed"):
         store.search("calibration")
-    monkeypatch.setattr(StrictFileGraph, "dump", original)
+    monkeypatch.setattr(ReMeCheckpoint, "commit", original)
     store.rebuild_index()
     assert store.search("calibration")[0]["entry_id"] == TASK
     store.close()

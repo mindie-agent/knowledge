@@ -106,6 +106,19 @@ def _public(hit):
     return {key: value for key, value in hit.items() if not key.startswith("_")}
 
 
+def _related_preview(hit):
+    """Keep each observation's evidence and identity, without repeated indexes.
+
+    The excerpt remains the match's own material, including failures and
+    corrections. It is a locating aid, not a complete account of that block.
+    Reading ``ref`` supplies the complete body; continuation visits the other
+    matches rather than replaying the two already visible observations.
+    """
+    fields = ("entry_id", "ref", "feedback_ref", "excerpt", "cites", "conditions",
+              "match_basis", "score")
+    return {key: hit[key] for key in fields}
+
+
 def group_matches(matches, tasks, domain):
     """Group resolvable single-source matches without treating citation as proof.
 
@@ -234,6 +247,8 @@ def page_groups(groups, *, query, conditions, fingerprint, limit, continuation=N
         next_page = None
         if start + len(related) < len(group["related"]):
             next_page = _encode_continuation(query, conditions, fingerprint, group["ref"], related[-1]["ref"])
+        if continuation is None:
+            related = [_related_preview(item) for item in related]
         result.append(dict(group, related=related, related_count=len(group["related"]),
                            related_next=next_page))
     return result

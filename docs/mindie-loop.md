@@ -60,8 +60,9 @@ action and is never re-onboarding.
 
 Stop forwards native identity and the transcript path. A duplicate final-answer
 copy in the hook is ignored and has no size veto. The hook commits the local
-notification before returning, then a worker reads the owning transcript. Hook
-and process deadlines bound a stalled caller; they are not text-size limits.
+notification before returning, then a worker reads the owning transcript. There
+is no default elapsed-time deadline for the accepted hook or indexing operation;
+owner cancellation and actual process or protocol failures remain visible.
 
 Each harness owns its public-message projection. User input, visible assistant
 progress and final answers remain; tool calls/results, hidden reasoning,
@@ -71,9 +72,11 @@ limits work between records without discarding data. Malformed complete records
 and unverifiable ownership/timestamps do not advance the cursor.
 
 Gitleaks and deterministic privacy rules redact locally before storage. Body,
-cursor and continuation commit together. A scanner launch failure or timeout
-leaves the same notification pending and automatically retries after recovery;
-no new Stop is required and no unredacted body is published. No model creates,
+cursor and continuation commit together. Scanning has no default execution
+deadline and retains its complete report. Shutdown cancellation or scanner failure
+leaves the same notification pending for recovery;
+explicit authority revocation remains cancelled. No new Stop is required for
+recovery and no unredacted body is published. No model creates,
 shortens or rewrites the body. The GitHub ordinary-Git per-file 100 MiB limit
 remains a visible publication constraint, not a silent truncation rule.
 
@@ -166,6 +169,21 @@ from current material files. They search every current block, not only the short
 navigation. Technical identifiers and Chinese token boundaries retain the
 repository's established tokenization. The index is replaceable and explicitly
 reports load/build failures; a failed refresh does not become an empty result.
+The current directory persists validated task headers and the latest change
+generation per task. Source pointers update one task at a time; `current.json`
+contains only the directory generation. A pending-marker receipt covers a crash
+between the committed directory and marker replacement. An unrelated missing or
+malformed marker remains an error. This replaces the unpublished `current/1`
+whole-directory JSON format; there is no alternate compatibility path.
+
+Warm queries reuse that generation without enumerating every manifest or statting
+every block. Returned blocks and resolved source links check current file state;
+changed files are read and verified before use. An explicit body read always
+verifies its exact current member hash. This is not a continuous audit of files
+that no operation has selected. Each changed block checkpoints its ReMe graph,
+chunks and exact term counts in one compressed SQLite row. Restart restores those
+counts without rechunking old bodies. ReMe's scoring and token semantics remain
+unchanged, and retired lexical slots are compacted automatically.
 There is no ReMe agent, provider, watcher, service, separate transcript store or
 model invocation in consumer retrieval. The SQLite runtime must still satisfy
 the package's supported runtime prerequisite checks.
@@ -198,8 +216,16 @@ validate a present source is an operational failure, never a missing citation.
 Exact task/block references and complete task IDs preserve the requested object
 instead of redirecting to its cited source.
 
-The first group includes a bounded related-match preview, `related_count` and,
-when more matches exist, `related_next`. Continue with
+Each initial group includes up to two compact related-match previews: their own
+read and feedback references, original excerpts, observed conditions, match
+basis and citation information. Repeated task navigation and generated titles
+or summaries are omitted from these previews. An excerpt can omit a later
+correction or applicability limit; the complete block remains available through
+its own `ref`. Neither the preview nor its score certifies the claim.
+
+`related_count` counts all other matches in the group. When more matches exist,
+`related_next` continues after the previews, returning the remaining matches
+with their full retrieval metadata. Continue with
 `knowledge_query(continuation=related_next, limit=20)`, sending only that token and
 an optional `limit`; `query` and `conditions` must be omitted. The token binds the
 original query, filters, anchor and current corpus. `continuation_invalid` rejects
@@ -260,15 +286,16 @@ commit messages or PR text.
 
 ## Knowledge sync
 
-`sync --config` is standalone and model-free (30 s per attempt): it follows
+`sync --config` is standalone and model-free, with no default execution deadline: it follows
 the configured content repository branch as an immutable Git commit,
 validates the candidate tree (canonical complete task packages under `tasks/`,
 per-file platform envelope, UTF-8/LF, schema, revisions, domain) and switches
 atomically. There is no whole-feed entry-count or total-byte cap: blobs are
 read one at a time through a bounded persistent `git cat-file --batch`
 process, and each verified blob is checkpointed against the exact candidate
-commit, so an attempt that hits the deadline resumes after the last staged
-blob — never restarting at item zero — and the visible feed switches in one
+commit, so recovery resumes after the last staged blob rather than restarting
+at item zero. Healthy long work continues until completion or owner cancellation;
+the visible feed switches in one
 short local transaction only after the candidate completes. Transient
 failures persist a backoff `next_check` and are retried automatically once
 due; a structurally incompatible candidate stays quarantined against its
@@ -277,6 +304,18 @@ tree empties ordinary search (withdrawal is upstream deletion); an
 unsupported old layout (e.g. `corpus/`) fails loudly instead of looking like
 an empty feed. Sync works with community contribution off and never starts
 the maintenance service.
+
+The service starter likewise waits for its one owned initializer for any duration.
+Real process exit, failed readiness protocol and cancellation remain failures;
+elapsed time and a slow store recovery do not cause termination or another spawn.
+
+Developer resource checks use actual SQL instructions, file reads and changed
+checkpoint rows in `tests/test_incremental_resources.py`. The standalone
+`benchmarks/resource_paths.py` reports measured CPU, elapsed time, memory,
+descriptors and storage for synthetic workloads (requires developer-only
+`psutil`). Its workload counts and measurement windows are never runtime limits.
+Observed costs and limitations are recorded in
+[local resource validation](resource-validation-2026-10-05.md).
 
 ## MCP surface
 

@@ -80,7 +80,7 @@ class StartLock:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
-        deadline = time.monotonic() + wait
+        deadline = None if wait is None else time.monotonic() + wait
         try:
             # Windows permits locking beyond EOF; acquire before any write.
             while True:
@@ -88,10 +88,10 @@ class StartLock:
                     _lock_file_nb(fd)
                     break
                 except OSError as exc:
-                    remaining = deadline - time.monotonic()
-                    if exc.errno not in (errno.EACCES, errno.EAGAIN) or remaining <= 0:
+                    remaining = None if deadline is None else deadline - time.monotonic()
+                    if exc.errno not in (errno.EACCES, errno.EAGAIN) or remaining is not None and remaining <= 0:
                         raise
-                    time.sleep(min(.01, remaining))
+                    time.sleep(.01 if remaining is None else min(.01, remaining))
         except OSError:
             os.close(fd)
             try:

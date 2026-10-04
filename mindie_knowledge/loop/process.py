@@ -96,7 +96,7 @@ def _spawn(command, stdin):
             stdin=stdin,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env={**os.environ, "MINDIE_MAINTENANCE_GROUP": "1"},
+            env={**os.environ, "MINDIE_MAINTENANCE_GROUP": "1", "MINDIE_MAINTENANCE_OWNER": str(os.getpid())},
         )
     return subprocess.Popen(
         command,
@@ -104,7 +104,7 @@ def _spawn(command, stdin):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         start_new_session=True,
-        env={**os.environ, "MINDIE_MAINTENANCE_GROUP": "1"},
+        env={**os.environ, "MINDIE_MAINTENANCE_GROUP": "1", "MINDIE_MAINTENANCE_OWNER": str(os.getpid())},
     )
 
 
@@ -153,12 +153,20 @@ def _reader(stream, tag, chunks, cancel, errors):
             pass
 
 
-def bounded_run(command, payload, *, timeout, max_output, cancel=None):
+def bounded_run(command, payload, *, timeout=None, max_output, cancel=None, cleanup_receipt=None, on_result=None):
     started = time.monotonic()
+    if cancel is not None and cancel.is_set():
+        exc = MaintenanceCancelled('maintenance cancelled before start')
+        exc.mindie_execution = 'not_started'
+        raise exc
     with tempfile.TemporaryFile() as input_file:
         input_file.write(payload.encode())
         input_file.seek(0)
-        process = _spawn(command, input_file)
+        try:
+            process = _spawn(command, input_file)
+        except OSError as exc:
+            exc.mindie_execution = 'not_started'
+            raise annotated_error(exc, 'configuration', started, stage='start')
         chunks = queue.Queue(maxsize=max(2, max_output // 4096 + 1))
         readers_stop = threading.Event()
         read_errors = []
@@ -173,16 +181,17 @@ def bounded_run(command, payload, *, timeout, max_output, cancel=None):
         output = bytearray()
         total = 0
         open_streams = len(readers)
-        deadline = started + timeout
+        result_saved = False
+        deadline = None if timeout is None else started + timeout
         try:
-            while open_streams:
+            while open_streams or process.poll() is None:
                 if read_errors:
                     raise annotated_error(RuntimeError("maintenance output read failed"),
                                           "invalid_result", started) from read_errors[0]
                 if cancel is not None and cancel.is_set():
                     raise MaintenanceCancelled("maintenance cancelled by shutdown")
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
                     raise annotated_error(
                         TimeoutError(
                             "maintenance deadline exceeded; "
@@ -192,8 +201,10 @@ def bounded_run(command, payload, *, timeout, max_output, cancel=None):
                         started,
                     )
                 try:
-                    tag, chunk = chunks.get(timeout=min(0.1, remaining))
+                    tag, chunk = chunks.get(timeout=0.1 if remaining is None else min(0.1, remaining))
                 except queue.Empty:
+                    if process.poll() is not None:
+                        break  # Native exit, even when a descendant inherited its pipes.
                     continue
                 if chunk is None:
                     open_streams -= 1
@@ -210,20 +221,36 @@ def bounded_run(command, payload, *, timeout, max_output, cancel=None):
                     )
                 if tag == "out":
                     output.extend(chunk)
+                    if on_result is not None and not result_saved and b'\n' in output:
+                        on_result(bytes(output).decode())
+                        result_saved = True
+                        break  # A validated terminal envelope closes this operation.
             if read_errors:
                 raise annotated_error(RuntimeError("maintenance output read failed"),
                                       "invalid_result", started) from read_errors[0]
             try:
-                code = process.wait(timeout=max(0.01, deadline - time.monotonic()))
+                # Without a saved terminal result, the loop above observes
+                # actual exit while keeping cancellation and any explicit
+                # deadline live even after both output pipes have closed.
+                code = process.wait(timeout=2 if result_saved else None)
             except subprocess.TimeoutExpired:
-                raise annotated_error(
+                if result_saved:
+                    if cleanup_receipt is not None:
+                        cleanup_receipt['cleanup_failed'] = True
+                    code = 0
+                else:
+                    raise annotated_error(
                     TimeoutError(
                         "maintenance deadline exceeded; "
                         + _failure_detail("deadline", started)
                     ),
                     "deadline",
                     started,
-                ) from None
+                    ) from None
+            if code and result_saved:
+                if cleanup_receipt is not None:
+                    cleanup_receipt['cleanup_failed'] = True
+                code = 0
             if code:
                 category = next(
                     (name for name, value in AGENT_ERROR_EXIT_CODES.items()
@@ -254,8 +281,11 @@ def bounded_run(command, payload, *, timeout, max_output, cancel=None):
                     process.wait(timeout=1)
                 for reader in readers:
                     reader.join(timeout=1)
-                process.stdout.close()
-                process.stderr.close()
+                for reader, stream in zip(readers, (process.stdout, process.stderr)):
+                    if not reader.is_alive():
+                        stream.close()
+                if any(reader.is_alive() for reader in readers):
+                    raise RuntimeError('owned protocol pipes did not close during cleanup')
             except Exception as cleanup_error:
                 failure(
                     "organizer.process",
@@ -264,5 +294,7 @@ def bounded_run(command, payload, *, timeout, max_output, cancel=None):
                     exception=cleanup_error,
                     elapsed_ms=(time.monotonic() - started) * 1000,
                 )
-                if original_error is None:
+                if cleanup_receipt is not None:
+                    cleanup_receipt['cleanup_failed'] = True
+                elif original_error is None:
                     raise

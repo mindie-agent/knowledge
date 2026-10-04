@@ -363,6 +363,9 @@ class Store:
                 entry_id TEXT NOT NULL, block_ids TEXT NOT NULL,
                 status TEXT NOT NULL, detail TEXT NOT NULL,
                 authorization TEXT NOT NULL, created REAL NOT NULL);
+            CREATE INDEX IF NOT EXISTS material_batches_due ON material_batches(created,batch_id,entry_id)
+                WHERE status IN ('pending','retry-requested');
+            CREATE INDEX IF NOT EXISTS material_batches_by_entry ON material_batches(entry_id,status);
         """)
         self.db.execute("INSERT OR REPLACE INTO meta VALUES('schema', ?)", (SCHEMA,))
         self.db.execute("INSERT OR IGNORE INTO meta VALUES('capture_floor', ?)", (str(time.time()),))
@@ -390,7 +393,7 @@ class Store:
     @contextlib.contextmanager
     def _write_txn(self):
         """Serialize read-modify-write across processes sharing this root."""
-        with self.lock:
+        with self.lock, self.materials.validated_headers():
             if self.db.in_transaction:
                 yield
                 return
@@ -1069,18 +1072,31 @@ class Store:
 
     def query(self, query=None, limit=5, conditions=None, continuation=None):
         from ..materials.provenance import QueryContinuationError, query_request
+        from ..materials.catalog import CurrentVisibility
         query_request(query, limit, conditions, continuation)
         with self.lock:
-            rows = {r['entry_id']: dict(r) for r in self.db.execute(
-                'SELECT * FROM entries WHERE ' + self._VISIBLE_SQL)}
-            allowed = {key: r['published_revision'] if r['feed_active'] else r['draft_revision']
-                       for key, r in rows.items()}
             try:
+                if self._material_dirty:
+                    raise ValueError("material metadata has uncompleted pointer promotion")
+                generation = self.materials.current_generation()
+                # A different local Store can commit metadata and then fail
+                # before promoting the material directory. Catalog generation
+                # alone must not authorize a cached older visibility snapshot.
+                data_version = self.db.execute('PRAGMA data_version').fetchone()[0]
+                cache_version = (generation, data_version)
+                if getattr(self, '_query_version', None) != cache_version:
+                    self._query_rows = {r['entry_id']: dict(r) for r in self.db.execute(
+                        'SELECT * FROM entries WHERE ' + self._VISIBLE_SQL)}
+                    self._query_allowed = CurrentVisibility(generation, {
+                        key: r['published_revision'] if r['feed_active'] else r['draft_revision']
+                        for key, r in self._query_rows.items()})
+                    self._query_version = cache_version
+                rows, allowed = self._query_rows, self._query_allowed
                 found = self.materials.search(query, limit=limit, conditions=conditions, allowed_ids=allowed,
                                               continuation=continuation)
             except QueryContinuationError:
                 raise
-            except (OSError, ValueError, TypeError, KeyError) as exc:
+            except (OSError, ValueError, TypeError, KeyError, sqlite3.Error) as exc:
                 raise MaterialReadError("Current material could not be searched; inspect service diagnostics.") from exc
             def observable(item):
                 row = rows[item['entry_id']]
@@ -1096,7 +1112,9 @@ class Store:
                     page='related' if continuation is not None else 'groups',
                     note='Reference material, including failed attempts and uncertainty. Citation groups are navigation, '
                          'not independent evidence or factual confidence. Current source links do not reproduce an '
-                         'unavailable cited revision. Use each match ref to read its actual block.')
+                         'unavailable cited revision. Use each match ref to read its actual block. '
+                         'Related excerpts are locating aids and may omit later corrections or applicability limits; '
+                         'read the block when those details matter.')
 
     # ------------------------------------------------------------ feed switch
 

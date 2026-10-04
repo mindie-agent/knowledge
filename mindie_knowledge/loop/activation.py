@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import math
 import secrets
 import sqlite3
 import threading
@@ -176,8 +177,6 @@ class Admission:
         try:
             self.path.stat()
             db = sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True, timeout=0.1)
-            deadline = time.monotonic() + 0.25
-            db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
             row = db.execute(
                 "SELECT enabled, failures, project_root FROM leases WHERE session=? LIMIT 1",
                 (session,),
@@ -196,7 +195,7 @@ class Admission:
                 db.close()
         return result
 
-    def activate(self, session, *, project_root, root_session=None):
+    def activate(self, session, *, project_root, root_session=None, not_before=None, automatic=False):
         """Bind one native task internally for capture.
 
         A repeated activate for the same session and scope preserves its
@@ -213,12 +212,17 @@ class Admission:
         scope = str(Path(project_root).expanduser().resolve(strict=False))
         if root_session is not None and not isinstance(root_session, str):
             raise ValueError("root_session must be text or None")
+        if not_before is not None and (type(not_before) not in (int, float)
+                or not math.isfinite(not_before) or not_before < 0):
+            raise ValueError("binding boundary must be finite Unix seconds")
 
         def op(db):
             row = db.execute(
                 "SELECT * FROM leases WHERE session=?", (session,)
             ).fetchone()
             now = time.time()
+            if automatic and row and not row[2]:
+                raise ValueError("task binding was explicitly revoked")
             if row and row[2] == 1 and row[4] == scope:
                 # Healthy re-activation: keep the token and original boundary.
                 db.execute(
@@ -237,7 +241,7 @@ class Admission:
                         0,
                         scope,
                         root_session or session,
-                        now,
+                        now if not_before is None else not_before,
                     ),
                 )
             return db.execute(
@@ -255,6 +259,15 @@ class Admission:
             "activated_at": row[6],
             "capture_schema": True,
         }
+
+    def associate(self, session, *, project_root, not_before):
+        """Associate a verified host event using its existing authorization.
+
+        Association time is not a new authorization boundary. Never reactivate
+        an explicitly revoked task as a side effect of an ordinary event.
+        """
+        return self.activate(session, project_root=project_root,
+                             not_before=not_before, automatic=True)
 
     def deactivate(self, session):
         """Disable one task's lease; durable attempt identities are preserved
@@ -340,8 +353,6 @@ class Admission:
             raise AdmissionUnavailable(type(exc).__name__) from None
         try:
             db.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
-            deadline = time.monotonic() + timeout
-            db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
             columns = [row[1] for row in db.execute("PRAGMA table_info(leases)")]
             if not columns:
                 raise AdmissionUnavailable("lease schema is missing")

@@ -486,7 +486,11 @@ class Engine:
         except AdmissionUnreadable:
             self._defer_admission(ident)
         except MaintenanceCancelled:
-            self.store.mark_capture(ident, "cancelled", "capture authority revoked")
+            if self.stop.is_set():
+                self.store.defer_capture(ident, due=time.time(),
+                                         reason="service stopped; local work retained")
+            else:
+                self.store.mark_capture(ident, "cancelled", "capture authority revoked")
         except GateFault:
             self._defer_gate_fault(ident)
         except Exception as exc:

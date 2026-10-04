@@ -2,8 +2,8 @@
 
 The file carries schema ``mindie-community-config/1``. Tokens never live in
 settings; only the *name* of an environment variable may be configured. A
-missing/disabled/malformed sharing config fails closed for publication: the
-caller receives ``disabled`` and no Git mutation or outbound request happens.
+disabled sharing config stops publication. Read and validation failures remain
+errors to the caller; neither case starts a Git mutation or outbound request.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
 from .common import (
-    DEFAULT_TRANSACTION_SECONDS,
+    optional_timeout,
     CommunityError,
     check_account,
     check_repository,
@@ -25,8 +25,8 @@ MAX_CONFIG_BYTES = 64 * 1024
 DEFAULTS = {
     "branch": "main",
     "idle_seconds": 300,
-    "transaction_seconds": DEFAULT_TRANSACTION_SECONDS,
-    "operation_limit": 60,
+    "transaction_seconds": None,
+    "operation_limit": None,
     "transport": "gh",
 }
 
@@ -90,11 +90,11 @@ def validate_settings(data: Mapping[str, Any]) -> dict[str, Any]:
     account = data.get("account")
     out["account"] = check_account(account) if account else None
 
-    for key, limit in (("transaction_seconds", (5, 3600)), ("operation_limit", (1, 500))):
-        value = data.get(key, DEFAULTS[key])
-        if type(value) is not int or not limit[0] <= value <= limit[1]:
-            raise CommunityError(f"{key} must be {limit[0]}..{limit[1]}")
-        out[key] = value
+    out["transaction_seconds"] = optional_timeout(data.get("transaction_seconds"), "transaction_seconds")
+    operations = data.get("operation_limit")
+    if operations is not None and (type(operations) is not int or operations <= 0):
+        raise CommunityError("operation_limit must be a positive integer or null")
+    out["operation_limit"] = operations
 
     transport = data.get("transport", "gh")
     if transport not in ("gh", "file"):
@@ -156,10 +156,7 @@ def live_gate(settings: Mapping[str, Any]) -> None:
     path = settings.get("config_path")
     if not isinstance(path, str) or not path or not Path(path).is_absolute():
         raise SharingDisabled("publication requires the actual absolute shared config path")
-    try:
-        live = load_settings_file(Path(path))
-    except CommunityError as exc:
-        raise SharingDisabled(f"live community config unreadable: {str(exc)[:120]}")
+    live = load_settings_file(Path(path))
     if live.get("enabled") is not True:
         raise SharingDisabled("community sharing was disabled")
     live_generation = live.get("generation")

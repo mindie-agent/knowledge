@@ -155,10 +155,12 @@ def test_related_cursor_recomputes_pages_and_expires_when_corpus_changes(materia
     cursor = first["related_next"]
     first_cursor = cursor
     assert cursor and len(first["related"]) == 2
+    assert all("navigation" not in item and "summary" not in item for item in first["related"])
     materials.close()  # cursor and citation relationships survive a reader restart
     while cursor:
         page = materials.search(continuation=cursor, limit=2)[0]
         assert page["ref"] == ref(a)
+        assert all("navigation" in item and "summary" in item for item in page["related"])
         seen.extend(item["ref"] for item in page["related"])
         cursor = page["related_next"]
     assert set(seen) == {ref(item) for item in copies}
@@ -250,6 +252,32 @@ def test_store_query_keeps_read_refs_and_feedback_revisions_separate_without_wri
     assert related["feedback_ref"] == feedback_ref(store.domain, second["entry_id"], second["revision"])
     assert related["origin"] == "draft"
     assert "failed" in store.explain(related["ref"])["content"]
+
+
+def test_compact_related_preserves_own_conditions_and_historical_source_status(store):
+    original = store.create_draft(
+        kind="experience", title="Initial calibration", summary="A fallible first index.",
+        content="RMSNorm float16 calibration matched the reference.",
+        conditions={"torch_version": "1.0"}, owner="a" * 64,
+    )
+    old = feedback_ref(store.domain, original["entry_id"], "f" * 64)
+    body = f"RMSNorm float16 calibration failed on a different shape after reading {old}."
+    correction = store.create_draft(
+        kind="experience", title="Different conditions", summary="A fallible later index.",
+        content=body, conditions={"torch_version": "2.0"}, owner="b" * 64,
+    )
+    group = store.query("RMSNorm float16 calibration")["results"][0]
+    assert group["entry_id"] == original["entry_id"]
+    related = group["related"][0]
+    assert related["entry_id"] == correction["entry_id"]
+    assert related["conditions"] == {"torch_version": "2.0"}
+    assert related["feedback_ref"] == feedback_ref(store.domain, correction["entry_id"], correction["revision"])
+    assert related["match_basis"] == "body" and "failed on a different shape" in related["excerpt"]
+    assert not {"title", "summary", "navigation", "block_summary", "source_range"}.intersection(related)
+    assert related["cites"][0]["cited_ref"] == old
+    assert related["cites"][0]["citation_status"] == "version_unavailable"
+    assert related["cites"][0]["current_source_ref"] == task_ref(store.domain, original["entry_id"])
+    assert store.explain(related["ref"])["content"] == body
 
 
 def test_query_rpc_distinguishes_cursor_input_from_present_material_failure(store, tmp_path):

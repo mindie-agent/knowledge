@@ -11,8 +11,11 @@ authorized visible user and assistant messages with exact source-byte ranges;
 hidden reasoning, system/developer messages, tool traffic and foreign tasks are
 excluded. Gitleaks 8.30.1 plus the deterministic privacy rules run before storage.
 The installer verifies the pinned binary and license; capture never downloads a
-scanner. Private-key redaction state crosses page boundaries. Scanner failure
-leaves the source cursor unchanged and schedules only local deterministic work.
+scanner. Private-key redaction state crosses page boundaries. Scanning has no
+default total deadline or report truncation. Shutdown cancellation stops the owned
+scanner process tree, preserves pending work and leaves the source cursor unchanged.
+Explicit authority revocation remains cancelled rather than pending.
+Scanner failure also leaves the cursor unchanged and schedules only local deterministic work.
 The scanner detects rule-defined secrets and identifiers, not proprietary meaning.
 
 One authorized task owns stable material blocks and a current navigation file.

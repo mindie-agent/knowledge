@@ -10,9 +10,12 @@ ReMe owns derived chunking, the file graph, and BM25 (see ``reme_index.py``).
 from __future__ import annotations
 
 import hashlib
+import contextlib
+import copy
 import json
 import os
 import re
+import sqlite3
 import threading
 from pathlib import Path
 from uuid import uuid4
@@ -101,6 +104,10 @@ def _make_manifest(entry, blocks, navigation, status):
 
 def _parse_manifest(text, domain=None):
     header, body = _parse(text)
+    return _validate_manifest(header, body, domain)
+
+
+def _validate_manifest(header, body, domain=None):
     if set(header) != {"schema", "task_id", "entry", "blocks", "navigation", "status"}:
         raise ValueError("invalid material task fields")
     if header["schema"] != TASK_SCHEMA:
@@ -198,9 +205,29 @@ class MaterialStore:
         self.domain = domain
         self.root.mkdir(parents=True, exist_ok=True)
         self._mutex = threading.RLock()
+        self._write_lock = StartLock(self.root / ".write.lock")
         self._index = None
         self._index_verified = None
         self._index_failure = None
+        self._header_cache = None
+        self._catalog = None
+
+    @contextlib.contextmanager
+    def validated_headers(self):
+        """Reuse immutable headers only inside one owning write transaction.
+
+        Public reads always inspect the authoritative file. A subsequent
+        transaction cannot silently inherit a header that changed on disk.
+        """
+        with self._mutex:
+            outer = self._header_cache is None
+            if outer:
+                self._header_cache = {}
+            try:
+                yield
+            finally:
+                if outer:
+                    self._header_cache = None
 
     def _atomic(self, path, text):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -219,25 +246,32 @@ class MaterialStore:
             raise
 
     def _lock(self):
-        return StartLock(self.root / ".write.lock")
+        return self._write_lock
+
+    @contextlib.contextmanager
+    def _locked_current(self):
+        with self._mutex:
+            owned = self._write_lock.acquired
+            if not owned:
+                self._write_lock.acquire(wait=None)
+            try:
+                yield
+            finally:
+                if not owned:
+                    self._write_lock.release()
 
     def _pointers(self):
-        path = self.root / "current.json"
-        if not path.exists():
-            return dict(schema="mindie-material-current/1", draft={}, feed={}, source_revision="")
-        state = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(state, dict) or set(state) != {"schema", "draft", "feed", "source_revision"} or state["schema"] != "mindie-material-current/1":
-            raise ValueError("invalid current material pointers")
-        for source in _SOURCE:
-            if not isinstance(state[source], dict):
-                raise ValueError("invalid current source pointers")
-            for ident, revision in state[source].items():
-                _identity(ident)
-                _identity(revision, "revision")
-        return state
+        return self._current_catalog().pointers()
 
-    def _save_pointers(self, state):
-        self._atomic(self.root / "current.json", _canonical(state) + "\n")
+    def _current_catalog(self):
+        if self._catalog is None:
+            from .catalog import CurrentCatalog
+            self._catalog = CurrentCatalog(self)
+        return self._catalog
+
+    def _save_pointers(self, state, touched=None):
+        catalog = self._current_catalog()
+        catalog.publish(state, touched)
 
     def _task_root(self, task_id):
         path = self.root / "tasks" / _identity(task_id, "task_id")
@@ -258,6 +292,8 @@ class MaterialStore:
             if revision is None:
                 raise KeyError(task_id)
         path = self._manifest_path(task_id, revision)
+        if self._header_cache is not None and (task_id, revision) in self._header_cache:
+            return copy.deepcopy(self._header_cache[task_id, revision])
         try:
             text = path.read_bytes().decode("utf-8")
         except FileNotFoundError:
@@ -265,6 +301,9 @@ class MaterialStore:
         header = _parse_manifest(text, self.domain)
         if header["task_id"] != task_id or header["entry"]["revision"] != revision:
             raise ValueError("material manifest path does not match its identity")
+        if self._header_cache is not None:
+            self._header_cache[task_id, revision] = header
+            return copy.deepcopy(header)
         return header
 
     def _write_block(self, task_id, block):
@@ -287,8 +326,10 @@ class MaterialStore:
 
     def _write_manifest(self, entry, descriptors, navigation, status):
         header, text = _make_manifest(entry, descriptors, navigation, status)
-        _parse_manifest(text, self.domain)
+        _validate_manifest(header, _navigation_body(header), self.domain)
         self._atomic(self._manifest_path(entry["entry_id"], header["entry"]["revision"]), text)
+        if self._header_cache is not None:
+            self._header_cache[entry["entry_id"], header["entry"]["revision"]] = header
         return dict(header["entry"], content="")
 
     def append_batch(self, task_id, blocks, navigation, *, domain=None, title="", summary="",
@@ -298,7 +339,7 @@ class MaterialStore:
         _source(source)
         lock = self._lock()
         with self._mutex:
-            lock.acquire(wait=3)
+            lock.acquire(wait=None)
             try:
                 selected = revision if revision is not None else self._pointers()[source].get(task_id)
                 prior = self._header(task_id, selected, source) if selected is not None else None
@@ -325,7 +366,7 @@ class MaterialStore:
                 if promote:
                     state = self._pointers()
                     state[source][task_id] = result["revision"]
-                    self._save_pointers(state)
+                    self._save_pointers(state, {task_id})
                 return self.read_task(task_id, result["revision"], source)
             finally:
                 lock.release()
@@ -343,7 +384,7 @@ class MaterialStore:
                   for i, text in enumerate(_split_text(doc["content"]))]
         lock = self._lock()
         with self._mutex:
-            lock.acquire(wait=3)
+            lock.acquire(wait=None)
             try:
                 descriptors = [self._write_block(task_id, block) for block in blocks]
                 result = self._write_manifest(doc, descriptors, doc["summary"], "incomplete")
@@ -384,7 +425,7 @@ class MaterialStore:
         navigation_ref = task_ref(self.domain, task_id)
         lock = self._lock()
         with self._mutex:
-            lock.acquire(wait=3)
+            lock.acquire(wait=None)
             try:
                 pointers = self.root / "current.json"
                 if pointers.is_symlink():
@@ -413,7 +454,7 @@ class MaterialStore:
                 return dict(header=header, block=dict(descriptor), content=text, position=position)
             except ReadReferenceError:
                 raise
-            except (OSError, ValueError, KeyError) as exc:
+            except (OSError, ValueError, KeyError, sqlite3.Error) as exc:
                 raise MaterialReadError(
                     "Required current material could not be read or verified (" + type(exc).__name__ + ").",
                     read_ref=navigation_ref,
@@ -433,7 +474,7 @@ class MaterialStore:
         _source(source)
         lock = self._lock()
         with self._mutex:
-            lock.acquire(wait=3)
+            lock.acquire(wait=None)
             try:
                 prior = self._header(task_id, revision, source)
                 changes = {item["block_id"]: item for item in indexes}
@@ -456,7 +497,7 @@ class MaterialStore:
                 if promote:
                     state = self._pointers()
                     state[source][task_id] = result["revision"]
-                    self._save_pointers(state)
+                    self._save_pointers(state, {task_id})
                 return self.read_task(task_id, result["revision"], source)
             finally:
                 lock.release()
@@ -472,7 +513,7 @@ class MaterialStore:
         """
         lock = self._lock()
         with self._mutex:
-            lock.acquire(wait=3)
+            lock.acquire(wait=None)
             try:
                 draft = self._header(task_id, draft_revision, "draft")
                 public = self._header(task_id, published_revision, "feed")
@@ -515,8 +556,8 @@ class MaterialStore:
     def retain_snapshot(self, updates, *, complete=False):
         """Atomically promote all metadata-committed tasks, then retire garbage."""
         lock = self._lock()
-        with self._mutex:
-            lock.acquire(wait=3)
+        with self._mutex, self.validated_headers():
+            lock.acquire(wait=None)
             try:
                 if complete:
                     updates = dict(updates)
@@ -542,7 +583,7 @@ class MaterialStore:
                             state[source][entry_id] = revisions[source]
                         else:
                             state[source].pop(entry_id, None)
-                self._save_pointers(state)
+                self._save_pointers(state, set(updates))
                 try:
                     for entry_id, revisions in updates.items():
                         self._prune_task(entry_id, set(revisions.values()) - {None, ""})
@@ -616,7 +657,7 @@ class MaterialStore:
             validated.append(value)
         lock = self._lock()
         with self._mutex:
-            lock.acquire(wait=3)
+            lock.acquire(wait=None)
             try:
                 state = self._pointers()
                 old_ids = set(state[source])
@@ -646,29 +687,61 @@ class MaterialStore:
                 lock.release()
 
     def visible_tasks(self):
-        state = self._pointers()
-        selected = {**{k: (v, "draft") for k, v in state["draft"].items()},
-                    **{k: (v, "feed") for k, v in state["feed"].items()}}
-        return {ident: dict(self._header(ident, rev), source=source) for ident, (rev, source) in selected.items()}
+        with self._locked_current():
+            return self._current_catalog().view()[1]
+
+    def current_generation(self):
+        with self._locked_current():
+            return self._current_catalog().ensure_current()
+
+    def _verify_matches(self, results, tasks):
+        """Inspect selected authority, never stat every unrelated block."""
+        from .catalog import signature
+        from .references import parse_read_ref
+        selected, checked_tasks = set(), set()
+        def visit(items):
+            for item in items:
+                if item.get("ref"):
+                    selected.add(item["ref"])
+                for citation in item.get("cites", ()):
+                    if citation.get("current_source_ref"):
+                        selected.add(citation["current_source_ref"])
+                visit(item.get("related", ()))
+        visit(results)
+        for ref in selected:
+            parsed = parse_read_ref(ref, domain=self.domain)
+            task_id = parsed["task_id"]
+            task = tasks[task_id]
+            if task_id not in checked_tasks:
+                path = self._manifest_path(task_id, task["entry"]["revision"])
+                current = signature(path)
+                if current is None:
+                    raise FileNotFoundError("required current material manifest is missing")
+                if current != task["_manifest_signature"]:
+                    header = self._header(task_id, task["entry"]["revision"])
+                    if any(header[key] != task[key] for key in header):
+                        raise ValueError("current material catalog differs from the authoritative manifest")
+                    task["_manifest_signature"] = current
+                checked_tasks.add(task_id)
+            if parsed["kind"] == "block":
+                block = next((block for block in task["blocks"] if block["block_id"] == parsed["block_id"]), None)
+                if block is None or block["sha256"] != parsed["sha256"]:
+                    raise ValueError("search result is not a current material block")
+                self._index.verify_path(f"tasks/{task_id}/blocks/{block['block_id']}.md", block)
 
     def search(self, query=None, limit=5, conditions=None, allowed_ids=None, continuation=None):
         from .provenance import QueryContinuationError, query_request
         query, conditions = query_request(query, limit, conditions, continuation)
         from .reme_index import ReMeIndex
-        with self._mutex:
-            tasks = self.visible_tasks()
-            if allowed_ids is not None:
-                if set(allowed_ids) - set(tasks):
-                    raise ValueError("metadata references material pointers not yet promoted")
-                if isinstance(allowed_ids, dict) and any(
-                    tasks[key]["entry"]["revision"] != revision for key, revision in allowed_ids.items()
-                ):
-                    raise ValueError("metadata and current material revision differ")
+        with self._locked_current():
+            catalog = self._current_catalog()
+            generation, tasks = catalog.view()
             if self._index is None:
                 self._index = ReMeIndex(self.root, self.domain)
             try:
                 results = self._index.search(tasks, query, limit, conditions, allowed_ids,
-                                             continuation=continuation)
+                                             continuation=continuation, catalog=catalog)
+                self._verify_matches(results, tasks)
             except QueryContinuationError:
                 # A stale/invalid caller cursor is not a broken derived index.
                 raise
@@ -676,32 +749,32 @@ class MaterialStore:
                 self._index_failure = type(exc).__name__
                 self._index_verified = None
                 raise
-            self._index_verified = _digest({key: task["entry"]["revision"] for key, task in tasks.items()})
+            self._index_verified = generation
             self._index_failure = None
             return results
 
     def index_status(self):
         """Report observed readiness; a file pointer is not an indexed body."""
-        tasks = self.visible_tasks()
-        fingerprint = _digest({key: task["entry"]["revision"] for key, task in tasks.items()})
-        complete = not self._index_failure and (not tasks or self._index_verified == fingerprint)
-        phase = ("failed" if self._index_failure else "ready" if complete else
-                 "checkpointed-unverified" if (self.root / ".reme-index" / "snapshot.json").exists() else "unbuilt")
-        return dict(backend="reme", complete=complete, phase=phase, visible=len(tasks),
-                    indexed=len(tasks) if complete else None, error=self._index_failure)
+        with self._locked_current():
+            fingerprint, tasks = self._current_catalog().view()
+            complete = not self._index_failure and (not tasks or self._index_verified == fingerprint)
+            phase = ("failed" if self._index_failure else "ready" if complete else
+                     "checkpointed-unverified" if (self.root / ".reme-index" / "snapshot.json").exists() else "unbuilt")
+            return dict(backend="reme", complete=complete, phase=phase, visible=len(tasks),
+                        indexed=len(tasks) if complete else None, error=self._index_failure)
 
     def refresh_index(self):
         """Build changed ReMe files once without making a model or search call."""
         from .reme_index import ReMeIndex
-        with self._mutex:
-            tasks = self.visible_tasks()
-            fingerprint = _digest({key: task["entry"]["revision"] for key, task in tasks.items()})
+        with self._locked_current():
+            catalog = self._current_catalog()
+            fingerprint, tasks = catalog.view()
             if self._index_verified == fingerprint:
                 return self.index_status()
             if self._index is None:
                 self._index = ReMeIndex(self.root, self.domain)
             try:
-                self._index.refresh(tasks)
+                self._index.refresh(tasks, catalog=catalog)
             except Exception as exc:
                 self._index_failure = type(exc).__name__
                 self._index_verified = None
@@ -711,17 +784,22 @@ class MaterialStore:
             return self.index_status()
 
     def close(self):
-        if self._index is not None:
-            self._index.close()
+        try:
+            if self._index is not None:
+                self._index.close()
+        finally:
             self._index = None
-        self._index_verified = None
+            self._index_verified = None
+            if self._catalog is not None:
+                self._catalog.close()
+                self._catalog = None
 
     def rebuild_index(self):
         """Explicitly discard only ReMe's derived cache after a visible failure."""
         import shutil
         self.close()
         lock = StartLock(self.root / ".index.lock")
-        lock.acquire(wait=3)
+        lock.acquire(wait=None)
         try:
             path = self.root / ".reme-index"
             if path.exists():

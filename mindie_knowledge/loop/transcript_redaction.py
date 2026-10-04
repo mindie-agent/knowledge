@@ -15,7 +15,6 @@ import os
 from pathlib import Path
 import platform
 import re
-import subprocess
 import sys
 import tarfile
 import tempfile
@@ -23,6 +22,8 @@ import urllib.request
 import zipfile
 
 from mindie_knowledge.redact import scan_text
+from mindie_knowledge.community.common import CommunityError, run_argv
+from .process import MaintenanceCancelled
 
 VERSION = "8.30.1"
 ARCHIVES = {
@@ -94,13 +95,19 @@ class ScannerUnavailable(OSError):
 _KEY_BEGIN = re.compile(r"-----BEGIN ((?:[A-Z0-9]+ )*PRIVATE KEY)-----")
 
 
-def redact_increment(text, *, state=None, executable, key, private_paths=()):
+def _check_cancel(cancel):
+    if cancel is not None and callable(getattr(cancel, "is_set", None)) and cancel.is_set():
+        raise MaintenanceCancelled("transcript secret scanner cancelled by owner")
+
+
+def redact_increment(text, *, state=None, executable, key, private_paths=(), cancel=None):
     """Redact a complete-message increment, carrying only the open PEM type.
 
     State contains no source text. The caller commits it with the source cursor
     and material files; a retry of the same range starts from the same state.
     A missing or mismatched END keeps subsequent increments masked.
     """
+    _check_cancel(cancel)
     state = dict(state or {})
     if set(state) - {'private_key'}:
         raise ValueError('unknown redaction state')
@@ -123,13 +130,14 @@ def redact_increment(text, *, state=None, executable, key, private_paths=()):
             opened = match.group(1)
             break
         cursor = end + len(marker)
-    clean, rules = redact(text, executable=executable, key=key, private_paths=private_paths)
+    clean, rules = redact(text, executable=executable, key=key, private_paths=private_paths, cancel=cancel)
     if continued:
         rules = sorted(set(rules) | {'credential-private-key'})
     return clean, rules, {'private_key': opened} if opened else {}
 
 
-def redact(text, *, executable, key, private_paths=()):
+def redact(text, *, executable, key, private_paths=(), cancel=None):
+    _check_cancel(cancel)
     if not executable or not Path(executable).is_absolute():
         raise ValueError("transcript redaction requires an installed scanner")
     # Never honor transcript comments, repository config or environment
@@ -138,21 +146,23 @@ def redact(text, *, executable, key, private_paths=()):
         config = Path(temp) / "config.toml"
         config.write_text("[extend]\nuseDefault = true\n", encoding="utf-8")
         try:
-            result = subprocess.run(
+            result = run_argv(
                 [executable, "stdin", "--no-banner", "--no-color", "--log-level", "error",
                  "--config", str(config), "--ignore-gitleaks-allow", "--report-format", "json",
                  "--report-path", "-", "--exit-code", "0"],
-                input=text.encode("utf-8"), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                cwd=temp, timeout=30, check=False,
+                input_bytes=text.encode("utf-8"), max_output=None,
+                cwd=Path(temp), timeout=None, cancel=cancel,
                 env={k: v for k, v in os.environ.items() if not k.startswith("GITLEAKS_")},
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                inherit_env=False,
             )
-        except (OSError, subprocess.TimeoutExpired):
+        except (OSError, CommunityError):
+            _check_cancel(cancel)
             raise ScannerUnavailable("transcript secret scanner unavailable") from None
-    if result.returncode != 0:
+    _check_cancel(cancel)
+    if result.code != 0 or result.timed_out:
         raise ScannerUnavailable("transcript secret scanner failed")
     try:
-        findings = json.loads(result.stdout or b"[]")
+        findings = json.loads(result.out or b"[]")
         if not isinstance(findings, list):
             raise ValueError
         spans = []

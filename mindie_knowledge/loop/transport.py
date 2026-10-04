@@ -38,7 +38,7 @@ class RequestRejected(ValueError):
         self.read_ref = read_ref
 
 
-def rpc(connection, method, arguments=None, *, timeout=10):
+def rpc(connection, method, arguments=None, *, timeout=None):
     url = connection["url"]
     if not url.startswith("http://127.0.0.1:"):
         raise ValueError("the knowledge service is loopback-only")
@@ -123,7 +123,7 @@ class _BoundedHTTPServer(ThreadingHTTPServer):
 
 class Service:
     def __init__(self, engine, *, connection_path=None, admission=None, feeds=(),
-                 max_workers=8, request_timeout=10.0, config_path=None):
+                 max_workers=8, request_timeout=None, config_path=None):
         self.engine, self.store = engine, engine.store
         self.admission = admission
         self.feeds = list(feeds)
@@ -214,7 +214,7 @@ class Service:
             ("127.0.0.1", 0),
             Handler,
             max_workers=max_workers,
-            slot_wait=min(5.0, request_timeout),
+            slot_wait=0,  # Reject exhausted server capacity before admitting work.
         )
         self.http.service_actions = self._check_config_lifetime
         self.connection = dict(
@@ -225,13 +225,14 @@ class Service:
 
     # -------------------------------------------------------------- routing
 
-    def _identify(self, args, *, capture=False):
+    def _identify(self, args, *, capture=False, read_only=False):
         """Pop and validate the internal identity fields.
 
         ``_activation`` proves the call with the adapter-issued token (Hook /
         CLI path). ``_session_verified`` means the MCP layer already bound the
-        call to verified host metadata; the lease is still re-checked here.
-        Capture always requires the token and the current lease schema.
+        call to verified host metadata. Public reads need no capture lease;
+        feedback uses a lease only to decide publication eligibility. Capture
+        always requires the token and the current lease schema.
         """
         args = dict(args)
         session = args.pop("_session_id", None)
@@ -246,9 +247,7 @@ class Service:
             else:
                 lease = self.admission.check(session, token)
         elif not capture and args.pop("_session_verified", False):
-            lease = self.admission.active_lease(session)
-            if lease is None:
-                raise ValueError("session is not manually activated")
+            lease = None if read_only else self.admission.active_lease(session)
         else:
             raise ValueError("call identity cannot be verified")
         return args, session, lease
@@ -287,8 +286,12 @@ class Service:
     def _dispatch(self, method, args):
         lease = None
         session = None
-        if method in {"query", "explain", "feedback", "capture"}:
+        if method in {"feedback", "capture"}:
             args, session, lease = self._identify(args, capture=method == "capture")
+        elif method in {'query', 'explain'}:
+            # Host identity is verified without creating or consulting a
+            # capture lease for ordinary public knowledge reads.
+            args, session, lease = self._identify(args, read_only=True)
         if method == "query":
             return self.store.query(
                 args.get("query"), limit=args.get("limit", 5),

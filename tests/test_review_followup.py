@@ -172,7 +172,7 @@ def test_live_pid_in_wake_json_does_not_coalesce(tmp_path, monkeypatch):
     wake = tmp_path / "root" / "test" / "wake.json"
     wake.write_text(json.dumps({"wake_pid": live.pid, "service_pid": live.pid}))
     try:
-        result = request_wake(config, session_id="manual-A", budget_seconds=0.8)
+        result = request_wake(config, session_id="manual-A")
     finally:
         live.kill()
         live.wait(timeout=2)

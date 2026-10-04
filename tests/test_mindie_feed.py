@@ -368,3 +368,27 @@ def test_sync_discards_old_git_objects_and_old_database_bodies(env):
     assert missing.returncode != 0
     assert store.get(store.ref('c' * 64))['title'] == current['title']
     assert not (feed.dir / 'staging').exists()
+
+
+def test_normal_sync_has_no_internal_execution_deadline(env, monkeypatch):
+    import mindie_knowledge.loop.feed as feed_module
+    import mindie_knowledge.gitread as gitread
+    git, repo, store, feed = env
+    commit_docs(git, repo, [entry_doc('7' * 64, 'Complete public evidence')])
+    calls = []
+    run, listing, read = feed_module.run_argv, gitread.run_stdout_to_file, gitread.CatFileBatch.read
+    def checked_run(*args, **kwargs):
+        calls.append(('process', kwargs.get('timeout')))
+        return run(*args, **kwargs)
+    def checked_listing(*args, **kwargs):
+        calls.append(('listing', kwargs.get('timeout')))
+        return listing(*args, **kwargs)
+    def checked_read(self, *args, **kwargs):
+        calls.append(('blob', kwargs.get('deadline')))
+        return read(self, *args, **kwargs)
+    monkeypatch.setattr(feed_module, 'run_argv', checked_run)
+    monkeypatch.setattr(gitread, 'run_stdout_to_file', checked_listing)
+    monkeypatch.setattr(gitread.CatFileBatch, 'read', checked_read)
+    assert feed.sync()['status'] == 'synced'
+    assert {kind for kind, _ in calls} == {'process', 'listing', 'blob'}
+    assert all(deadline is None for _, deadline in calls)

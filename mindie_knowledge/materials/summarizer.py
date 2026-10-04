@@ -28,7 +28,6 @@ MAX_BLOCKS = 8
 MAX_NAVIGATION_BYTES = 4096
 MAX_TITLE_CHARS = 120
 MAX_SUMMARY_CHARS = 1000
-SUMMARY_TIMEOUT = 90
 ID = re.compile(r"[0-9a-f]{64}\Z")
 COUNTERS = ("input_tokens", "cached_input_tokens", "output_tokens")
 
@@ -234,7 +233,7 @@ def policy_identity(*, model, effort, implementation):
                  output_schema=digest(output_schema()),
                  limits=dict(block_bytes=MAX_BLOCK_BYTES, prompt_bytes=MAX_PROMPT_BYTES,
                              response_bytes=MAX_RESPONSE_BYTES, blocks=MAX_BLOCKS,
-                             navigation_bytes=MAX_NAVIGATION_BYTES, timeout=SUMMARY_TIMEOUT))
+                             navigation_bytes=MAX_NAVIGATION_BYTES))
     return {**value, "fingerprint": digest(value)}
 
 
@@ -463,6 +462,10 @@ class SummaryLedger:
         )""")
         db.execute("CREATE INDEX IF NOT EXISTS material_summary_by_task_batch "
                    "ON material_summary_attempts(task_id,batch_id,created)")
+        db.execute("CREATE INDEX IF NOT EXISTS material_summary_window "
+                   "ON material_summary_attempts(created) WHERE status!='prepared'")
+        db.execute("CREATE INDEX IF NOT EXISTS material_summary_invoking "
+                   "ON material_summary_attempts(updated) WHERE status='invoking'")
 
     def _get(self, where, values):
         cursor = self.db.execute("SELECT * FROM material_summary_attempts WHERE " + where, values)

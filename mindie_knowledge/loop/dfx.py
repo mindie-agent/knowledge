@@ -11,15 +11,6 @@ _warned = False
 
 
 def _unavailable():
-    global _warned
-    if not _warned:
-        _warned = True
-        try:
-            # A full redirected stderr must not delay the original failure.
-            if os.name == "posix" and not os.get_blocking(2):
-                os.write(2, b"mindie-knowledge: diagnostic logging unavailable\n")
-        except Exception:
-            pass
     return {"recorded": False, "logging_failed": True}
 
 
@@ -107,6 +98,11 @@ def failure(
         result = None
     if result is None:
         result = _unavailable()
+    try:
+        from .agent_diagnostics import enqueue
+        enqueue('mindie-knowledge', operation, stage, category, result)
+    except Exception:
+        result['delivery_failed'] = True
     if exception is None:
         return result
     try:

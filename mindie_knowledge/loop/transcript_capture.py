@@ -6,17 +6,17 @@ import time
 from pathlib import Path
 
 from .process import bounded_run
+from .dfx import failure as diagnostic_failure
 from .store import canonical, digest
 from .transcript_redaction import ScannerUnavailable, redact
 from ..materials.ingest import prepare_increment
 from ..materials.summarizer import (
-    SummaryLedger, MAX_RESPONSE_BYTES, SUMMARY_TIMEOUT, make_request,
-    partition_blocks, validate_identity, validate_result, batch_identity, failure_detail,
+    SummaryLedger, MAX_RESPONSE_BYTES, make_request,
+    partition_blocks, validate_identity, validate_result, batch_identity, failure_detail, outcome,
 )
 
 MODE = 'public-transcript'
 SUMMARY_SETTLE_SECONDS = 3
-SUMMARY_SECONDS = SUMMARY_TIMEOUT + 10
 
 
 def _admit_summary(engine):
@@ -29,13 +29,19 @@ def _admit_summary(engine):
         raise ValueError('invalid summary budget configuration')
     rows = engine.store.db.execute("SELECT created,response FROM material_summary_attempts "
                                     "WHERE status!='prepared' AND created>?", (time.time() - 3600,)).fetchall()
-    used = 0
+    used, invoked = 0, []
     for row in rows:
         response = json.loads(row['response']) if row['response'] else {}
+        model_calls = response.get('model_calls', 1)
+        if type(model_calls) is not int or model_calls not in (0, 1):
+            raise ValueError('invalid persisted summary model-call receipt')
+        if model_calls == 0:
+            continue  # Proven refusal/spawn failure consumed no model call.
+        invoked.append(row['created'])
         usage = response.get('usage')
         used += usage['input_tokens'] if isinstance(usage, dict) and type(usage.get('input_tokens')) is int else 32768
-    if len(rows) >= calls or used + 32768 > tokens:
-        retry_at = min(row['created'] for row in rows) + 3601 if rows else time.time() + 3600
+    if len(invoked) >= calls or used + 32768 > tokens:
+        retry_at = min(invoked) + 3601 if invoked else time.time() + 3600
         raise BudgetExceeded('summary rolling budget reached; material retained', retry_at=retry_at)
 
 
@@ -56,7 +62,7 @@ def capture(engine, row, text, region):
                                  source_digest=inc['digest'],
                                  scanner_state=json.loads(prior['redaction_state']) if prior else {},
                                  executable=engine.redactor_executable, key=store.redaction_key(),
-                                 private_paths=(row['scope'], str(Path.home())))
+                                 private_paths=(row['scope'], str(Path.home())), cancel=engine._cancel)
     engine._revalidate(row)
     with store._write_txn():
         engine._revalidate(row)
@@ -81,7 +87,7 @@ def _settle_task(store, entry_id):
     row = store._row(entry_id)
     task = store.materials.read_task(entry_id, revision=row['draft_revision'], source='draft')
     indexed = {b['block_id'] for b in task['blocks'] if b['indexed']}
-    for batch in store.db.execute('SELECT batch_id,block_ids FROM material_batches WHERE entry_id=?',
+    for batch in store.db.execute("SELECT batch_id,block_ids FROM material_batches WHERE entry_id=? AND status!='complete'",
                                   (entry_id,)).fetchall():
         if set(json.loads(batch['block_ids'])) <= indexed:
             store.db.execute("UPDATE material_batches SET status='complete',detail='' WHERE batch_id=?", (batch['batch_id'],))
@@ -138,7 +144,7 @@ def summarize_due(engine):
             if not engine.summary_command:
                 raise ValueError('configuration: summary worker is not configured')
             identity = validate_identity(json.loads(bounded_run([*engine.summary_command, '--identity'], '{}',
-                                                                timeout=15, max_output=8192)))
+                                                                timeout=None, max_output=8192, cancel=engine._summary_cancel)))
             request = make_request(task_id=batch['entry_id'], body_version=batch_identity(selected), blocks=selected,
                                    prior_navigation=prior_navigation, identity=identity)
             with store._write_txn():
@@ -155,18 +161,35 @@ def summarize_due(engine):
                 invoke = True
         if invoke:
             try:
-                raw = bounded_run(engine.summary_command, canonical(request), timeout=SUMMARY_SECONDS,
-                                  max_output=MAX_RESPONSE_BYTES * 3, cancel=engine._summary_cancel)
+                cleanup_receipt = {}
+                def save_result(raw):
+                    response = json.loads(raw)
+                    with store._write_txn():
+                        ledger.record(attempt['attempt_id'], response)
+                raw = bounded_run(engine.summary_command, canonical(request), timeout=None,
+                                  max_output=MAX_RESPONSE_BYTES * 3, cancel=engine._summary_cancel,
+                                  cleanup_receipt=cleanup_receipt, on_result=save_result)
                 response = json.loads(raw)
-                with store._write_txn():
-                    ledger.record(attempt['attempt_id'], response)
+                if ledger.get(attempt['attempt_id'])['status'] == 'invoking':
+                    save_result(raw)
+                if cleanup_receipt.get('cleanup_failed'):
+                    response['cleanup_failed'] = True
+                    with store._write_txn():
+                        store.db.execute('UPDATE material_summary_attempts SET response=? WHERE attempt_id=?',
+                                         (canonical(response), attempt['attempt_id']))
+                if response.get('cleanup_failed'):
+                    diagnostic_failure('index.summary', stage='cleanup', category='cleanup_failed')
             except Exception as exc:
                 with store._write_txn():
                     current = ledger.get(attempt['attempt_id'])
                     if current['status'] == 'invoking':
-                        category = getattr(exc, 'mindie_category', 'unknown')
-                        ledger.uncertain(attempt['attempt_id'], category if category in {
-                            'deadline', 'cancelled', 'invalid_result', 'output_limit', 'native'} else 'unknown')
+                        if getattr(exc, 'mindie_execution', None) == 'not_started':
+                            ledger.record(attempt['attempt_id'], outcome(request, status='failed',
+                                error='configuration', model_calls=0, error_reason='native_start_failed'))
+                        else:
+                            category = getattr(exc, 'mindie_category', 'unknown')
+                            ledger.uncertain(attempt['attempt_id'], category if category in {
+                                'deadline', 'cancelled', 'invalid_result', 'output_limit', 'native'} else 'unknown')
                 raise
         attempt = ledger.get(attempt['attempt_id'])
         if attempt['status'] != 'returned':
@@ -177,6 +200,9 @@ def summarize_due(engine):
                 store.db.execute('UPDATE material_batches SET status=?,detail=? WHERE batch_id=?',
                                  (attempt['status'], reason, batch['batch_id']))
                 _settle_task(store, batch['entry_id'])
+            diagnostic_failure('index.summary',
+                stage=failure['stage'] if failure else 'native-execution',
+                category=failure['reason'] if failure else 'outcome_unknown')
             return
         response = json.loads(attempt['response'])
         result = validate_result(response['result'], [b['block_id'] for b in selected])
@@ -186,7 +212,8 @@ def summarize_due(engine):
             for field in ('title', 'summary'):
                 header[field], _ = redact(header[field], executable=engine.redactor_executable,
                                           key=store.redaction_key(),
-                                          private_paths=(authorization['scope'], str(Path.home())))
+                                          private_paths=(authorization['scope'], str(Path.home())),
+                                          cancel=engine._summary_cancel)
         validate_result(result, [b['block_id'] for b in selected])
         engine._gate_live()
         engine._revalidate(authorization)
@@ -201,6 +228,7 @@ def summarize_due(engine):
             store.db.execute('UPDATE transcript_tasks SET summary_detail=?,summary_due=? WHERE entry_id=?',
                              ('summary budget deferred; no call made', exc.retry_at, batch['entry_id']))
     except (ScannerUnavailable, AdmissionUnreadable, GateFault) as exc:
+        diagnostic_failure('index.summary', stage='local-apply', category='dependency_unavailable', exception=exc)
         with store._write_txn():
             if ledger and attempt and ledger.get(attempt['attempt_id'])['status'] == 'returned':
                 ledger.local_failure(attempt['attempt_id'], 'scanner_unavailable' if isinstance(exc, ScannerUnavailable)
@@ -225,6 +253,7 @@ def summarize_due(engine):
                                  "WHERE entry_id=? AND status IN ('pending','retry-requested')", (batch['entry_id'],))
             _settle_task(store, batch['entry_id'])
     except Exception as exc:
+        diagnostic_failure('index.summary', stage='process', category='summary_failed', exception=exc)
         if getattr(exc, 'metadata_committed', False):
             engine._error('Material metadata committed; current-file promotion or cleanup failed (' + type(exc).__name__ + ').')
             return

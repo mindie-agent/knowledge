@@ -7,8 +7,10 @@ Design inherits all nine [VAWS / MindIE Agent principles](https://github.com/min
 Local domain knowledge and experience loop for MindIE Agent: bounded capture from admitted tasks, optional community sharing through Git, and read-only retrieval from the canonical Git publication.
 
 Use `mindie-knowledge` from the `mindie-knowledge` Python package (Python 3.11+).
-The module namespace is `mindie_knowledge`. SQLite holds only small queue and
-receipt metadata; current material bodies are ordinary Markdown files.
+The module namespace is `mindie_knowledge`. The runtime database holds queue,
+receipt and header metadata; authoritative current material bodies are ordinary
+Markdown files. A replaceable retrieval checkpoint stores current block chunks
+and term counts.
 Pinned ReMe components provide local file chunking, the file graph and BM25
 retrieval. No ReMe service, daemon, watcher, model, embedding or external
 account configuration is started or required for retrieval.
@@ -45,7 +47,7 @@ ordinary task/feedback contributions from contract, workflow and policy changes.
 - The adapters ask for a contribution choice only once after installation and persist it in the shared profile. New tasks and forks bind internally without asking again; ordinary failures do not revoke the choice.
 - Community contribution is a single explicit switch (`mindie-community-config/1`). Off means no capture, extraction or sanitization at all — not local-only capture. Retrieval, updates and sync keep working.
 - Entries have stable opaque IDs and internally computed content revisions. Drafts and the subscribed feed retain current packages only. A block reference remains readable across appends or navigation changes while its exact bytes remain a current member; replaced blocks and withdrawn tasks are unavailable. Pending contributions freeze their send files separately; the outbox holds only descriptors. Upstream deletion removes the published body and leaves a withdrawal marker. Local drafts update by append-only observations and never restore withdrawn content. The private feed Git cache retains one shallow tip, without old revision objects.
-- Harness adapters expose `knowledge_query`, `knowledge_explain` and optional `knowledge_feedback`; each adapter verifies native task identity and the core rechecks its shared admission grant. Feedback is fully optional up/down with an optional one-line reason; there is no judge and no voting weight.
+- Harness adapters expose `knowledge_query`, `knowledge_explain` and optional `knowledge_feedback`; each adapter verifies native task identity. Public reads require that identity but no capture grant. Capture and feedback publication still check their applicable shared authorization. Feedback is fully optional up/down with an optional one-line reason; there is no judge and no voting weight.
 - Raw task records stay with the user's Harness. Complete mechanically redacted material, fallible block titles/summaries, current navigation and optional vote files reach contribution staging.
 - Temporary publication or sync failures recover through the existing background worker with persisted backoff. Packaging, submission and consumer retrieval make no model calls. The index worker summarizes only new blocks plus prior navigation, retains returned output through local apply failures, and records failed or uncertain invocations without automatically repeating them. Confirmed submissions retain minimal receipts; the current remote PR or upstream main provides the published body.
 - The core uses the shared `mindie-diagnostics` component directly for bounded local failure logs and incident references; automatic fault reporting has its own explicit consent, separate from community contribution.
