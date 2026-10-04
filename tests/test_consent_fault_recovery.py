@@ -2,7 +2,6 @@
 A fault is not revocation; saved model output resumes without another call.
 """
 import json
-import time
 import pytest
 from conftest import make_admission, write_settings
 from lane_support import load_parser, transcript_path, write_transcript, entry_documents
@@ -27,12 +26,14 @@ def _world(tmp_path):
     parsed = write_settings(settings, enabled=True, roots=[project], consent_config=str(consent))
     admission = Admission(make_admission(tmp_path, project_root=project, session='ses-fault'))
     source = transcript_path('codex', tmp_path / 'logs', 'ses-fault')
-    write_transcript('codex', source, 'ses-fault', [TOKEN], time.time()+2)
     store = Store(tmp_path / 'store', 'test')
     marker = tmp_path / 'calls'
     engine = Engine(store, settings_path=settings, admission=admission,
                     transcript_adapter=load_parser('codex'), redactor_executable=install_scanner(),
                     summary_command=summary_command(calls=marker))
+    when = max(parsed.enabled_at, admission.active_lease('ses-fault')['activated_at'],
+               store.capture_floor) + 1
+    write_transcript('codex', source, 'ses-fault', [TOKEN], when)
     return dict(store=store, engine=engine, settings=settings, consent=consent,
                 marker=marker, project=project, source=source, saved=consent.read_bytes(),
                 settings_bytes=settings.read_bytes(), generation=parsed.generation)
@@ -154,6 +155,8 @@ def test_k3_saved_model_result_survives_authority_fault_without_another_call(tmp
     try:
         captured = _capture(world)
         engine._process(captured['id'])
+        assert store.capture_row(captured['id'])['status'] == 'organized', store.capture_row(captured['id'])
+        assert TOKEN in '\n'.join(entry_documents(store))
         real = transcript_capture.bounded_run
         def corrupt_after_return(command, *args, **kwargs):
             response = real(command, *args, **kwargs)

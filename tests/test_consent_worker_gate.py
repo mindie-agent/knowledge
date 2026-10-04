@@ -163,11 +163,9 @@ def _world(tmp_path, *, enabled, consent):
         if "consent_config" not in extensions:
             extensions["consent_config"] = str(consent_path.resolve())
     settings = tmp_path / "community.json"
-    write_settings(settings, enabled=enabled, roots=[project], **extensions)
+    parsed = write_settings(settings, enabled=enabled, roots=[project], **extensions)
     admission = make_admission(tmp_path, project_root=project, session=SESSION)
-    when = time.time() + 180
     log = transcript_path(PARSER_NAME, tmp_path / "logs", SESSION)
-    write_transcript(PARSER_NAME, log, SESSION, [TOKEN], when)
     store = Store(tmp_path / "store", "test")
     marker = tmp_path / "spawns"
     parser = _observe(load_parser(PARSER_NAME))
@@ -179,6 +177,9 @@ def _world(tmp_path, *, enabled, consent):
         admission=Admission(admission),
         transcript_adapter=parser,
     )
+    when = max(parsed.enabled_at or 0, engine.admission.active_lease(SESSION)['activated_at'],
+               store.capture_floor) + 1
+    write_transcript(PARSER_NAME, log, SESSION, [TOKEN], when)
     world = {
         "store": store,
         "engine": engine,

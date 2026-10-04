@@ -37,13 +37,15 @@ def world(tmp_path, request, scanner):
     parser = load_parser(name)
     assert Path(parser.__file__).resolve() == parser_path(name).resolve()
     path = transcript_path(name, tmp_path / 'logs', session)
-    when = time.time() + 180
-    write_transcript(name, path, session, ['EARLYCTRL 原始观测; acceptance remains incomplete.'], when)
     store = Store(tmp_path / 'store', 'test')
     args = dict(settings_path=settings, admission=admission, transcript_adapter=parser,
                 redactor_executable=scanner)
+    engine = Engine(store, **args)
+    when = max(engine._settings().enabled_at, admission.active_lease(session)['activated_at'],
+               store.capture_floor) + 1
+    write_transcript(name, path, session, ['EARLYCTRL 原始观测; acceptance remains incomplete.'], when)
     box = dict(name=name, session=session, path=path, when=when, store=store, args=args,
-               engine=Engine(store, **args), calls=tmp_path / 'calls', root=tmp_path / 'store')
+               engine=engine, calls=tmp_path / 'calls', root=tmp_path / 'store')
     yield box
     box['store'].close()
 
