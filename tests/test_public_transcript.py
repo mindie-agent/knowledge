@@ -342,6 +342,14 @@ def wait_until(predicate, seconds=8):
     assert predicate(), 'expected pipeline outcome did not arrive'
 
 
+def authorized_message_time(engine, session):
+    # Initialization can take longer than a guessed future offset. Construct
+    # public messages only after all persisted authorization boundaries exist.
+    return max(engine._settings().enabled_at,
+               engine.admission.active_lease(session)['activated_at'],
+               engine.store.capture_floor) + 1
+
+
 def test_slow_summary_does_not_hold_new_body_and_stale_result_is_discarded(pipeline):
     engine, store, path = pipeline
     marker, release = path.parent / 'summary-started', path.parent / 'summary-release'
@@ -402,11 +410,11 @@ def test_production_parsers_preserve_large_public_messages_through_export(tmp_pa
     # Distinct head/middle/tail and total bytes catch clipping, skipped records,
     # and dropped multibyte data. The only injected private value is the token.
     text = 'begin-public\n' + ('公开进度。\n' * (size // 16)) + '\nend-public'
-    write_transcript(harness, path, session, [text], time.time() + 2)
     with closing(Store(tmp_path / 'store', 'test')) as store:
         engine = Engine(store, settings_path=settings, admission=admission,
                         transcript_adapter=load_parser(harness), capture_mode='public-transcript',
                         redactor_executable=scanner)
+        write_transcript(harness, path, session, [text], authorized_message_time(engine, session))
         event = engine.capture(session_id=session, turn_id='long-public', transcript_path=str(path))
         # The worker may yield between pages or defer a temporary scanner
         # failure. Acceptance is eventual complete persistence from this one
@@ -431,15 +439,15 @@ def test_kimi_lineage_recovers_without_exporting_inherited_history(tmp_path, sca
     admission = Admission(make_admission(tmp_path, project_root=tmp_path, session=session))
     path = transcript_path('kimi', tmp_path, session)
     from lane_support import encode_record
-    when = time.time() + 2
-    path.write_bytes(encode_record('kimi', session, 'inherited-parent-marker', when)
-                     + encode_record('kimi', session, 'new-child-marker', when + 2))
     state = path.parents[2] / 'state.json'
-    state.unlink()
     with closing(Store(tmp_path / 'store', 'test')) as store:
         engine = Engine(store, settings_path=settings, admission=admission,
                         transcript_adapter=load_parser('kimi'), capture_mode='public-transcript',
                         redactor_executable=scanner)
+        when = authorized_message_time(engine, session)
+        path.write_bytes(encode_record('kimi', session, 'inherited-parent-marker', when)
+                         + encode_record('kimi', session, 'new-child-marker', when + 2))
+        state.unlink()
         event = engine.capture(session_id=session, turn_id='lineage', transcript_path=str(path))
         engine._process(event['id'])
         assert store.drafts_changed() == []
@@ -466,15 +474,15 @@ def test_corrupt_record_blocks_incomplete_page_without_losing_source(tmp_path, s
     write_settings(settings, roots=[tmp_path])
     admission = Admission(make_admission(tmp_path, project_root=tmp_path, session=session))
     path = transcript_path(harness, tmp_path, session)
-    when = time.time() + 2
-    write_transcript(harness, path, session, ['before-bad-marker'], when)
-    with path.open('ab') as stream:
-        stream.write(bad)
-        stream.write(encode_record(harness, session, 'after-bad-marker', when + 2))
     with closing(Store(tmp_path / 'store', 'test')) as store:
         engine = Engine(store, settings_path=settings, admission=admission,
                         transcript_adapter=load_parser(harness), capture_mode='public-transcript',
                         redactor_executable=scanner)
+        when = authorized_message_time(engine, session)
+        write_transcript(harness, path, session, ['before-bad-marker'], when)
+        with path.open('ab') as stream:
+            stream.write(bad)
+            stream.write(encode_record(harness, session, 'after-bad-marker', when + 2))
         event = engine.capture(session_id=session, turn_id='broken-line', transcript_path=str(path))
         engine._process(event['id'])
         row = store.capture_row(event['id'])
