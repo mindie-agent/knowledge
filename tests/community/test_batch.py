@@ -24,7 +24,7 @@ def test_valid_entry_batch_passes():
     checked = validate_batch(batch)
     assert checked["batch_id"] == "b1"
     assert checked["votes_only"] is False
-    assert checked["files"][0]["path"].startswith("cases/")
+    assert checked["files"][0]["path"].startswith("tasks/")
 
 
 def test_votes_only_batch_is_valid_without_entries():
@@ -57,7 +57,7 @@ def test_disallowed_paths_rejected(path):
         check_path(path)
 
 
-@pytest.mark.parametrize("path", ["cases/x.md", "topics/topic-a.md", "feedback/fb.json"])
+@pytest.mark.parametrize("path", ["tasks/" + "a" * 64 + "/index.md", "tasks/" + "a" * 64 + "/blocks/part-1.md", "feedback/fb.json"])
 def test_allowed_paths(path):
     assert check_path(path) == path
 
@@ -144,7 +144,7 @@ def test_entrydoc_roundtrip_and_revision_stability():
     assert parsed["entry_id"] == doc["entry_id"]
     assert parsed["revision"] == doc["revision"]
     assert parsed["kind"] == "experience"
-    # mindie-entry/2 carries no private or tombstone fields in the file.
+    # mindie-entry/3 carries no private or tombstone fields in the file.
     for leaked in ("revision", "producers", "sources", "status", "retirement_reason"):
         assert f"{leaked}:" not in text
 

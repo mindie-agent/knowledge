@@ -31,7 +31,8 @@ from .community.batch import check_path,validate_feedback
 from .community.common import SCHEMA_FEEDBACK,CommunityError,run_argv,sha256_text
 from .gitread import CatFileBatch,iter_file_records,run_stdout_to_file,with_windows_longpaths
 from .loop import documents
-from .loop.documents import MAX_FILE_BYTES,parse_entry
+from .loop.documents import MAX_FILE_BYTES
+from .materials.store import BLOCK_SCHEMA, _parse, _parse_manifest, _parse_block, _sha
 from .redact import scan_text
 
 def _git_env():
@@ -58,6 +59,7 @@ _TRUSTED_SOURCES = (
     'loop/documents.py',
     'community/batch.py',
     'community/common.py',
+    'materials/store.py',
 )
 
 
@@ -98,6 +100,7 @@ def _validator_context(domain):
         'redaction_profile': _redact.REDACTION_PROFILE,
         'sources': _trusted_source_fingerprint(),
         'entry_schema': documents.SCHEMA,
+        'package_schema': 'mindie-material-package/1',
         'feedback_schema': SCHEMA_FEEDBACK,
     }
 
@@ -125,12 +128,9 @@ def _load_checkpoint(path,revision,context):
     clean={}
     for path,value in verified.items():
         if not isinstance(path,str):continue
-        if value is True:
-            clean[path]=True
-        elif (isinstance(value,dict) and isinstance(value.get('id'),str)
-              and value.get('kind') in ('knowledge','experience')
+        if (isinstance(value,dict) and value.get('type') in ('task','block','feedback')
               and isinstance(value.get('sha'),str)):
-            clean[path]={'id':value['id'],'kind':value['kind'],'sha':value['sha']}
+            clean[path]=value
     return clean
 
 def _save_checkpoint(path,revision,context,verified):
@@ -148,6 +148,43 @@ def _git(repo,args,maximum,deadline):
     if result.timed_out:raise _SliceExhausted()
     if result.code:raise ValueError('Cannot read the candidate Git publication')
     return result.out
+
+
+def _record_verified(path, value, stats):
+    if value['type']=='feedback':
+        if not path.startswith('feedback/'):
+            raise ValueError(f'{path}: checkpoint type differs from path')
+        stats['feedback']+=1
+        return
+    parts=path.split('/')
+    task_id=parts[1]
+    if value['type']=='task':
+        if len(parts)!=3 or parts[2]!='index.md' or value['header']['task_id']!=task_id:
+            raise ValueError(f'{path}: task manifest identity differs from path')
+        if task_id in stats['entries']:
+            raise ValueError('Duplicate canonical task identity')
+        stats['entries'][task_id]=value['header']
+    else:
+        if len(parts)!=4 or parts[2]!='blocks' or parts[3]!=value['block_id']+'.md':
+            raise ValueError(f'{path}: material block identity differs from path')
+        stats['blocks'].setdefault(task_id,{})[value['block_id']]=value
+
+
+def _validate_task_sets(stats):
+    """Same-commit topology and hashes, using metadata only after blob checks."""
+    if set(stats['blocks'])-set(stats['entries']):
+        raise ValueError('Material blocks have no task index in the selected commit')
+    for task_id,header in stats['entries'].items():
+        actual=stats['blocks'].get(task_id,{})
+        expected={block['block_id']:block for block in header['blocks']}
+        if set(actual)!=set(expected):
+            raise ValueError(f'tasks/{task_id}: files differ from the exact manifest reference set')
+        for block_id,descriptor in expected.items():
+            blob=actual[block_id]
+            if blob['sha256']!=descriptor['sha256'] or blob['source_range']!=descriptor['source_range']:
+                raise ValueError(f'tasks/{task_id}/blocks/{block_id}.md: material block hash or source mismatch')
+        if not all(block['indexed'] for block in header['blocks']):
+            raise ValueError(f'tasks/{task_id}: public material indexing is incomplete')
 
 def _validate_slice(repo,revision,domain,state_path,context,verified,stats):
     """One bounded slice over the candidate tree; resumes from ``verified``.
@@ -173,8 +210,8 @@ def _validate_slice(repo,revision,domain,state_path,context,verified,stats):
                 if not raw:continue
                 head,path=raw.decode('utf-8','strict').split('\t',1)
                 mode,kind,sha,size=head.split()
-                if not path.startswith(('cases/','topics/','feedback/')):
-                    if path.startswith(('corpus/','generations/')):
+                if not path.startswith(('tasks/','feedback/')):
+                    if path.startswith(('cases/','topics/','corpus/','generations/')):
                         raise ValueError('Retired knowledge layout is not supported')
                     continue
                 if path in stats['done_paths']:
@@ -185,17 +222,9 @@ def _validate_slice(repo,revision,domain,state_path,context,verified,stats):
                 if int(size)>MAX_FILE_BYTES:
                     raise ValueError(f'{path}: exceeds the per-file platform envelope')
                 prior=verified.get(path)
-                if prior is not None and (prior is True or prior.get('sha')==sha):
+                if prior is not None and prior.get('sha')==sha:
                     stats['count']+=1;stats['bytes']+=int(size)
-                    if prior is True:
-                        stats['feedback']+=1
-                    else:
-                        expected='topics/' if prior['kind']=='knowledge' else 'cases/'
-                        if not path.startswith(expected):
-                            raise ValueError(f'{path}: kind does not match directory')
-                        if prior['id'] in stats['entries']:
-                            raise ValueError('Duplicate canonical entry identity')
-                        stats['entries'].add(prior['id'])
+                    _record_verified(path,prior,stats)
                     stats['done_paths'].add(path)
                     continue
                 if time.monotonic()>=deadline:
@@ -211,16 +240,20 @@ def _validate_slice(repo,revision,domain,state_path,context,verified,stats):
                 if '\r' in text:raise ValueError(f'{path}: canonical LF bytes required')
                 if scan_text(text):raise ValueError(f'{path}: public data fails the privacy scan')
                 if path.startswith('feedback/'):
-                    validate_feedback(text,path);stats['feedback']+=1
-                    verified[path]=True
+                    validate_feedback(text,path)
+                    value={'type':'feedback','sha':sha}
+                elif path.endswith('/index.md'):
+                    header=_parse_manifest(text,domain)
+                    value={'type':'task','sha':sha,'header':header}
                 else:
-                    doc=parse_entry(text)
-                    if doc['domain']!=domain:raise ValueError(f'{path}: wrong domain')
-                    expected='topics/' if doc['kind']=='knowledge' else 'cases/'
-                    if not path.startswith(expected):raise ValueError(f'{path}: kind does not match directory')
-                    if doc['entry_id'] in stats['entries']:raise ValueError('Duplicate canonical entry identity')
-                    stats['entries'].add(doc['entry_id'])
-                    verified[path]={'id':doc['entry_id'],'kind':doc['kind'],'sha':sha}
+                    header,_body=_parse(text)
+                    if set(header)!={'schema','block_id','source_range'} or header['schema']!=BLOCK_SCHEMA:
+                        raise ValueError(f'{path}: invalid material block header')
+                    value={'type':'block','sha':sha,'block_id':header['block_id'],
+                           'source_range':header['source_range'],'sha256':_sha(text)}
+                    _parse_block(text,value)
+                _record_verified(path,value,stats)
+                verified[path]=value
                 stats['done_paths'].add(path)
                 stats['count']+=1;stats['bytes']+=int(size)
                 pending+=1
@@ -243,7 +276,7 @@ def validate(repo,revision,domain,state=None):
     context=_validator_context(domain)
     state_path=state if state is not None else _default_state_path(repo)
     verified=_load_checkpoint(state_path,revision,context)
-    stats={'count':0,'bytes':0,'entries':set(),'feedback':0,'done_paths':set()}
+    stats={'count':0,'bytes':0,'entries':{},'blocks':{},'feedback':0,'done_paths':set()}
     stalled=0
     while True:
         before=len(verified)
@@ -255,6 +288,7 @@ def validate(repo,revision,domain,state=None):
             stalled=0 if len(verified)>before else stalled+1
             if stalled>=2:
                 raise ValueError('no validation progress across bounded slices') from None
+    _validate_task_sets(stats)
     return {'commit':revision,'entries':len(stats['entries']),
             'feedback_files':stats['feedback'],'bytes':stats['bytes']}
 

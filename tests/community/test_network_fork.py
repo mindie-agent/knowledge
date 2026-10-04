@@ -18,7 +18,7 @@ from mindie_knowledge.community import gitops, transport
 from mindie_knowledge.community.batch import contribution_branch
 from mindie_knowledge.community.common import CommunityError, Deadline, finite_epoch
 
-from .conftest import entry_file, git, make_batch, make_entry
+from .conftest import entry_file, package_files, git, make_batch, make_entry
 
 # Extensionless shebang children are a POSIX process mechanism. They are not
 # Windows process coverage.
@@ -281,104 +281,44 @@ def test_open_update_does_not_write_without_proven_head(settings, state_dir, tra
     assert moved != before
 
 
-def test_restore_follows_api_pr_state(tmp_path):
-    """API state chooses the body. A leftover branch is not a source."""
-    from mindie_knowledge.community.batch import batch_revision, contribution_branch
-    from mindie_knowledge.community.transport import FileTransport
-    from mindie_knowledge.loop import settings as loop_settings
-    from mindie_knowledge.loop.engine import Engine, RestoreUnavailable
+def test_feed_reads_current_main_without_reconstructing_a_leftover_pr(tmp_path):
+    """A retained PR branch never overrides main's absence or withdrawal."""
+    import shutil
+    from mindie_knowledge.loop.feed import Feed
     from mindie_knowledge.loop.store import Store
-
-    repo = "acme/npu-knowledge"
-    bare = tmp_path / "remote.git"
-    work = tmp_path / "seed"
-    git(["init", "--bare", "-b", "main", str(bare)])
-    git(["clone", str(bare), str(work)])
-    doc = make_entry(content="Body that must not be resurrected.")
-    rendered = entry_file(doc)
-    (work / "cases").mkdir()
-    (work / rendered["path"]).write_text(rendered["content"], encoding="utf-8")
+    from .conftest import make_remote
+    remote = make_remote(tmp_path, "source")
+    work = tmp_path / "writer"
+    git(["clone", "--quiet", remote, str(work)])
+    doc = make_entry(content="Current source material, independent of old PR state.")
+    for item in package_files(doc):
+        target = work / item["path"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(item["content"], encoding="utf-8")
     git(["add", "-A"], cwd=work)
-    git(["-c", "user.name=t", "-c", "user.email=t@example.invalid",
-         "commit", "-m", "add"], cwd=work)
-    kept = git(["rev-parse", "HEAD"], cwd=work)
-    branch = contribution_branch("npu", "batch-restore")
-    git(["push", "origin", "HEAD:refs/heads/main"], cwd=work)
-    git(["push", "origin", f"HEAD:refs/heads/{branch}"], cwd=work)
-
-    def attempt(mode, number, api_sha):
-        config = loop_settings.write(
-            tmp_path / f"{mode}.json", enabled=True, repository=repo,
-            project_roots=[tmp_path], transport="file",
-            dev_remotes={repo: str(bare)},
-        )
-        store = Store(tmp_path / f"store-{mode}", "npu")
-        try:
-            local = store.create_draft(
-                kind="experience", title=doc["title"], summary=doc["summary"],
-                content=doc["content"], entry_id=doc["entry_id"],
-                owner="c" * 64, generation=config.generation,
-            )
-            payload = make_batch("batch-restore", [rendered])
-            payload["entry_refs"] = [store.ref(doc["entry_id"], local["revision"])]
-            payload["revision"] = batch_revision(
-                payload["files"], "npu", None, payload["entry_refs"]
-            )
-            store.create_batch(
-                batch_id="batch-restore", revision=payload["revision"], batch=payload,
-                entry_ids=[doc["entry_id"]], vote_keys=[], generation=config.generation,
-            )
-            store.mark_batch(
-                "batch-restore", "submitted",
-                pr_url=f"https://example.invalid/{repo}/pull/{number}", head_sha=kept,
-            )
-            store.compact_confirmed("batch-restore")
-            merged = mode == "merged"
-            FileTransport(store.root / "outbox" / "dev-github.json", {repo: str(bare)}).seed(
-                repo,
-                pulls={
-                    str(number): {
-                        "number": number,
-                        "state": "open" if mode == "open" else "closed",
-                        "merged": merged,
-                        "html_url": f"https://example.invalid/{repo}/pull/{number}",
-                        "head": {
-                            "ref": branch,
-                            "sha": api_sha,
-                            "repo": {"full_name": repo},
-                        },
-                        "base": {"ref": "main"},
-                    }
-                },
-            )
-            engine = Engine(store, settings_path=config.path)
-            try:
-                restored = engine._restore_sent_draft(doc["entry_id"], config.generation)
-            except RestoreUnavailable:
-                restored = False
-            assert restored is False, mode
-            assert store._row(doc["entry_id"])["draft_revision"] is None
-        finally:
-            store.close()
-
-    # Closed unmerged while main still has the body. Reading main would restore.
-    attempt("closed", 4, kept)
-    # Open mismatch: API sha is not refs/pull/5/head. Main still has the body,
-    # and the PR ref does too. Either read would resurrect it. The branch is
-    # removed first so the dev double cannot replace the API sha with the tip.
-    other = git(["-c", "user.name=t", "-c", "user.email=t@example.invalid",
-                 "commit-tree", kept + "^{tree}", "-m", "different"], cwd=work)
-    git(["push", "origin", ":refs/heads/" + branch], cwd=work)
-    git(["--git-dir", str(bare), "update-ref", "refs/pull/5/head", kept])
-    attempt("open", 5, other)
-    # Merged withdrawal: main no longer has the file; the branch does.
-    git(["push", "origin", f"{kept}:refs/heads/{branch}"], cwd=work)
-    (work / rendered["path"]).unlink()
-    git(["add", "-A"], cwd=work)
-    git(["-c", "user.name=t", "-c", "user.email=t@example.invalid",
-         "commit", "-m", "withdraw"], cwd=work)
-    git(["push", "origin", "HEAD:refs/heads/main"], cwd=work)
-    attempt("merged", 6, kept)
+    git(["-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
+         "commit", "-m", "propose task"], cwd=work)
+    proposed = git(["rev-parse", "HEAD"], cwd=work)
+    git(["push", "origin", "HEAD:refs/heads/proposal"], cwd=work)
+    git(["--git-dir", remote, "update-ref", "refs/pull/1/head", proposed])
+    store = Store(tmp_path / "reader", "npu")
+    feed = Feed(store, dict(repository="acme/npu-knowledge", ref="main", domain="npu", url=remote))
+    try:
+        assert feed.sync()["entries"] == 0  # open/closed PR flags cannot install a body
+        git(["push", "origin", "HEAD:refs/heads/main"], cwd=work)
+        assert feed.sync()["entries"] == 1
+        assert "Current source material" in store.get(store.ref(doc["entry_id"]))["content"]
+        shutil.rmtree(work / "tasks")
+        git(["add", "-A"], cwd=work)
+        git(["-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
+             "commit", "-m", "withdraw task"], cwd=work)
+        git(["push", "origin", "HEAD:refs/heads/main"], cwd=work)
+        assert feed.sync()["entries"] == 0
+        assert store.get(store.ref(doc["entry_id"]))["withdrawn"] is True
+        assert git(["ls-remote", remote, "refs/heads/proposal"]).split()[0] == proposed
+        assert store.query("Current source material")["results"] == []
+    finally:
+        store.close()
 
 
 # Recorded public list shape: state closed, merged_at set, no merged field.
@@ -466,7 +406,8 @@ def test_stage_and_commit_many_paths_exceeding_argv_limit(tmp_path):
     git(["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
          "commit", "-q", "-m", "seed"], cwd=work)
     seeded = git(["rev-parse", "HEAD"], cwd=work)
-    assert gitops.stage_and_commit(work, [], "nothing", Deadline(30, 10)) == seeded
+    assert gitops.stage_and_commit(work, [], "nothing", Deadline(30, 10)) is None
+    assert git(["rev-parse", "HEAD"], cwd=work) == seeded
     # Real developer Git configuration must not turn canonical LF publication
     # into one conversion warning per file and exhaust the bounded subprocess.
     git(["config", "core.autocrlf", "true"], cwd=work)
@@ -475,6 +416,7 @@ def test_stage_and_commit_many_paths_exceeding_argv_limit(tmp_path):
     paths = [f"wide/{i:04d}-{stem}" for i in range(4300)]
     assert sum(len(path.encode()) + 1 for path in paths) > 1_048_576
     paths.append("wide/name with space.txt")
+    paths.append("wide/name-with\nnewline.txt")
     for path in paths:
         target = work / path
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -482,7 +424,10 @@ def test_stage_and_commit_many_paths_exceeding_argv_limit(tmp_path):
     committed = gitops.stage_and_commit(work, paths, "many paths", Deadline(60, 10))
     assert committed and committed != seeded
     listed = set(git(["ls-files"], cwd=work).splitlines())
-    assert set(paths) <= listed
+    assert set(paths) - {"wide/name-with\nnewline.txt"} <= listed
+    modes = gitops.ls_tree(work, committed, Deadline(60, 10))
+    assert set(paths) <= set(modes)
+    assert set(modes.values()) == {"100644"}
     assert "wide/name with space.txt" in listed
     assert git(["config", "core.autocrlf"], cwd=work) == "true"
     assert gitops.stage_and_commit(work, paths, "unchanged", Deadline(60, 10)) is None

@@ -1,22 +1,15 @@
-"""Canonical ``mindie-entry/2`` public entry documents.
+"""Normalized ``mindie-entry/3`` headers and explicit document helper values.
 
-One Markdown file per entry: a small YAML frontmatter header (schema,
-entry_id, domain, kind, title, summary, optional conditions) and the detailed
-body as the Markdown content. There is no separate summary artifact and no
-public revision/producers/sources/status/retirement metadata: the content
-``revision`` is an internal fingerprint computed during parse/write as the
-SHA256 of the canonical sorted compact UTF-8 JSON of the public semantic
-fields (including the detailed body and the normalized — possibly empty —
-conditions), excluding local ownership and state. Draft ownership lives in a
-private entry-owner relation, never in the Markdown. Withdrawal is deletion
-from the published tree, not a tombstone field. ``conditions`` carries only
-known relevant software versions or source commits; hardware, configuration,
-input parameters and documentation/code/issue citations stay in the body.
-Files are canonical LF bytes; hashing and Git commits see exactly what was
-rendered. Duplicate YAML keys and unknown fields are rejected so canonical
-identity is never ambiguous, and an unknown schema fails loudly.
+Public task packages are defined and verified by materials.store: index.md
+binds ordered block hashes, per-block indexes and current navigation. The
+entry revision binds the material digest and public header, while ownership
+and source transcript paths remain private metadata. The assembled content
+value is an explicit read result, never a second durable body authority.
 
-Only safe YAML is used: ``safe_load``/``safe_dump`` never execute constructors.
+The single-document render/parse helpers are for explicitly constructed
+values; they are not the public feed or contribution format. Package intake
+must verify every referenced Markdown file through validate_package_files.
+Safe YAML, unique keys and strict schemas keep identities unambiguous.
 """
 
 from __future__ import annotations
@@ -27,7 +20,7 @@ import re
 
 import yaml
 
-SCHEMA = "mindie-entry/2"
+SCHEMA = "mindie-entry/3"
 KINDS = ("knowledge", "experience")
 
 # The per-file envelope is the real external platform rejection point, not a
@@ -53,6 +46,7 @@ FIELDS = (
     "summary",
     "conditions",
     "content",
+    "material_digest",
 )
 
 PUBLIC_HEADER_FIELDS = (
@@ -63,6 +57,7 @@ PUBLIC_HEADER_FIELDS = (
     "title",
     "summary",
     "conditions",
+    "material_digest",
 )
 
 _OBSERVATION_HEADING = "## Later observations"
@@ -88,7 +83,9 @@ def digest(value) -> str:
 
 def revision_of(doc: dict) -> str:
     """Content revision: SHA256 of the canonical JSON of the public fields."""
-    return digest({key: doc[key] for key in FIELDS if key != "revision"})
+    # The file material layer verifies the ordered block hashes. A header or
+    # append updates this small binding, without hashing all earlier bodies.
+    return digest({key: doc[key] for key in FIELDS if key not in {"revision", "content"}})
 
 
 def _text(value, name, *, nonempty=True):
@@ -118,20 +115,21 @@ def _header_bytes(doc: dict) -> int:
 
 
 def validate(doc: dict) -> dict:
-    """Structural validation of one entry document; returns it unchanged.
+    """Validate header identity and an assembled body value without rewriting it.
 
-    Text fields must already be canonical (stripped): a document whose body
-    carries leading/trailing whitespace is rejected rather than silently
-    rewritten, so ``render_entry(parse_entry(x))`` and the revision digest can
-    never disagree about what the bytes are."""
+    The material digest is verified against ordered files by MaterialStore.
+    Body whitespace is preserved so parser-page/block joins remain lossless.
+    """
     if not isinstance(doc, dict) or set(doc) != set(FIELDS):
-        raise ValueError("entry must contain exactly the mindie-entry/2 fields")
+        raise ValueError("entry must contain exactly the mindie-entry/3 fields")
     if doc["schema"] != SCHEMA:
         raise ValueError("unsupported entry schema")
     if not isinstance(doc["entry_id"], str) or not HEX_RE.fullmatch(doc["entry_id"]):
         raise ValueError("entry_id must be a 64-character hex identity")
     if not isinstance(doc["revision"], str) or not HEX_RE.fullmatch(doc["revision"]):
         raise ValueError("revision must be a 64-character hex digest")
+    if not isinstance(doc["material_digest"], str) or not HEX_RE.fullmatch(doc["material_digest"]):
+        raise ValueError("material_digest must be a 64-character hex digest")
     if not isinstance(doc["domain"], str) or not DOMAIN_RE.fullmatch(doc["domain"]):
         raise ValueError("invalid domain")
     if doc["kind"] not in KINDS:
@@ -155,8 +153,6 @@ def validate(doc: dict) -> dict:
             raise ValueError("conditions must be canonical text")
     if not isinstance(doc["content"], str) or not doc["content"].strip():
         raise ValueError("content must be nonempty text")
-    if doc["content"] != doc["content"].strip():
-        raise ValueError("content must be canonical (no surrounding whitespace)")
     # The only size bound on a body is the real per-file platform envelope
     # the canonical Markdown file must fit; there is no cumulative cap.
     if len(doc["content"].encode("utf-8")) > MAX_FILE_BYTES:
@@ -179,6 +175,7 @@ def make_entry(*, entry_id, domain, kind, title, summary, content,
         summary=summary.strip(),
         conditions=dict(conditions or {}),
         content=content.strip(),
+        material_digest=hashlib.sha256(content.strip().encode('utf-8')).hexdigest(),
     )
     doc["revision"] = revision_of(doc)
     return validate(doc)
@@ -325,7 +322,8 @@ def append_observation(doc: dict, addition: str, *, marker: str) -> tuple[dict, 
     if f"<!-- observation:{marker} -->" in doc["content"]:
         return doc, False
     content = append_observation_text(doc["content"], addition, marker)
-    updated = dict(doc, content=content)
+    updated = dict(doc, content=content,
+                   material_digest=hashlib.sha256(content.encode('utf-8')).hexdigest())
     updated["revision"] = revision_of(updated)
     # The bound is the rendered canonical FILE against the real per-file
     # platform envelope (what Git hosting accepts), not a business total.

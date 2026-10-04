@@ -11,6 +11,9 @@ from mindie_knowledge.loop.cli import capture_hook
 from mindie_knowledge.loop.documents import DraftFull
 from mindie_knowledge.loop.engine import Engine
 from mindie_knowledge.loop.store import Store
+from mindie_knowledge.loop.transcript_redaction import install_scanner
+from material_worker_fixture import command as summary_command
+from lane_support import parser_path
 
 
 @pytest.fixture(autouse=True)
@@ -28,6 +31,7 @@ def _config(tmp_path, settings, admission):
     path.write_text(json.dumps(dict(
         root=str(tmp_path / "root"), domain="test",
         community_config=str(settings), admission_path=str(admission),
+        capture_mode='public-transcript', redactor_executable=install_scanner(), summary_command=summary_command(), transcript_adapter=str(parser_path('codex')),
     )))
     return path
 
@@ -50,6 +54,7 @@ def _event(admission, **extra):
         hook_event_name="Stop", identity_kind="turn", session_id="manual-A",
         turn_id="turn-1", harness="codex", mindie_activation=admission_token(admission),
         last_assistant_message="a bounded summary", budget_seconds=0.8,
+        transcript_path=str(__import__("pathlib").Path(admission).parent / "native.jsonl"),
     )
     event.update(extra)
     return event
@@ -104,7 +109,7 @@ def test_locked_store_is_not_accepted(tmp_path):
     project = tmp_path / "proj"
     project.mkdir()
     config, admission = _ready(tmp_path, project)
-    path = tmp_path / "root" / "test" / "store-v3.sqlite3"
+    path = tmp_path / "root" / "test" / "state-v4.sqlite3"
     held = sqlite3.connect(path)
     held.execute("BEGIN IMMEDIATE")
     started = time.monotonic()
@@ -132,7 +137,7 @@ def test_overlong_summary_keeps_the_transcript_reference(tmp_path):
         last_assistant_message="x" * 32769,
     ))
     refused = capture_hook(config, _event(
-        admission, turn_id="turn-2", last_assistant_message="y" * 32769,
+        admission, turn_id="turn-2", last_assistant_message="y" * 32769, transcript_path=None,
     ))
     assert kept["summary_dropped"] is True and kept["capture_id"]
     assert refused["stage"] == "rejected" and refused["capture_id"] is None
@@ -163,7 +168,7 @@ def test_public_transcript_handoff_never_stores_raw_native_answer(tmp_path):
     try:
         assert store.capture_row(result['capture_id'])['summary'] == ''
         assert store.capture_row(result['capture_id'])['transcript'] == str(transcript)
-        missing = capture_hook(config, _event(admission, turn_id='missing-source'))
+        missing = capture_hook(config, _event(admission, turn_id='missing-source', transcript_path=None))
         assert missing['stage'] == 'rejected' and missing['capture_id'] is None
     finally:
         store.close()
@@ -184,7 +189,7 @@ def test_reactivated_epoch_cancels_the_queued_turn(tmp_path):
         from mindie_knowledge.loop import settings as settings_mod
 
         engine = Engine(
-            store, agent_command=[__import__("sys").executable, "-c", "print('{}')"],
+            store, summary_command=summary_command(), redactor_executable=install_scanner(),
             settings_path=str(tmp_path / "community.json"),
             admission=Admission(admission),
         )
@@ -207,7 +212,7 @@ def test_partial_tail_is_not_no_new_material(tmp_path):
     accepted = capture_hook(config, _event(admission, transcript_path=str(project / "t.jsonl")))
     store = Store(tmp_path / "root", "test")
     try:
-        engine = Engine(store, agent_command=["false"], settings_path=str(tmp_path / "community.json"),
+        engine = Engine(store, redactor_executable=install_scanner(), settings_path=str(tmp_path / "community.json"),
                         admission=Admission(admission))
 
         def read_material(*_a, **_k):
@@ -222,33 +227,5 @@ def test_partial_tail_is_not_no_new_material(tmp_path):
         assert row["status"] == "pending"
         assert "no-new-material" not in (row["detail"] or "")
         assert store.continuation_reason(accepted["capture_id"]).startswith("partial-tail:")
-    finally:
-        store.close()
-
-
-def test_apply_failure_keeps_the_scanned_result(tmp_path, monkeypatch):
-    project = tmp_path / "proj"
-    project.mkdir()
-    config, admission = _ready(tmp_path, project)
-    accepted = capture_hook(config, _event(admission))
-    store = Store(tmp_path / "root", "test")
-    script = tmp_path / "agent.py"
-    script.write_text(
-        "import json,sys\nsys.stdin.buffer.read()\n"
-        "sys.stdout.buffer.write(json.dumps({'entries':[{'entry_id':None,'title':'Case',"
-        "'summary':'Short','conditions':{},'content':'Observed rank 0 failed.'}]}).encode('utf-8'))\n"
-    )
-    try:
-        engine = Engine(
-            store, agent_command=[__import__("sys").executable, str(script)],
-            settings_path=str(tmp_path / "community.json"), admission=Admission(admission),
-        )
-        monkeypatch.setattr(store, "create_draft", lambda **_k: (_ for _ in ()).throw(DraftFull("full")))
-        engine._process(accepted["capture_id"])
-        assert store.capture_row(accepted["capture_id"])["status"] == "apply-pending"
-        attempt = engine.budget.pending_applications()
-        assert attempt and engine.budget.application(attempt[0])["result"]
-        engine._apply_saved(attempt[0], store.capture_row(accepted["capture_id"]))
-        assert store.capture_row(accepted["capture_id"])["status"] == "apply-pending"
     finally:
         store.close()

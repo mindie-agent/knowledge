@@ -27,26 +27,29 @@ def test_wake_survives_hook_process_group_kill(tmp_path):
     write_settings(settings, enabled=True, roots=[project])
     admission = make_admission(tmp_path, project_root=project)
     calls = tmp_path / "calls.txt"
-    agent = tmp_path / "agent.py"
-    agent.write_text(
-        "import json,sys\n"
-        f"open({str(calls)!r}, 'a', encoding='utf-8', newline='\\n').write('call\\n')\n"
-        "sys.stdin.buffer.read()\n"
-        "sys.stdout.buffer.write(json.dumps({'entries': []}).encode('utf-8'))\n"
-    )
+    from datetime import datetime, timezone
+    from mindie_knowledge.loop.transcript_redaction import install_scanner
+    from material_worker_fixture import command
+    import transcript_double
+    transcript = project / 'wire.jsonl'
     from mindie_knowledge.loop.store import Store
 
     Store(tmp_path / "root", "test").close()
+    transcript.write_text(json.dumps(dict(type='session_meta', payload=dict(id='manual-A'))) + '\n' +
+        json.dumps(dict(type='response_item', timestamp=datetime.now(timezone.utc).isoformat(),
+                        payload=dict(type='message', role='user', content=[dict(type='input_text',
+                            text='Anonymous resumed precision case remains unverified.')]))) + '\n')
     config = tmp_path / "engine.json"
     config.write_text(json.dumps(dict(
         root=str(tmp_path / "root"), domain="test",
         community_config=str(settings), admission_path=str(admission),
-        agent_command=[sys.executable, str(agent)],
+        capture_mode="public-transcript", transcript_adapter=transcript_double.__file__,
+        redactor_executable=install_scanner(), summary_command=command(calls=calls),
     )))
     event = dict(
         hook_event_name="Stop", identity_kind="turn", session_id="manual-A",
         turn_id="turn-1", harness="codex", mindie_activation=admission_token(admission),
-        last_assistant_message="rank 0 failed on the real command",
+        transcript_path=str(transcript),
         budget_seconds=1.0,
     )
     marker = tmp_path / "hook.json"
@@ -94,11 +97,11 @@ def test_wake_survives_hook_process_group_kill(tmp_path):
         )
         deadline = time.monotonic() + 8
         while time.monotonic() < deadline:
-            if calls.is_file() and calls.read_text().count("call") >= 1:
+            if calls.is_file() and calls.read_text().count("x") >= 1:
                 break
             time.sleep(0.1)
-        assert calls.is_file() and calls.read_text().count("call") == 1, (
-            calls.read_text() if calls.is_file() else "no agent call",
+        assert calls.is_file() and calls.read_text().count("x") == 1, (
+            calls.read_text() if calls.is_file() else "no index call",
         )
         row = Store(tmp_path / "root", "test")
         try:

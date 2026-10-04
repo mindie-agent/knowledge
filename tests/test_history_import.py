@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 import pytest
+from material_worker_fixture import package_body, command as summary_command
 
 from conftest import make_admission, write_settings
 from lane_support import load_parser
@@ -57,7 +58,7 @@ def contribute(case, **overrides):
 def test_old_messages_are_explicitly_imported_redacted_and_exportable(case):
     import sys
     engine, source = case
-    engine.summary_command = [sys.executable, '-c', 'print(\'{"title":"Synthetic history", "summary":"Reported public result."}\')']
+    engine.summary_command = summary_command(title='Synthetic history')
     secret = 'ghp_' + 'AbCdEf0123456789' * 3
     append(source, message('Historical public result ' + secret),
            message('private reasoning canary', role='assistant', channel='analysis'),
@@ -81,8 +82,11 @@ def test_old_messages_are_explicitly_imported_redacted_and_exportable(case):
     summary_due(engine)
     assert contribute(case)['summary']['status'] == 'complete'
     batch_id = build_batch(engine.store, settings=engine._settings())[0]
-    payload = json.loads(engine.store.batch(batch_id)['batch'])
-    assert parse_entry(payload['files'][0]['content'].encode())['content'] == body
+    from mindie_knowledge.materials.publication import load_batch_payload
+    from mindie_knowledge.materials.store import validate_package_files
+    payload = load_batch_payload(engine.store, engine.store.batch(batch_id))
+    package = validate_package_files({item['path'].split('/', 2)[2]: item['content'] for item in payload['files']})
+    assert package_body(package) == body
     assert engine.store.db.execute('SELECT COUNT(*) FROM captures').fetchone()[0] == 0
 
 
@@ -100,7 +104,7 @@ def test_duplicate_and_explicit_extension_keep_one_latest_entry(case):
     assert len(docs) == 1 and docs[0]['content'].count('first historical observation') == 1
     assert 'second historical observation' in docs[0]['content']
     assert engine.store.db.execute('SELECT COUNT(*) FROM revisions').fetchone()[0] == 1
-    assert engine.store.db.execute('SELECT COUNT(*) FROM history_imports').fetchone()[0] == 1
+    assert engine.store.db.execute('SELECT COUNT(*) FROM material_streams').fetchone()[0] == 1
 
 
 @pytest.mark.parametrize('denial', ['inactive', 'sharing-off', 'source-scope', 'wrong-token'])
@@ -169,7 +173,14 @@ def test_incomplete_or_replaced_source_never_commits_a_partial_entry(case, damag
         args['identity'] = expected
     with pytest.raises(HistoryImportError):
         contribute(case, **args)
-    assert engine.store.drafts_changed() == []
+    if damage == 'tail':
+        row = engine.store.db.execute('SELECT entry_id FROM entries').fetchone()
+        assert 'first valid text' in engine.store.get(engine.store.ref(row[0]))['content']
+        assert engine.store.quarantined_entries()[row[0]] == 'history-intake'
+        from mindie_knowledge.loop.export import build_batch
+        assert build_batch(engine.store, settings=engine._settings()) is None
+    else:
+        assert engine.store.drafts_changed() == []
 
 
 def test_revocation_mid_read_stops_before_redaction_and_commit(case, monkeypatch):
@@ -192,7 +203,7 @@ def test_scanner_failure_does_not_create_an_import_receipt(case, monkeypatch):
     engine.redactor_executable = str(source.parent / 'absent-scanner')
     with pytest.raises(ScannerUnavailable):
         contribute(case)
-    assert engine.store.db.execute('SELECT COUNT(*) FROM history_imports').fetchone()[0] == 0
+    assert engine.store.db.execute('SELECT COUNT(*) FROM material_streams').fetchone()[0] == 0
     assert engine.store.drafts_changed() == []
 
 
@@ -201,7 +212,7 @@ def test_changed_prefix_is_reported_without_overwriting_latest_body(case):
     append(source, message('original history'))
     contribute(case)
     before = engine.store.drafts_changed()[0]
-    source.write_text(source.read_text().replace('original history', 'edited history'))
+    source.write_text(source.read_text().replace('original history', 'modified history'))
     with pytest.raises(HistoryImportError, match='changed'):
         contribute(case)
     assert engine.store.drafts_changed()[0] == before
@@ -224,15 +235,15 @@ def test_repeat_after_header_change_returns_current_reference(case):
 def test_receipt_rolls_back_with_failed_body_commit(case, monkeypatch):
     engine, source = case
     append(source, message('atomic import'))
-    real = engine.store.create_draft
-    def fail(**kwargs):
-        real(**kwargs)
+    real = engine.store._bind_material_draft
+    def fail(*args, **kwargs):
+        real(*args, **kwargs)
         raise OSError('simulated commit interruption')
-    monkeypatch.setattr(engine.store, 'create_draft', fail)
+    monkeypatch.setattr(engine.store, '_bind_material_draft', fail)
     with pytest.raises(OSError):
         contribute(case)
     assert engine.store.drafts_changed() == []
-    assert engine.store.db.execute('SELECT COUNT(*) FROM history_imports').fetchone()[0] == 0
+    assert engine.store.db.execute('SELECT COUNT(*) FROM material_streams').fetchone()[0] == 0
 
 
 def test_ordinary_capture_does_not_import_pre_activation_history(case):
@@ -242,7 +253,7 @@ def test_ordinary_capture_does_not_import_pre_activation_history(case):
     capture = engine.capture(session_id='manual-A', turn_id='ordinary', transcript_path=str(source))
     engine._process(capture['id'])
     assert engine.store.drafts_changed() == []
-    assert engine.store.db.execute('SELECT COUNT(*) FROM history_imports').fetchone()[0] == 0
+    assert engine.store.db.execute('SELECT COUNT(*) FROM material_streams').fetchone()[0] == 0
 
 
 def summary_due(engine):
@@ -258,11 +269,7 @@ def test_import_summary_uses_saved_public_body_once_without_reopening_history(ca
     import sys
     engine, source = case
     marker = source.parent / 'calls'
-    command = ('import json,sys; from pathlib import Path; '
-               f'p=Path({str(marker)!r}); p.write_text(p.read_text()+"x" if p.exists() else "x"); '
-               'v=json.load(sys.stdin); assert "technical result" in v["text"]; '
-               'print(json.dumps(dict(title="Useful title", summary="Reported technical result; not a rerun.")))')
-    engine.summary_command = [sys.executable, '-c', command]
+    engine.summary_command = summary_command(title='Useful title', calls=marker, required='technical result')
     append(source, message('technical result'))
     contribute(case)
     before = engine.store.drafts_changed()[0]['content']
@@ -300,7 +307,7 @@ def test_missing_history_job_is_reported_and_not_exported(case):
     engine, source = case
     append(source, message('saved historical result'))
     first = contribute(case)
-    assert first['summary']['status'] == 'failed'
+    assert first['summary']['status'] == 'pending'
     with engine.store._write_txn():
         engine.store.db.execute('DELETE FROM transcript_tasks')
     result = contribute(case)
@@ -308,3 +315,63 @@ def test_missing_history_job_is_reported_and_not_exported(case):
     assert result['summary']['status'] == 'missing'
     assert not engine.store.has_changed_drafts(generation=engine._settings().generation, ready_only=True)
     assert build_batch(engine.store, settings=engine._settings()) is None
+
+
+def test_missing_material_batch_is_visible_without_recreating_model_work(case):
+    from mindie_knowledge.loop.export import build_batch
+    engine, source = case
+    marker = source.parent / 'must-not-call-model'
+    engine.summary_command = summary_command(calls=marker)
+    append(source, message('Material survives its missing queue record.'))
+    assert contribute(case)['summary']['status'] == 'pending'
+    before = engine.store.drafts_changed()[0]['content']
+    with engine.store._write_txn():
+        engine.store.db.execute('DELETE FROM material_batches')
+    summary_due(engine)
+    result = contribute(case)
+    assert result['status'] == 'unchanged'
+    assert result['summary']['status'] == 'missing'
+    assert 'batch job is missing' in result['summary']['detail']
+    assert engine.status()['transcript_summaries'] == {'missing': 1}
+    assert engine.store.drafts_changed()[0]['content'] == before
+    assert engine.store.db.execute('SELECT COUNT(*) FROM material_batches').fetchone()[0] == 0
+    assert engine.store.db.execute('SELECT summary_status FROM transcript_tasks').fetchone()[0] == 'pending'
+    assert not marker.exists()
+    assert build_batch(engine.store, settings=engine._settings()) is None
+
+
+def test_k3_interrupted_import_retains_pages_but_requires_complete_selected_snapshot(case):
+    engine, source = case
+    engine.summary_command = summary_command()
+    append(source, message('K3-04 resumed precision observation remains unresolved.'))
+    with source.open('ab') as stream:
+        stream.write(b'{"partial":')
+    with pytest.raises(HistoryImportError):
+        contribute(case)
+    summary_due(engine)
+    from mindie_knowledge.loop.export import build_batch
+    assert build_batch(engine.store, settings=engine._settings()) is None
+    assert set(engine.store.quarantined_entries().values()) == {'history-intake'}
+    with source.open('ab') as stream:
+        stream.write(b'null}\n')
+    result = contribute(case)
+    assert result['consumed_bytes'] == source.stat().st_size
+    assert engine.store.quarantined_entries() == {}
+    assert build_batch(engine.store, settings=engine._settings()) is not None
+
+
+def test_k3_explicit_same_body_retry_preserves_failure_call_cost(case):
+    engine, source = case
+    engine.summary_command = summary_command(fail=True)
+    append(source, message('K3-02 checkpoint correction invalidates the early benchmark interpretation.'))
+    contribute(case)
+    summary_due(engine)
+    assert contribute(case)['summary']['status'] == 'failed'
+    before = engine.status()['summary_usage']
+    engine.summary_command = summary_command()
+    summary_due(engine)
+    assert engine.status()['summary_usage'] == before
+    assert contribute(case, retry_summary=True)['summary']['status'] == 'pending'
+    summary_due(engine)
+    assert contribute(case)['summary']['status'] == 'complete'
+    assert engine.status()['summary_usage']['model_calls'] == 2

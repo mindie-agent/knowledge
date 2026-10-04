@@ -1,4 +1,8 @@
-"""Latest-only drafts: bounded retention, pending sends and atomic updates."""
+"""Current file packages and frozen contributions across resumed work.
+
+The continuation-after-apparent-completion scenario is orthogonalized from
+the long K3 task cases; no historical transcript or business value is copied.
+"""
 import json
 from contextlib import closing
 
@@ -8,6 +12,7 @@ from conftest import write_settings
 from mindie_knowledge.loop.engine import Engine
 from mindie_knowledge.loop.export import build_batch
 from mindie_knowledge.loop.store import Store, digest
+from mindie_knowledge.materials.publication import load_batch_payload
 
 
 def draft(store, generation="allowed"):
@@ -37,7 +42,10 @@ def test_pending_send_owns_old_payload_after_draft_advances(tmp_path):
         old = draft(store, settings.generation)
         batch_id, *_ = build_batch(store, settings=settings)
         pending = store.batch(batch_id)
-        sent_body = json.loads(pending["batch"])["files"][0]["content"]
+        descriptor = json.loads(pending["batch"])
+        assert all("content" not in item for item in descriptor["files"])
+        frozen = load_batch_payload(store, pending)
+        sent_files = frozen["files"]
         new, _ = store.append_observation(old["entry_id"], "Later unsent observation",
                                           marker="a" * 32, generation=settings.generation)
         assert store._revision_doc(old["entry_id"], old["revision"]) is None
@@ -47,31 +55,38 @@ def test_pending_send_owns_old_payload_after_draft_advances(tmp_path):
             sent.append(batch) or {"status": "submitted", "head_sha": "a" * 40,
                                    "pr_url": "https://example.invalid/pull/1"})}
         engine._submit(pending)
-        assert len(sent) == 1 and sent[0]["files"][0]["content"] == sent_body
-        assert "Later unsent observation" not in sent_body
+        assert len(sent) == 1 and sent[0]["files"] == sent_files
+        assert all("Later unsent observation" not in item["content"] for item in sent_files)
         assert store.drafts_changed(generation=settings.generation) == [new]
         assert "content" not in json.loads(store.batch(batch_id)["batch"])["files"][0]
 
 
-def test_existing_store_discards_old_drafts_once_and_keeps_published_cache(tmp_path):
+def test_restart_keeps_current_packages_and_does_not_open_old_database(tmp_path):
     root = tmp_path / "store"
+    previous = root / "test" / "store-v3.sqlite3"
+    previous.parent.mkdir(parents=True)
+    previous.write_bytes(b"An inert previous database; never imported by the new file authority.")
+    old_bytes = previous.read_bytes()
+    with closing(Store(tmp_path / "author", "test")) as author:
+        published = author.create_draft(kind="experience", title="Published correction",
+                                       summary="The early result was corrected.",
+                                       content="Public correction retained for independent readers.",
+                                       entry_id="b" * 64)
+        package = author.materials.export_task(published["entry_id"])
     with closing(Store(root, "test")) as store:
         old = draft(store)
         new, _ = store.append_observation(old["entry_id"], "Latest", marker="a" * 32,
                                           generation="allowed")
-        published = dict(old, entry_id="b" * 64)
-        from mindie_knowledge.loop.documents import revision_of
-        published["revision"] = revision_of(published)
-        store.install_feed([published], feed_ident="f" * 64)
-        with store._write_txn():
-            store._insert_revision(old, "draft", 0)
-            store.grant("draft", old["entry_id"], old["revision"], "allowed")
-            store.db.execute("DELETE FROM meta WHERE key='latest-body-only'")
+        store.install_feed([package], feed_ident="f" * 64, source_revision="c" * 40)
     with closing(Store(root, "test")) as store:
         assert store._revision_doc(old["entry_id"], old["revision"]) is None
         assert store._revision_doc(new["entry_id"], new["revision"]) == new
         assert store.get(store.ref(published["entry_id"]))["content"] == published["content"]
         assert not store.granted("draft", old["entry_id"], old["revision"], "allowed")
+        for table in ("entries", "revisions"):
+            assert all(not json.loads(row[0]).get("content")
+                       for row in store.db.execute(f"SELECT doc FROM {table}"))
+        assert previous.read_bytes() == old_bytes
 
 
 def test_failed_append_rolls_back_latest_body_and_retention(store, monkeypatch):

@@ -24,7 +24,7 @@ from mindie_knowledge.loop.process import terminate_tree
 SCHEMA_BATCH = "mindie-contribution/1"
 SCHEMA_FEEDBACK = "mindie-feedback/1"
 SCHEMA_CONFIG = "mindie-community-config/1"
-SCHEMA_ENTRY = "mindie-entry/2"
+SCHEMA_ENTRY = "mindie-entry/3"
 
 MAX_DETAIL = 800
 # The per-file envelope is the real external platform rejection point, not a

@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -19,6 +20,9 @@ from mindie_knowledge.loop.transport import Service
 
 import transcript_double as transcript_mod
 from conftest import admission_token, make_admission, write_settings
+from package_fixture import install_documents
+from material_worker_fixture import command as summary_command
+from test_history_import import summary_due
 
 PRODUCER = "a" * 64
 
@@ -33,12 +37,19 @@ def draft(store, title="ACL graph investigation", content="Compare eager first."
 
 
 def _revision_double(files, domain, base_commit, entry_refs):
-    # Clearly labeled mechanism double for the community-owned batch digest.
-    from mindie_knowledge.loop.store import digest as _digest
+    from mindie_knowledge.community.batch import batch_revision
+    return batch_revision(files, domain, base_commit, entry_refs)
 
-    return _digest({"files": sorted((f["path"], f["sha256"]) for f in files),
-                    "domain": domain, "base_commit": base_commit,
-                    "entry_refs": sorted(entry_refs)})
+
+def capture_public(engine, text, turn):
+    from datetime import datetime, timezone
+    source = Path(engine.settings_path).parent / "public-transcript.jsonl"
+    if not source.exists():
+        source.write_text(json.dumps(dict(type="session_meta", payload=dict(id="manual-A"))) + "\n")
+    with source.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(dict(type="response_item", timestamp=datetime.now(timezone.utc).isoformat(),
+            payload=dict(type="message", role="user", content=[dict(type="input_text", text=text)]))) + "\n")
+    return engine.capture(session_id="manual-A", turn_id=turn, transcript_path=str(source))
 
 
 def test_stable_id_latest_draft_and_expired_pins(store):
@@ -66,7 +77,7 @@ def test_same_title_entries_keep_distinct_identities(store):
     assert first["entry_id"] != second["entry_id"]
     hits = store.query("Shared symptom title")["results"]
     assert {h["ref"].split("@")[0].rsplit("/", 1)[-1] for h in hits} == {
-        first["entry_id"][:16], second["entry_id"][:16]
+        first["entry_id"], second["entry_id"]
     }
 
 
@@ -80,7 +91,7 @@ def test_imported_content_cannot_forge_ownership(store):
         title="Downloaded entry", summary="Published elsewhere.",
         content="A published body carrying no ownership claim.",
     )
-    store.install_feed([foreign], feed_ident="f" * 64)
+    install_documents(store, [foreign], feed_ident="f" * 64)
     with pytest.raises(ValueError, match="owning task"):
         store.append_observation(doc["entry_id"], "forged update", marker="b" * 32,
                                  producer="d" * 64)
@@ -124,7 +135,8 @@ def test_short_refs_resolve_exactly_and_ambiguity_fails(store):
     short = store.query("ACL graph")["results"][0]["ref"]
     # Query pins a short ref: 16-hex prefixes, no separate revision field.
     entry_tok, rev_tok = short.rsplit("/", 1)[-1].split("@")
-    assert entry_tok == doc["entry_id"][:16] and rev_tok == updated["revision"][:16]
+    assert entry_tok == doc["entry_id"] and rev_tok == updated["revision"]
+    assert store.get(f"{entry_tok[:16]}@{rev_tok[:16]}")["revision"] == updated["revision"]
     assert store.get(short)["revision"] == updated["revision"]
     # Superseded draft pins expire, including abbreviated references.
     old_pin = f"{doc['entry_id'][:16]}@{doc['revision'][:16]}"
@@ -154,26 +166,20 @@ def test_correction_changes_retrieval_header_but_preserves_old_body(store):
     assert store.get(store.ref(old['entry_id']))['summary']==new['summary']
 
 
-def test_quota_deferred_material_keeps_cursor_and_resumes(gated,tmp_path):
-    store,engine,_,_=gated
-    from datetime import datetime,timezone
-    stamp=datetime.now(timezone.utc).isoformat()
-    rollout=tmp_path/'native.jsonl'
-    rollout.write_text(json.dumps({'type':'session_meta','payload':{'id':'manual-A'}})+'\n'+
-        json.dumps({'timestamp':stamp,'type':'response_item','payload':{'type':'message','role':'assistant','phase':'final_answer','content':[{'type':'output_text','text':'Observed device mapping: physical id does not equal logical id.'}]}})+'\n')
-    root=session_key('manual-A')
-    for i in range(6):engine.budget.reserve(str(i),root,'organize');engine.budget.finish(str(i),True)
-    capture=engine.capture(session_id='manual-A',turn_id='defer',transcript_path=str(rollout))
-    # The fixture may root this native child elsewhere; use its actual root key.
-    actual_root=store.capture_row(capture['id'])['root_session']
-    with store.db:store.db.execute('UPDATE maintenance_attempts SET session=?',(actual_root,))
-    engine._process(capture['id'])
-    assert store.capture_row(capture['id'])['status']=='pending'
-    assert store.cursor(str(rollout.resolve())) is None
-    with store.db:store.db.execute('UPDATE maintenance_attempts SET started=started-3602')
-    engine._process(capture['id'])
-    assert store.capture_row(capture['id'])['status']=='organized'
-    assert store.cursor(str(rollout.resolve()))['finish']==rollout.stat().st_size
+def test_pending_index_uses_saved_material_without_reopening_source(gated, tmp_path):
+    store, engine, _, _ = gated
+    calls = tmp_path / "summary-calls"
+    engine.summary_command = summary_command(calls=calls, title="Device mapping")
+    captured = capture_public(engine, "Observed device mapping evidence.", "index-later")
+    engine._process(captured["id"])
+    assert store.capture_row(captured["id"])["status"] == "organized"
+    assert not calls.exists()
+    source = tmp_path / "public-transcript.jsonl"
+    source.rename(tmp_path / "archived-native.jsonl")
+    summary_due(engine)
+    assert calls.read_text() == "x"
+    assert store.query("Observed device mapping")["results"]
+    assert store.db.execute("SELECT summary_status FROM transcript_tasks").fetchone()[0] == "complete"
 
 
 def test_vote_replaces_per_root_and_stays_opaque(store):
@@ -204,23 +210,16 @@ def gated(tmp_path):
     settings = write_settings(tmp_path / "community.json", enabled=True,
                               roots=[project])
     adapter = make_admission(tmp_path, project_root=project)
-    runner = tmp_path / "runner.py"
-    runner.write_text(
-        "import json,sys\n"
-        "p=json.loads(sys.stdin.buffer.read().decode('utf-8'))\n"
-        "sys.stdout.buffer.write(json.dumps({'entries':[{'entry_id':None,'title':'Device mapping',"
-        "'summary':'Container logical ids restart at zero.',"
-        "'content':p['increment'][:400],'conditions':{}}]}).encode('utf-8'))\n"
-    )
     store = Store(tmp_path / "store", "test")
     from mindie_knowledge.loop.activation import Admission
 
     engine = Engine(
         store,
-        agent_command=[sys.executable, str(runner)],
         settings_path=tmp_path / "community.json",
         admission=Admission(adapter),
-        transcript_adapter=transcript_mod,
+        transcript_adapter=__import__("lane_support").load_parser("codex"),
+        redactor_executable=__import__("mindie_knowledge.loop.transcript_redaction", fromlist=["install_scanner"]).install_scanner(),
+        summary_command=summary_command(title="Device mapping"),
     )
     yield store, engine, settings, adapter
     store.close()
@@ -234,7 +233,7 @@ def test_community_off_produces_zero_capture_state(tmp_path):
     from mindie_knowledge.loop.activation import Admission
 
     engine = Engine(
-        store, agent_command=[sys.executable, "-c", "import sys; sys.exit(3)"],
+        store,
         settings_path=settings_path, admission=Admission(adapter),
     )
     result = engine.capture(session_id="manual-A", turn_id="t1",
@@ -246,10 +245,9 @@ def test_community_off_produces_zero_capture_state(tmp_path):
     store.close()
 
 
-def test_capture_organizes_draft_from_summary_without_a_query(gated):
+def test_capture_preserves_public_transcript_without_a_query(gated):
     store, engine, _, _ = gated
-    result = engine.capture(session_id="manual-A", turn_id="t1",
-                            summary="Mapped physical device 8; container uses logical 0.")
+    result = capture_public(engine, "Device mapping: physical device 8; container uses logical 0.", "t1")
     assert result["status"] == "queued"
     engine._process(result["id"])
     row = store.capture_row(result["id"])
@@ -311,7 +309,7 @@ def test_cursor_persists_full_anchor_identity_and_tamper_fails_closed(gated, tmp
     assert store.capture_row(first["id"])["status"] == "organized"
     cursor = next(iter(store.db.execute("SELECT * FROM cursors")), None)
     assert cursor is not None
-    persisted = transcript_mod.FileIdentity.unserialize(
+    persisted = engine.transcript.FileIdentity.unserialize(
         cursor["identity"], cursor["file_identity"]
     )
     assert persisted is not None and persisted.anchor_len > 0
@@ -329,47 +327,30 @@ def test_cursor_persists_full_anchor_identity_and_tamper_fails_closed(gated, tmp
     assert store.cursor(cursor["file_identity"])["finish"] == finish_before
 
 
-def test_failed_region_is_consumed_and_never_replayed(gated, tmp_path):
-    store, engine, settings_path, _ = gated
-    engine.agent_command = [sys.executable, "-c", "import sys; sys.exit(1)"]
-    rollout = tmp_path / "rollout.jsonl"
-    from datetime import datetime, timezone
-
-    stamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    with open(rollout, "w", encoding="utf-8", newline="\n") as f:
-        f.write(json.dumps({"type":"session_meta","payload":{"id":"manual-A"}})+"\n")
-        f.write(json.dumps({"timestamp": stamp, "type": "response_item",
-                            "payload": {"type": "message", "role": "user",
-                                        "content": [{"type": "input_text",
-                                                     "text": "investigate"}]}}) + "\n")
-    result = engine.capture(session_id="manual-A", turn_id="t1",
-                            transcript_path=str(rollout), summary="")
-    engine._process(result["id"])
-    row = store.capture_row(result["id"])
-    assert row["status"] == "failed"
-    gaps = store.coverage_gaps()
-    assert len(gaps) == 1 and gaps[0]["status"] == "failed"
-    # A later Stop starts past the failed region; it is not reread.
-    with open(rollout, "a", encoding="utf-8", newline="\n") as f:
-        f.write(json.dumps({"timestamp": stamp, "type": "response_item",
-                            "payload": {"type": "message", "role": "user",
-                                        "content": [{"type": "input_text",
-                                                     "text": "new material"}]}}) + "\n")
-    engine.agent_command = [sys.executable, "-c", "print('{\"entries\":[]}')"]
-    second = engine.capture(session_id="manual-A", turn_id="t2",
-                            transcript_path=str(rollout), summary="")
+def test_failed_index_keeps_complete_body_and_later_capture_does_not_replay_it(gated):
+    store, engine, _, _ = gated
+    engine.summary_command = summary_command(fail=True)
+    first = capture_public(engine, "Original public failure evidence.", "failed-index")
+    engine._process(first["id"])
+    assert store.capture_row(first["id"])["status"] == "organized"
+    summary_due(engine)
+    assert store.db.execute("SELECT summary_status FROM transcript_tasks").fetchone()[0] == "failed"
+    second = capture_public(engine, "Later public correction.", "later-evidence")
     engine._process(second["id"])
-    assert store.capture_row(second["id"])["status"] == "organized"
-    assert store.coverage_gaps()[0]["finish"] == gaps[0]["finish"]
+    body = store.drafts_changed()[0]["content"]
+    assert body.count("Original public failure evidence.") == 1
+    assert body.count("Later public correction.") == 1
+    from mindie_knowledge.loop.export import build_batch
+    assert build_batch(store, settings=engine._settings()) is None
 
 
 def test_disable_while_queued_cancels_without_model(gated, tmp_path):
     store, engine, settings, _ = gated
-    result = engine.capture(session_id="manual-A", turn_id="t1", summary="work")
+    result = capture_public(engine, "Queued public material.", "t1")
     write_settings(tmp_path / "community.json", enabled=False, roots=[tmp_path])
     engine._process(result["id"])
     assert store.capture_row(result["id"])["status"] == "cancelled"
-    assert engine.budget.status()["calls_last_hour"] == 0
+    assert store.db.execute("SELECT count(*) FROM material_batches").fetchone()[0] == 0
 
 
 def test_outbox_coalesces_and_disable_cancels_unsent(gated, tmp_path):
@@ -386,7 +367,7 @@ def test_outbox_coalesces_and_disable_cancels_unsent(gated, tmp_path):
     built = build_batch(store, settings=current, revision_fn=_revision_double)
     batch_id, revision, batch, ids, votes = built
     paths = {f["path"] for f in batch["files"]}
-    assert any(p.startswith("cases/") for p in paths)
+    assert any(p.startswith("tasks/") for p in paths)
     assert any(p.startswith("feedback/") for p in paths)
     assert (store.root / "outbox" / "staging" / batch_id).is_dir()
     current = settings_mod.load(tmp_path / "community.json")
@@ -461,7 +442,7 @@ def test_transport_loopback_and_identity(tmp_path):
     store = Store(tmp_path / "store", "test")
     from mindie_knowledge.loop.activation import Admission
 
-    engine = Engine(store, agent_command=None, settings_path=settings_path,
+    engine = Engine(store, settings_path=settings_path,
                     admission=Admission(adapter))
     service = Service(engine, admission=Admission(adapter))
     thread = threading.Thread(target=service.http.serve_forever, daemon=True)
@@ -483,15 +464,17 @@ def test_transport_loopback_and_identity(tmp_path):
                                              reason="", _session_id="manual-A",
                                              _session_verified=True))
         assert vote["publishable"] is True
+        native = project / "native.jsonl"
+        native.write_text(json.dumps(dict(type="session_meta", payload=dict(id="manual-A"))) + "\n")
         queued = service.call(
             "capture",
-            dict(session_id="manual-A", turn_id="t", summary="x",
+            dict(session_id="manual-A", turn_id="t", transcript_path=str(native), summary="x",
                  _session_id="manual-A", _activation=admission_token(adapter)),
         )
         assert queued["status"] == "queued"  # admission passes; runner is absent
         engine._process(queued["id"])
         assert store.capture_row(queued["id"])["status"] == "failed"
-        assert engine.budget.status()["calls_last_hour"] == 0  # no model attempt
+        assert store.db.execute("SELECT count(*) FROM material_batches").fetchone()[0] == 0  # no model attempt
         from mindie_knowledge.loop.transport import rpc
 
         assert rpc(service.connection, "status", timeout=5)["domain"] == "test"
@@ -507,8 +490,7 @@ def test_unsent_draft_never_backfills_after_reenable(gated, tmp_path):
     from mindie_knowledge.loop.export import build_batch
 
     store, engine, _, _ = gated
-    result = engine.capture(session_id="manual-A", turn_id="t1",
-                            summary="Mapped physical device 8; container uses 0.")
+    result = capture_public(engine, "Device mapping: physical device 8; container uses 0.", "t1")
     engine._process(result["id"])
     assert store.capture_row(result["id"])["status"] == "organized"
     gen_a = settings_mod.load(tmp_path / "community.json").generation
@@ -539,7 +521,7 @@ def test_old_pending_batch_disabled_after_restart(gated, tmp_path):
     assert store.batch(batch_id)["status"] == "pending"
     write_settings(tmp_path / "community.json", enabled=False, roots=[tmp_path / "proj"])
     write_settings(tmp_path / "community.json", enabled=True, roots=[tmp_path / "proj"])
-    restarted = Engine(store, agent_command=None,
+    restarted = Engine(store,
                        settings_path=tmp_path / "community.json",
                        admission=engine.admission)
     restarted.revoke_stale()  # what start() runs before any thread
@@ -558,22 +540,12 @@ def test_old_generation_update_id_cannot_republish(gated, tmp_path):
     write_settings(tmp_path / "community.json", enabled=False, roots=[tmp_path / "proj"])
     write_settings(tmp_path / "community.json", enabled=True, roots=[tmp_path / "proj"])
     gen_c = settings_mod.load(tmp_path / "community.json").generation
-    # A (malicious or confused) organizer result naming the old draft as an
-    # update id must not append — that would republish the whole old body.
-    result = {"entries": [dict(entry_id=doc["entry_id"], title=None,
-                               summary=doc["summary"], content="smuggled update",
-                               conditions={})]}
-    refs, notes = engine._apply(result, opaque=PRODUCER, marker="f" * 32,
-                                generation=gen_c)
-    assert refs == [] and any("generation" in note for note in notes)
+    with pytest.raises(ValueError, match="generation"):
+        store.append_observation(doc["entry_id"], "smuggled update", producer=PRODUCER,
+                                 marker="f" * 32, generation=gen_c)
     assert store.drafts_changed(generation=gen_c) == []
-    # Fresh material in the current generation works normally.
-    result = {"entries": [dict(entry_id=None, title="Fresh note", summary="s",
-                               content="current generation body", conditions={})]}
-    refs, _ = engine._apply(result, opaque=PRODUCER, marker="e" * 32,
-                            generation=gen_c)
-    assert len(refs) == 1
-    assert len(store.drafts_changed(generation=gen_c)) == 1
+    fresh = draft(store, title="Fresh note", content="Current generation body.", generation=gen_c)
+    assert [item["entry_id"] for item in store.drafts_changed(generation=gen_c)] == [fresh["entry_id"]]
 
 
 def test_current_generation_draft_and_vote_publish(gated, tmp_path):
@@ -590,14 +562,14 @@ def test_current_generation_draft_and_vote_publish(gated, tmp_path):
                       generation=current.generation)
     built = build_batch(store, settings=current, revision_fn=_revision_double)
     batch = built[2]
-    cases = [f for f in batch["files"] if f["path"].startswith("cases/")]
+    cases = [f for f in batch["files"] if f["path"].endswith("/index.md")]
     feedback = [f for f in batch["files"] if f["path"].startswith("feedback/")]
     assert len(cases) == 1 and len(feedback) == 1
     votes = json.loads(feedback[0]["content"])["votes"]
     assert len(votes) == 1 and votes[0]["rating"] == "down"
 
 
-def test_v3_store_keeps_old_private_files_inert_and_persists_capture_floor(tmp_path):
+def test_v4_store_keeps_old_private_files_inert_and_persists_capture_floor(tmp_path):
     root = tmp_path / 'test'
     root.mkdir()
     prior = root / 'store-v2.sqlite3'
@@ -610,16 +582,17 @@ def test_v3_store_keeps_old_private_files_inert_and_persists_capture_floor(tmp_p
     second = Store(tmp_path, 'test')
     assert second.capture_floor == floor
     assert prior.read_bytes() == before
-    assert (root / 'store-v3.sqlite3').is_file()
+    assert (root / 'state-v4.sqlite3').is_file()
     second.close()
 
 
 def test_title_correction_keeps_publication_path(store):
-    from mindie_knowledge.loop.export import _filename
     first = draft(store)
+    first_index = f"tasks/{first['entry_id']}/index.md"
     second, _ = store.append_observation(first['entry_id'], 'Correction.',
         marker='c' * 32, producer=PRODUCER, header={'title': 'Corrected scope'})
-    assert _filename(first) == _filename(second)
+    assert first_index == f"tasks/{second['entry_id']}/index.md"
+    assert 'Corrected scope' in store.materials.export_task(second['entry_id'])['files']['index.md']
 
 
 def test_pending_votes_are_not_sent_after_upstream_withdrawal(gated):
@@ -627,7 +600,7 @@ def test_pending_votes_are_not_sent_after_upstream_withdrawal(gated):
     store, engine, _, _ = gated
     settings = engine._settings()
     doc = draft(store)
-    store.install_feed([doc], feed_ident='f' * 64)
+    install_documents(store, [doc], feed_ident='f' * 64)
     ref = store.ref(doc['entry_id'], doc['revision'])
     store.record_vote(ref=ref, rating='down', reason='', root_hash=session_key('consumer'),
                       publishable=True, generation=settings.generation)
@@ -639,4 +612,4 @@ def test_pending_votes_are_not_sent_after_upstream_withdrawal(gated):
     engine._submit(pending)
     assert writes == []
     assert store.batch(built[0])['status'] == 'disabled'
-    assert store.draft_headers(owner=PRODUCER) == []
+    assert store.query(doc["title"])["results"] == []

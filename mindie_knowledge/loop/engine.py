@@ -1,65 +1,31 @@
-"""Bounded background organization with a configured agent runner.
+"""Authorized public transcript capture, incremental indexing and publication.
 
-One organizer role, no judge: the runner receives the filtered, already
-redaction-masked increment plus compact draft headers and returns at most
-three entries; the first content of an entry is its detailed case body and
-later content is appended as a marker-deduplicated, self-contained
-observation. The input region is durably reserved BEFORE the model spawns,
-so every outcome — failure, crash, cancellation — consumes it; attempted and
-successful cursors are separate and failed regions stay visible as coverage
-gaps.
-
-A region that failed with an explicit deadline and has no saved result gets
-exactly one delayed background recovery (at most two model attempts per
-region in total, the counter persisted across restarts). The recovery
-re-reads the SAME source range with the SAME transcript identity and
-verifies the recorded end offset and content digest before any model call;
-an unverifiable or again-failing recovery keeps a locatable, non-complete
-gap while other captures and new material continue. Successful regions are
-never re-organized and saved results are never re-applied.
-
-Sharing revocation is live: the outbox/idle thread rereads the shared
-settings file about once a second; disabling (or replacing) the configuration
-cancels in-flight model work, pending batch timers and unsent contributions,
-and never backfills the disabled period after re-enable. An *unknown*
-authority state — the settings file or the named consent document missing,
-unreadable, corrupt or malformed — is a fault, not a revocation (GateFault):
-no new read/model/outbound-write happens, but already-received captures,
-pending gap recoveries and saved apply results are parked with a persisted
-bounded backoff and resume once the authority is restored and revalidates;
-unsent batches are held, not cancelled.
+Capture stores complete deterministically redacted material. The separate summary
+worker indexes complete new blocks plus prior navigation using the bounded
+LangMem protocol. Its durable ledger owns model outcomes and local result recovery;
+this engine never rewrites a body or automatically replays a paid attempt.
+Authority faults park work, revocation cancels unsent work, and uncertain remote
+writes remain subject to read-only reconciliation.
 """
 
 from __future__ import annotations
 
-import json
 import queue
 import threading
 import time
 from pathlib import Path
 
-from mindie_knowledge.redact import scan_text
-
 from . import settings as settings_mod
 from .activation import activation_epoch, AdmissionUnavailable as AdmissionUnreadable
-from .budget import BudgetExceeded, MaintenanceBudget
+from .budget import BudgetExceeded
 from .dfx import failure
-from .documents import MAX_FILE_BYTES, DraftFull
-from .limits import ORGANIZER_PROCESS_TIMEOUT
-from .process import MaintenanceCancelled, bounded_run
-from .store import Store, canonical, digest, new_identity, session_key
+from .process import MaintenanceCancelled
+from .store import Store, canonical, session_key
 
 Store_confirmed = Store.CONFIRMED_BATCH
 
-ORGANIZE_FIELDS = {"entry_id", "title", "summary", "conditions", "content"}
-MAX_STRUCTURED_RESULT = 32 * 1024
-MAX_INPUT = 64 * 1024
-SUMMARY_FIELD = 4096
 _EOF_SETTLE_LIMIT = 3
 _PARTIAL_LIMIT = 4
-# One delayed recovery attempt for a deadline-failed region; the persisted
-# per-region counter, not wall time, bounds the total model attempts to two.
-GAP_RECOVERY_DELAY = 300.0
 
 
 class GateFault(Exception):
@@ -74,45 +40,17 @@ class CursorConflict(Exception):
     """The shared cursor moved. Do not call the model or count a failure."""
 
 
-class RestoreUnavailable(OSError):
-    """The current remote body could not be read (network/IO environment).
-
-    A saved apply resumes it with persisted backoff — it is never a
-    deterministic content refusal (those return False) and never a reason to
-    replay the organizer."""
-
-
-def mask_text(text):
-    """Deterministic pre-model privacy filter; returns (masked, rules)."""
-    findings = scan_text(text)
-    for finding in findings:
-        if finding.start is None or finding.end is None:
-            raise ValueError("redaction finding is missing original source offsets")
-    for finding in sorted(findings, key=lambda f: f.start, reverse=True):
-        text = text[: finding.start] + f"[redacted:{finding.rule}]" + text[finding.end :]
-    return text, sorted({finding.rule for finding in findings})
-
-
 class Engine:
-    def __init__(self, store, *, agent_command=None, settings_path=None,
+    def __init__(self, store, *, settings_path=None,
                  admission=None, state_dir=None, transcript_adapter=None,
-                 capture_mode="organize", redactor_executable=None, summary_command=None):
+                 capture_mode="public-transcript", redactor_executable=None, summary_command=None):
         """``transcript_adapter`` is the already-loaded trusted parser module
         (absolute local module from engine config ``transcript_adapter``)
         exporting ``FileIdentity``/``identify``/``read_material``. Without it
         transcript capture fails explicitly; core never substitutes a summary."""
-        if agent_command is not None and (
-            not isinstance(agent_command, list)
-            or not agent_command
-            or not all(isinstance(x, str) for x in agent_command)
-        ):
-            raise ValueError("agent_command must be a nonempty argv list or None")
         self.store = store
-        self.agent_command = agent_command
-        if capture_mode not in {"organize", "public-transcript"}:
-            raise ValueError("unknown capture mode")
-        if capture_mode == "public-transcript" and not redactor_executable:
-            raise ValueError("public transcript capture requires an installed redactor")
+        if capture_mode != "public-transcript":
+            raise ValueError("only public-transcript capture is supported")
         if summary_command is not None and (not isinstance(summary_command, list) or not summary_command or not all(isinstance(x, str) for x in summary_command)):
             raise ValueError("summary_command must be a nonempty argv list")
         self.capture_mode = capture_mode
@@ -122,13 +60,12 @@ class Engine:
         self.admission = admission
         self.transcript = transcript_adapter
         self.state_dir = Path(state_dir) if state_dir else store.root / "outbox"
-        self.budget = MaintenanceBudget(store)
         self.queue = queue.Queue(maxsize=8)
         self.stop = threading.Event()
         self._cancel = threading.Event()
         self._summary_cancel = threading.Event()
         self.thread = threading.Thread(
-            target=self.run, name="mindie-maintenance", daemon=True
+            target=self.run, name="mindie-capture", daemon=True
         )
         self.outbox_thread = threading.Thread(
             target=self._outbox_loop, name="mindie-outbox", daemon=True
@@ -213,12 +150,10 @@ class Engine:
             return dict(status="skipped",
                         reason="service is not admitting new work")
         namespace = harness if isinstance(harness, str) else ""
-        if self.capture_mode == "public-transcript":
-            if not transcript_path:
-                return dict(status="skipped", reason="public transcript reference is required")
-            # The native transcript is the only raw source. Do not duplicate
-            # an unredacted final answer in the durable handoff queue.
-            summary = ""
+        if not transcript_path:
+            return dict(status="skipped", reason="public transcript reference is required")
+        # The native transcript is the only raw source; the queue stores no body.
+        summary = ""
         captured = self.store.add_capture(
             root_session=root_hash, session=session_id, turn=turn_id,
             transcript=transcript_path, summary=summary or "",
@@ -239,7 +174,7 @@ class Engine:
             self.last_activity = time.monotonic()
         return captured
 
-    # -------------------------------------------------------------- organize
+    # -------------------------------------------------------------- capture gates
 
     def _gate_live(self):
         if self.stop.is_set():
@@ -281,98 +216,6 @@ class Engine:
                 raise MaintenanceCancelled("project scope is no longer allowed")
         return settings
 
-    def agent(self, payload, *, attempt_id, root_hash, gate=None, reserve_region=None):
-        if self.capture_mode == "public-transcript":
-            raise ValueError("public transcript capture forbids body model calls")
-        raw = canonical(payload)
-        if len(raw.encode("utf-8")) > MAX_INPUT:
-            raise ValueError("maintenance input exceeds limit")
-        self._cancel.clear()
-        self.budget.reserve(attempt_id, root_hash, payload.get("role", "organize"))
-        outcome = False
-        started = False
-        category = None
-        try:
-            self._gate_live()
-            if gate is not None:
-                gate()  # identical-authorization recheck immediately before spawn
-            if reserve_region is not None:
-                reserve_region()  # budget admitted; consume exactly this input before spawn
-            started = True
-            output = bounded_run(
-                self.agent_command, raw, timeout=ORGANIZER_PROCESS_TIMEOUT, max_output=131072,
-                cancel=self._cancel,
-            )
-            try:
-                result = json.loads(output)
-                if not isinstance(result, dict):
-                    raise ValueError("agent must return one JSON object")
-                if len(canonical(result).encode("utf-8")) > MAX_STRUCTURED_RESULT:
-                    raise ValueError("structured result exceeds the 32 KiB limit")
-                self._validate_organize(result)
-            except (ValueError, UnicodeError, TypeError) as exc:
-                # A malformed result is this item's content failure, not a
-                # shared maintenance problem.
-                category = "invalid_result"
-                failure(
-                    "organizer.result",
-                    stage="validate",
-                    category="invalid_result",
-                    exception=exc,
-                )
-                raise
-            outcome = True
-            return result
-        except MaintenanceCancelled:
-            outcome = None
-            raise
-        except (AdmissionUnreadable, CursorConflict, GateFault):
-            if not started:
-                self.budget.abandon_unstarted(attempt_id)
-                outcome = "abandoned"
-            raise
-        except (RuntimeError, TimeoutError, ValueError, OSError) as exc:
-            if category is None:
-                category = getattr(exc, "mindie_category", None)
-            raise
-        finally:
-            # A validated result stays 'running' until the caller checkpoints
-            # it. Finishing success here would drop the output on an apply crash.
-            # An unstarted admission, cursor conflict or gate fault is
-            # abandoned, not failed.
-            # A per-item content failure stays consumed but does not feed the
-            # domain pause circuit.
-            if outcome is not True and outcome != "abandoned":
-                self.budget.finish(attempt_id, outcome, category=category)
-
-    @staticmethod
-    def _validate_organize(result):
-        if set(result) != {"entries"} or not isinstance(result["entries"], list):
-            raise ValueError("invalid organizer result")
-        if len(result["entries"]) > 3:
-            raise ValueError("at most three entries per call")
-        for entry in result["entries"]:
-            if not isinstance(entry, dict) or not set(entry) <= ORGANIZE_FIELDS:
-                raise ValueError("invalid organized entry fields")
-            ident = entry.get("entry_id")
-            if ident is not None and not isinstance(ident, str):
-                raise ValueError("entry_id must be null or an identity string")
-            title = entry.get("title")
-            if ident:
-                # An update may pass title=null to preserve the existing one.
-                if title is not None and (not isinstance(title, str) or not title.strip()):
-                    raise ValueError("title must be null or nonempty text")
-            elif not isinstance(title, str) or not title.strip():
-                raise ValueError("a new entry requires a nonempty title")
-            for name in ("summary", "content"):
-                if not isinstance(entry.get(name), str) or not entry[name].strip():
-                    raise ValueError(f"organized entry requires nonempty {name}")
-            if not isinstance(entry.get("conditions", {}), dict):
-                raise ValueError("conditions must be an object")
-
-    @staticmethod
-    def _is_notification(row):
-        return row.get("identity_kind") == "notification"
 
     def _defer_counted(self, ident, prefix, limit, *, dormant_reason=None, terminal=None):
         """Finite model-free waits. The last state is dormant or a terminal status."""
@@ -425,14 +268,8 @@ class Engine:
         in an unknown state. Nothing is cancelled and no saved result is
         dropped: the capture stays pending with a persisted, capped backoff
         and resumes once the authority is restored and revalidation passes.
-        A pending gap recovery keeps its routing reason (the region is still
-        owed its one bounded recovery) and just waits out the fault."""
+        """
         reason = self.store.continuation_reason(ident) or ""
-        if reason.startswith("gap-recovery:"):
-            self.store.schedule_continuation(
-                ident, due=time.time() + 60, reason=reason, eligible=1,
-            )
-            return
         try:
             count = (
                 int(reason.split(":", 1)[1])
@@ -458,53 +295,10 @@ class Engine:
             ident, "cursor-conflict", _PARTIAL_LIMIT, dormant_reason="cursor-conflict",
         )
 
-    def _defer_apply(self, ident, *, transient=False):
-        """Keep a saved result and wait. Never calls the organizer.
-
-        A transient environment failure (local IO, remote read) resumes with
-        persisted exponential backoff and no terminal attempt count — a saved
-        valid result is not abandoned because the environment was down.
-        A deterministic content failure is checked finitely, then parks
-        dormant: it cannot heal without new content, and it is never a
-        network probe."""
-        reason = self.store.continuation_reason(ident) or ""
-        if transient:
-            try:
-                count = (
-                    int(reason.split(":", 1)[1])
-                    if reason.startswith("apply-transient:")
-                    else 0
-                )
-            except ValueError:
-                count = 0
-            count += 1
-            self.store.schedule_continuation(
-                ident,
-                due=time.time() + min(3600.0, 60.0 * 2.0 ** min(count - 1, 6)),
-                reason=f"apply-transient:{count}", eligible=1,
-            )
-            return
-        if reason == "apply-pending":
-            count = 0
-        else:
-            try:
-                count = int(reason.split(":", 1)[1]) if reason.startswith("apply-retry:") else 0
-            except ValueError:
-                count = 0
-        count += 1
-        if count > _PARTIAL_LIMIT:
-            self.store.schedule_continuation(
-                ident, due=0, reason="apply-pending", eligible=0,
-            )
-            return
-        self.store.schedule_continuation(
-            ident, due=time.time() + min(8, 2 ** (count - 1)),
-            reason=f"apply-retry:{count}", eligible=1,
-        )
 
     def _transcript_increment(self, row, settings, lease, region):
         """Read/filter the authorized increment; reserves regions as it goes.
-        Returns (text, summary_only, notes) or None when there is no material."""
+        Returns complete public text or None when there is no material."""
         parser = self.transcript
         if parser is None:
             self.store.mark_capture(row["id"], "failed", "no transcript adapter is configured")
@@ -571,7 +365,7 @@ class Engine:
                     row["id"], "failed", "unreliable transcript timestamps",
                 )
                 return None
-            return (inc["text"], False, [])
+            return inc["text"]
         if inc.get("partial") and inc["end"] == start:
             self._defer_partial(row["id"])
             return None
@@ -660,7 +454,7 @@ class Engine:
             self.store.mark_capture(row["id"], "failed",
                                     "transcript identity mismatch; not read")
             return None
-        if self.capture_mode == "public-transcript" and status in {
+        if status in {
             "invalid-record", "invalid-boundary", "oversize",
         }:
             self.store.mark_capture(row["id"], "failed",
@@ -669,691 +463,24 @@ class Engine:
         self.store.mark_capture(row["id"], "failed", "transcript read failed: " + status)
         return None
 
-    @staticmethod
-    def _pr_number(pr_url):
-        if not isinstance(pr_url, str):
-            return None
-        tail = pr_url.rstrip("/").rsplit("/", 1)[-1]
-        return int(tail) if tail.isdigit() else None
-
-    def _restore_sent_draft(self, entry_id, generation):
-        """Fetch the exact body this entry last sent so a later same-task
-        observation appends to/updates the prior body instead of replacing it
-        with only the new paragraph.
-
-        Submitted content obeys the linked PR's actual state. A merged PR,
-        including one accepted by squash or rebase, is read from upstream
-        main only. An open PR is read only from the upstream PR ref whose
-        fetched SHA is the API head. A closed unmerged PR is not restored.
-        The synced feed is a local cache of an earlier read; it does not
-        prove the current remote body and cannot override a withdrawal.
-        A deterministic refusal keeps the update refused (False); an
-        environment or linkage read failure raises :class:`RestoreUnavailable`
-        so the saved apply resumes with persisted backoff. No base is ever
-        fabricated, a withdrawn entry is never resurrected and a maintainer
-        correction is never overwritten.
-        """
-        def fail(reason):
-            self._error(f"restore: {reason}"[:240])
-            return False
-
-        if not generation:
-            return fail("community unavailable")
-        receipt = self.store.sent_receipt(entry_id)
-        if not receipt or receipt.get("generation") not in (generation, None):
-            return fail("no matching receipt")
-        if self.community is None:
-            return fail("community unavailable")
-        path = receipt.get("path")
-        if not path:
-            return fail("incomplete receipt")
-        settings = self._settings()
-        if not settings.allows_capture() or not settings.repository:
-            return fail("capture disabled")
-        from mindie_knowledge.community.common import CommunityError
-
-        try:
-            from mindie_knowledge.community import gitops
-            from mindie_knowledge.community.common import Deadline
-            from mindie_knowledge.community.publish import (
-                _contribution_head, _remote_url, _valid_sha,
-            )
-            from mindie_knowledge.community.transport import transport_from_settings
-
-            from .documents import parse_entry
-
-            cfg = settings.as_dict()
-            read_repo = settings.repository
-            number = self._pr_number(receipt.get("pr_url"))
-            if number is None:
-                return fail("incomplete receipt")
-            deadline = Deadline(cfg.get("transaction_seconds", 120), 30,
-                                cancel=self._cancel)
-            env = gitops.git_env(cfg)
-            pr = transport_from_settings(cfg, self.state_dir).get_pull_request(
-                read_repo, number, deadline
-            )
-            if not _contribution_head(pr, cfg):
-                return fail("PR head is not the configured contribution")
-            if pr.get("state") == "closed" and not pr.get("merged"):
-                return fail("closed unmerged PR is not restored")
-            if pr.get("state") != "open" and not pr.get("merged"):
-                raise CommunityError("PR state is unreadable")
-            # Upstream is the content remote. The fork is only a push target.
-            work_dir = gitops.ensure_clone(
-                _remote_url(cfg, read_repo),
-                self.state_dir / "git" / read_repo.replace("/", "_"),
-                deadline, env=env,
-            )
-            if pr.get("merged"):
-                source = f"origin/{settings.branch}"
-            else:
-                api_sha = (pr.get("head") or {}).get("sha")
-                if not _valid_sha(api_sha):
-                    raise CommunityError("open PR has no valid head SHA")
-                fetched = gitops.fetch_pr_head(
-                    work_dir, number, "", deadline, env=env,
-                    remote_url=_remote_url(cfg, read_repo),
-                )
-                if fetched.lower() != str(api_sha).lower():
-                    raise CommunityError("upstream PR ref does not match the API head")
-                source = fetched
-            raw = gitops.show_file(work_dir, source, path, deadline, env=env)
-            if raw is None:
-                return fail(f"no blob at {source}")
-            normalized = raw.encode("utf-8").replace(b"\r\n", b"\n").replace(b"\r", b"\n")
-            if len(normalized) > MAX_FILE_BYTES:
-                return fail("blob exceeds the per-file platform envelope")
-            try:
-                doc = parse_entry(normalized)
-            except ValueError:
-                return fail(f"blob at {source} is not a canonical entry")
-            if doc["entry_id"] != entry_id:
-                return fail(f"blob at {source} is a different entry")
-            self.store.restore_draft(entry_id, doc, generation=generation)
-            return True
-        except RestoreUnavailable:
-            raise
-        except (OSError, TimeoutError, CommunityError) as exc:
-            raise RestoreUnavailable(
-                f"current remote body unreadable: {type(exc).__name__}: {exc}"
-            ) from exc
-        except Exception as exc:
-            return fail(f"{type(exc).__name__}: {exc}")
-
-    def _scanned_entries(self, result):
-        """Keep only outbound-clean entries and assign stable ids before apply."""
-        kept, notes = [], []
-        for entry in result["entries"]:
-            candidate = canonical({key: entry.get(key) for key in sorted(ORGANIZE_FIELDS)})
-            findings = scan_text(candidate)
-            if findings:
-                rules = ", ".join(sorted({finding.rule for finding in findings}))
-                notes.append(
-                    "entry rejected before storage/publication; outbound scan: " + rules
-                )
-                continue
-            item = {key: entry.get(key) for key in ORGANIZE_FIELDS if key in entry}
-            if not item.get("entry_id"):
-                item["entry_id"] = new_identity()
-                item["new"] = True
-            kept.append(item)
-        return kept, notes
-
-    def _apply_one(self, entry, *, opaque, marker, generation):
-        ident = entry["entry_id"]
-        header = {
-            key: entry[key] for key in ("title", "summary", "conditions") if key in entry
-        }
-        if entry.get("new"):
-            found = self.store._row(ident)
-            if found is not None and found["draft_revision"]:
-                return self.store.ref(ident, found["draft_revision"])
-            doc = self.store.create_draft(
-                kind="experience", title=entry["title"], summary=entry["summary"],
-                content=entry["content"], conditions=entry.get("conditions") or {},
-                owner=opaque, entry_id=ident, generation=generation,
-            )
-            return self.store.ref(doc["entry_id"], doc["revision"])
-        try:
-            doc, _appended = self.store.append_observation(
-                ident, entry["content"], marker=marker, producer=opaque,
-                generation=generation, header=header,
-            )
-        except ValueError as exc:
-            if "no local draft" not in str(exc) or not self._restore_sent_draft(ident, generation):
-                raise
-            doc, _appended = self.store.append_observation(
-                ident, entry["content"], marker=marker, producer=opaque,
-                generation=generation, header=header,
-            )
-        return self.store.ref(doc["entry_id"], doc["revision"])
-
-    def _checkpoint_result(self, attempt_id, result, region, inc, summary_only, notes, row, *, apply=False):
-        """Save the scanned result and the region receipt in one transaction.
-
-        ``apply`` then runs the saved body. A false value leaves apply-pending
-        when there is something to apply, which is the admission-unreadable path.
-        """
-        kept, scan_notes = self._scanned_entries(result)
-        notes = list(notes) + scan_notes
-        more = bool(inc.get("more") and inc.get("end", 0) > inc.get("start", 0))
-        region_id = region.get("region_id")
-        region_status = "summary-only" if summary_only else "succeeded" if region_id else None
-        detail = canonical(dict(refs=[], notes=notes))[:1000]
-        if not kept:
-            self.budget.settle_empty(
-                attempt_id, canonical(dict(refs=[], notes=notes)),
-                capture_id=row["id"], capture_detail=detail,
-                region_id=region_id, region_status=region_status or "succeeded",
-                more=more,
-            )
-            return
-        self.budget.checkpoint(
-            attempt_id, canonical(dict(entries=kept)),
-            canonical(dict(items=[], notes=scan_notes, refs=[], more=more)),
-            capture_id=row["id"], capture_status="apply-pending",
-            capture_detail=detail, region_id=region_id, region_status=region_status,
-        )
-        if apply:
-            self._apply_saved(attempt_id, self.store.capture_row(row["id"]) or row)
-
-    def _apply_saved(self, attempt_id, row):
-        """Apply a checkpointed result once. Never calls the organizer."""
-        record = self.budget.application(attempt_id)
-        if record is None or not record.get("result"):
-            return
-        if self.capture_mode == "public-transcript":
-            # Retain an uncommitted legacy result for inspection, but do not
-            # publish model-authored bodies under the new transcript contract.
-            with self.store._write_txn():
-                self.store.db.execute("UPDATE maintenance_attempts SET status='held' WHERE id=?", (attempt_id,))
-                if row:
-                    self.store.mark_capture(row['id'], 'failed', 'legacy model result held; not applied to public transcript')
-            return
-        try:
-            self._revalidate(row)
-        except (AdmissionUnreadable, GateFault):
-            # The body stays. A later due continuation retries the apply.
-            if row and row.get("id"):
-                self._defer_apply(row["id"], transient=True)
-            return
-        except MaintenanceCancelled as exc:
-            self.budget.release_application(
-                attempt_id, canonical(dict(state="revoked", cause=str(exc)[:200])),
-            )
-            if row and row.get("status") not in {"cancelled", "organized"}:
-                self.store.mark_capture(row["id"], "cancelled", str(exc)[:500])
-            return
-        payload = json.loads(record["result"])
-        receipt = json.loads(record["apply_receipt"] or "{}")
-        if not isinstance(receipt, dict):
-            receipt = {}
-        items = [item for item in receipt.get("items", []) if isinstance(item, dict)]
-        done = {item.get("entry_id") for item in items if item.get("state") == "applied"}
-        refs = [ref for ref in receipt.get("refs", []) if isinstance(ref, str)]
-        notes = [note for note in receipt.get("notes", []) if isinstance(note, str)]
-        marker = attempt_id.split(":", 2)[2]
-        opaque = self.store.opaque_for(row["root_session"])
-        blocked = False
-        transient = False
-        for entry in payload.get("entries", []):
-            entry_id = entry.get("entry_id")
-            if entry_id in done:
-                continue
-            try:
-                ref = self._apply_one(
-                    entry, opaque=opaque, marker=marker, generation=row["generation"],
-                )
-                refs.append(ref)
-                items.append(dict(entry_id=entry_id, state="applied"))
-                done.add(entry_id)
-            except DraftFull:
-                blocked = True
-                items.append(dict(entry_id=entry_id, state="blocked", cause="draft-full"))
-                notes.append("draft full: the per-file platform envelope is reached")
-            except OSError as exc:
-                # Environment failure (local IO, remote body read): resume
-                # with persisted backoff; never counted as a content failure.
-                blocked = True
-                transient = True
-                items.append(dict(entry_id=entry_id, state="blocked", cause="apply-transient"))
-                notes.append(str(exc)[:200])
-            except ValueError as exc:
-                # Deterministic content failure: parked after finite checks.
-                blocked = True
-                items.append(dict(entry_id=entry_id, state="blocked", cause="apply-failed"))
-                notes.append(str(exc)[:200])
-        receipt = dict(items=items, notes=notes, refs=refs, more=bool(receipt.get("more")))
-        detail = canonical(dict(refs=refs, notes=notes))[:1000]
-        if blocked:
-            self.budget.checkpoint(
-                attempt_id, record["result"], canonical(receipt),
-                capture_id=row["id"], capture_status="apply-pending",
-                capture_detail=detail,
-            )
-            self._defer_apply(row["id"], transient=transient)
-            return
-        self.budget.complete_application(
-            attempt_id, canonical(receipt), capture_id=row["id"],
-            capture_detail=detail, more=bool(receipt.get("more")),
-        )
-
-    def _apply(self, result, *, opaque, marker, generation):
-        """Deterministic metadata update + append; no repair model call."""
-        refs, notes = [], []
-        for entry in result["entries"]:
-            candidate = canonical({k: entry.get(k) for k in sorted(ORGANIZE_FIELDS)})
-            findings = scan_text(candidate)
-            if findings:
-                rules = ", ".join(sorted({f.rule for f in findings}))
-                notes.append(f"entry rejected before storage/publication; outbound scan: {rules}")
-                continue
-            try:
-                ident = entry.get("entry_id")
-                if ident:
-                    try:
-                        doc, _appended = self.store.append_observation(
-                            ident, entry["content"], marker=marker, producer=opaque,
-                            generation=generation, header={k: entry[k] for k in
-                                ("title", "summary", "conditions") if k in entry},
-                        )
-                    except ValueError as exc:
-                        # A compacted (confirmed-sent) draft has no local body:
-                        # fetch the exact prior remote body once, then append.
-                        if "no local draft" not in str(exc) or not self._restore_sent_draft(
-                            ident, generation
-                        ):
-                            raise
-                        doc, _appended = self.store.append_observation(
-                            ident, entry["content"], marker=marker, producer=opaque,
-                            generation=generation, header={k: entry[k] for k in
-                                ("title", "summary", "conditions") if k in entry},
-                        )
-                else:
-                    doc = self.store.create_draft(
-                        kind="experience", title=entry["title"],
-                        summary=entry["summary"], content=entry["content"],
-                        conditions=entry.get("conditions") or {}, owner=opaque,
-                        generation=generation,
-                    )
-                refs.append(self.store.ref(doc["entry_id"], doc["revision"]))
-            except DraftFull:
-                notes.append(f"draft full: {entry.get('entry_id')}")
-            except ValueError as exc:
-                notes.append(str(exc)[:200])
-        return refs, notes
-
-    def _optional_refs(self, masked, notes):
-        """Optional retrieval context for the organizer payload.
-
-        Only an explicit index-not-ready state skips the refs: the authorized
-        increment is still organized normally. Any other query error still
-        propagates to the failure path — nothing is silently swallowed and no
-        material is consumed by a missing index.
-        """
-        from .store import IndexNotReady
-
-        try:
-            return [
-                hit["ref"]
-                for hit in self.store.query(masked[:2000], limit=5)["results"]
-            ]
-        except IndexNotReady:
-            notes.append("retrieval index not ready; organized without optional refs")
-            return []
-
-    def _recover_gap(self, row, region_id):
-        """The one permitted delayed recovery of a deadline-failed region.
-
-        Re-reads exactly the failed source range with the recorded transcript
-        identity and verifies the persisted end offset and content digest
-        before any model call — never the live cursor and never new material.
-        A second failure (or an unverifiable source) leaves a locatable,
-        non-complete gap; other captures continue.
-        """
-        ident = row["id"]
-        region = self.store.gap_region(region_id)
-        if region is None:
-            self.store.mark_capture(
-                ident, "failed", "gap recovery region is missing; gap retained"
-            )
-            return
-        if region["status"] != "failed":
-            # Already resolved (or cancelled) elsewhere: resume normal flow.
-            self.store.defer_capture(
-                ident, due=time.time(), reason="gap already resolved; continuing",
-            )
-            return
-
-        def keep_gap(detail):
-            detail = f"{detail}; gap retained at [{region['start']},{region['finish']})"
-            # Guarded: a concurrent winner's recovered success is never
-            # downgraded by this loser's late failure write.
-            self.store.finish_gap_if_unresolved(region_id, ident, detail)
-
-        try:
-            self._revalidate(row)
-        except AdmissionUnreadable:
-            self.store.schedule_continuation(
-                ident, due=time.time() + 60,
-                reason=f"gap-recovery:{region_id}", eligible=1,
-            )
-            return
-        except GateFault:
-            # Wait out the authority fault; the region keeps its one recovery.
-            self.store.schedule_continuation(
-                ident, due=time.time() + 60,
-                reason=f"gap-recovery:{region_id}", eligible=1,
-            )
-            return
-        except MaintenanceCancelled as exc:
-            self.store.mark_capture(ident, "cancelled", str(exc)[:500])
-            return
-        parser = self.transcript
-        if parser is None or not row["transcript"]:
-            keep_gap("gap recovery requires the original transcript")
-            return
-        key = str(Path(row["transcript"]).resolve(strict=False))
-        if key != region["file_identity"]:
-            keep_gap("gap recovery source path changed")
-            return
-        expected = None
-        if region.get("identity"):
-            expected = parser.FileIdentity.unserialize(region["identity"], key)
-            if expected is None:
-                keep_gap("persisted transcript identity is unusable")
-                return
-        import inspect
-
-        try:
-            exact_range = "scan_until" in inspect.signature(
-                parser.read_material
-            ).parameters
-        except (TypeError, ValueError):
-            exact_range = False
-        if not exact_range:
-            keep_gap("transcript parser lacks exact-range recovery support")
-            return
-        inc = parser.read_material(
-            row["transcript"], int(region["start"]),
-            session_id=row["session"], not_before=row["boundary"],
-            expected=expected, scan_until=int(region["finish"]),
-        )
-        if (
-            inc.get("status") != "ok"
-            or inc.get("end") != region["finish"]
-            or inc.get("digest") != region["digest"]
-            or not str(inc.get("text") or "").strip()
-        ):
-            keep_gap("gap recovery could not verify the same source range")
-            return
-        masked, rules = mask_text(inc["text"])
-        notes = ["bounded deadline-gap recovery"]
-        if rules:
-            notes.append("pre-model redaction: " + ", ".join(rules))
-        if not masked.strip():
-            keep_gap("recovery increment fully redacted")
-            return
-        opaque = self.store.opaque_for(row["root_session"])
-        marker = (inc.get("digest") or region["digest"])[:64]
-        payload = dict(
-            role="organize", domain=self.store.domain, increment=masked,
-            coverage=dict(
-                summary_only=False, notes=notes,
-                gaps=len(self.store.coverage_gaps(key)),
-                ranges=inc.get("coverage", []),
-                start=inc.get("start"), end=inc.get("end"),
-                more=inc.get("more", False),
-            ),
-            existing_drafts=self.store.draft_headers(
-                owner=opaque, generation=row["generation"], query=masked),
-            retrieved_refs=self._optional_refs(masked, notes),
-        )
-        while payload["existing_drafts"] and len(canonical(payload).encode()) > MAX_INPUT:
-            payload["existing_drafts"].pop()
-        attempt_id = f"organize:{ident}:{marker}:recover"
-        try:
-            result = self.agent(
-                payload, attempt_id=attempt_id,
-                root_hash=row["root_session"],
-                gate=lambda: self._revalidate(row),
-            )
-        except BudgetExceeded as exc:
-            if exc.retry_at is not None:
-                self.store.schedule_continuation(
-                    ident, due=exc.retry_at,
-                    reason=f"gap-recovery:{region_id}", eligible=1,
-                )
-                return
-            keep_gap(f"gap recovery exhausted ({exc})")
-            return
-        except AdmissionUnreadable:
-            self.store.schedule_continuation(
-                ident, due=time.time() + 60,
-                reason=f"gap-recovery:{region_id}", eligible=1,
-            )
-            return
-        except CursorConflict:
-            self.store.schedule_continuation(
-                ident, due=time.time() + 8,
-                reason=f"gap-recovery:{region_id}", eligible=1,
-            )
-            return
-        except GateFault:
-            self.store.schedule_continuation(
-                ident, due=time.time() + 60,
-                reason=f"gap-recovery:{region_id}", eligible=1,
-            )
-            return
-        except MaintenanceCancelled as exc:
-            self.store.mark_capture(ident, "cancelled", str(exc)[:500])
-            return
-        except (RuntimeError, TimeoutError, ValueError, OSError) as exc:
-            keep_gap(f"gap recovery failed again ({type(exc).__name__})")
-            return
-        try:
-            self._revalidate(row)  # again before applying any result
-        except AdmissionUnreadable:
-            self._checkpoint_result(
-                attempt_id, result, {"region_id": region_id}, inc, False, notes, row,
-            )
-            return
-        except GateFault:
-            # Save the recovered result; the apply waits out the fault.
-            self._checkpoint_result(
-                attempt_id, result, {"region_id": region_id}, inc, False, notes, row,
-            )
-            return
-        except MaintenanceCancelled as exc:
-            self.store.mark_capture(ident, "cancelled", str(exc)[:500])
-            return
-        self._checkpoint_result(
-            attempt_id, result, {"region_id": region_id}, inc, False, notes, row,
-            apply=True,
-        )
-        self.last_activity = time.monotonic()
 
     def _process(self, ident):
         row = self.store.capture_row(ident)
-        if row is None:
-            return
-        if row["status"] not in {"queued", "pending", "deferred"}:
-            return
-        settings = self._settings()
-        block = settings.capture_block_kind()
-        if block == "fault":
-            # An unknown authority state is not a revocation: park the
-            # received work with a bounded backoff; it resumes unchanged
-            # after the authority is restored.
-            self._defer_gate_fault(ident)
-            return
-        if block == "revoked":
-            self.store.mark_capture(ident, "cancelled", "sharing disabled while queued")
-            return
-        try:
-            lease = self.admission.active_lease(row["session"]) if self.admission else None
-        except AdmissionUnreadable:
-            self._defer_admission(ident)
-            return
-        if self.admission is not None and lease is None:
-            inspected = self.admission.inspect(row["session"])
-            if inspected.get("status") == "unavailable":
-                self._defer_admission(ident)
-                return
-            self.store.mark_capture(ident, "cancelled", "task deactivated while queued")
-            return
-        if not self.agent_command and self.capture_mode != "public-transcript":
-            self.store.mark_capture(
-                ident, "failed", "no maintenance runner is configured"
-            )
-            return
-        reason = self.store.continuation_reason(ident) or ""
-        if reason.startswith("gap-recovery:"):
-            if self.capture_mode == "public-transcript":
-                self.store.mark_capture(ident, "failed", "legacy organizer gap retained; not replayed through transcript capture")
-                return
-            self._recover_gap(row, reason.split(":", 1)[1].strip())
+        if row is None or row["status"] not in {"queued", "pending", "deferred"}:
             return
         region = {}
         try:
-            try:
-                self._revalidate(row)
-            except AdmissionUnreadable:
-                self._defer_admission(ident)
+            settings = self._revalidate(row)
+            lease = self.admission.active_lease(row["session"]) if self.admission else None
+            if not row["transcript"]:
+                raise ValueError("public transcript reference is required; summary fallback is forbidden")
+            if not self.redactor_executable:
+                raise ValueError("public transcript capture requires an installed redactor")
+            text = self._transcript_increment(row, settings, lease, region)
+            if text is None:
                 return
-            except GateFault:
-                self._defer_gate_fault(ident)
-                return
-            except MaintenanceCancelled as exc:
-                self.store.mark_capture(ident, "cancelled", str(exc)[:500])
-                return
-            if row["transcript"]:
-                outcome = self._transcript_increment(row, settings, lease, region)
-            elif self._is_notification(row):
-                self.store.mark_capture(
-                    ident, "failed",
-                    "notification requires a transcript; summary is forbidden",
-                )
-                return
-            elif row["summary"].strip():
-                outcome = ("", True, [])
-            else:
-                self.store.mark_capture(ident, "no-new-material")
-                return
-            if outcome is None:
-                return
-            text, summary_only, notes = outcome
-            if self.capture_mode == "public-transcript":
-                if summary_only:
-                    self.store.mark_capture(ident, "failed", "public transcript mode forbids summary fallback")
-                    return
-                from .transcript_capture import capture
-                capture(self, row, text, region)
-                return
-            if summary_only and self._is_notification(row):
-                self.store.mark_capture(
-                    ident, "failed", "notification forbids summary fallback",
-                )
-                return
-            if summary_only:
-                text = "[summary] " + " ".join(row["summary"].split())[:SUMMARY_FIELD]
-            masked, rules = mask_text(text)
-            if rules:
-                notes.append("pre-model redaction: " + ", ".join(rules))
-            if not masked.strip():
-                if region.get("region_id"):
-                    self.store.finish_region(
-                        region["region_id"], "failed", "increment fully redacted"
-                    )
-                self.store.mark_capture(ident, "no-shareable-material")
-                return
-            opaque = self.store.opaque_for(row["root_session"])
-            inc = region.get("inc") or {}
-            marker = (inc.get("digest") or digest(["summary", ident]))[:64]
-            payload = dict(
-                role="organize", domain=self.store.domain, increment=masked,
-                coverage=dict(
-                    summary_only=summary_only, notes=notes,
-                    gaps=len(self.store.coverage_gaps(region.get("key", "")))
-                    if region.get("key") else 0,
-                    ranges=inc.get("coverage", []),
-                    start=inc.get("start"), end=inc.get("end"),
-                    more=inc.get("more", False),
-                ),
-                existing_drafts=self.store.draft_headers(
-                    owner=opaque, generation=row["generation"], query=masked),
-                retrieved_refs=self._optional_refs(masked, notes),
-            )
-            # Keep the new evidence intact; older optional context yields first
-            # when UTF-8 headers would exceed the worker envelope.
-            while payload["existing_drafts"] and len(canonical(payload).encode()) > MAX_INPUT:
-                payload["existing_drafts"].pop()
-            def reserve_input():
-                if inc and not region.get("region_id"):
-                    reserved = region["reserve"](inc["start"], inc["end"], inc["digest"])
-                    if reserved is None:
-                        raise CursorConflict("cursor advanced before reservation")
-                    region["region_id"] = reserved
-                self.store.mark_capture(ident, "processing", "input reserved; no retry of this region")
-            attempt_id = f"organize:{ident}:{marker}"
-            try:
-                result = self.agent(
-                    payload, attempt_id=attempt_id,
-                    root_hash=row["root_session"],
-                    gate=lambda: self._revalidate(row),
-                    reserve_region=reserve_input,
-                )
-            except AdmissionUnreadable:
-                self._defer_admission(ident)
-                return
-            except CursorConflict:
-                self._defer_reread(ident)
-                return
-            except GateFault:
-                # Pre-spawn authority fault: the attempt was abandoned before
-                # any region reservation; park the capture unchanged.
-                self._defer_gate_fault(ident)
-                return
-            except MaintenanceCancelled as exc:
-                if region.get("region_id"):
-                    self.store.finish_region(
-                        region["region_id"], "cancelled", str(exc)[:500]
-                    )
-                self.store.mark_capture(ident, "cancelled", str(exc)[:500])
-                return
-            try:
-                self._revalidate(row)  # again before applying any result
-            except AdmissionUnreadable:
-                self._checkpoint_result(
-                    attempt_id, result, region, inc, summary_only, notes, row,
-                )
-                return
-            except GateFault:
-                # The model result is durably saved; only the apply waits out
-                # the authority fault (apply-pending continuation, backoff in
-                # _apply_saved). Nothing is cancelled, nothing is re-run.
-                self._checkpoint_result(
-                    attempt_id, result, region, inc, summary_only, notes, row,
-                )
-                return
-            except MaintenanceCancelled as exc:
-                if region.get("region_id"):
-                    self.store.finish_region(
-                        region["region_id"], "cancelled", str(exc)[:500]
-                    )
-                self.store.mark_capture(ident, "cancelled", str(exc)[:500])
-                return
-            self._checkpoint_result(
-                attempt_id, result, region, inc, summary_only, notes, row,
-                apply=True,
-            )
-            self.last_activity = time.monotonic()
-        except BudgetExceeded as exc:
-            if exc.retry_at is not None and not region.get("region_id"):
-                self.store.defer_capture(ident, due=exc.retry_at, reason=str(exc))
-            else:
-                self.store.mark_capture(ident, "discarded", str(exc))
+            from .transcript_capture import capture
+            capture(self, row, text, region)
         except CursorConflict:
             self._defer_reread(ident)
         except AdmissionUnreadable:
@@ -1361,12 +488,16 @@ class Engine:
         except MaintenanceCancelled:
             self.store.mark_capture(ident, "cancelled", "capture authority revoked")
         except GateFault:
-            # Safety net for any gate site above: park, never drop.
             self._defer_gate_fault(ident)
         except Exception as exc:
-            if self.capture_mode == "public-transcript" and isinstance(exc, OSError):
-                # Deterministic local work retries unchanged input. No body/
-                # cursor transaction committed and no model was called.
+            detail = f"{type(exc).__name__}: {exc}"[:1000]
+            self._error(detail)
+            if getattr(exc, "metadata_committed", False):
+                # The body/cursor committed; cleanup is a separate visible fault.
+                self.background_errors["material-cleanup"] = type(exc).__name__
+                return
+            if isinstance(exc, OSError):
+                # Retry only deterministic local work whose transaction failed.
                 previous = self.store.continuation_reason(ident) or ""
                 try:
                     attempt = int(previous.split(":")[1]) if previous.startswith("public-io:") else 0
@@ -1377,84 +508,21 @@ class Engine:
                                          reason=f"public-io:{attempt}:{type(exc).__name__}")
                 return
             self._unexpected("knowledge.capture", "process", exc)
-            detail = f"{type(exc).__name__}: {exc}"[:1000]
-            self._error(detail)
-            current = self.store.capture_row(ident)
-            if current and current["status"] in {"apply-pending", "organized"}:
-                return
             if region.get("region_id"):
                 self.store.finish_region(region["region_id"], "failed", detail)
-                if (
-                    getattr(exc, "mindie_category", None) == "deadline"
-                    and row.get("transcript")
-                    and self.store.schedule_gap_recovery(
-                        region["region_id"], due=time.time() + GAP_RECOVERY_DELAY
-                    )
-                    is not None
-                ):
-                    # The gap keeps one delayed recovery: the capture stays
-                    # pending on its gap-recovery continuation, not failed.
-                    return
             self.store.mark_capture(ident, "failed", detail)
 
     # ---------------------------------------------------------------- worker
 
-    def _apply_due(self):
-        """Apply one saved result whose continuation is due. No new model.
-
-        ``begin_work`` is the same admission gate as capture processing.
-        Frozen or stopping does not start. One count covers the whole apply
-        and is released in ``finally``.
-        """
-        attempt_id = self.store.due_application()
-        if not attempt_id or not self.begin_work():
-            return
-        try:
-            capture_id = attempt_id.split(":", 2)[1] if attempt_id.count(":") >= 2 else None
-            row = self.store.capture_row(capture_id) if capture_id else None
-            if row is None:
-                return
-            try:
-                self._apply_saved(attempt_id, row)
-            except Exception as exc:
-                self._unexpected("knowledge.capture", "apply", exc)
-                if row.get("id"):
-                    self._defer_apply(row["id"], transient=True)
-        finally:
-            self.end_work()
 
     def start(self):
-        with self.store.lock, self.store.db:
-            self.store.db.execute("UPDATE transcript_tasks SET summary_status='pending', summary_detail='interrupted; body retained', summary_due=? WHERE summary_status='running'", (time.time() + 30,))
-            self.store.db.execute(
-                "UPDATE captures SET status='failed', "
-                "detail='service restarted after input reservation; not replaying' "
-                "WHERE status='processing'"
-            )
-            interrupted = [
-                row[0]
-                for row in self.store.db.execute(
-                    "SELECT id FROM regions WHERE status='attempted'"
-                ).fetchall()
-            ]
-            self.store.db.execute("UPDATE regions SET status='failed', detail='interrupted attempt; no replay' WHERE status='attempted'")
-        # A crash-interrupted attempt already consumed its first model attempt
-        # without landing an outcome: the failed region still gets exactly one
-        # bounded delayed recovery, scheduled at the same storage boundary as
-        # the in-process deadline path. The persisted per-region counter keeps
-        # the total at two model attempts; an unverifiable source keeps the
-        # locatable gap instead of a third call.
-        for region_id in interrupted:
-            self.store.schedule_gap_recovery(
-                region_id, due=time.time() + GAP_RECOVERY_DELAY
-            )
-        self.budget.recover_interrupted()
+        with self.store._write_txn():
+            from ..materials.summarizer import SummaryLedger
+            SummaryLedger(self.store.db).recover()
         self.revoke_stale()
-        # Arm only. Applying here can block readiness on a network restore.
-        self.store.arm_apply_continuations()
         self.thread.start()
         self.outbox_thread.start()
-        if self.capture_mode == "public-transcript" and self.summary_command:
+        if self.summary_command:
             self.summary_thread.start()
 
     def revoke_stale(self):
@@ -1487,8 +555,6 @@ class Engine:
                             self._process(ident)
                         finally:
                             self.end_work()
-                    elif not ident:
-                        self._apply_due()
                 except (MaintenanceCancelled, AdmissionUnreadable, CursorConflict,
                         GateFault):
                     continue
@@ -1563,7 +629,14 @@ class Engine:
                        "the contribution cannot be sent (dependency failure)",
             )
             return
-        batch = json.loads(batch_row["batch"])
+        from ..materials.publication import load_batch_payload
+        try:
+            batch = load_batch_payload(self.store, batch_row)
+        except Exception as exc:
+            self.store.mark_batch(batch_row['batch_id'], 'unavailable',
+                                  detail='local frozen contribution could not be loaded: ' + type(exc).__name__)
+            self._error('Publication did not start: frozen contribution load failed (' + type(exc).__name__ + ').')
+            return
         try:
             withdrawn = any(self.store.is_withdrawn(ref)
                             for ref in batch["entry_refs"])
@@ -1593,9 +666,11 @@ class Engine:
             actual_files=receipt.get("files"), retry_at=receipt.get("retry_at"),
         )
         if receipt.get("status") in Store_confirmed:
-            # The GitHub branch is now the durable body source: drop the sent
-            # private payload (draft bodies/history, raw summaries, staging).
-            self.store.compact_confirmed(batch_row["batch_id"])
+            # Confirmed upload retires staging. The candidate remains readable
+            # until this revision is confirmed in the synchronized public feed.
+            cleanup = self.store.compact_confirmed(batch_row["batch_id"])
+            if cleanup.get('cleanup_status') == 'failed':
+                self._error('Publication confirmed; local cleanup failed: ' + cleanup.get('cleanup_error', 'unknown'))
 
     def _reconcile(self, batch_row):
         if self.community is None:
@@ -1617,19 +692,30 @@ class Engine:
             actual_files=receipt.get("files"), retry_at=receipt.get("retry_at"),
         )
         if receipt.get("status") in Store_confirmed:
-            self.store.compact_confirmed(batch_row["batch_id"])
+            cleanup = self.store.compact_confirmed(batch_row["batch_id"])
+            if cleanup.get('cleanup_status') == 'failed':
+                self._error('Publication confirmed; local cleanup failed: ' + cleanup.get('cleanup_error', 'unknown'))
 
     def _flush(self):
         """Coalesce all pending material into one batch and send it."""
         from .export import build_batch
+        from ..materials.publication import CleanupReceiptError
 
         settings = self._settings()
         if not settings.allows_capture():
             return
-        built = build_batch(self.store, settings=settings)
-        if built is None:
-            return
-        batch_id, _revision, _batch, _ids, _votes = built
+        try:
+            built = build_batch(self.store, settings=settings)
+        except CleanupReceiptError as exc:
+            batch_id = exc.batch_id
+            self._error("New contribution staged; prior staging cleanup receipt failed: " + str(exc))
+        else:
+            if built is None:
+                return
+            batch_id, _revision, _batch, _ids, _votes = built
+            cleanup = self.store.feed_get("publication-cleanup:" + batch_id)
+            if cleanup and cleanup.get("status") == "failed":
+                self._error("New contribution staged; prior staging cleanup failed: " + cleanup.get("detail", "unknown"))
         self._submit(self.store.batch(batch_id))
 
     def _outbox_loop(self):
@@ -1770,18 +856,23 @@ class Engine:
             activity = self._activity
             queued = self.queue.unfinished_tasks
         due = self.store.due_capture() is not None
-        busy = activity > 0 or queued > 0 or due
+        with self.store.lock:
+            due_summary = self.store.db.execute(
+                "SELECT 1 FROM material_batches b JOIN transcript_tasks t ON t.entry_id=b.entry_id "
+                "WHERE b.status IN ('pending','retry-requested') AND t.summary_due<=? LIMIT 1",
+                (time.time(),)).fetchone() is not None
+        busy = activity > 0 or queued > 0 or due or due_summary
         if busy:
             with self._activity_lock:
                 if not self.stop.is_set():
                     self._frozen = False
             return dict(
                 idle=False, status="busy", activity=activity,
-                queued_captures=queued, due_capture=due,
+                queued_captures=queued, due_capture=due, due_summary=due_summary,
             )
         return dict(
             idle=True, status="stopping", activity=0,
-            queued_captures=0, due_capture=False,
+            queued_captures=0, due_capture=False, due_summary=False,
         )
 
     def status(self):
@@ -1795,13 +886,20 @@ class Engine:
         with self._activity_lock:
             activity = self._activity
             frozen = self._frozen
+        from ..materials.summarizer import SummaryLedger
+        with self.store._write_txn():
+            ledger = SummaryLedger(self.store.db)
+            summary_usage = ledger.usage_totals()
+            summary_attempts = dict(self.store.db.execute(
+                'SELECT status,count(*) FROM material_summary_attempts GROUP BY status').fetchall())
         return dict(
             **self.store.status(),
             capture_pipeline=self.capture_mode,
-            summary_mode=("required-model" if self.summary_command else "configuration-error")
-                         if self.capture_mode == "public-transcript" else "organizer",
+            summary_mode="required-model" if self.summary_command else "configuration-error",
             maintenance_pending=self.queue.unfinished_tasks,
-            maintenance_budget=self.budget.status(),
+            summary_budget=settings.as_dict().get('summary_budget', dict(calls_per_hour=32, input_tokens_per_hour=512000)),
+            summary_usage=summary_usage,
+            summary_attempts=summary_attempts,
             sharing=settings.public_status(),
             community_package=self.community is not None,
             publication_runtime=dict(

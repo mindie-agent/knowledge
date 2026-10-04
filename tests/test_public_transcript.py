@@ -19,6 +19,7 @@ from mindie_knowledge.loop.store import Store, digest
 from mindie_knowledge.loop.transcript_redaction import install_scanner, redact
 from mindie_knowledge.loop import transcript_capture
 import transcript_double
+from material_worker_fixture import package_body, command as summary_command, answer, identity
 from lane_support import load_parser, transcript_path, write_transcript, SESSIONS
 
 
@@ -59,14 +60,14 @@ def process(engine, path, turn, **kwargs):
 
 def test_capture_saves_body_but_export_waits_for_summary(pipeline):
     engine, store, path = pipeline
-    engine.summary_command = [sys.executable, '-c', 'print(\'{"title":"Synthetic case", "summary":"Reported eight-token result."}\')']
+    engine.summary_command = summary_command(title='Public case')
     append(path, 'Synthetic NPU case: eager inference returned 8 tokens. Reported result, not a readiness claim.')
     row = process(engine, path, 'first', summary='private raw native answer')
     assert row['summary'] == ''
     docs = store.drafts_changed(generation=engine._settings().generation)
     assert len(docs) == 1
     assert 'returned 8 tokens' in docs[0]['content']
-    assert store.db.execute('SELECT COUNT(*) FROM maintenance_attempts').fetchone()[0] == 0
+    assert engine.status()['summary_usage']['model_calls'] == 0
     from mindie_knowledge.loop.export import build_batch
     from mindie_knowledge.loop.documents import parse_entry
     assert build_batch(store, settings=engine._settings()) is None
@@ -76,10 +77,11 @@ def test_capture_saves_body_but_export_waits_for_summary(pipeline):
     transcript_capture.summarize_due(engine)
     batch_id = build_batch(store, settings=engine._settings())[0]
     batch = store.batch(batch_id)
-    payload = json.loads(batch['batch'])
-    assert len(payload['files']) == 1
-    public = parse_entry(payload['files'][0]['content'].encode())
-    assert public['content'] == docs[0]['content']
+    from mindie_knowledge.materials.publication import load_batch_payload
+    from mindie_knowledge.materials.store import validate_package_files
+    payload = load_batch_payload(store, batch)
+    package = validate_package_files({item['path'].split('/', 2)[2]: item['content'] for item in payload['files']})
+    assert package_body(package) == docs[0]['content']
 
 
 def test_missing_summary_is_configuration_failure_not_publishable_excerpt(pipeline):
@@ -89,8 +91,10 @@ def test_missing_summary_is_configuration_failure_not_publishable_excerpt(pipeli
     process(engine, path, 'first')
     assert len(store.drafts_changed()) == 1
     assert engine.status()['summary_mode'] == 'configuration-error'
+    engine.last_activity = 0
+    transcript_capture.summarize_due(engine)
     task = dict(store.db.execute('SELECT * FROM transcript_tasks').fetchone())
-    assert task['summary_status'] == 'failed' and 'configuration' in task['summary_detail']
+    assert task['summary_status'] == 'failed'
     assert not store.has_changed_drafts(generation=engine._settings().generation, ready_only=True)
     assert build_batch(store, settings=engine._settings()) is None
 
@@ -122,31 +126,31 @@ def test_restart_and_duplicate_stop_append_one_task_record(pipeline):
     assert len(docs) == 1
     assert docs[0]['content'].count('first-public-marker') == 1
     assert docs[0]['content'].count('second-public-marker') == 1
-    assert 'second-public-marker' in docs[0]['summary']
-    assert 'second-public-marker' in docs[0]['title']
+    assert docs[0]['title'] == 'Task experience awaiting indexing'
+    assert store.db.execute('SELECT count(*) FROM material_batches').fetchone()[0] == 2
     assert store.cursor(str(path.resolve()))['ok_finish'] == path.stat().st_size
 
 
 def test_body_failure_rolls_back_cursor_then_retry_succeeds(pipeline, monkeypatch):
     engine, store, path = pipeline
     append(path, 'atomic-public-marker')
-    original = store.create_draft
+    original = store.commit_material_increment
     def fail_after_write(**kwargs):
         original(**kwargs)
         raise OSError('synthetic power loss before commit')
-    monkeypatch.setattr(store, 'create_draft', fail_after_write)
+    monkeypatch.setattr(store, 'commit_material_increment', fail_after_write)
     event = engine.capture(session_id='manual-A', turn_id='crash', transcript_path=str(path))
     engine._process(event['id'])
     assert store.cursor(str(path.resolve())) is None
     assert store.drafts_changed() == []
-    monkeypatch.setattr(store, 'create_draft', original)
+    monkeypatch.setattr(store, 'commit_material_increment', original)
     process(engine, path, 'retry')
     assert store.drafts_changed()[0]['content'].count('atomic-public-marker') == 1
 
 
 def test_summary_cannot_rewrite_body_and_failure_does_not_block(pipeline):
     engine, store, path = pipeline
-    engine.summary_command = [sys.executable, '-c', 'print(\'{"title":"Injected", "summary":"x", "content":"replace body"}\')']
+    engine.summary_command = summary_command(fail=True)
     append(path, 'body-must-survive-marker')
     process(engine, path, 'first')
     before = store.drafts_changed()[0]['content']
@@ -164,7 +168,7 @@ def test_summary_cannot_rewrite_body_and_failure_does_not_block(pipeline):
     transcript_capture.summarize_due(engine)
     assert store.transcript_task(task['task_key']) == task
     # A later body version gets exactly one new metadata opportunity.
-    engine.summary_command = [sys.executable, '-c', 'print(\'{"title":"Public case", "summary":"Synthetic public observations."}\')']
+    engine.summary_command = summary_command(title='Public case')
     append(path, 'new-observation-marker')
     process(engine, path, 'second')
     body = store.drafts_changed()[0]['content']
@@ -174,7 +178,9 @@ def test_summary_cannot_rewrite_body_and_failure_does_not_block(pipeline):
     transcript_capture.summarize_due(engine)
     doc = store.drafts_changed()[0]
     assert doc['content'] == body and doc['title'] == 'Public case'
-    assert store.transcript_task(task['task_key'])['summary_status'] == 'complete'
+    assert store.transcript_task(task['task_key'])['summary_status'] == 'failed'
+    # New evidence cannot silently retry the failed older batch.
+    assert store.db.execute("SELECT count(*) FROM material_batches WHERE status='failed'").fetchone()[0] == 1
 
 
 def test_real_scanner_secrets_unicode_overlap_and_technical_negative_controls(scanner):
@@ -192,8 +198,7 @@ def test_real_scanner_secrets_unicode_overlap_and_technical_negative_controls(sc
 @pytest.mark.parametrize('failure', ['scanner', 'interrupted'])
 def test_metadata_recovers_the_same_body_without_another_stop(pipeline, failure):
     engine, store, path = pipeline
-    engine.summary_command = [sys.executable, '-c',
-        'print(\'{"title":"Recovered title", "summary":"Recovered public observations."}\')']
+    engine.summary_command = summary_command(title='Recovered title')
     append(path, 'body-survives-metadata-interruption')
     process(engine, path, 'last-stop')
     before = store.drafts_changed()[0]['content']
@@ -260,34 +265,6 @@ def test_workspace_aliases_and_uri_suffixes(scanner):
     assert redact(source, executable=scanner, key=b'a' * 32, private_paths=('D:/private/work/task',))[0] == source
 
 
-def test_upgrade_retains_legacy_gap_and_checkpoint_without_body_model(pipeline):
-    engine, store, path = pipeline
-    append(path, 'public source marker')
-    event = engine.capture(session_id='manual-A', turn_id='legacy', transcript_path=str(path))
-    row = store.capture_row(event['id'])
-    inc = transcript_double.read_material(path, 0, session_id='manual-A', not_before=0)
-    region = store.reserve_region(capture_id=row['id'], file_identity=str(path.resolve()),
-        identity=inc['identity'], start=inc['start'], finish=inc['end'], region_digest=inc['digest'],
-        observed_cursor=None, status='failed', detail='legacy timeout')
-    store.schedule_gap_recovery(region, due=time.time())
-    engine.agent_command = [sys.executable, '-c', 'raise Exception("must not call")']
-    engine._process(row['id'])
-    assert store.capture_row(row['id'])['status'] == 'failed'
-    assert store.coverage_gaps(str(path.resolve()))
-    assert store.drafts_changed() == []
-    assert store.db.execute('SELECT COUNT(*) FROM maintenance_attempts').fetchone()[0] == 0
-    with pytest.raises(ValueError, match='forbids body model'):
-        engine.agent(dict(role='organize'), attempt_id='forbidden', root_hash=row['root_session'])
-    attempt = 'organize:' + row['id'] + ':legacy-result'
-    engine.budget.reserve(attempt, row['root_session'], 'organize')
-    result = json.dumps(dict(entries=[dict(title='old', summary='old', content='model body')]))
-    engine.budget.checkpoint(attempt, result, '{}', capture_id=row['id'], capture_status='apply-pending')
-    engine._apply_saved(attempt, row)
-    assert engine.budget.application(attempt)['status'] == 'held'
-    assert engine.budget.application(attempt)['result'] == result
-    assert store.drafts_changed() == []
-
-
 @pytest.mark.parametrize('failure', ['missing', 'exit', 'invalid-report'])
 def test_scanner_recovers_same_notification_without_new_stop(pipeline, monkeypatch, failure):
     engine, store, path = pipeline
@@ -333,24 +310,26 @@ def test_revoked_pending_summary_does_not_block_next_task(pipeline):
     assert store.drafts_changed()[0]['content'].count('original public marker') == 1
 
 
-def test_summary_receives_whole_body_without_an_input_cap(pipeline, monkeypatch):
+def test_k3_long_task_batches_cover_every_byte_without_old_body_replay(pipeline, monkeypatch):
     engine, store, path = pipeline
-    engine.summary_command = [sys.executable, '-c', 'print(\'{"title":"Case", "summary":"Model claimed full coverage."}\')']
+    engine.summary_command = ['fixture']
     append(path, 'first marker ' + 'public middle observation ' * 3000 + 'last marker')
     process(engine, path, 'partial')
     before = store.drafts_changed()[0]['content']
-    engine.last_activity = time.monotonic() - 10
-    with store._write_txn():
-        store.db.execute('UPDATE transcript_tasks SET summary_due=0')
+    engine.last_activity = 0
     inputs = []
     def model(command, payload, **kwargs):
-        inputs.append(json.loads(payload)['text'])
-        return json.dumps(dict(title='Case', summary='Public observations.'))
+        if '--identity' in command:
+            return json.dumps(identity())
+        request = json.loads(payload)
+        inputs.extend(b['text'] for b in request['blocks'])
+        return json.dumps(answer(request, 'Case', 'Public observations.'))
     monkeypatch.setattr(transcript_capture, 'bounded_run', model)
-    transcript_capture.summarize_due(engine)
+    for _ in range(5):
+        transcript_capture.summarize_due(engine)
     doc = store.drafts_changed()[0]
     assert doc['content'] == before
-    assert inputs == [before]
+    assert ''.join(inputs) == before
     assert doc['summary'] == 'Public observations.'
 
 
@@ -366,11 +345,7 @@ def wait_until(predicate, seconds=8):
 def test_slow_summary_does_not_hold_new_body_and_stale_result_is_discarded(pipeline):
     engine, store, path = pipeline
     marker, release = path.parent / 'summary-started', path.parent / 'summary-release'
-    engine.summary_command = [sys.executable, '-c',
-        'import pathlib,time; '
-        f'pathlib.Path({str(marker)!r}).touch(); '
-        f'exec("while not pathlib.Path({str(release)!r}).exists(): time.sleep(.05)"); '
-        'print(\'{"title":"Stale result", "summary":"Old observation."}\')']
+    engine.summary_command = summary_command(title='Indexed first block', started=marker, release=release)
     append(path, 'first-public-marker')
     process(engine, path, 'first')
     engine.last_activity = time.monotonic() - 10
@@ -388,7 +363,9 @@ def test_slow_summary_does_not_hold_new_body_and_stale_result_is_discarded(pipel
         engine.last_activity = time.monotonic() + 30
         release.touch()
         wait_until(lambda: engine.status()['activity'] == 0)
-        assert store.drafts_changed()[0]['title'] != 'Stale result'
+        task = store.materials.read_task(store.drafts_changed()[0]['entry_id'])
+        assert [block['indexed'] for block in task['blocks']] == [True, False]
+        assert not store.summary_ready(store.drafts_changed()[0])
     finally:
         release.touch()
         engine.shutdown()
@@ -443,9 +420,8 @@ def test_production_parsers_preserve_large_public_messages_through_export(tmp_pa
             engine.shutdown()
         assert store.cursor(str(path.resolve()))['ok_finish'] == path.stat().st_size
         doc = store.drafts_changed()[0]
-        assert doc['content'] == '### user\n' + text
-        from mindie_knowledge.loop.documents import render_entry, parse_entry
-        assert parse_entry(render_entry(doc))['content'] == doc['content']
+        assert doc['content'] == '### user\n' + text + '\n\n'
+        assert package_body(store.materials.export_task(doc['entry_id'])) == doc['content']
 
 
 def test_kimi_lineage_recovers_without_exporting_inherited_history(tmp_path, scanner):
@@ -515,7 +491,7 @@ def test_corrupt_record_blocks_incomplete_page_without_losing_source(tmp_path, s
 def test_summary_of_previous_body_does_not_release_a_new_body(pipeline):
     from mindie_knowledge.loop.export import build_batch
     engine, store, path = pipeline
-    engine.summary_command = [sys.executable, '-c', 'print(\'{"title":"Synthetic case", "summary":"First reported result."}\')']
+    engine.summary_command = summary_command(title='Public case')
     append(path, 'first result')
     process(engine, path, 'first')
     engine.last_activity = time.monotonic() - 10
@@ -528,3 +504,18 @@ def test_summary_of_previous_body_does_not_release_a_new_body(pipeline):
                                            generation=engine._settings().generation)
     assert not store.summary_ready(changed)
     assert build_batch(store, settings=engine._settings()) is None
+
+
+def test_k3_live_split_secret_carries_only_scanner_state_between_stops(pipeline):
+    engine, store, path = pipeline
+    append(path, 'K3-01 initial adaptation\n-----BEGIN RSA PRIVATE KEY-----\nfirst-secret')
+    process(engine, path, 'secret-start')
+    append(path, 'SPLIT_SECRET_CANARY\n-----END EC PRIVATE KEY-----\nstill-secret')
+    process(engine, path, 'wrong-end')
+    append(path, 'FINAL_SECRET_CANARY\n-----END RSA PRIVATE KEY-----\npublic precision correction')
+    process(engine, path, 'correct-end')
+    body = store.drafts_changed()[0]['content']
+    assert 'public precision correction' in body
+    assert all(value not in body for value in ('first-secret', 'SPLIT_SECRET_CANARY', 'still-secret', 'FINAL_SECRET_CANARY'))
+    state = store.db.execute('SELECT redaction_state FROM material_streams').fetchone()[0]
+    assert 'secret' not in state.lower() and 'PRIVATE KEY' not in state

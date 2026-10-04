@@ -7,7 +7,8 @@ import time
 
 import pytest
 
-from mindie_knowledge.loop.documents import make_entry, render_entry
+from mindie_knowledge.loop.documents import make_entry
+from package_fixture import package_for, write_package
 from mindie_knowledge.loop.feed import Feed
 from mindie_knowledge.loop.store import Store
 
@@ -30,26 +31,22 @@ def init_repo(path):
 
 
 def entry_doc(entry_id, title, *, kind="experience", conditions=None):
-    return make_entry(
+    doc = make_entry(
         entry_id=entry_id, domain="vllm-ascend", kind=kind, title=title,
         summary=f"Summary of {title}.",
         content=f"Detailed body of {title} with failure and fix context.",
         conditions=conditions or {},
     )
+    package_for(doc)
+    return doc
 
 
 def commit_docs(git, repo, docs):
-    for folder in ("cases", "topics"):
-        (repo / folder).mkdir(exist_ok=True)
-    for old in repo.glob("cases/*.md"):
-        old.unlink()
-    for old in repo.glob("topics/*.md"):
-        old.unlink()
+    import shutil
+    if (repo / "tasks").exists():
+        shutil.rmtree(repo / "tasks")
     for doc in docs:
-        subdir = "topics" if doc["kind"] == "knowledge" else "cases"
-        (repo / subdir / f"{doc['entry_id'][:12]}.md").write_text(
-            render_entry(doc), encoding="utf-8", newline="\n"
-        )
+        write_package(repo, package_for(doc))
     git("add", "-A")
     git("commit", "-qm", "publish")
     return git("rev-parse", "HEAD")
@@ -312,15 +309,15 @@ def test_interrupted_candidate_resumes_from_staged_progress(env, monkeypatch):
 
     monkeypatch.setattr(gitread.CatFileBatch, "read", counting_read)
     assert feed.sync()["status"] == "unavailable"
-    assert store.feed_staging_count(feed.ident, commit) == 3
+    assert feed._staged_count(commit) == 3
     first_attempt = len(reads)
     receipt = feed.sync(force=True)  # explicit resume skips the backoff
     assert receipt["status"] == "synced" and receipt["entries"] == 6
-    # The second attempt read only the three still-unverified blobs: verified
+    # The second attempt read only the nine still-unverified blobs: verified
     # progress was kept, no restart at item zero.
     assert first_attempt == 4  # three staged, the fourth hit the fault
-    assert len(reads) - first_attempt == 3
-    assert store.feed_staging_count(feed.ident, commit) == 0
+    assert len(reads) - first_attempt == 9
+    assert feed._staged_count(commit) == 0
     assert store.query("Staged case 4")["results"]
 
 
@@ -343,7 +340,7 @@ def test_sync_discards_old_git_objects_and_old_database_bodies(env):
     git, repo, store, feed = env
     first = entry_doc('c' * 64, 'original only marker')
     first_commit = commit_docs(git, repo, [first])
-    old_blob = git('rev-parse', f'{first_commit}:cases/{first["entry_id"][:12]}.md')
+    old_blob = git('rev-parse', f'{first_commit}:tasks/{first["entry_id"]}/index.md')
     assert feed.sync()['status'] == 'synced'
     for i in range(3):
         current = entry_doc('c' * 64, f'current only marker {i}')
@@ -355,4 +352,4 @@ def test_sync_discards_old_git_objects_and_old_database_bodies(env):
     missing = subprocess.run(['git', '-C', str(feed.repo), 'cat-file', '-e', old_blob], capture_output=True)
     assert missing.returncode != 0
     assert store.get(store.ref('c' * 64))['title'] == current['title']
-    assert store.db.execute('SELECT count(*) FROM feed_staging').fetchone()[0] == 0
+    assert not (feed.dir / 'staging').exists()

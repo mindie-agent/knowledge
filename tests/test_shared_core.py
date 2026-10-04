@@ -19,12 +19,15 @@ from mindie_knowledge.loop.store import Store
 
 import transcript_double
 from conftest import make_admission, write_settings
+from lane_support import parser_path
+from material_worker_fixture import command as summary_command
+from mindie_knowledge.loop.transcript_redaction import install_scanner
 
 PRODUCER = "b" * 64
 
 
 def _revision_double(files, domain, base_commit, entry_refs):
-    return "r" * 64
+    return "a" * 64
 
 
 def _confirmed_batch(store, settings):
@@ -34,7 +37,7 @@ def _confirmed_batch(store, settings):
         generation=settings.generation,
     )
     batch_id, revision, batch, _ids, _votes = build_batch(
-        store, settings=settings, revision_fn=_revision_double
+        store, settings=settings
     )
     store.mark_batch(batch_id, "submitted", pr_url="https://x/pr/1",
                      head_sha="a" * 40)
@@ -44,14 +47,14 @@ def _confirmed_batch(store, settings):
 def test_transcript_adapter_config_seam(tmp_path):
     engine_config = tmp_path / "engine.json"
     engine_config.write_text(json.dumps(dict(
-        root=str(tmp_path), domain="test",
+        root=str(tmp_path), domain="test", redactor_executable=install_scanner(), summary_command=summary_command(),
         transcript_adapter="relative/parser.py",
     )))
     with pytest.raises(ValueError, match="absolute local parser module"):
         config_at(engine_config)
     assert load_transcript_adapter({}) is None
     engine_config.write_text(json.dumps(dict(
-        root=str(tmp_path), domain="test",
+        root=str(tmp_path), domain="test", redactor_executable=install_scanner(), summary_command=summary_command(),
         transcript_adapter=str(tmp_path / "parser.py"),
     )))
     with pytest.raises(ValueError, match="missing"):
@@ -95,7 +98,7 @@ def test_missing_adapter_fails_without_substituting_summary(tmp_path):
         "'summary':'s','content':p['increment'][:100],'conditions':{}}]}).encode('utf-8'))\n"
     )
     engine = Engine(
-        store, agent_command=[sys.executable, str(runner)],
+        store, redactor_executable=install_scanner(),
         settings_path=tmp_path / "community.json",
         admission=Admission(adapter),  # no transcript_adapter configured
     )
@@ -106,7 +109,7 @@ def test_missing_adapter_fails_without_substituting_summary(tmp_path):
     row = store.capture_row(result["id"])
     assert row["status"] == "failed" and "no transcript adapter" in row["detail"]
     assert store.drafts_changed() == []
-    assert store.db.execute("SELECT COUNT(*) FROM maintenance_attempts").fetchone()[0] == 0
+    assert engine.status()['summary_usage']['model_calls'] == 0
     assert store.coverage_gaps() == []  # no transcript region was consumed
     store.close()
 
@@ -147,42 +150,29 @@ def test_compact_confirmed_removes_sent_payload_and_keeps_receipts(tmp_path):
                               transcript=None, summary="newer unsent summary",
                               generation=settings.generation)
     store.mark_capture(newer["id"], "organized")
-    other_revision = documents.make_entry(
-        entry_id=doc["entry_id"], domain="test", kind="experience",
-        title="Sent case", summary="s", content="older referenced body",
-    )
-    with store._write_txn():
-        store._insert_revision(other_revision, "draft", __import__("time").time())
-        store.db.execute(
-            "INSERT INTO outbox VALUES(?,?,?,?,?,NULL,NULL,?,NULL,?,0,NULL,?)",
-            ("batch-failed-older", "x" * 64,
-             json.dumps({"entry_refs": [store.ref(doc["entry_id"],
-                                                other_revision["revision"])]}),
-             "failed", "", 1.0, 2.0, settings.generation),
-        )
     assert (store.root / "outbox" / "staging" / batch_id).is_dir()
 
     removed = store.compact_confirmed(batch_id)
-    assert removed["entries"] == 1 and removed["staging"] == 1
+    assert removed["entries"] == 0 and removed["staging"] == 1
     assert removed["captures"] == 1  # only the capture whose refs are this batch
     row = store._row(doc["entry_id"])
-    assert row["draft_revision"] is None
+    assert row["draft_revision"] == doc["revision"]
     assert row["batched_revision"]  # hash receipt kept
     header = json.loads(row["doc"])
-    assert header["title"] == "Sent case" and header["content"] == ""
-    assert store._revision_doc(doc["entry_id"], doc["revision"]) is None
+    assert header["title"] == "Sent case" and "content" not in header
+    assert store._revision_doc(doc["entry_id"], doc["revision"])["content"] == doc["content"]
     # Outbox payloads no longer pin redundant local draft history.
-    assert store._revision_doc(doc["entry_id"], other_revision["revision"]) is None
     assert store.capture_row(covered["id"])["summary"] == ""
     assert store.capture_row(newer["id"])["summary"] == "newer unsent summary"
     # A different draft's earlier capture is not cleared by timestamp.
     assert store.capture_row(other_cap["id"])["summary"] == "other draft evidence"
-    assert not (store.root / "outbox" / "staging" / batch_id).exists()
+    assert not any((store.root / "outbox" / "staging" / batch_id).iterdir())
     receipt = json.loads(store.batch(batch_id)["batch"])
-    assert receipt["schema"] == "mindie-contribution-receipt/1"
+    assert receipt["schema"] == "mindie-contribution/1"
     assert all("content" not in f for f in receipt["files"])
-    assert receipt["files"][0]["path"].endswith(f"{doc['entry_id']}.md")
-    assert store.sent_file_hash(doc["entry_id"]) == receipt["files"][0]["sha256"]
+    manifest = next(item for item in receipt["files"] if item["path"].endswith("/index.md"))
+    assert manifest["path"].endswith(f"{doc['entry_id']}/index.md")
+    assert store.sent_file_hash(doc["entry_id"]) == manifest["sha256"]
     assert store.sent_receipt(doc["entry_id"])["head_sha"] == "a" * 40
     assert store.compact_confirmed("batch-unknown") is None
     store.close()
@@ -222,39 +212,13 @@ def test_per_entry_receipt_survives_later_lineage_batch(tmp_path):
         content="entry B only", owner=PRODUCER,
         generation=settings.generation,
     )
-    built = build_batch(store, settings=settings, revision_fn=lambda *a: "s" * 64)
+    built = build_batch(store, settings=settings)
     assert built is not None
     assert store.batch(batch_id)["status"] == "pending"  # lineage row replaced
     assert store.sent_file_hash(doc_a["entry_id"]) == hash_a
     assert store.sent_receipt(doc_a["entry_id"])["head_sha"] == head_a
     pending = json.loads(store.batch(batch_id)["batch"])
     assert all(doc_a["entry_id"] not in f.get("path", "") for f in pending["files"])
-    store.close()
-
-
-def test_restore_draft_enables_safe_later_continuation(tmp_path):
-    settings = write_settings(tmp_path / "community.json", enabled=True,
-                              roots=[tmp_path])
-    store = Store(tmp_path / "store", "test")
-    doc, batch_id = _confirmed_batch(store, settings)
-    store.compact_confirmed(batch_id)
-    with pytest.raises(ValueError, match="no local draft"):
-        store.append_observation(doc["entry_id"], "new paragraph", marker="ab"*32,
-                                 producer=PRODUCER,
-                                 generation=settings.generation)
-    remote = documents.make_entry(
-        entry_id=doc["entry_id"], domain="test", kind="experience",
-        title="Sent case", summary="s", content="the sent body",
-    )
-    store.restore_draft(doc["entry_id"], remote, generation=settings.generation)
-    updated, appended = store.append_observation(
-        doc["entry_id"], "new paragraph", marker="ab"*32, producer=PRODUCER,
-        generation=settings.generation,
-    )
-    assert appended and "the sent body" in updated["content"]
-    assert "new paragraph" in updated["content"]  # appended, never replaced
-    with pytest.raises(ValueError, match="already has a local draft"):
-        store.restore_draft(doc["entry_id"], remote)
     store.close()
 
 
@@ -268,6 +232,8 @@ def test_contribution_recovery_ops(tmp_path):
     engine_config.write_text(json.dumps(dict(
         root=str(tmp_path / "store"), domain="test",
         community_config=str(tmp_path / "community.json"),
+        capture_mode="public-transcript", redactor_executable=__import__("mindie_knowledge.loop.transcript_redaction", fromlist=["install_scanner"]).install_scanner(),
+        summary_command=summary_command(), transcript_adapter=str(parser_path("codex")),
     )))
     config = config_at(engine_config)
 
@@ -276,7 +242,7 @@ def test_contribution_recovery_ops(tmp_path):
     assert inspected["outbox"]["pr_url"] == "https://x/pr/1"
 
     compacted = contribution_recovery(config, "contribution-compact", batch_id)
-    assert compacted["compacted"]["entries"] == 1
+    assert compacted["compacted"]["entries"] == 0
     absent = contribution_recovery(config, "contribution-inspect", "batch-nope")
     assert absent["outbox"] is None and absent["ledger"] == []
     with pytest.raises(ValueError, match="unknown contribution batch"):
@@ -339,116 +305,4 @@ def test_compact_capture_coverage_requires_all_exact_sent_revisions(tmp_path):
         assert store.capture_row(captures[name])["summary"] == name
     assert store._revision_doc(old["entry_id"], old["revision"]) is None
     assert store._revision_doc(newer["entry_id"], newer["revision"])["content"].endswith("not yet sent")
-    store.close()
-
-
-def test_draft_headers_offer_compacted_sent_receipt_header(tmp_path):
-    settings = write_settings(tmp_path / "community.json", enabled=True,
-                              roots=[tmp_path])
-    store = Store(tmp_path / "store", "test")
-    doc, batch_id = _confirmed_batch(store, settings)
-    store.compact_confirmed(batch_id)
-    headers = store.draft_headers(owner=PRODUCER, generation=settings.generation)
-    assert len(headers) == 1
-    header = headers[0]
-    assert header["entry_id"] == doc["entry_id"]
-    assert header["title"] == "Sent case" and header["summary"] == "s"
-    assert header["revision"] == doc["revision"]  # the exact sent revision
-    assert header["excerpt"] == ""
-    # Body and revision history stay absent; this is a bare receipt header.
-    row = store._row(doc["entry_id"])
-    assert row["draft_revision"] is None
-    assert store._revision_doc(doc["entry_id"], header["revision"]) is None
-    # Cross-owner and cross-generation readers see nothing.
-    assert store.draft_headers(owner="c" * 64,
-                               generation=settings.generation) == []
-    assert store.draft_headers(owner=PRODUCER, generation="other-gen") == []
-    store.close()
-
-
-def test_draft_headers_receipt_not_duplicated_after_restore(tmp_path):
-    settings = write_settings(tmp_path / "community.json", enabled=True,
-                              roots=[tmp_path])
-    store = Store(tmp_path / "store", "test")
-    doc, batch_id = _confirmed_batch(store, settings)
-    store.compact_confirmed(batch_id)
-    remote = documents.make_entry(
-        entry_id=doc["entry_id"], domain="test", kind="experience",
-        title="Sent case", summary="s", content="the sent body",
-    )
-    store.restore_draft(doc["entry_id"], remote, generation=settings.generation)
-    headers = store.draft_headers(owner=PRODUCER, generation=settings.generation)
-    assert len(headers) == 1  # the current draft, not a receipt duplicate
-    assert headers[0]["revision"] == remote["revision"]
-    assert "the sent body" in headers[0]["excerpt"]
-    store.close()
-
-
-def test_draft_headers_limit_withdrawal_and_incomplete_receipt(tmp_path):
-    settings = write_settings(tmp_path / "community.json", enabled=True,
-                              roots=[tmp_path])
-    store = Store(tmp_path / "store", "test")
-    doc, batch_id = _confirmed_batch(store, settings)
-    store.compact_confirmed(batch_id)
-    store.create_draft(
-        kind="experience", title="Ordinary draft", summary="o",
-        content="ordinary body", owner=PRODUCER,
-        generation=settings.generation,
-    )
-    headers = store.draft_headers(owner=PRODUCER, generation=settings.generation)
-    assert len(headers) == 2
-    limited = store.draft_headers(owner=PRODUCER, limit=1,
-                                  generation=settings.generation)
-    assert len(limited) == 1
-    # Feed withdrawal removes the compacted receipt header.
-    store.install_feed([doc], feed_ident="x")
-    assert len(store.draft_headers(owner=PRODUCER,
-                                   generation=settings.generation)) == 2
-    store.install_feed([], feed_ident="x")
-    headers = store.draft_headers(owner=PRODUCER, generation=settings.generation)
-    assert [h["title"] for h in headers] == ["Ordinary draft"]
-    store.close()
-
-
-def test_draft_headers_skip_incomplete_receipt(tmp_path):
-    settings = write_settings(tmp_path / "community.json", enabled=True,
-                              roots=[tmp_path])
-    store = Store(tmp_path / "store", "test")
-    doc, batch_id = _confirmed_batch(store, settings)
-    store.compact_confirmed(batch_id)
-    with store._write_txn():
-        store.db.execute(
-            "UPDATE sent_receipts SET sha256='' WHERE entry_id=?",
-            (doc["entry_id"],),
-        )
-    assert store.draft_headers(owner=PRODUCER,
-                               generation=settings.generation) == []
-    store.close()
-
-
-def test_draft_headers_current_generation_not_hidden_by_old_limit(tmp_path):
-    settings = write_settings(tmp_path / "community.json", enabled=True,
-                              roots=[tmp_path])
-    store = Store(tmp_path / "store", "test")
-    doc, batch_id = _confirmed_batch(store, settings)
-    store.compact_confirmed(batch_id)
-    live = store.create_draft(
-        kind="experience", title="Current live", summary="live",
-        content="current live body", owner=PRODUCER,
-        generation=settings.generation,
-    )
-    for i in range(256):
-        store.create_draft(
-            kind="experience", title=f"Old draft {i}", summary="old",
-            content="old generation body", owner=PRODUCER,
-            generation="old-gen",
-        )
-    headers = store.draft_headers(owner=PRODUCER,
-                                  generation=settings.generation)
-    by_title = {h["title"]: h for h in headers}
-    assert set(by_title) == {"Sent case", "Current live"}
-    assert by_title["Sent case"]["revision"] == doc["revision"]
-    assert by_title["Sent case"]["excerpt"] == ""
-    assert by_title["Current live"]["revision"] == live["revision"]
-    assert "current live body" in by_title["Current live"]["excerpt"]
     store.close()

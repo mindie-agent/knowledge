@@ -87,21 +87,15 @@ def test_cleanup_fault_keeps_original_and_both_facts(reports, monkeypatch, child
     assert [r['category'] for r in reports] == (['native', 'cleanup'] if child_code else ['cleanup'])
 
 
-def test_actual_agent_invalid_json_and_expected_publish_error(reports, store, tmp_path):
-    from conftest import write_settings
+def test_expected_publish_error_is_not_an_internal_incident(reports, store):
     from mindie_knowledge.loop.engine import Engine
     from mindie_knowledge.community.common import CommunityError
-    settings = tmp_path / 'sharing.json'
-    write_settings(settings, roots=[tmp_path])
-    engine = Engine(store, settings_path=settings, agent_command=[sys.executable, '-c', 'print("[1]")'])
-    with pytest.raises(ValueError, match='one JSON object'):
-        engine.agent({'role': 'organize'}, attempt_id='fixture', root_hash='root')
-    assert [r['category'] for r in reports] == ['invalid_result']
+    engine = Engine(store)
     engine._unexpected('knowledge.publish', 'submit', CommunityError('private_network_sentinel'))
     engine._unexpected('knowledge.publish', 'submit', PermissionError('private_permission_sentinel'))
-    assert len(reports) == 1
+    assert reports == []
     engine._unexpected('knowledge.publish', 'submit', KeyError('private_internal_sentinel'))
-    assert [r['category'] for r in reports] == ['invalid_result', 'internal_exception']
+    assert [r['category'] for r in reports] == ['internal_exception']
 
 
 def test_live_http_internal_reference_not_duplicated(reports, store, monkeypatch):
@@ -141,12 +135,12 @@ def test_capture_hook_records_only_authorized_rpc_internal(reports, tmp_path, mo
     write_settings(sharing, enabled=enabled, roots=[tmp_path])
     admission = make_admission(tmp_path, project_root=tmp_path)
     config = tmp_path / 'config.json'
-    config.write_text(json.dumps({'root': str(tmp_path / 'knowledge'), 'domain': 'fixture', 'community_config': str(sharing), 'admission_path': str(admission)}))
+    config.write_text(json.dumps({'root': str(tmp_path / 'knowledge'), 'domain': 'fixture', 'community_config': str(sharing), 'admission_path': str(admission), 'capture_mode': 'public-transcript', 'transcript_adapter': __import__('transcript_double').__file__, 'redactor_executable': str(tmp_path / 'gitleaks')}))
     event = {
         'hook_event_name': 'Stop', 'identity_kind': 'turn',
         'session_id': 'manual-A', 'turn_id': 'turn',
         'mindie_activation': admission_token(admission), 'harness': 'codex',
-        'last_assistant_message': 'summary',
+        'transcript_path': str(tmp_path / 'wire.jsonl'),
     }
     result = cli.capture_hook(config, event)
     if enabled:

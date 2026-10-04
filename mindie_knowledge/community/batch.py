@@ -30,9 +30,8 @@ from .common import (
     sha256_text,
 )
 
-ALLOWED_PREFIXES = {"cases": ".md", "topics": ".md", "feedback": ".json"}
+ALLOWED_PREFIXES = {"feedback": ".json"}
 RATINGS = ("up", "down")
-_MARKER_RE = re.compile(r"[0-9a-f]{16,64}")
 
 
 def check_path(path: Any) -> str:
@@ -43,10 +42,12 @@ def check_path(path: Any) -> str:
     if pure.is_absolute() or str(path) != str(pure):
         raise CommunityError(f"file path {path!r} is not a clean relative POSIX path")
     parts = pure.parts
+    if re.fullmatch(r"tasks/[0-9a-f]{64}/(?:index\.md|blocks/[A-Za-z0-9_-]{1,128}\.md)", path):
+        return path
     if len(parts) != 2 or parts[0] not in ALLOWED_PREFIXES:
         raise CommunityError(
             f"file path {path!r} is outside the approved prefixes "
-            "(cases/*.md, topics/*.md, feedback/*.json)"
+            "(tasks/<id>/index.md, tasks/<id>/blocks/*.md, feedback/*.json)"
         )
     name = parts[1]
     if (
@@ -153,7 +154,7 @@ def batch_revision(files: list[Mapping[str, Any]], domain: str, base_commit: str
             "entry_refs": sorted(entry_refs),
             "files": sorted(
                 (
-                    {"path": f["path"], "sha256": f["sha256"], "base_sha256": f.get("base_sha256")}
+                    {"path": f["path"], "sha256": f["sha256"], "base_sha256": f.get("base_sha256"), **({"delete": True} if f.get("delete") is True else {})}
                     for f in files
                 ),
                 key=lambda f: f["path"],
@@ -187,7 +188,7 @@ def validate_batch(batch: Any) -> dict[str, Any]:
     for index, item in enumerate(files):
         if not isinstance(item, Mapping):
             raise CommunityError(f"files[{index}] must be an object")
-        unknown = set(item) - {"path", "content", "sha256", "base_sha256", "sent_markers"}
+        unknown = set(item) - {"path", "content", "sha256", "base_sha256", "delete"}
         if unknown:
             raise CommunityError(f"files[{index}] has unknown fields: {sorted(unknown)}")
         path = check_path(item.get("path"))
@@ -195,6 +196,19 @@ def validate_batch(batch: Any) -> dict[str, Any]:
             raise CommunityError(f"duplicate path {path!r}")
         seen_paths.add(path)
         content = item.get("content")
+        if "delete" in item and item["delete"] is not True:
+            raise CommunityError(f"{path}: delete must be true when present")
+        if item.get("delete") is True:
+            if not path.startswith("tasks/") or path.endswith("/index.md"):
+                raise CommunityError("only superseded task block files can be deleted by a contribution")
+            if content is not None or item.get("sha256") is not None:
+                raise CommunityError(f"{path}: a deletion cannot contain replacement bytes")
+            base_sha = item.get("base_sha256")
+            if not isinstance(base_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", base_sha):
+                raise CommunityError(f"{path}: deletion requires the exact previous file digest")
+            checked_files.append(dict(path=path, content=None, sha256=None,
+                                      base_sha256=base_sha, delete=True))
+            continue
         if not isinstance(content, str):
             raise CommunityError(f"{path}: content must be a UTF-8 string")
         raw = content.encode("utf-8")
@@ -202,19 +216,15 @@ def validate_batch(batch: Any) -> dict[str, Any]:
             raise CommunityError(f"{path}: exceeds the per-file platform envelope")
         total += len(raw)
         if total > MAX_BATCH_BYTES:
-            # Soft multi-record grouping budget: an over-budget batch is valid
-            # only when exactly one platform-legal entry document accounts for
-            # the excess (JSON overhead included by construction). Anything
-            # else must have been chunked by the contributor side.
-            entry_files = [
-                *checked_files, {"path": path, "content": content},
-            ]
-            entry_files = [f for f in entry_files
-                           if f["path"].startswith(("cases/", "topics/"))]
-            if not (
-                len(entry_files) == 1
-                and total - len(entry_files[0]["content"].encode("utf-8")) <= MAX_BATCH_BYTES
-            ):
+            # A complete task package is the indivisible publication unit.
+            # The grouping budget may be exceeded by one platform-legal task.
+            package_ids = {f["path"].split("/")[1] for f in files
+                           if isinstance(f, Mapping) and str(f.get("path", "")).startswith("tasks/")}
+            one_package = len(package_ids) == 1 and all(
+                isinstance(f, Mapping) and str(f.get("path", "")).startswith("tasks/")
+                for f in files
+            )
+            if not one_package:
                 raise CommunityError("batch exceeds the per-flush grouping budget")
         sha = item.get("sha256")
         if not isinstance(sha, str) or sha != sha256_text(content):
@@ -222,32 +232,44 @@ def validate_batch(batch: Any) -> dict[str, Any]:
         base_sha = item.get("base_sha256")
         if base_sha is not None and (not isinstance(base_sha, str) or len(base_sha) != 64):
             raise CommunityError(f"{path}: base_sha256 must be null or a sha256 digest")
-        markers = item.get("sent_markers")
-        if markers is not None:
-            # Confirmed observation identities (sending history), used to
-            # apply only still-unsent additions onto the actual remote body.
-            if (
-                not isinstance(markers, list)
-                or len(markers) > 65536
-                or any(not isinstance(marker, str) or not _MARKER_RE.fullmatch(marker)
-                       for marker in markers)
-            ):
-                raise CommunityError(
-                    f"{path}: sent_markers must be a bounded list of hex observation identities"
-                )
         if path.startswith("feedback/"):
             validate_feedback(content, path)
-            markers = None  # feedback files carry no observation identity
         checked_files.append(
             {"path": path, "content": content, "sha256": sha,
-             "base_sha256": base_sha, "sent_markers": markers}
+             "base_sha256": base_sha}
         )
 
     revision = batch.get("revision")
     expected = batch_revision(checked_files, domain, base_commit, entry_refs)
     if revision != expected:
         raise CommunityError("batch revision does not match the digest of files and metadata")
-    has_entries = any(f["path"].startswith(("cases/", "topics/")) for f in checked_files)
+    # Package writes include every current file together. Validate its structure
+    # with the same parser the file authority and consumer use; never publish a
+    # detached block or a navigation index referring to missing material.
+    task_files = {}
+    for item in checked_files:
+        if item["path"].startswith("tasks/"):
+            _, task_id, relative = item["path"].split("/", 2)
+            task_files.setdefault(task_id, {})
+            if item.get("delete") is not True:
+                task_files[task_id][relative] = item["content"]
+    task_revisions = {}
+    if task_files:
+        from mindie_knowledge.materials import validate_package_files
+        for task_id, package_files in task_files.items():
+            try:
+                package = validate_package_files(package_files, domain)
+            except ValueError as exc:
+                raise CommunityError(f"invalid task package {task_id}: {exc}") from exc
+            if not package["ready"]:
+                raise CommunityError("task package has unfinished material indexes")
+            task_revisions[task_id] = package["revision"]
+            expected_ref = f"mindie://{domain}/{task_id}@{package['revision']}"
+            if expected_ref not in entry_refs:
+                raise CommunityError("task package requires its exact revision reference")
+            if package.get("task_id") != task_id:
+                raise CommunityError("task package identity differs from its public path")
+    has_entries = any(f["path"].startswith(("tasks/",)) for f in checked_files)
     return {
         "batch_id": batch_id,
         "revision": revision,
@@ -257,6 +279,7 @@ def validate_batch(batch: Any) -> dict[str, Any]:
         "files": checked_files,
         "summary": summary,
         "votes_only": not has_entries,
+        "task_revisions": task_revisions,
         "explicit_retry": batch.get("explicit_retry") is True,
     }
 
@@ -270,6 +293,8 @@ def scan_outbound(batch: Mapping[str, Any], pr_title: str, pr_body: str, commit_
     allow = Allowlist()
     findings = []
     for item in batch["files"]:
+        if item.get("delete") is True:
+            continue
         findings.extend(scan_text(item["content"], allow, path=item["path"]))
     for label, text in (("pr-title", pr_title), ("pr-body", pr_body), ("commit-message", commit_message)):
         findings.extend(scan_text(text, allow, path=label))
@@ -317,7 +342,7 @@ def render_pr_body(batch: Mapping[str, Any]) -> str:
         lines.append(f"- entry refs: {', '.join('`' + ref + '`' for ref in batch['entry_refs'][:20])}")
     lines += ["", "Files:"]
     for item in sorted(batch["files"], key=lambda f: f["path"]):
-        change = "added" if item["base_sha256"] is None else "modified"
+        change = "deleted" if item.get("delete") is True else ("added" if item["base_sha256"] is None else "modified")
         lines.append(f"- `{item['path']}` ({change})")
     lines += ["", "Generated by the MindIE community contribution path; no model wrote this text."]
     return "\n".join(lines) + "\n"

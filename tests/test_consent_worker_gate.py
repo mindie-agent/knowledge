@@ -22,6 +22,9 @@ from mindie_knowledge.loop.engine import Engine
 from mindie_knowledge.loop.store import Store
 
 from conftest import make_admission, write_settings
+from material_worker_fixture import command as summary_command
+from mindie_knowledge.loop.transcript_redaction import install_scanner
+from mindie_knowledge.loop.transcript_capture import summarize_due
 from lane_support import (
     SESSIONS,
     allow_read,
@@ -48,18 +51,6 @@ def _observe(parser):
     parser.read_material = wrapped
     parser._grok_core_calls = calls
     return parser
-
-
-def _runner(path, marker):
-    path.write_text(
-        "import pathlib, json, sys\n"
-        f"mark = pathlib.Path({str(marker)!r})\n"
-        "mark.write_text((mark.read_text(encoding='utf-8') if mark.exists() else '') + 'x\\n', encoding='utf-8', newline='\\n')\n"
-        "payload = json.loads(sys.stdin.buffer.read().decode('utf-8'))\n"
-        "text = payload.get('increment', '')[:400]\n"
-        "sys.stdout.buffer.write(json.dumps({'entries':[{'entry_id':None,'title':'Gate observation',"
-        "'summary':'worker gate outcome','content':text,'conditions':{}}]}).encode('utf-8'))\n"
-    )
 
 
 _SHAPES = (
@@ -179,12 +170,11 @@ def _world(tmp_path, *, enabled, consent):
     write_transcript(PARSER_NAME, log, SESSION, [TOKEN], when)
     store = Store(tmp_path / "store", "test")
     marker = tmp_path / "spawns"
-    runner = tmp_path / "runner.py"
-    _runner(runner, marker)
     parser = _observe(load_parser(PARSER_NAME))
     engine = Engine(
         store,
-        agent_command=[sys.executable, str(runner)],
+        summary_command=summary_command(calls=marker),
+        redactor_executable=install_scanner(),
         settings_path=settings,
         admission=Admission(admission),
         transcript_adapter=parser,
@@ -213,6 +203,8 @@ def _stop(world):
     )
     if captured.get("id") and captured.get("status") in {"queued", "pending", "deferred"}:
         world["engine"]._process(captured["id"])
+        world["engine"].last_activity = 0
+        summarize_due(world["engine"])
     return captured
 
 
@@ -343,29 +335,12 @@ def test_blocked_consent_keeps_local_retrieval(tmp_path):
 
 
 def _pending_batch(store, generation):
-    batch_id = "batch-gate"
-    with store._write_txn():
-        store.db.execute(
-            "INSERT INTO outbox(batch_id, revision, batch, status, detail, "
-            "pr_url, head_sha, created, attempted, updated, reconciliations, "
-            "next_attempt, generation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                batch_id,
-                "rev-1",
-                json.dumps({"entry_refs": []}),
-                "pending",
-                "",
-                None,
-                None,
-                time.time(),
-                None,
-                time.time(),
-                0,
-                None,
-                generation,
-            ),
-        )
-    return batch_id
+    from mindie_knowledge.loop.export import build_batch
+    from mindie_knowledge.loop import settings as settings_mod
+    store.create_draft(kind='experience', title='K3 source observation', summary='Reported, unverified.',
+                       content='Pending source material retains its uncertainty.', generation=generation)
+    path = store.root.parents[1] / 'community.json'
+    return build_batch(store, settings=settings_mod.load(path))[0]
 
 
 def _submit(tmp_path, consent):
@@ -374,7 +349,7 @@ def _submit(tmp_path, consent):
 
     def submit_batch(*args, **kwargs):
         called.append((args, kwargs))
-        return {"status": "submitted", "detail": "recorder"}
+        return {"status": "submitted", "detail": "recorder", "head_sha": "a"*40, "pr_url":"https://github.com/example/repo/pull/1"}
 
     world["engine"].community = {
         "submit_batch": submit_batch,
@@ -382,6 +357,7 @@ def _submit(tmp_path, consent):
     }
     generation = json.loads(world["settings"].read_text())["generation"]
     batch_id = _pending_batch(world["store"], generation)
+    world["batch_id"] = batch_id
     world["engine"]._submit(world["store"].batch(batch_id))
     return world, called
 
@@ -403,7 +379,7 @@ def test_non_contribute_consent_does_not_submit(tmp_path, consent):
     world, called = _submit(tmp_path, consent)
     try:
         assert called == []
-        row = world["store"].batch("batch-gate")
+        row = world["store"].batch(world["batch_id"])
         assert row["status"] == "pending"
         assert row["attempted"] is None
     finally:
@@ -415,7 +391,7 @@ def test_malformed_gate_does_not_submit(tmp_path, consent):
     world, called = _submit(tmp_path, consent)
     try:
         assert called == [], called
-        row = world["store"].batch("batch-gate")
+        row = world["store"].batch(world["batch_id"])
         assert row["status"] == "pending", row
         assert row["attempted"] is None
     finally:

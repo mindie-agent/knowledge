@@ -16,7 +16,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from mindie_knowledge.markdown import _atomic_write_text
-from .store import session_key
+from .store import MISSING_MATERIAL_JOB_DETAIL, SUMMARY_STATUS_SQL, session_key
 from .process import AGENT_ERROR_EXIT_CODES
 
 MAX_JSON = 64 * 1024
@@ -344,8 +344,90 @@ def _task_roots(config, session):
     return sorted(session_key(root) for root in roots)
 
 
+
+def _summary_failure(detail):
+    if detail.startswith('{'):
+        from ..materials.summarizer import failure_detail
+        value = json.loads(detail)
+        if not isinstance(value, dict):
+            raise ValueError('invalid stored summary failure')
+        safe = failure_detail(dict(error=value.get('error'), error_reason=value.get('reason')))
+        if safe is None or safe != value:
+            raise ValueError('invalid stored summary failure')
+        return dict(category=safe['error'], **{key: value for key, value in safe.items() if key != 'error'})
+    category = detail.removeprefix('category=')
+    if detail == 'configuration: summary worker is not configured':
+        category = 'configuration'
+    return {'category': category} if category in AGENT_ERROR_EXIT_CODES else failure(detail)
+
+
+def _summary_diagnostics(db, session, roots, result):
+    """Project counters and safe states in SQL; never load model output or body."""
+    from ..materials.summarizer import failure_detail
+    placeholders = ",".join("?" for _ in roots)
+    scoped = f"""
+        SELECT t.entry_id FROM transcript_tasks t LEFT JOIN captures c ON c.id=t.capture_id
+        WHERE c.session=? OR c.root_session IN ({placeholders})
+           OR json_extract(CASE WHEN json_valid(t.authorization) THEN t.authorization ELSE '{{}}' END, '$.session')=?
+           OR json_extract(CASE WHEN json_valid(t.authorization) THEN t.authorization ELSE '{{}}' END, '$.root_session') IN ({placeholders})
+    """
+    fields = ('error', 'error_reason', 'model_calls', 'billing_status', 'usage_known', 'usage.input_tokens',
+              'usage.cached_input_tokens', 'usage.output_tokens')
+    projection = ','.join(
+        f"CASE WHEN json_valid(m.response) THEN json_extract(m.response, '$.{field}') END AS receipt_{field.replace('.', '_')}"
+        for field in fields)
+    projection += ',' + ','.join(
+        f"CASE WHEN json_valid(m.response) THEN json_type(m.response, '$.{field}') END AS type_{field.replace('.', '_')}"
+        for field in ('model_calls', 'usage.input_tokens', 'usage.cached_input_tokens', 'usage.output_tokens'))
+    rows = db.execute(f"""
+        SELECT substr(m.attempt_id,1,129) AS attempt_id, substr(m.status,1,64) AS status,
+               substr(m.error,1,64) AS error, m.response IS NOT NULL AS has_receipt,
+               json_valid(m.response) AS receipt_valid, {projection}
+        FROM material_summary_attempts m WHERE m.task_id IN ({scoped})
+        ORDER BY (m.status IN ('outcome_unknown','failed')) DESC, m.updated DESC
+    """, (session, *roots, session, *roots))
+    totals = dict(model_calls=0, unknown_calls=0, input_tokens=0, cached_input_tokens=0, output_tokens=0)
+    attempts = []
+    states = {'prepared', 'invoking', 'returned', 'complete', 'failed', 'outcome_unknown'}
+    categories = {'configuration', 'deadline', 'native', 'invalid_result', 'output_limit', 'unknown',
+                  'scanner_unavailable', 'authority_unavailable', 'apply_failed', 'interrupted', 'cancelled'}
+    for row in rows:
+        state = row['status']
+        if state not in states or not isinstance(row['attempt_id'], str) or not _SAFE_ID.fullmatch(row['attempt_id']):
+            raise ValueError('invalid stored summary state')
+        if not row['has_receipt']:
+            if state not in {'prepared', 'invoking', 'outcome_unknown'}:
+                raise ValueError('missing summary receipt')
+            calls = int(state in {'invoking', 'outcome_unknown'})
+            billing = 'unknown' if calls else 'not_called'
+            usage = {}
+        else:
+            calls, billing = row['receipt_model_calls'], row['receipt_billing_status']
+            if (not row['receipt_valid'] or row['type_model_calls'] != 'integer' or type(calls) is not int or calls not in {0, 1}
+                    or billing not in {'not_called', 'rejected', 'reported', 'unknown'}
+                    or (billing == 'not_called') != (calls == 0)):
+                raise ValueError('invalid stored summary usage')
+            usage = {key: row['receipt_usage_' + key] for key in ('input_tokens', 'cached_input_tokens', 'output_tokens')
+                     if row['receipt_usage_' + key] is not None}
+            if any(row['type_usage_' + key] != 'integer' or type(value) is not int or value < 0 for key, value in usage.items()):
+                raise ValueError('invalid stored summary usage counter')
+            if billing == 'reported' and (row['receipt_usage_known'] != 1 or len(usage) != 3):
+                raise ValueError('incomplete reported summary usage')
+        totals['model_calls'] += calls
+        totals['unknown_calls'] += int(billing == 'unknown')
+        for key, value in usage.items():
+            totals[key] += value
+        detail = failure_detail(dict(error=row['receipt_error'], error_reason=row['receipt_error_reason'])) if row['has_receipt'] else None
+        if len(attempts) < 5:
+            attempts.append(dict(attempt_id=row['attempt_id'], status=state, billing_status=billing,
+                                 **({'category': row['error']} if row['error'] in categories else {}),
+                                 **({key: value for key, value in detail.items() if key != 'error'} if detail else {})))
+    result['summary_attempts'] = attempts
+    result['summary_usage'] = dict(scope='task', **totals)
+
+
 def _store(config, session, result):
-    path = Path(config["root"]) / config["domain"] / "store-v3.sqlite3"
+    path = Path(config["root"]) / config["domain"] / "state-v4.sqlite3"
     try:
         path.stat()
     except FileNotFoundError:
@@ -361,10 +443,6 @@ def _store(config, session, result):
         counts = {table: db.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
                   for table in ("captures", "outbox")}
         result["maintenance"] = dict(status="ok", scope="shared", counts=counts)
-        if "maintenance_attempts" in tables:
-            result["maintenance"]["calls_last_hour"] = db.execute(
-                "SELECT count(*) FROM maintenance_attempts WHERE started>?", (time.time() - 3600,)
-            ).fetchone()[0]
         if session is not None:
             roots = _task_roots(config, session)
             placeholders = ",".join("?" for _ in roots)
@@ -377,25 +455,26 @@ def _store(config, session, result):
                                    for row in rows if isinstance(row["id"], str) and _SAFE_ID.fullmatch(row["id"])]
             if "transcript_tasks" in tables:
                 rows = db.execute(f"""
-                    SELECT t.summary_status, substr(t.summary_detail,1,200) AS detail
+                    SELECT {SUMMARY_STATUS_SQL} AS visible_status, substr(t.summary_detail,1,1024) AS detail
                     FROM transcript_tasks t LEFT JOIN captures c ON c.id=t.capture_id
                     WHERE c.session=? OR c.root_session IN ({placeholders})
                        OR json_extract(CASE WHEN json_valid(t.authorization)
                                        THEN t.authorization ELSE '{{}}' END, '$.session')=?
-                    ORDER BY (t.summary_status NOT IN
+                       OR json_extract(CASE WHEN json_valid(t.authorization)
+                                       THEN t.authorization ELSE '{{}}' END, '$.root_session') IN ({placeholders})
+                    ORDER BY (visible_status NOT IN
                               ('pending','running','complete','cancelled','superseded')) DESC,
                              t.updated DESC LIMIT 5
-                """, (session, *roots, session))
+                """, (session, *roots, session, *roots))
                 for row in rows:
-                    state = row["summary_status"]
-                    detail = row["detail"]
-                    category = detail.removeprefix("category=")
-                    if detail == "configuration: summary worker is not configured":
-                        category = "configuration"
+                    state = row["visible_status"]
                     result["summaries"].append(dict(
-                        status=state if state in {"pending", "running", "complete", "failed", "cancelled", "superseded"} else "unknown",
-                        **({"category": category} if category in AGENT_ERROR_EXIT_CODES else failure(detail)),
+                        status=state if state in {"pending", "running", "complete", "failed", "cancelled", "superseded", "outcome_unknown", "missing"} else "unknown",
+                        **(dict(stage="index-queue", reason="missing-material-batch", message=MISSING_MATERIAL_JOB_DETAIL)
+                           if state == "missing" else _summary_failure(row["detail"])),
                     ))
+            if "material_summary_attempts" in tables:
+                _summary_diagnostics(db, session, roots, result)
             # JSON is inspected inside SQLite, not copied into Python. The time
             # progress handler bounds history scans; invalid/oversized payloads
             # cannot prove ownership through entry_refs. Votes remain independent.
@@ -437,6 +516,7 @@ def snapshot(config_path, *, session=None):
     result = dict(configuration=dict(status="unavailable"), service=dict(status="unknown"),
                   store=dict(status="unknown"), admission=dict(status="missing", enabled=False),
                   maintenance=dict(status="unknown", scope="shared"), captures=[], contributions=[], summaries=[],
+                  summary_attempts=[], summary_usage=None,
                   startup=dict(status="absent"), delivery=dict(status="absent"), hints=[])
     try:
         if session is not None:
@@ -478,8 +558,10 @@ def snapshot(config_path, *, session=None):
         result["hints"].append("Use this task's contributions batch_id for recover inspect; reconcile unknown writes before any explicit retry.")
     if result["startup"].get("status") == "failed":
         result["hints"].append("Inspect the reported configured startup component and installation.")
-    if any(row["status"] in {"failed", "unknown"} for row in result["summaries"]):
-        result["hints"].append("Required experience organization failed; the local body is retained and publication is blocked.")
+    if any(row["status"] in {"failed", "unknown", "outcome_unknown", "missing"} for row in result["summaries"]):
+        result["hints"].append("Required material indexing has not completed; local material is retained and publication is blocked.")
+    if result["summary_usage"] and result["summary_usage"]["unknown_calls"]:
+        result["hints"].append("Summary invocation or billing remains uncertain; these calls are counted without inventing missing usage. Status does not retry them.")
     if result["service"].get("status") != "running" or result["store"].get("status") == "unavailable":
         result["hints"].append("Knowledge is unavailable; continue native/local or independent remote business work while inspecting the reported stage and class. Status does not retry work.")
     return result

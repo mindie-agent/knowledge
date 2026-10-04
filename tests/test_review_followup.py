@@ -9,7 +9,6 @@ import time
 
 import pytest
 
-from mindie_knowledge.loop.budget import MAX_CHECKPOINT_RESULT
 from mindie_knowledge.loop.cli import capture_hook
 from mindie_knowledge.loop.diagnostics import _DELIVERY_RECOVERY
 from mindie_knowledge.loop.engine import Engine
@@ -30,6 +29,8 @@ def _ready(tmp_path):
     config.write_text(json.dumps(dict(
         root=str(tmp_path / "root"), domain="test",
         community_config=str(settings), admission_path=str(admission),
+        capture_mode="public-transcript", transcript_adapter=__import__("transcript_double").__file__,
+        redactor_executable=__import__("shutil").which("gitleaks") or str(tmp_path / "gitleaks"),
     )))
     return config, admission, project, settings
 
@@ -86,7 +87,7 @@ def test_cursor_conflict_is_not_due_immediately(tmp_path):
             root_session="root", session="manual-A", turn="t", transcript=None,
             summary="kept", namespace="codex",
         )
-        engine = Engine(store, agent_command=["false"])
+        engine = Engine(store)
         engine._defer_reread(captured["id"])
         row = store.db.execute(
             "SELECT due, eligible, reason FROM continuations WHERE capture_id=?",
@@ -107,50 +108,8 @@ def test_cursor_conflict_is_not_due_immediately(tmp_path):
         store.close()
 
 
-def test_checkpoint_accepts_local_entry_metadata_past_32kib(tmp_path):
-    store = Store(tmp_path, "vllm-ascend")
-    try:
-        engine = Engine(store, agent_command=["false"])
-        ident = "organize:" + "a" * 64 + ":marker"
-        engine.budget.reserve(ident, "session", "organize")
-        body = "x" * (32 * 1024 + 100)
-        assert len(body.encode()) < MAX_CHECKPOINT_RESULT
-        engine.budget.checkpoint(ident, body, "{}")
-        assert engine.budget.application(ident)["result"] == body
-        with pytest.raises(ValueError):
-            engine.budget.checkpoint(ident, "y" * (MAX_CHECKPOINT_RESULT + 1), "{}")
-    finally:
-        store.close()
 
 
-def test_start_arms_apply_and_does_not_apply_it(tmp_path):
-    _config, _admission, _project, settings = _ready(tmp_path)
-    store = Store(tmp_path / "root", "test")
-    try:
-        captured = store.add_capture(
-            root_session="root", session="manual-A", turn="t", transcript=None,
-            summary="kept", namespace="codex",
-        )
-        store.mark_capture(captured["id"], "apply-pending", "saved")
-        # mark_capture drops continuations for a non-pending status.
-        attempt = f"organize:{captured['id']}:marker"
-        engine = Engine(
-            store, agent_command=["false"], settings_path=str(settings),
-        )
-        engine.budget.reserve(attempt, "root", "organize")
-        engine.budget.checkpoint(attempt, '{"entries":[]}', "{}")
-        store.db.execute("DELETE FROM continuations WHERE capture_id=?", (captured["id"],))
-        store.db.commit()
-        calls = []
-        engine._apply_saved = lambda *args, **kwargs: calls.append(args)
-        engine.thread.start = lambda: None
-        engine.outbox_thread.start = lambda: None
-        engine.start()
-        assert calls == []
-        assert store.continuation_reason(captured["id"]) == "apply-pending"
-        assert store.due_application() == attempt
-    finally:
-        store.close()
 
 
 def test_notification_without_token_and_locked_admission(tmp_path, monkeypatch):
@@ -191,104 +150,8 @@ def test_recovery_text_does_not_ask_for_a_stop_replay():
     assert "replay this stop" in blob
 
 
-def test_apply_transient_failure_resumes_without_terminal_dormancy(tmp_path):
-    """A saved organizer result blocked by a transient local failure keeps its
-    persisted backoff and stays eligible — no terminal attempt count parks it
-    and no model is replayed."""
-    _config, _admission, _project, settings = _ready(tmp_path)
-    store = Store(tmp_path / "root", "test")
-    try:
-        captured = store.add_capture(
-            root_session="root", session="manual-A", turn="t", transcript=None,
-            summary="kept", namespace="codex",
-        )
-        store.mark_capture(captured["id"], "apply-pending", "saved")
-        engine = Engine(store, agent_command=["false"], settings_path=str(settings))
-        attempt = f"organize:{captured['id']}:marker"
-        engine.budget.reserve(attempt, "root", "organize")
-        payload = json.dumps({"entries": [dict(
-            entry_id="e" * 64, title="Transient case", summary="s",
-            content="kept body", conditions={}, new=True,
-        )]})
-        engine.budget.checkpoint(attempt, payload, "{}")
-
-        from mindie_knowledge.loop.store import Store as _Store
-
-        calls = []
-        real_create = _Store.create_draft
-
-        def busy_create(*args, **kwargs):
-            calls.append(1)
-            raise OSError("disk busy")
-
-        store.create_draft = busy_create
-        row = store.capture_row(captured["id"])
-        engine._apply_saved(attempt, row)
-        assert store.continuation_reason(captured["id"]) == "apply-transient:1"
-        cont = store.db.execute(
-            "SELECT due, eligible FROM continuations WHERE capture_id=?",
-            (captured["id"],),
-        ).fetchone()
-        assert cont["eligible"] == 1 and cont["due"] > time.time()
-        # Still apply-pending with the saved result intact; repeated transient
-        # faults grow the backoff but never park the valid result.
-        engine._apply_saved(attempt, store.capture_row(captured["id"]))
-        assert store.continuation_reason(captured["id"]) == "apply-transient:2"
-        assert engine.budget.application(attempt)["result"] == payload
-        store.create_draft = real_create.__get__(store, _Store)
-        engine._apply_saved(attempt, store.capture_row(captured["id"]))
-        assert store.capture_row(captured["id"])["status"] == "organized"
-        assert engine.budget.application(attempt)["result"] is None  # settled
-    finally:
-        store.close()
 
 
-def test_apply_due_counts_activity_and_does_not_start_when_frozen(tmp_path):
-    store = Store(tmp_path, "vllm-ascend")
-    try:
-        captured = store.add_capture(
-            root_session="root", session="manual-A", turn="t", transcript=None,
-            summary="kept", namespace="codex",
-        )
-        store.mark_capture(captured["id"], "apply-pending", "saved")
-        attempt = f"organize:{captured['id']}:marker"
-        engine = Engine(store, agent_command=["false"])
-        engine.budget.reserve(attempt, "root", "organize")
-        engine.budget.checkpoint(attempt, '{"entries":[{"kept":true}]}', "{}")
-        store.schedule_continuation(
-            captured["id"], due=0, reason="apply-pending", eligible=1,
-        )
-        entered = threading.Event()
-        release = threading.Event()
-
-        def hold(_attempt_id, _row):
-            entered.set()
-            release.wait(timeout=2)
-
-        engine._apply_saved = hold
-        worker = threading.Thread(target=engine._apply_due)
-        worker.start()
-        try:
-            assert entered.wait(2)
-            decision = engine.stop_if_idle()
-            assert decision["idle"] is False
-            assert decision["activity"] >= 1
-        finally:
-            release.set()
-            worker.join(2)
-        assert not worker.is_alive()
-        assert engine.status()["activity"] == 0
-        assert engine.budget.application(attempt)["result"]
-
-        engine._frozen = True
-        calls = []
-        engine._apply_saved = lambda *_a, **_k: calls.append(1)
-        engine._apply_due()
-        assert calls == []
-        assert engine.status()["activity"] == 0
-        assert engine.budget.application(attempt)["result"]
-    finally:
-        store.close()
 
 
 def test_live_pid_in_wake_json_does_not_coalesce(tmp_path, monkeypatch):
@@ -360,50 +223,5 @@ def test_append_cas_exhaustion_is_transient_not_content_failure(tmp_path):
             doc["entry_id"], "contended observation", marker="ab" * 32,
             producer="a" * 64)
         assert not again_appended and again["revision"] == updated["revision"]
-    finally:
-        store.close()
-
-
-def test_apply_saved_cas_contention_recovers_via_existing_backoff(tmp_path):
-    """A saved organizer result whose append exhausts the CAS bound resumes
-    through the existing persisted apply backoff — never recorded as a
-    content failure, and applied exactly once after contention clears."""
-    _config, _admission, _project, settings = _ready(tmp_path)
-    store = Store(tmp_path / "root", "test")
-    try:
-        captured = store.add_capture(
-            root_session="root", session="manual-A", turn="t", transcript=None,
-            summary="kept", namespace="codex",
-        )
-        store.mark_capture(captured["id"], "apply-pending", "saved")
-        engine = Engine(store, agent_command=["false"], settings_path=str(settings))
-        attempt = f"organize:{captured['id']}:" + "ab" * 32
-        engine.budget.reserve(attempt, "root", "organize")
-        opaque = store.opaque_for("root")
-        base = store.create_draft(kind="experience", title="Contended saved",
-                                  summary="s", content="base body", owner=opaque)
-        payload = json.dumps({"entries": [
-            dict(entry_id=base["entry_id"], title=None, summary="s",
-                 content="observation one", conditions={}),
-        ]})
-        engine.budget.checkpoint(attempt, payload, "{}")
-        races = _force_cas_races(store, 3)
-        engine._apply_saved(attempt, store.capture_row(captured["id"]))
-        assert store.continuation_reason(captured["id"]) == "apply-transient:1"
-        cont = store.db.execute(
-            "SELECT due, eligible FROM continuations WHERE capture_id=?",
-            (captured["id"],),
-        ).fetchone()
-        assert cont["eligible"] == 1 and cont["due"] > time.time()
-        assert engine.budget.application(attempt)["result"] == payload
-        # The saved result is intact; no entry was half-applied.
-        assert "observation one" not in store.get(store.ref(base["entry_id"]))["content"]
-        # Contention cleared: the same saved result applies exactly once.
-        del store._row
-        engine._apply_saved(attempt, store.capture_row(captured["id"]))
-        assert store.capture_row(captured["id"])["status"] == "organized"
-        body = store.get(store.ref(base["entry_id"]))["content"]
-        assert "observation one" in body
-        assert engine.budget.application(attempt)["result"] is None
     finally:
         store.close()

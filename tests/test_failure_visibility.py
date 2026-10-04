@@ -31,15 +31,15 @@ def test_locked_admission_is_not_empty(tmp_path):
     assert len(gate.leases()) == 1
 
 
-@pytest.mark.parametrize('name,read', [('search_backfill', '_search_backfill_state'),
-                                       ('search_requeue', '_search_requeue_read')])
-def test_corrupt_index_progress_is_not_reset(tmp_path, name, read):
+@pytest.mark.parametrize('bad', ['{broken', '[]'])
+def test_corrupt_material_pointer_is_not_empty_success(tmp_path, bad):
     with closing(Store(tmp_path / 'store', 'test')) as store:
-        with store._write_txn():
-            store.db.execute('INSERT OR REPLACE INTO meta VALUES (?,?)', (name, '{broken'))
-        with pytest.raises(ValueError, match='invalid stored search'):
-            getattr(store, read)()
-        assert store.db.execute('SELECT value FROM meta WHERE key=?', (name,)).fetchone()[0] == '{broken'
+        store.create_draft(kind='experience', title='Preserved', summary='Observation', content='material canary')
+        path = store.materials.root / 'current.json'
+        path.write_text(bad)
+        with pytest.raises(ValueError):
+            store.query('material')
+        assert path.read_text() == bad
 
 
 def test_corrupt_export_attempt_cannot_be_retried_as_new(tmp_path):
@@ -63,7 +63,9 @@ def test_file_transport_never_overwrites_corrupt_state(tmp_path, bad):
 
 def test_corrupt_batch_cannot_receive_a_success_receipt(tmp_path):
     with closing(Store(tmp_path / 'store', 'test')) as store:
-        store.create_batch(batch_id='batch', revision='revision', batch={'entry_refs': []}, entry_ids=[], vote_keys=[])
+        from mindie_knowledge.materials.publication import freeze_batch
+        descriptor = freeze_batch(store.root, dict(batch_id='batch', revision='a' * 64, files=[], entry_refs=[]))
+        store.create_batch(batch_id='batch', revision='a' * 64, batch=descriptor, entry_ids=[], vote_keys=[])
         with store._write_txn():
             store.db.execute("UPDATE outbox SET batch='{broken' WHERE batch_id='batch'")
         with pytest.raises(ValueError, match='invalid stored outbox batch'):
@@ -105,3 +107,21 @@ def test_summary_worker_failure_is_visible_in_status(tmp_path, monkeypatch):
         status = engine.status()
         assert status['background_errors'] == {'summary': 'OSError'}
         assert status['errors'] == ['summary worker stopped: OSError']
+
+
+def test_store_close_preserves_committed_effect_error_over_cleanup(tmp_path, monkeypatch):
+    store = Store(tmp_path / 'store', 'test')
+    original = OSError('pointer promotion failed after metadata commit')
+    original.metadata_committed = True
+    def promotion_failed():
+        raise original
+    def index_close_failed():
+        raise ValueError('derived cleanup failed')
+    monkeypatch.setattr(store, '_finish_material_writes', promotion_failed)
+    monkeypatch.setattr(store.materials, 'close', index_close_failed)
+    with pytest.raises(OSError) as caught:
+        store.close()
+    assert caught.value is original and caught.value.metadata_committed
+    assert 'ValueError' in ' '.join(caught.value.__notes__)
+    with pytest.raises(sqlite3.ProgrammingError):
+        store.db.execute('SELECT 1')

@@ -26,7 +26,7 @@ def test_unsafe_material_is_quarantined_without_blocking_valid_material(tmp_path
     assert built is not None
     _batch_id, _revision, batch, entry_ids, _votes = built
     assert entry_ids == [valid['entry_id']]
-    assert [f['path'] for f in batch['files']] == [f"cases/{valid['entry_id']}.md"]
+    assert len(batch["files"]) >= 2 and all(f["path"].startswith(f"tasks/{valid['entry_id']}/") for f in batch["files"])
     assert store.quarantined_entries() == {unsafe['entry_id']: 'content-scan'}
     # Nothing is rebuilt on idle ticks or after a restart: the quarantined
     # entry is out of the selection, not parked behind a failing fingerprint.
@@ -79,13 +79,13 @@ def test_transient_staging_failure_resumes_with_backoff(tmp_path, monkeypatch):
     from mindie_knowledge.loop import export as export_mod
 
     calls = []
-    real_write = export_mod._atomic_write_text
+    real_write = export_mod.freeze_batch
 
-    def failing_write(target, text):
+    def failing_write(target, batch):
         calls.append(str(target))
         raise OSError('disk temporarily not writable')
 
-    monkeypatch.setattr(export_mod, '_atomic_write_text', failing_write)
+    monkeypatch.setattr(export_mod, 'freeze_batch', failing_write)
     with pytest.raises(OSError, match='disk temporarily not writable'):
         build_batch(store, settings=shared)
     attempt = store.status()['export_attempts'][0]
@@ -94,7 +94,7 @@ def test_transient_staging_failure_resumes_with_backoff(tmp_path, monkeypatch):
     assert store.status()['outbox'] == []
     # While the backoff is due nothing rebuilds every idle tick...
     assert build_batch(store, settings=shared) is None
-    monkeypatch.setattr(export_mod, '_atomic_write_text', real_write)
+    monkeypatch.setattr(export_mod, 'freeze_batch', real_write)
     assert build_batch(store, settings=shared) is None  # still backing off
     # ...and once the local problem is fixed and the check is due, the exact
     # same material is staged without any organizer replay or cursor reset.
@@ -234,7 +234,7 @@ def test_submit_and_reconcile_receipts_apply_retry_after_floor(tmp_path):
     retry_at = time.time() + 1800
 
     from mindie_knowledge.loop.engine import Engine
-    engine = Engine(store, agent_command=None, settings_path=tmp_path / 'sharing.json')
+    engine = Engine(store, settings_path=tmp_path / 'sharing.json')
     engine.community = {
         'submit_batch': lambda *a, **k: dict(status='unavailable', retry_at=retry_at),
         'reconcile_batch': lambda *a, **k: dict(status='unknown', retry_at=retry_at - 900),
@@ -308,7 +308,7 @@ def test_waiting_for_old_write_does_not_consume_new_material(tmp_path, waiting):
     store.close()
     store = Store(tmp_path / 'data', 'test')
     assert build_batch(store, settings=shared) is None  # durable wait, no rewrite
-    store.mark_batch(first[0], 'submitted')  # original write now confirmed
+    store.mark_batch(first[0], 'submitted', head_sha='a' * 40)  # original write now confirmed
     second = build_batch(store, settings=shared)
     assert second is not None and second[1] != first[1]
     assert new['entry_id'] in second[3]

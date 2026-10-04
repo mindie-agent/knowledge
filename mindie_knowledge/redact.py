@@ -383,6 +383,15 @@ RULES: tuple[Rule, ...] = (
             re.IGNORECASE,
         ),
     ),
+    Rule(
+        id="credential-cjk-assignment",
+        description="credential provided with a Chinese password or token label",
+        hint="never submit credentials from natural-language setup instructions",
+        pattern=re.compile(
+            r"(?:密码|口令|访问令牌|密钥)\s*(?:都是|均为|是|为|[:：=])\s*"
+            r"[\"'`]?([A-Za-z0-9!@#$%^&*()_+={}\[\]:;.,/?~-]{6,})"
+        ),
+    ),
     # --- network identifiers ------------------------------------------------
     Rule(
         id="mac-address",
@@ -595,6 +604,7 @@ BUILTIN_ALLOWLIST: frozenset[str] = frozenset(
         # not values: "the token: expired" is a symptom, not a credential.
         "expired", "required", "missing", "invalid", "rejected", "redacted",
         "omitted", "unset", "unknown", "changed", "rotated", "present", "absent",
+        "[REDACTED_SECRET]",
         "correct", "incorrect", "mismatch", "needed", "ignored", "accepted",
     )
 )

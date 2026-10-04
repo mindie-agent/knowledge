@@ -1,25 +1,10 @@
-"""Versioned local knowledge store, scoped to one domain.
+"""Current task metadata, consent-bound capture and publication queues.
 
-This is the ``mindie-store/3`` runtime store (``store-v3.sqlite3``) serving
-canonical ``mindie-entry/2`` documents. It replaces content-as-identity with
-stable opaque entry IDs and content revisions. Local drafts retain only their
-latest body; superseded draft references expire. Pending publication owns its
-payload in the outbox independently. Published revisions installed from the
-content repository remain available to pinned readers.
-Local drafts update by append-only, marker-deduplicated observations; draft
-ownership lives in a private entry-owner relation, never in a downloaded
-document. Withdrawal is upstream deletion: an entry the feed tree no longer
-carries leaves ordinary search, is never resurrected by its local draft, and
-its retained pinned reads carry an explicit ``withdrawn`` flag and note.
-
-Per explicit user steering there is no legacy compatibility layer: the public
-knowledge base restarts empty in this format, old public migration is
-cancelled, and pre-existing private user files stay inert (never opened,
-never deleted). The runtime never creates or reads the obsolete
-``ledger.sqlite3``.
-
-SQLite is the serving catalogue and event ledger. Rendered draft Markdown is
-an inspectable export, not an independently editable input.
+The state-v4 SQLite database stores small headers, identifiers, cursors and
+receipts. Current material bodies live in canonical Markdown packages managed
+by MaterialStore; ReMe owns the disposable local retrieval index. Writes stage
+files first, commit queue metadata, then promote matching current pointers.
+Superseded unreferenced bodies are retired, and old database files are inert.
 """
 
 from __future__ import annotations
@@ -39,9 +24,15 @@ from pathlib import Path
 from . import documents
 from .documents import DraftFull
 
-SCHEMA = "mindie-store/3"
+SCHEMA = "mindie-store/4"
 MAX_VOTE_REASON = 1000
 RATINGS = ("up", "down")
+# Shared read-only projection; callers alias transcript_tasks as t. Missing
+# durable work is a diagnostic fault, never permission to recreate a model call.
+SUMMARY_STATUS_SQL = ("CASE WHEN t.summary_status='pending' AND NOT EXISTS "
+                      "(SELECT 1 FROM material_batches b WHERE b.entry_id=t.entry_id) "
+                      "THEN 'missing' ELSE t.summary_status END")
+MISSING_MATERIAL_JOB_DETAIL = "material index batch job is missing; no model work was scheduled"
 # A rejected lineage row may be replaced by a NEW batch of other material:
 # the rejection quarantines the rejected entries, never the whole domain.
 REPLACEABLE_BATCH = frozenset({"submitted", "updated", "unchanged", "needs_review",
@@ -75,16 +66,6 @@ def _backoff_seconds(base, cap, attempt):
     """Exponential backoff; the exponent is clamped before computing so a
     long-failing persisted counter can never overflow to an error."""
     return min(cap, base * (2.0 ** min(max(0, attempt - 1), 20)))
-
-
-class IndexNotReady(ValueError):
-    """The derived search index is being built or rebuilt.
-
-    A brief honest readiness state (existing read-rejection shape): never a
-    fake empty result and never a failure of the queried content. Callers
-    that merely wanted OPTIONAL retrieval context (the organizer payload)
-    must catch exactly this type and continue without it; anything else still
-    propagates."""
 
 
 def session_key(value):
@@ -156,16 +137,6 @@ def capture_identity(namespace, session, kind, key):
     return digest(["capture", kind, namespace or "", session, key.strip()])
 
 
-def legacy_session_capture_identity(namespace, session, turn):
-    """Previous handoff id: harness, session, and native turn. Turn kind only."""
-    return digest(["capture", namespace or "", session, turn.strip()])
-
-
-def legacy_capture_identity(root_hash, turn):
-    """Pre-handoff id. Ownership hash plus turn; not safe across sibling sessions."""
-    return digest(["capture", root_hash, turn.strip()])
-
-
 def _capture_identity_row(db, ident):
     return db.execute(
         "SELECT id, status, session, generation, activation_epoch "
@@ -200,8 +171,7 @@ def commit_capture(
 ):
     """Insert or adopt one capture. The caller holds the write transaction.
 
-    A repeat of the same kind and key returns the existing row. Turn identity
-    still adopts this session's older id formulas. An unprocessed row whose
+    A repeat of the same kind and key returns the existing row. An unprocessed row whose
     activation epoch or sharing generation no longer matches is cancelled in
     place; the id stays so the event is not captured again. ``processing``
     and terminal rows are not rewritten. A repeat makes a dormant tail or
@@ -220,18 +190,6 @@ def commit_capture(
         stored_event = None
     ident = capture_identity(namespace, session, kind, key)
     row = _capture_identity_row(db, ident)
-    if row is None and kind == "turn":
-        for candidate in (
-            legacy_session_capture_identity(namespace, session, key),
-            legacy_capture_identity(root_session, key),
-        ):
-            if candidate == ident:
-                continue
-            found = _capture_identity_row(db, candidate)
-            if found is not None and found["session"] == session:
-                row = found
-                ident = found["id"]
-                break
     if row is not None:
         status = row["status"]
         epoch_changed = bool(activation_epoch) and row["activation_epoch"] != activation_epoch
@@ -285,8 +243,11 @@ class Store:
         self.root.mkdir(parents=True, exist_ok=True)
         self.root.chmod(0o700)
         self.lock = threading.RLock()
+        from mindie_knowledge.materials.store import MaterialStore
+        self.materials = MaterialStore(self.root / "materials", domain=domain)
+        self._material_dirty = set()
         self.db = sqlite3.connect(
-            self.root / "store-v3.sqlite3", check_same_thread=False
+            self.root / "state-v4.sqlite3", check_same_thread=False
         )
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -310,7 +271,8 @@ class Store:
             CREATE TABLE IF NOT EXISTS regions(id TEXT PRIMARY KEY,
                 capture_id TEXT NOT NULL, file_identity TEXT NOT NULL,
                 start INTEGER NOT NULL, finish INTEGER NOT NULL, digest TEXT NOT NULL,
-                status TEXT NOT NULL, detail TEXT NOT NULL, created REAL NOT NULL);
+                status TEXT NOT NULL, detail TEXT NOT NULL, created REAL NOT NULL,
+                recovery INTEGER NOT NULL DEFAULT 0, identity TEXT);
             CREATE TABLE IF NOT EXISTS cursors(file_identity TEXT PRIMARY KEY,
                 identity TEXT NOT NULL, finish INTEGER NOT NULL, digest TEXT NOT NULL,
                 ok_finish INTEGER NOT NULL, updated REAL NOT NULL);
@@ -329,9 +291,6 @@ class Store:
                 next_attempt REAL, generation TEXT);
             CREATE TABLE IF NOT EXISTS feed_state(key TEXT PRIMARY KEY,
                 value TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS feed_staging(feed TEXT NOT NULL,
-                git_commit TEXT NOT NULL, path TEXT NOT NULL, entry_id TEXT NOT NULL,
-                doc TEXT NOT NULL, PRIMARY KEY(feed, path));
             CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY,
                 value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS continuations(capture_id TEXT PRIMARY KEY,
@@ -353,7 +312,7 @@ class Store:
                 repository TEXT,
                 pr_url TEXT,
                 batch_id TEXT,
-                updated REAL NOT NULL);
+                updated REAL NOT NULL, markers TEXT, batch_revision TEXT);
             CREATE TABLE IF NOT EXISTS entry_quarantine(
                 entry_id TEXT PRIMARY KEY,
                 kind TEXT NOT NULL,
@@ -363,113 +322,43 @@ class Store:
                 task_key TEXT PRIMARY KEY, entry_id TEXT NOT NULL,
                 capture_id TEXT NOT NULL, body_digest TEXT NOT NULL,
                 summary_status TEXT NOT NULL, summary_detail TEXT NOT NULL,
-                updated REAL NOT NULL, summary_due REAL NOT NULL);
-            CREATE TABLE IF NOT EXISTS history_imports(
-                source_key TEXT PRIMARY KEY, entry_id TEXT NOT NULL,
-                content_chars INTEGER NOT NULL, content_digest TEXT NOT NULL,
-                generation TEXT NOT NULL, revision TEXT NOT NULL);
+                updated REAL NOT NULL, summary_due REAL NOT NULL, authorization TEXT);
         """)
-        capture_columns = {
-            row[1] for row in self.db.execute("PRAGMA table_info(captures)")
-        }
-        task_columns = {row[1] for row in self.db.execute("PRAGMA table_info(transcript_tasks)")}
-        if "authorization" not in task_columns:
-            # Explicit imports use the importing session's authority, without
-            # creating a capture or a watcher for the historical session.
-            self.db.execute("ALTER TABLE transcript_tasks ADD COLUMN authorization TEXT")
-        if capture_columns and "activation_epoch" not in capture_columns:
-            self.db.execute("ALTER TABLE captures ADD COLUMN activation_epoch TEXT")
-        if capture_columns and "identity_kind" not in capture_columns:
-            self.db.execute("ALTER TABLE captures ADD COLUMN identity_kind TEXT")
-        if capture_columns and "event_key" not in capture_columns:
-            self.db.execute("ALTER TABLE captures ADD COLUMN event_key TEXT")
-        continuation_columns = {
-            row[1] for row in self.db.execute("PRAGMA table_info(continuations)")
-        }
-        if continuation_columns and "eligible" not in continuation_columns:
-            self.db.execute(
-                "ALTER TABLE continuations ADD COLUMN eligible INTEGER NOT NULL DEFAULT 1"
-            )
-        receipt_columns = {
-            row[1] for row in self.db.execute("PRAGMA table_info(sent_receipts)")
-        }
-        if receipt_columns and "markers" not in receipt_columns:
-            self.db.execute("ALTER TABLE sent_receipts ADD COLUMN markers TEXT")
-        if receipt_columns and "batch_revision" not in receipt_columns:
-            self.db.execute("ALTER TABLE sent_receipts ADD COLUMN batch_revision TEXT")
-        region_columns = {
-            row[1] for row in self.db.execute("PRAGMA table_info(regions)")
-        }
-        if region_columns and "recovery" not in region_columns:
-            # Bounded gap recovery: one delayed recovery model attempt per
-            # deadline-failed region (total at most two), persisted across
-            # restarts. ``identity`` is the transcript identity observed when
-            # the region was reserved, so the recovery re-read proves it sees
-            # the same source range and content.
-            self.db.execute(
-                "ALTER TABLE regions ADD COLUMN recovery INTEGER NOT NULL DEFAULT 0"
-            )
-            self.db.execute("ALTER TABLE regions ADD COLUMN identity TEXT")
-        staging_columns = {
-            row[1] for row in self.db.execute("PRAGMA table_info(feed_staging)")
-        }
-        if staging_columns and "tokens" not in staging_columns:
-            self.db.execute("ALTER TABLE feed_staging ADD COLUMN tokens TEXT")
-            self.db.execute("ALTER TABLE feed_staging ADD COLUMN text_digest TEXT")
-        entry_columns = {
-            row[1] for row in self.db.execute("PRAGMA table_info(entries)")
-        }
-        if entry_columns and "conditions" not in entry_columns:
-            # Small authoritative metadata for pre-LIMIT filtering; the
-            # search backfill populates it for pre-existing rows.
-            self.db.execute(
-                "ALTER TABLE entries ADD COLUMN conditions TEXT NOT NULL DEFAULT '{}'"
-            )
-        # Polling cost follows actionable rows, not lifetime task history.
-        # These additive indexes also work with existing databases.
         self.db.executescript("""
             CREATE INDEX IF NOT EXISTS captures_by_status ON captures(status, created);
             CREATE INDEX IF NOT EXISTS summaries_pending ON transcript_tasks(summary_due, updated)
                 WHERE summary_status='pending';
             CREATE INDEX IF NOT EXISTS summaries_by_entry ON transcript_tasks(entry_id);
-            CREATE INDEX IF NOT EXISTS imports_by_entry ON history_imports(entry_id);
             CREATE INDEX IF NOT EXISTS outbox_by_status ON outbox(status, next_attempt, created);
+            CREATE TABLE IF NOT EXISTS material_streams(
+                stream_key TEXT PRIMARY KEY, entry_id TEXT NOT NULL,
+                source_cursor INTEGER NOT NULL, source_identity TEXT NOT NULL,
+                redaction_state TEXT NOT NULL, generation TEXT NOT NULL,
+                authorization TEXT NOT NULL, updated REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS material_batches(
+                batch_id TEXT PRIMARY KEY, stream_key TEXT NOT NULL,
+                entry_id TEXT NOT NULL, block_ids TEXT NOT NULL,
+                status TEXT NOT NULL, detail TEXT NOT NULL,
+                authorization TEXT NOT NULL, created REAL NOT NULL);
         """)
-        self._init_search_index()
-        self.db.execute(
-            "INSERT OR REPLACE INTO meta VALUES('schema', ?)", (SCHEMA,)
-        )
-        self.db.execute(
-            "INSERT OR IGNORE INTO meta VALUES('capture_floor', ?)",
-            (str(time.time()),),
-        )
-        self.capture_floor = float(self.db.execute(
-            "SELECT value FROM meta WHERE key='capture_floor'"
-        ).fetchone()[0])
-        if self.db.execute("SELECT 1 FROM meta WHERE key='required-transcript-summary'").fetchone() is None:
-            self.db.execute("UPDATE transcript_tasks SET summary_status='failed', "
-                            "summary_detail='configuration: summary was not run' WHERE summary_status='excerpt'")
-            self.db.execute("INSERT INTO meta VALUES('required-transcript-summary', '1')")
-        # Legacy one-time migration at the single atomic storage boundary:
-        # the retired maintenance pause latch left captures parked with
-        # reason='maintenance-paused', eligible=0. Clear the latch and re-due
-        # exactly those rows; every other dormant/revoked/cancelled state is
-        # untouched. Idempotent — once migrated, no rows match.
-        self.db.execute("DELETE FROM state WHERE key='maintenance_paused'")
-        self.db.execute(
-            "UPDATE continuations SET due=?, eligible=1 "
-            "WHERE reason='maintenance-paused' AND eligible=0",
-            (time.time(),),
-        )
-        if self.db.execute(
-            "SELECT 1 FROM meta WHERE key='latest-body-only'"
-        ).fetchone() is None:
-            self._prune_body_history()
-            # Retired full-body mirrors are not a second source of truth.
-            for mirror in (self.root / 'drafts').glob('*.md'):
-                if re.fullmatch(r'[0-9a-f]{64}', mirror.stem):
-                    mirror.unlink(missing_ok=True)
-            self.db.execute("INSERT INTO meta VALUES('latest-body-only', '1')")
+        self.db.execute("INSERT OR REPLACE INTO meta VALUES('schema', ?)", (SCHEMA,))
+        self.db.execute("INSERT OR IGNORE INTO meta VALUES('capture_floor', ?)", (str(time.time()),))
+        self.capture_floor = float(self.db.execute("SELECT value FROM meta WHERE key='capture_floor'").fetchone()[0])
+        self.db.commit()
+        self.db.execute('BEGIN IMMEDIATE')
+        try:
+            snapshot = {}
+            for row in self.db.execute('SELECT entry_id,draft_revision,published_revision,feed_active FROM entries'):
+                revisions = {}
+                if row['draft_revision']:
+                    revisions['draft'] = row['draft_revision']
+                if row['feed_active'] and row['published_revision']:
+                    revisions['feed'] = row['published_revision']
+                snapshot[row['entry_id']] = revisions
+            self.materials.recover_snapshot(snapshot)
+        except Exception:
+            self.db.rollback()
+            raise
         self.db.commit()
 
     @contextlib.contextmanager
@@ -486,379 +375,69 @@ class Store:
                 self.db.rollback()
                 raise
             self.db.commit()
+            self._finish_material_writes()
 
     def close(self):
-        self.db.close()
+        error = None
+        for operation in (self._finish_material_writes, self.materials.close, self.db.close):
+            try:
+                operation()
+            except BaseException as exc:
+                if error is None:
+                    error = exc
+                else:
+                    error.add_note(f"store close also failed: {type(exc).__name__}")
+        if error is not None:
+            raise error
 
-    # ------------------------------------------------- derived search index
-    #
-    # The store keeps a REBUILDABLE contentless FTS5 index of derived token
-    # streams; `entries` remains the only authority. The index stores only
-    # the inverted term index (content='', contentless_delete=1) — no body
-    # and no token-stream text copy — plus the entry_id ↔ rowid map with a
-    # text fingerprint, so a state-only change never retokenizes. Tokenizer
-    # semantics are exactly `retrieval.tokens()` (qualified identifiers,
-    # aliases, CJK bigrams); FTS tokenchars keep `./+:-_` inside tokens.
-    # A query is one SQL join: index MATCH → entry map → current visibility +
-    # conditions filters → rank → LIMIT; only hit headers are read.
-    #
-    # Tokenization always happens off the write transaction/store lock:
-    # create/restore compute from the known document before the write txn;
-    # append computes from an off-lock base and re-verifies the base revision
-    # at apply (a raced draft recomputes, bounded); feed staging precomputes
-    # per blob and the atomic switch applies them; compaction/withdrawal
-    # remove the row in the same transaction. An old store (or a
-    # version/corruption reset) backfills in bounded resumable slices driven
-    # by the existing outbox worker, with apply-time verification that the
-    # staged tokens still match the entry's current visible revision — a
-    # raced entry is requeued, never overwritten with a stale snapshot and
-    # never skipped at completion.
-
-    SEARCH_INDEX_VERSION = "fts5-t3"
-    SEARCH_BACKFILL_SLICE = 128
-
-    _VISIBLE_SQL = (
-        "feed_active=1 OR (draft_revision IS NOT NULL AND published_revision IS NULL)"
-    )
-
-    def _init_search_index(self):
-        version_row = self.db.execute(
-            "SELECT value FROM meta WHERE key='search_index_version'"
-        ).fetchone()
-        current = version_row[0] if version_row else None
-        if current is not None and current != self.SEARCH_INDEX_VERSION:
-            # Index-semantics change: drop only derived tables and rebuild.
-            self.db.execute("DROP TABLE IF EXISTS search_index")
-            self.db.execute("DROP TABLE IF EXISTS search_map")
-        try:
-            self.db.execute(
-                "CREATE VIRTUAL TABLE IF NOT EXISTS search_index "
-                "USING fts5(tokens, content='', contentless_delete=1, "
-                "tokenize=\"unicode61 tokenchars './+:-_'\")"
-            )
-        except sqlite3.OperationalError as exc:
-            raise ValueError(
-                "knowledge search requires SQLite FTS5 with contentless "
-                "delete support (SQLite >= 3.43.0); this runtime provides "
-                f"SQLite {sqlite3.sqlite_version} ({exc})"
-            ) from None
-        self.db.execute(
-            "CREATE TABLE IF NOT EXISTS search_map("
-            "entry_id TEXT PRIMARY KEY, docid INTEGER NOT NULL UNIQUE, "
-            "text_digest TEXT NOT NULL)"
-        )
-        if current != self.SEARCH_INDEX_VERSION:
-            self.db.execute(
-                "INSERT OR REPLACE INTO meta VALUES('search_index_version', ?)",
-                (self.SEARCH_INDEX_VERSION,),
-            )
-            self.db.execute("DELETE FROM meta WHERE key='search_backfill'")
-            self.db.execute("DELETE FROM meta WHERE key='search_requeue'")
-
-    def _search_backfill_state(self):
-        row = self.db.execute(
-            "SELECT value FROM meta WHERE key='search_backfill'"
-        ).fetchone()
-        if row is None:
-            return {"next_rowid": 0, "complete": False}
-        return _stored_json(row[0], dict, "search backfill")
-
-    def _search_requeue_read(self):
-        row = self.db.execute(
-            "SELECT value FROM meta WHERE key='search_requeue'"
-        ).fetchone()
-        if row is None:
-            return []
-        value = _stored_json(row[0], list, "search requeue")
-        if not all(isinstance(item, str) for item in value):
-            raise ValueError("invalid stored search requeue: expected entry IDs")
-        return value
+    _VISIBLE_SQL = "feed_active=1 OR (draft_revision IS NOT NULL AND published_revision IS NULL)"
 
     @staticmethod
-    def _doc_source_text(doc):
-        return doc["title"] + "\n" + doc["summary"] + "\n" + doc["content"]
+    def _header(doc):
+        return canonical({key: value for key, value in doc.items() if key != 'content'})
 
-    @classmethod
-    def _doc_state_digest(cls, doc):
-        """Fingerprint of everything the derived rows carry: the indexed
-        text AND the small authoritative conditions metadata.
-
-        A conditions-only upstream change must invalidate a staged snapshot
-        exactly like a body change."""
-        return digest([
-            cls._doc_source_text(doc),
-            canonical(doc["conditions"]),
-        ])
-
-    def _index_upsert_doc(self, entry_id, doc):
-        """Tokenize and index one entry's visible document. Only used where
-        the caller is already on a short local path (fallback when no staged
-        token stream exists); the feed production path precomputes per blob.
-        """
-        from mindie_knowledge.retrieval import index_text
-
-        text = self._doc_source_text(doc)
-        self._index_upsert_tokens(
-            entry_id, index_text(text),
-            self._doc_state_digest(doc),
-        )
-
-    def _index_upsert_tokens(self, entry_id, tokens_text, text_digest):
-        """Write one entry's precomputed token row (caller holds the txn;
-        consistency with the current revision is the caller's verified
-        precondition)."""
-        row = self.db.execute(
-            "SELECT docid, text_digest FROM search_map WHERE entry_id=?",
-            (entry_id,),
-        ).fetchone()
-        if row is not None and row["text_digest"] == text_digest:
-            return  # state-only change: never retokenize
-        if row is not None:
-            self.db.execute(
-                "UPDATE search_index SET tokens=? WHERE rowid=?",
-                (tokens_text, row["docid"]),
-            )
-            self.db.execute(
-                "UPDATE search_map SET text_digest=? WHERE entry_id=?",
-                (text_digest, entry_id),
-            )
-        else:
-            cursor = self.db.execute(
-                "INSERT INTO search_index(rowid, tokens) VALUES(NULL, ?)",
-                (tokens_text,),
-            )
-            self.db.execute(
-                "INSERT INTO search_map VALUES(?,?,?)",
-                (entry_id, cursor.lastrowid, text_digest),
-            )
-
-    def _index_remove(self, entry_id):
-        row = self.db.execute(
-            "SELECT docid FROM search_map WHERE entry_id=?", (entry_id,)
-        ).fetchone()
-        if row is None:
+    def _finish_material_writes(self):
+        if not self._material_dirty:
             return
-        self.db.execute("DELETE FROM search_index WHERE rowid=?", (row["docid"],))
-        self.db.execute("DELETE FROM search_map WHERE entry_id=?", (entry_id,))
+        self.db.execute('BEGIN IMMEDIATE')
+        try:
+            snapshot = {}
+            for entry_id in tuple(self._material_dirty):
+                row = self._row(entry_id)
+                revisions = {}
+                if row is not None:
+                    if row['draft_revision']:
+                        revisions['draft'] = row['draft_revision']
+                    if row['feed_active'] and row['published_revision']:
+                        revisions['feed'] = row['published_revision']
+                snapshot[entry_id] = revisions
+            self.materials.retain_snapshot(snapshot)
+        except Exception as exc:
+            self.db.rollback()
+            if getattr(exc, 'committed', False):
+                self._material_dirty.difference_update(snapshot)
+            exc.metadata_committed = True
+            raise
+        self.db.commit()
+        self._material_dirty.difference_update(snapshot)
 
-    def _index_sweep_invisible(self):
-        """Drop index rows for entries gone or no longer visible (same txn)."""
-        stale = self.db.execute(
-            "SELECT m.entry_id, m.docid FROM search_map m WHERE m.entry_id "
-            "NOT IN (SELECT entry_id FROM entries WHERE " + self._VISIBLE_SQL + ")"
-        ).fetchall()
-        for entry_id, docid in stale:
-            self.db.execute("DELETE FROM search_index WHERE rowid=?", (docid,))
-            self.db.execute("DELETE FROM search_map WHERE entry_id=?", (entry_id,))
+    def _mark_material_changed(self, entry_id):
+        self._material_dirty.add(entry_id)
 
-    def _search_reset(self):
-        """Corruption: drop only derived data and restart the backfill."""
-        with self._write_txn():
-            self.db.execute("DROP TABLE IF EXISTS search_index")
-            self.db.execute("DROP TABLE IF EXISTS search_map")
-            self._init_search_index()
-            self.db.execute("DELETE FROM meta WHERE key='search_backfill'")
-            self.db.execute("DELETE FROM meta WHERE key='search_requeue'")
+    def _mark_all_material_changed(self):
+        self._material_dirty.update(r[0] for r in self.db.execute('SELECT entry_id FROM entries'))
 
     def search_index_status(self):
         with self.lock:
-            state = self._search_backfill_state()
-            return dict(
-                version=self.SEARCH_INDEX_VERSION,
-                complete=bool(state.get("complete")),
-                indexed=self.db.execute(
-                    "SELECT count(*) FROM search_map"
-                ).fetchone()[0],
-                visible=self.db.execute(
-                    "SELECT count(*) FROM entries WHERE " + self._VISIBLE_SQL
-                ).fetchone()[0],
-                next_rowid=state.get("next_rowid", 0),
-                requeued=len(self._search_requeue_read()),
-            )
+            visible = self.db.execute('SELECT count(*) FROM entries WHERE ' + self._VISIBLE_SQL).fetchone()[0]
+            status = self.materials.index_status()
+            return dict(status, visible=visible, requeued=len(self._material_dirty))
 
-    def _search_mark_complete_if_covered(self):
-        """Persist completeness when the visible set is fully covered.
-
-        The write-path hooks keep coverage current directly, so a store that
-        never needed a backfill becomes ready without slicing; a store with
-        genuine gaps keeps its persisted cursor untouched."""
-        missing = self.db.execute(
-            "SELECT count(*) FROM entries WHERE (" + self._VISIBLE_SQL + ") "
-            "AND entry_id NOT IN (SELECT entry_id FROM search_map)"
-        ).fetchone()[0]
-        stale = self.db.execute(
-            "SELECT count(*) FROM search_map WHERE entry_id NOT IN "
-            "(SELECT entry_id FROM entries WHERE " + self._VISIBLE_SQL + ")"
-        ).fetchone()[0]
-        if missing or stale or self._search_requeue_read():
-            return False
-        with self._write_txn():
-            top = self.db.execute("SELECT MAX(rowid) FROM entries").fetchone()[0] or 0
-            self.db.execute(
-                "INSERT OR REPLACE INTO meta VALUES('search_backfill', ?)",
-                (canonical({"next_rowid": top, "complete": True}),),
-            )
-        return True
-
-    def advance_search_index(self, *, max_entries=None, budget_seconds=0.5):
-        """Advance the derived search index by one bounded, resumable slice.
-
-        Tokenization runs off the store lock; one short write transaction per
-        slice; the persisted cursor resumes after interruption. At apply time
-        each staged result must still match the entry's current visible text
-        (digest proof); a raced entry is requeued for the next slice instead
-        of being overwritten with a stale snapshot or skipped at completion.
-        Returns True when the index covers every currently visible entry.
-        Purely local read-only maintenance: no capture, no model, no
-        publication.
-        """
-        max_entries = max_entries or self.SEARCH_BACKFILL_SLICE
-        deadline = time.monotonic() + budget_seconds
+    def advance_search_index(self, **_budgets):
         with self.lock:
-            state = self._search_backfill_state()
-            requeue = self._search_requeue_read()
-            if state.get("complete") and not requeue:
-                return True
-            cursor = int(state.get("next_rowid") or 0)
-            rows = []
-            for entry_id in requeue:
-                found = self.db.execute(
-                    "SELECT rowid, entry_id, doc, feed_active, "
-                    "draft_revision, published_revision FROM entries "
-                    "WHERE entry_id=?",
-                    (entry_id,),
-                ).fetchone()
-                if found is not None:
-                    rows.append(found)
-            remaining = max_entries - len(rows)
-            slice_rows = []
-            if remaining > 0 and not state.get("complete"):
-                slice_rows = self.db.execute(
-                    "SELECT rowid, entry_id, doc, feed_active, draft_revision, "
-                    "published_revision FROM entries "
-                    "WHERE rowid > ? ORDER BY rowid LIMIT ?",
-                    (cursor, remaining),
-                ).fetchall()
-                rows.extend(slice_rows)
-            existing = (
-                {
-                    r[0]: r[1]
-                    for r in self.db.execute(
-                        "SELECT entry_id, text_digest FROM search_map "
-                        f"WHERE entry_id IN ({','.join('?' for _ in rows)})",
-                        tuple(r["entry_id"] for r in rows),
-                    )
-                }
-                if rows
-                else {}
-            )
-        from mindie_knowledge.retrieval import index_text
-
-        prepared = []
-        last_rowid = cursor
-        exhausted = False
-        for row in rows:
-            if time.monotonic() > deadline:
-                exhausted = True
-                break
-            visible = bool(
-                row["feed_active"]
-                or (row["draft_revision"] and not row["published_revision"])
-            )
-            if row["rowid"] > cursor:
-                last_rowid = row["rowid"]
-            if not visible:
-                prepared.append((row["entry_id"], None))
-                continue
-            doc = json.loads(row["doc"])
-            digest = self._doc_state_digest(doc)
-            text = self._doc_source_text(doc)
-            if existing.get(row["entry_id"]) == digest:
-                continue  # already current: no retokenization, no write
-            prepared.append(
-                (row["entry_id"],
-                 (index_text(text), digest, canonical(doc["conditions"])))
-            )
-        still_racing = []
-        with self._write_txn():
-            for entry_id, payload in prepared:
-                # Both branches verify the snapshot against the CURRENT
-                # authoritative row inside this short transaction: a stale
-                # snapshot never deletes a newer index row and never writes
-                # superseded conditions/metadata.
-                current = self.db.execute(
-                    "SELECT doc, feed_active, draft_revision, "
-                    "published_revision FROM entries WHERE entry_id=?",
-                    (entry_id,),
-                ).fetchone()
-                if current is None:
-                    self._index_remove(entry_id)
-                    continue
-                current_visible = bool(
-                    current["feed_active"]
-                    or (current["draft_revision"]
-                        and not current["published_revision"])
-                )
-                current_doc = json.loads(current["doc"])
-                current_digest = (
-                    self._doc_state_digest(current_doc) if current_visible
-                    else None
-                )
-                have = self.db.execute(
-                    "SELECT text_digest FROM search_map WHERE entry_id=?",
-                    (entry_id,),
-                ).fetchone()
-                if payload is None:
-                    # The snapshot saw it invisible.
-                    if not current_visible:
-                        self._index_remove(entry_id)  # snapshot agrees
-                        continue
-                    if have is not None and have[0] == current_digest:
-                        continue  # the write path already indexed it
-                    # It became visible meanwhile (e.g. a feed switch
-                    # republished it): never let the stale snapshot delete
-                    # anything; the next slice re-reads the current version.
-                    still_racing.append(entry_id)
-                    continue
-                tokens_text, digest, conditions_json = payload
-                if not current_visible:
-                    # It left the visible set meanwhile: a state change, no
-                    # tokenization; the row goes.
-                    self._index_remove(entry_id)
-                    continue
-                if current_digest != digest:
-                    # The entry moved while we tokenized: discard the stale
-                    # derived result; the next slice re-reads the current
-                    # version. Never overwrite with it, never skip it.
-                    still_racing.append(entry_id)
-                    continue
-                self.db.execute(
-                    "UPDATE entries SET conditions=? WHERE entry_id=?",
-                    (conditions_json, entry_id),
-                )
-                self._index_upsert_tokens(entry_id, tokens_text, digest)
-            self.db.execute("DELETE FROM meta WHERE key='search_requeue'")
-            if still_racing:
-                self.db.execute(
-                    "INSERT INTO meta VALUES('search_requeue', ?)",
-                    (canonical(still_racing),),
-                )
-            # The cursor slice completed when it read past the last row; a
-            # complete index also requires no entry still racing.
-            slice_finished = (not exhausted) and len(slice_rows) < (
-                max_entries - len(requeue)
-            )
-            complete = slice_finished and not still_racing
-            if complete:
-                self._index_sweep_invisible()
-            self.db.execute(
-                "INSERT OR REPLACE INTO meta VALUES('search_backfill', ?)",
-                (canonical({"next_rowid": last_rowid, "complete": complete}),),
-            )
-        return complete
-
-
-    # ------------------------------------------------- material authorization
+            self._finish_material_writes()
+            self.materials.refresh_index()
+        return self.search_index_status()
 
     def grant(self, kind, identity, revision, generation):
         """Durably authorize exactly one material revision for one sharing
@@ -974,11 +553,9 @@ class Store:
         ).fetchone()
 
     def _revision_doc(self, entry_id, revision):
-        row = self.db.execute(
-            "SELECT doc FROM revisions WHERE entry_id=? AND revision=?",
-            (entry_id, revision),
-        ).fetchone()
-        return json.loads(row[0]) if row else None
+        row = self.db.execute('SELECT 1 FROM revisions WHERE entry_id=? AND revision=?',
+                              (entry_id, revision)).fetchone()
+        return self.materials.get_document(entry_id, revision=revision) if row else None
 
     def _withdrawn(self, row):
         """Published once, no longer carried by the feed tree after a
@@ -993,6 +570,8 @@ class Store:
         with self.lock:
             entry_id, revision = self._parse_ref(ref)
             row = self._row(entry_id)
+            if row is not None and self._withdrawn(row) and not revision:
+                return dict(json.loads(row['doc']), content='', withdrawn=True, note=self.WITHDRAWN_NOTE)
             if revision:
                 doc = self._revision_doc(entry_id, revision)
                 if doc is None:
@@ -1000,7 +579,7 @@ class Store:
             else:
                 if row is None:
                     raise ValueError("unknown reference in this domain")
-                doc = json.loads(row["doc"])
+                doc = self._revision_doc(entry_id, json.loads(row["doc"])["revision"])
             if self._withdrawn(row):
                 return dict(doc, withdrawn=True, note=self.WITHDRAWN_NOTE)
             return dict(doc, withdrawn=False)
@@ -1053,8 +632,97 @@ class Store:
 
     def transcript_task(self, task_key):
         with self.lock:
-            row = self.db.execute("SELECT * FROM transcript_tasks WHERE task_key=?", (task_key,)).fetchone()
+            row = self.db.execute(f"SELECT t.*, {SUMMARY_STATUS_SQL} AS visible_status "
+                                  "FROM transcript_tasks t WHERE t.task_key=?", (task_key,)).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result['summary_status'] = result.pop('visible_status')
+        if result['summary_status'] == 'missing':
+            result['summary_detail'] = MISSING_MATERIAL_JOB_DETAIL
+        return result
+
+    def material_stream(self, stream_key):
+        with self.lock:
+            row = self.db.execute('SELECT * FROM material_streams WHERE stream_key=?',
+                                  (stream_key,)).fetchone()
         return dict(row) if row else None
+
+    def _bind_material_draft(self, doc, *, generation, owner=None):
+        """Bind staged file metadata. The outer transaction promotes files."""
+        entry_id, now = doc['entry_id'], time.time()
+        current = self._row(entry_id)
+        self._record_material_revision(doc, 'draft', now)
+        if current is None:
+            self.db.execute('INSERT INTO entries VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+                            (entry_id, doc['kind'], doc['title'], 'draft', doc['revision'],
+                             None, 0, None, self._header(doc), now, canonical(doc['conditions'])))
+        else:
+            self.db.execute('UPDATE entries SET draft_revision=?,title=?,doc=?,updated=? WHERE entry_id=?',
+                            (doc['revision'], doc['title'], self._header(doc) if not current['feed_active']
+                             else current['doc'], now, entry_id))
+        if owner is not None:
+            self.db.execute('INSERT OR IGNORE INTO owners VALUES(?,?,?)', (entry_id, owner, now))
+        self.grant('draft', entry_id, doc['revision'], generation)
+        self._prune_body_history(entry_id)
+
+    def commit_material_increment(self, *, stream_key, entry_id, prepared, start,
+                                  end, source_identity, authorization, owner,
+                                  observed_stream=None):
+        """Both intake paths use this file/cursor/queue transaction."""
+        with self._write_txn():
+            previous = self.material_stream(stream_key)
+            if previous != observed_stream:
+                raise BlockingIOError('material stream changed before commit')
+            if previous and (previous['generation'] != authorization['generation']
+                             or previous['source_cursor'] > start):
+                raise ValueError('material source range or authorization changed')
+            if self.db.execute('SELECT 1 FROM material_batches WHERE batch_id=?',
+                               (prepared['batch_id'],)).fetchone():
+                raise ValueError('material range already committed')
+            current = self._row(entry_id)
+            if self._withdrawn(current):
+                raise ValueError('task was withdrawn from the current public feed; not resurrecting it')
+            revision = ((current['draft_revision'] or
+                         (current['published_revision'] if current['feed_active'] else None))
+                        if current else None)
+            prior = self.materials.read_task(entry_id, revision=revision, source='draft') if revision else None
+            title = prior['entry']['title'] if prior else 'Task experience awaiting indexing'
+            navigation = prior['navigation'] if prior else 'Reference material; indexing is pending.'
+            result = self.materials.append_batch(entry_id, prepared['blocks'], navigation,
+                                                 title=title, status='pending', source='draft',
+                                                 revision=revision, promote=False)
+            doc = result['entry']
+            self._bind_material_draft(doc, generation=authorization['generation'], owner=owner)
+            now = time.time()
+            self.db.execute('INSERT OR REPLACE INTO material_streams VALUES(?,?,?,?,?,?,?,?)',
+                            (stream_key, entry_id, end, source_identity,
+                             canonical(prepared['redaction_state']), authorization['generation'],
+                             canonical(authorization), now))
+            self.db.execute('INSERT INTO material_batches VALUES(?,?,?,?,?,?,?,?)',
+                            (prepared['batch_id'], stream_key, entry_id,
+                             canonical([b['block_id'] for b in prepared['blocks']]),
+                             'pending', '', canonical(authorization), now))
+            self.db.execute('INSERT OR REPLACE INTO transcript_tasks VALUES(?,?,?,?,?,?,?,?,?)',
+                            (stream_key, entry_id, authorization.get('id', ''), doc['material_digest'],
+                             'pending', '', now, now, canonical(authorization)))
+            return doc
+
+    def apply_material_indexes(self, *, entry_id, indexes, navigation, generation):
+        with self._write_txn():
+            row = self._row(entry_id)
+            if row is None or not row['draft_revision'] or not self.granted(
+                    'draft', entry_id, row['draft_revision'], generation):
+                raise ValueError('material authority changed before index application')
+            task = self.materials.read_task(entry_id, revision=row['draft_revision'], source='draft')
+            newly_indexed = {item['block_id'] for item in indexes}
+            complete = all(item['indexed'] or item['block_id'] in newly_indexed for item in task['blocks'])
+            result = self.materials.update_indexes(entry_id, indexes, navigation['summary'],
+                                                   title=navigation['title'], source='draft',
+                                                   revision=row['draft_revision'], promote=False,
+                                                   status='complete' if complete else 'pending')
+            self._bind_material_draft(result['entry'], generation=generation)
+            return result
 
     def redaction_key(self):
         """Private random HMAC key; no original sensitive values are retained."""
@@ -1066,7 +734,6 @@ class Store:
 
     def update_draft_header(self, entry_id, *, expected_body, title, summary, generation):
         """Metadata-only compare/apply: a model can never supply body content."""
-        from mindie_knowledge.retrieval import index_text
         with self._write_txn():
             row = self._row(entry_id)
             if row is None or not row['draft_revision']:
@@ -1082,9 +749,9 @@ class Store:
             self.db.execute("INSERT OR REPLACE INTO grants VALUES(?,?,?,?,?)", ('draft', entry_id, doc['revision'], generation, now))
             visible = not row['feed_active']
             self.db.execute("UPDATE entries SET draft_revision=?, title=?, doc=?, updated=? WHERE entry_id=?",
-                            (doc['revision'], title, canonical(doc) if visible else row['doc'], now, entry_id))
+                            (doc['revision'], title, self._header(doc) if visible else row['doc'], now, entry_id))
             if visible:
-                self._index_upsert_tokens(entry_id, index_text(self._doc_source_text(doc)), self._doc_state_digest(doc))
+                self._mark_material_changed(entry_id)
             self._prune_body_history(entry_id)
             return True
 
@@ -1117,15 +784,21 @@ class Store:
             " AND NOT EXISTS (SELECT 1 FROM entries AS e WHERE e.entry_id=g.identity"
             " AND e.draft_revision=g.revision)", args,
         )
+        if entry_id is not None:
+            self._material_dirty.add(entry_id)
         return removed
 
     def _insert_revision(self, doc, source, created):
+        saved = self.materials.put_document(doc, source=source)
+        doc.update(saved)
+        self._record_material_revision(doc, source, created)
+
+    def _record_material_revision(self, doc, source, created):
         self.db.execute(
-            "INSERT INTO revisions VALUES(?,?,?,?,?) "
-            "ON CONFLICT(entry_id, revision) DO UPDATE SET "
+            'INSERT INTO revisions VALUES(?,?,?,?,?) ON CONFLICT(entry_id, revision) DO UPDATE SET '
             "source=CASE WHEN revisions.source='feed' THEN 'feed' ELSE excluded.source END",
-            (doc["entry_id"], doc["revision"], canonical(doc), source, created),
-        )
+            (doc['entry_id'], doc['revision'], self._header(doc), source, created))
+        self._material_dirty.add(doc['entry_id'])
 
     def _owner_of(self, entry_id):
         row = self.db.execute(
@@ -1154,13 +827,6 @@ class Store:
             entry_id=entry_id, domain=self.domain, kind=kind, title=title,
             summary=summary, content=content, conditions=conditions,
         )
-        # Derived tokenization happens off the write transaction; the applied
-        # row is exactly this content, so no verify is needed for a creation.
-        from mindie_knowledge.retrieval import index_text
-
-        source_text = self._doc_source_text(doc)
-        tokens_text = index_text(source_text)
-        text_digest = self._doc_state_digest(doc)
         now = time.time()
         with self._write_txn():
             if self._row(entry_id) is not None:
@@ -1172,7 +838,7 @@ class Store:
                 "batched_revision, doc, updated, conditions) "
                 "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (entry_id, kind, doc["title"], origin, doc["revision"],
-                 None, 0, None, canonical(doc), now,
+                 None, 0, None, self._header(doc), now,
                  canonical(doc["conditions"])),
             )
             if owner is not None:
@@ -1184,7 +850,7 @@ class Store:
                     "INSERT OR REPLACE INTO grants VALUES(?,?,?,?,?)",
                     ("draft", entry_id, doc["revision"], generation, now),
                 )
-            self._index_upsert_tokens(entry_id, tokens_text, text_digest)
+            self._mark_material_changed(entry_id)
         return doc
 
     def append_observation(self, entry_id, addition, *, marker, producer=None,
@@ -1207,7 +873,6 @@ class Store:
         long body is ever tokenized under the write transaction and no stale
         derived row can overwrite a newer draft.
         """
-        from mindie_knowledge.retrieval import index_text
 
         for _attempt in range(3):
             with self.lock:
@@ -1238,9 +903,6 @@ class Store:
                     doc["conditions"] = dict(header["conditions"])
                 doc["revision"] = documents.revision_of(doc)
                 documents.validate(doc)
-            source_text = self._doc_source_text(doc)
-            tokens_text = index_text(source_text)
-            text_digest = self._doc_state_digest(doc)
             now = time.time()
             with self._write_txn():
                 current = self._row(entry_id)
@@ -1264,7 +926,7 @@ class Store:
                     "UPDATE entries SET draft_revision=?, title=?, doc=?, "
                     "updated=?, conditions=? WHERE entry_id=?",
                     (doc["revision"], doc["title"],
-                     canonical(doc) if visible else current["doc"], now,
+                     self._header(doc) if visible else current["doc"], now,
                      canonical(doc["conditions"]) if visible
                      else current["conditions"],
                      entry_id),
@@ -1272,7 +934,7 @@ class Store:
                 if visible:
                     # Only a genuinely visible document enters the index; for
                     # a feed-active entry the published body keeps the row.
-                    self._index_upsert_tokens(entry_id, tokens_text, text_digest)
+                    self._mark_material_changed(entry_id)
                 self._prune_body_history(entry_id)
                 return doc, True
         raise BlockingIOError(
@@ -1305,7 +967,7 @@ class Store:
         if ready_only:
             sql += (" AND NOT EXISTS (SELECT 1 FROM transcript_tasks t "
                     "WHERE t.entry_id=entries.entry_id AND t.summary_status!='complete')"
-                    " AND (NOT EXISTS (SELECT 1 FROM history_imports h WHERE h.entry_id=entries.entry_id)"
+                    " AND (NOT EXISTS (SELECT 1 FROM material_streams h WHERE h.entry_id=entries.entry_id)"
                     " OR EXISTS (SELECT 1 FROM transcript_tasks t WHERE t.entry_id=entries.entry_id))")
         if limit is not None:
             sql += ' LIMIT ?'
@@ -1343,217 +1005,32 @@ class Store:
         with self.lock:
             tasks = self.db.execute('SELECT summary_status,body_digest FROM transcript_tasks WHERE entry_id=?',
                                     (doc['entry_id'],)).fetchall()
-            if not tasks and self.db.execute('SELECT 1 FROM history_imports WHERE entry_id=?', (doc['entry_id'],)).fetchone():
+            if not tasks and self.db.execute('SELECT 1 FROM material_streams WHERE entry_id=?', (doc['entry_id'],)).fetchone():
                 return False
-        return all(t['summary_status'] == 'complete' and t['body_digest'] == digest(doc['content']) for t in tasks)
+        return all(t['summary_status'] == 'complete' and t['body_digest'] == doc['material_digest'] for t in tasks)
 
-    def draft_headers(self, *, owner=None, limit=6, excerpt=1200,
-                      generation=None, query=""):
-        """Compact headers plus short excerpts as organizer context. With
-        ``generation``, only material granted to that sharing generation is
-        offered as update context; with ``owner``, only drafts that task owns
-        in the private entry-owner relation. A compacted sent entry (no local
-        draft body left) is offered as a bare receipt header — retained
-        title/summary plus the exact sent revision, empty excerpt — never a
-        body, never a draft or publication candidate; the caller restores the
-        exact remote head on demand."""
-        with self.lock:
-            sql = (
-                "SELECT entries.entry_id, entries.draft_revision, entries.doc, "
-                "sent_receipts.sent_revision "
-                "FROM entries LEFT JOIN sent_receipts "
-                "ON sent_receipts.entry_id=entries.entry_id "
-                f"WHERE {self._NOT_WITHDRAWN} "
-            )
-            params = []
-            if owner is not None:
-                sql += (
-                    "AND EXISTS (SELECT 1 FROM owners "
-                    "WHERE owners.entry_id=entries.entry_id AND owners.owner=?) "
-                )
-                params.append(owner)
-            live = "entries.draft_revision IS NOT NULL"
-            compacted = (
-                "entries.draft_revision IS NULL "
-                "AND sent_receipts.sent_revision != '' "
-                "AND sent_receipts.path != '' "
-                "AND sent_receipts.sha256 != '' "
-                "AND sent_receipts.head_sha != ''"
-            )
-            if generation is not None:
-                live += (
-                    " AND EXISTS (SELECT 1 FROM grants "
-                    "WHERE grants.kind='draft' "
-                    "AND grants.identity=entries.entry_id "
-                    "AND grants.revision=entries.draft_revision "
-                    "AND grants.generation=?)"
-                )
-                compacted += " AND sent_receipts.generation=?"
-                params.extend([generation, generation])
-            sql += f"AND (({live}) OR ({compacted})) "
-            sql += "ORDER BY entries.updated DESC LIMIT 256"
-            rows = self.db.execute(sql, params).fetchall()
-        headers = []
-        for row in rows:
-            if row["draft_revision"] is not None:
-                doc = self._revision_doc(row["entry_id"], row["draft_revision"]) or {}
-                headers.append(dict(
-                    entry_id=doc["entry_id"], title=doc["title"],
-                    revision=doc["revision"],
-                    summary=doc["summary"],
-                    excerpt=(doc["content"] if len(doc["content"]) <= excerpt else
-                             doc["content"][:excerpt//3] + "\n[earlier body omitted]\n" +
-                             doc["content"][-2*excerpt//3:]),
-                ))
-            else:
-                header = json.loads(row["doc"])
-                headers.append(dict(
-                    entry_id=row["entry_id"], title=header["title"],
-                    revision=row["sent_revision"],
-                    summary=header["summary"],
-                    excerpt="",
-                ))
-        if query:
-            import re
-            terms = set(re.findall(r"[\w.-]{3,}", query.lower()))
-            headers.sort(key=lambda h: sum(term in (h["title"]+" "+h["summary"]+" "+h["excerpt"]).lower()
-                                           for term in terms), reverse=True)
-        return headers[:limit]
 
     # ---------------------------------------------------------------- search
 
     def query(self, query, limit=5, conditions=None):
-        """BM25 over visible entries via the derived contentless FTS5 index:
-        published versions win; withdrawn-from-feed entries stay explainable
-        but leave the results. Draft overlays on published entries are
-        labeled, never a second hit. One SQL join does index MATCH → entry
-        map → current visibility/conditions filtering → rank → LIMIT, and
-        the response header (title/summary/conditions) is parsed only from
-        the ≤LIMIT hit rows' own visible documents in that same statement —
-        one consistent snapshot, so the header always matches the revision
-        the ref points at. No query ever walks, re-sorts or retokenizes the
-        library. While the derived index is being built (old store, version
-        reset, corruption), the call honestly rejects with
-        :class:`IndexNotReady` — a brief transient read-rejection, never a
-        fake/partial result set; the outbox worker completes the build.
-        Unrelated SQL errors keep their own class.
-        """
         if not isinstance(query, str) or not query.strip() or len(query) > 2000:
-            raise ValueError("query must be nonempty text of at most 2000 characters")
+            raise ValueError('query must be nonempty text of at most 2000 characters')
         if type(limit) is not int or not 1 <= limit <= 20:
-            raise ValueError("limit must be between 1 and 20")
-        if conditions is not None and not isinstance(conditions, dict):
-            raise ValueError("conditions must be an object")
-        from mindie_knowledge.retrieval import tokens
-
-        terms = list(dict.fromkeys(tokens(query)))
-        if not terms:
-            return dict(
-                domain=self.domain, retrieval="bm25", results=[],
-                note="Reference material. Scores indicate retrieval usefulness, not factual confidence.",
-            )
-        match = " OR ".join('"' + term.replace('"', '""') + '"' for term in terms)
-        condition_sql = ""
-        condition_args = []
-        if conditions:
-            for key, value in conditions.items():
-                # A knowledge entry carrying a conflicting value is excluded;
-                # entries without the key (or non-knowledge kinds) pass.
-                # Exact key comparison via json_each with bound parameters —
-                # quotes/backslashes in a legal key are data, never escaping.
-                condition_sql += (
-                    " AND NOT (e.kind='knowledge' AND EXISTS ("
-                    "SELECT 1 FROM json_each(e.conditions) AS j "
-                    "WHERE j.key=? AND j.value != ?))"
-                )
-                condition_args.extend([key, str(value)])
-        sql = (
-            "SELECT e.entry_id, e.kind, e.origin, e.feed_active, "
-            "e.draft_revision, e.published_revision, e.doc, "
-            "bm25(search_index) AS rank FROM search_index "
-            "JOIN search_map m ON m.docid = search_index.rowid "
-            "JOIN entries e ON e.entry_id = m.entry_id "
-            "WHERE search_index MATCH ? AND (" + self._VISIBLE_SQL + ")"
-            + condition_sql + " ORDER BY rank LIMIT ?"
-        )
+            raise ValueError('limit must be between 1 and 20')
         with self.lock:
-            if not self._search_backfill_state().get("complete"):
-                # Hooks may have kept full coverage without any backfill
-                # slice; check coverage once per readiness episode. There is
-                # deliberately no inline slice work here: a query never
-                # builds or tokenizes content.
-                self._search_mark_complete_if_covered()
-            if not self._search_backfill_state().get("complete"):
-                status = self.search_index_status()
-                raise IndexNotReady(
-                    "knowledge search index is being rebuilt "
-                    f"({status['indexed']}/{status['visible']} entries); "
-                    "this is a brief readiness state, not an empty result"
-                )
-            try:
-                rows = self.db.execute(
-                    sql, (match, *condition_args, limit),
-                ).fetchall()
-            except sqlite3.DatabaseError as exc:
-                code = getattr(exc, "sqlite_errorcode", None)
-                detail = str(exc).lower()
-                derived_missing = (
-                    code == sqlite3.SQLITE_ERROR
-                    and "no such table" in detail
-                    and ("search_index" in detail or "search_map" in detail)
-                )
-                if not (
-                    derived_missing or code == sqlite3.SQLITE_CORRUPT_VTAB
-                ):
-                    # Unrelated SQL/runtime/authorization/JSON errors keep
-                    # their real diagnostic classification; they never
-                    # rebuild derived data and never masquerade as readiness.
-                    # (SQLITE_CORRUPT_VTAB surfaces as DatabaseError, not
-                    # OperationalError, in the Python sqlite3 mapping.)
-                    raise
-                # Derived-index structure missing/damaged: drop only derived
-                # data and let the background worker rebuild; authoritative
-                # tables untouched.
-                self._search_reset()
-                raise IndexNotReady(
-                    "knowledge search index was reset after a read error and "
-                    "is being rebuilt; retry shortly"
-                ) from None
-            output = []
-            for row in rows:
-                # The header comes from the same row's own visible document
-                # in this one statement — a consistent snapshot, no second
-                # read window; a feed-active hit answers with its published
-                # header, not an overlay draft's.
-                doc = json.loads(row["doc"])
-                supplemental = bool(
-                    row["feed_active"]
-                    and row["draft_revision"]
-                    and row["draft_revision"] != row["published_revision"]
-                )
-                output.append(dict(
-                    ref=self._short_ref(
-                        row["entry_id"],
-                        row["published_revision"]
-                        if row["feed_active"] else row["draft_revision"],
-                    ),
-                    kind=row["kind"], title=doc["title"],
-                    summary=doc["summary"],
-                    conditions=doc["conditions"],
-                    # Describe the returned revision, not how this entry first
-                    # arrived locally. An author's own published contribution
-                    # is feed material too; its draft overlay stays separate.
-                    origin="feed" if row["feed_active"] else row["origin"],
-                    supplemental=supplemental,
-                    score=round(-row["rank"], 8),
-                ))
-            output.sort(key=lambda item: (-item["score"], item["ref"]))
-            return dict(
-                domain=self.domain,
-                retrieval="bm25",
-                results=output[:limit],
-                note="Reference material. Scores indicate retrieval usefulness, not factual confidence.",
-            )
+            rows = {r['entry_id']: dict(r) for r in self.db.execute(
+                'SELECT * FROM entries WHERE ' + self._VISIBLE_SQL)}
+            allowed = {key: r['published_revision'] if r['feed_active'] else r['draft_revision']
+                       for key, r in rows.items()}
+            found = self.materials.search(query, limit=limit, conditions=conditions, allowed_ids=allowed)
+            results = []
+            for item in found:
+                row = rows[item['entry_id']]
+                results.append(dict(item, ref=self.ref(item['entry_id'], item['revision']),
+                                    origin='feed' if row['feed_active'] else row['origin'],
+                                    supplemental=bool(row['feed_active'] and row['draft_revision'])))
+        return dict(domain=self.domain, retrieval='reme-bm25', results=results,
+                    note='Reference material, including failed attempts and uncertainty. Scores are not factual confidence.')
 
     # ------------------------------------------------------------ feed switch
 
@@ -1571,133 +1048,57 @@ class Store:
                 (key, canonical(value)),
             )
 
-    # ------------------------------------------------- feed staging (per commit)
+    def install_feed(self, packages, *, feed_ident, source_revision=None):
+        """Install one whole Git snapshot into the current file material store.
 
-    def feed_staging_prune(self, feed, commit):
-        """Drop staged verification progress for any other commit of this feed."""
-        with self._write_txn():
-            self.db.execute(
-                "DELETE FROM feed_staging WHERE feed=? AND git_commit != ?",
-                (feed, commit),
-            )
-
-    def feed_stage_doc(self, feed, commit, path, entry_id, doc,
-                       tokens=None, text_digest=None):
-        """Persist one validated blob as verified progress for this commit,
-        with its derived retrieval token stream precomputed off the switch.
-
-        Each row lands in its own short transaction — no long SQLite write
-        transaction is ever held across Git subprocess reads, and a crashed
-        attempt resumes after the last staged blob instead of item zero.
+        All package bytes validate and stage before the metadata transaction;
+        the root transaction promotes the selected revisions together after
+        commit. Only entry headers and memberships are retained in SQLite.
         """
-        with self._write_txn():
-            self.db.execute(
-                "INSERT OR REPLACE INTO feed_staging VALUES(?,?,?,?,?,?,?)",
-                (feed, commit, path, entry_id, canonical(doc), tokens,
-                 text_digest),
-            )
+        from mindie_knowledge.materials import validate_package_files
 
-    def feed_staging_state(self, feed, commit):
-        """(paths, entry_ids) already verified for exactly this commit."""
-        with self.lock:
-            rows = self.db.execute(
-                "SELECT path, entry_id FROM feed_staging WHERE feed=? AND git_commit=?",
-                (feed, commit),
-            ).fetchall()
-        return {row[0] for row in rows}, {row[1] for row in rows}
-
-    def feed_staging_count(self, feed, commit):
-        with self.lock:
-            return self.db.execute(
-                "SELECT count(*) FROM feed_staging WHERE feed=? AND git_commit=?",
-                (feed, commit),
-            ).fetchone()[0]
-
-    def feed_staged_docs(self, feed, commit):
-        """Lazily yield staged (doc, tokens, text_digest) tuples in path
-        order (one at a time); rows written before the tokens column existed
-        yield None tokens and the switch recomputes them."""
-        cursor = self.db.execute(
-            "SELECT doc, tokens, text_digest FROM feed_staging "
-            "WHERE feed=? AND git_commit=? ORDER BY path",
-            (feed, commit),
-        )
-        for doc_json, tokens, text_digest in cursor:
-            yield json.loads(doc_json), tokens, text_digest
-
-    def feed_staging_clear(self, feed):
-        with self._write_txn():
-            self.db.execute("DELETE FROM feed_staging WHERE feed=?", (feed,))
-
-    def install_feed(self, docs, *, feed_ident):
-        """Atomically switch published membership to one validated Git tree.
-
-        ``docs`` may be a lazy iterable (the feed streams validated blobs one
-        at a time instead of holding every body in memory): it is consumed
-        inside this single write transaction, so a mid-iteration parse or IO
-        failure rolls the whole candidate back and keeps the old cache.
-        Only current bodies are retained. Superseded or withdrawn published
-        bodies are removed; their pinned references no longer resolve. A published
-        revision of the same entry folds over its draft in search; the local
-        draft is then re-seated onto the new authoritative body, keeping only
-        not-yet-sent observation additions (see ``rebase_draft_on_published``)
-        — the feed switch never destroys unsubmitted local work.
-        """
+        checked, seen = [], set()
+        for package in packages:
+            value = validate_package_files(package["files"], self.domain)
+            if value["task_id"] in seen:
+                raise ValueError("duplicate task identity in feed")
+            seen.add(value["task_id"])
+            checked.append(value)
+        self.materials.install_packages(checked, source="feed",
+                                        source_revision=source_revision, promote=False)
         now = time.time()
-        seen = set()
         with self._write_txn():
-            # Membership is authoritative for every entry, however it first
-            # appeared locally. Clear then re-mark inside the same
-            # transaction: no giant NOT IN variable list (SQLite has a
-            # variable-count ceiling), and a mid-iteration failure rolls the
-            # whole candidate back so the old cache stays.
             self.db.execute("UPDATE entries SET feed_active=0 WHERE feed_active=1")
-            for item in docs:
-                if isinstance(item, tuple):
-                    # The feed staged the derived token stream per blob
-                    # (off the switch); the atomic switch only applies it.
-                    doc, tokens_text, text_digest = item
-                else:
-                    doc, tokens_text, text_digest = item, None, None
-                if doc["entry_id"] in seen:
-                    raise ValueError("duplicate entry identity in feed")
-                seen.add(doc["entry_id"])
+            for package in checked:
+                doc = package["entry"]
                 row = self._row(doc["entry_id"])
-                self._insert_revision(doc, "feed", now)
+                self._record_material_revision(doc, "feed", now)
                 if row is None:
                     self.db.execute(
-                        "INSERT INTO entries(entry_id, kind, title, origin, "
-                        "draft_revision, published_revision, feed_active, "
-                        "batched_revision, doc, updated, conditions) "
-                        "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                        (doc["entry_id"], doc["kind"], doc["title"],
-                         "feed", None, doc["revision"], 1, None,
-                         canonical(doc), now, canonical(doc["conditions"])),
-                    )
+                        "INSERT INTO entries(entry_id,kind,title,origin,draft_revision,published_revision,"
+                        "feed_active,batched_revision,doc,updated,conditions) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                        (doc["entry_id"], doc["kind"], doc["title"], "feed", None, doc["revision"],
+                         1, None, self._header(doc), now, canonical(doc["conditions"])))
                 else:
+                    draft = None if row["draft_revision"] == doc["revision"] else row["draft_revision"]
                     self.db.execute(
-                        "UPDATE entries SET kind=?, title=?, "
-                        "published_revision=?, feed_active=1, doc=?, updated=?, "
-                        "conditions=? WHERE entry_id=?",
-                        (doc["kind"], doc["title"], doc["revision"],
-                         canonical(doc), now, canonical(doc["conditions"]),
-                         doc["entry_id"]),
-                    )
-                # The visible document is the published body; index exactly
-                # it, with the feed-staged token stream when present.
-                if tokens_text is None:
-                    self._index_upsert_doc(doc["entry_id"], doc)
-                else:
-                    self._index_upsert_tokens(doc["entry_id"], tokens_text,
-                                              text_digest)
-                self.rebase_draft_on_published(doc["entry_id"])
-            # Once an entry has a published revision its visibility is
-            # governed by the feed alone: leaving the tree (or a valid empty
-            # tree) removes it from search, and its stale draft copy is never
-            # resurrected. Old bodies and index rows leave in the same transaction.
-            self._index_sweep_invisible()
+                        "UPDATE entries SET kind=?,title=?,draft_revision=?,published_revision=?,"
+                        "feed_active=1,doc=?,updated=?,conditions=? WHERE entry_id=?",
+                        (doc["kind"], doc["title"], draft, doc["revision"], self._header(doc),
+                         now, canonical(doc["conditions"]), doc["entry_id"]))
+            # Upstream withdrawal removes public visibility and its file pointer;
+            # a superseded local draft never silently reappears in consumer search.
+            self._mark_all_material_changed()
             self._prune_body_history()
-            return dict(entries=len(seen))
+            if source_revision is not None:
+                self.db.execute("INSERT OR REPLACE INTO feed_state VALUES(?,?)",
+                                ("published-commit", canonical(dict(commit=source_revision, feed=feed_ident))))
+        return dict(entries=len(seen))
+
+    def retry_feed_cleanup(self):
+        """Retry only retiring unused material files after a committed switch."""
+        with self._write_txn():
+            self._mark_all_material_changed()
 
     # ------------------------------------------------------- entry quarantine
 
@@ -1945,26 +1346,17 @@ class Store:
 
         Material bound to a batch is never silently re-batched: only a newer
         draft revision or a replacement vote becomes new work. The batch row
-        is one durable payload, bounded by the same per-flush envelope the
-        exporter chunks to; the envelope is a soft grouping budget, so a batch
-        holding exactly one platform-legal entry document always fits.
+        stores only its frozen-file descriptor, never a second body copy.
         """
-        from mindie_knowledge.community.common import MAX_BATCH_BYTES, MAX_FILE_BYTES
-
-        if len(canonical(batch).encode("utf-8")) > MAX_BATCH_BYTES:
-            entry_files = [
-                f for f in batch.get("files", [])
-                if isinstance(f, dict)
-                and str(f.get("path", "")).startswith(("cases/", "topics/"))
-            ]
-            single_ok = (
-                len(entry_files) == 1
-                and isinstance(entry_files[0].get("content"), str)
-                and len(entry_files[0]["content"].encode("utf-8")) <= MAX_FILE_BYTES
-            )
-            if not single_ok:
-                raise ValueError("batch exceeds the per-flush storage envelope")
+        # Only identities enter SQLite; publication reads the frozen files.
+        if any("content" in item for item in batch.get("files", [])):
+            raise ValueError("outbox descriptors cannot contain file bodies")
+        from mindie_knowledge.materials.publication import staging_path
+        frozen = staging_path(self.root, batch_id, revision) / "manifest.json"
+        if not frozen.is_file():
+            raise ValueError("contribution files must be frozen before recording the outbox")
         now = time.time()
+        replaced = False
         with self._write_txn():
             existing = self.db.execute(
                 "SELECT revision, status FROM outbox WHERE batch_id=?", (batch_id,)
@@ -1977,6 +1369,8 @@ class Store:
                     )
                 if existing["revision"] == revision:
                     raise ValueError("this exact batch revision was already sent")
+                self._queue_publication_cleanup(batch_id, existing["revision"])
+                replaced = True
                 self.db.execute("DELETE FROM outbox WHERE batch_id=?", (batch_id,))
             self.db.execute(
                 "INSERT INTO outbox VALUES(?,?,?,?,?,NULL,NULL,?,NULL,?,0,NULL,?)",
@@ -1996,6 +1390,8 @@ class Store:
                     "AND entry_id=? AND revision=?",
                     (batch_id, opaque, entry_id, revision),
                 )
+        if replaced:
+            self._cleanup_publication_staging(batch_id)
 
     def mark_batch(self, batch_id, status, *, detail="", pr_url=None, head_sha=None,
                    attempted=False, actual_files=None, retry_at=None):
@@ -2188,93 +1584,78 @@ class Store:
 
     CONFIRMED_BATCH = ("submitted", "updated", "unchanged")
 
-    def compact_confirmed(self, batch_id):
-        """Post-confirmation payload cleanup: the GitHub branch is the durable
-        body source for a confirmed (submitted/updated/unchanged) batch.
+    def _queue_publication_cleanup(self, batch_id, revision):
+        """Persist exact known-outcome revisions before replacing their receipt."""
+        key = "publication-cleanup:" + batch_id
+        previous = self.feed_get(key) or {}
+        pending = previous.get("pending_revisions", [])
+        if not isinstance(pending, list) or any(not isinstance(item, str) for item in pending):
+            raise ValueError("invalid publication cleanup revision queue")
+        if previous.get("status") == "failed" and previous.get("revision"):
+            pending = [*pending, previous["revision"]]
+        self.feed_set(key, dict(status="pending", revision=revision,
+                                pending_revisions=sorted(set([*pending, revision]))))
 
-        Drops this batch's current draft when no newer unsent draft exists.
-        Other pending batches carry their own payloads. Published revisions
-        stay. Capture summaries are cleared only for organized
-        captures whose recorded refs are a nonempty subset of this batch's
-        exact entry@revision refs; unversioned or otherwise ambiguous coverage
-        is left intact. The outbox row shrinks to a tiny receipt; a per-entry
-        last-confirmed receipt (path/hash/revision/exact head/PR) is kept
-        independently of later lineage-row replacement.
-        """
-        import shutil
+    def _cleanup_publication_staging(self, batch_id):
+        """Clean resolved candidates; retain failures independently of publication."""
+        from mindie_knowledge.materials.publication import CleanupReceiptError, cleanup_staged_batch
 
         with self._write_txn():
-            row = self.db.execute(
-                "SELECT * FROM outbox WHERE batch_id=?", (batch_id,)
-            ).fetchone()
+            key = "publication-cleanup:" + batch_id
+            receipt = self.feed_get(key)
+            failures, removed = {}, 0
+            for revision in receipt["pending_revisions"]:
+                try:
+                    removed += int(cleanup_staged_batch(self.root, batch_id, revision))
+                except (OSError, ValueError) as exc:
+                    failures[revision] = f"{type(exc).__name__}: {exc}"[:500]
+            result = dict(staging=removed)
+            updated = dict(status="failed" if failures else "complete", revision=receipt["revision"],
+                           pending_revisions=sorted(failures))
+            if failures:
+                updated["detail"] = "; ".join(failures.values())[:1000]
+                result.update(cleanup_status="failed", cleanup_error=updated["detail"])
+            try:
+                self.feed_set(key, updated)
+            except Exception as exc:
+                detail = (updated.get("detail", "cleanup finished")
+                          + f"; cleanup receipt could not be saved: {type(exc).__name__}: {exc}")
+                raise CleanupReceiptError(batch_id, detail) from exc
+            return result
+
+    def compact_confirmed(self, batch_id):
+        """Keep an unmerged candidate readable; clean only resolved staging.
+
+        The confirmed PR outcome stays recorded even if local cleanup fails.
+        A matching local draft is retired only after that revision is present
+        in the synchronized public main tree, never merely when a PR opens.
+        """
+        with self._write_txn():
+            row = self.db.execute("SELECT * FROM outbox WHERE batch_id=?", (batch_id,)).fetchone()
             if row is None or row["status"] not in self.CONFIRMED_BATCH:
                 return None
-            batch = json.loads(row["batch"])
+            batch = _stored_json(row["batch"], dict, "outbox batch")
             removed = dict(entries=0, revisions=0, captures=0, staging=0)
-            file_receipts = [
-                {key: file[key] for key in ("path", "sha256") if key in file}
-                for file in batch.get("files", [])
-            ]
-            batch_refs = set()
+            refs = set()
             for ref in batch.get("entry_refs", []):
                 parsed = _exact_revision_ref(ref)
                 if parsed is None:
                     continue
-                entry_id, sent_revision = parsed
-                batch_refs.add(parsed)
+                entry_id, revision = parsed
+                refs.add(parsed)
                 entry = self._row(entry_id)
-                if entry is None:
-                    continue
-                current = entry["draft_revision"]
-                if current == sent_revision:
-                    if entry["published_revision"]:
-                        published = self._revision_doc(
-                            entry_id, entry["published_revision"]
-                        )
-                    else:
-                        published = None
-                    header = published or {
-                        **json.loads(entry["doc"]), "content": ""
-                    }
-                    self.db.execute(
-                        "UPDATE entries SET draft_revision=NULL, doc=?, "
-                        "updated=?, conditions=? WHERE entry_id=?",
-                        (canonical(header), time.time(),
-                         canonical(header["conditions"]), entry_id),
-                    )
+                if (entry is not None and entry["feed_active"]
+                        and entry["published_revision"] == revision
+                        and entry["draft_revision"] == revision):
+                    self.db.execute("UPDATE entries SET draft_revision=NULL WHERE entry_id=?", (entry_id,))
+                    self._material_dirty.add(entry_id)
                     removed["entries"] += 1
-                    if not entry["feed_active"]:
-                        # A compacted, never-published draft leaves search
-                        # entirely; the derived row goes with it.
-                        self._index_remove(entry_id)
-                    try:
-                        (self.root / "drafts" / f"{entry_id}.md").unlink()
-                    except OSError:
-                        pass
-                removed["revisions"] += self._prune_body_history(entry_id)
-            self._record_sent_receipts(row, batch)
-            generation = row["generation"]
-            if generation and batch_refs:
-                removed["captures"] += self._clear_covered_captures(
-                    generation, batch_refs
-                )
-            receipt = {
-                "schema": "mindie-contribution-receipt/1",
-                "batch_id": batch.get("batch_id", batch_id),
-                "revision": batch.get("revision", row["revision"]),
-                "domain": batch.get("domain", self.domain),
-                "entry_refs": batch.get("entry_refs", []),
-                "files": file_receipts,
-                "summary": batch.get("summary", ""),
-            }
-            self.db.execute(
-                "UPDATE outbox SET batch=? WHERE batch_id=?",
-                (canonical(receipt), batch_id),
-            )
-        staging = self.root / "outbox" / "staging" / batch_id
-        if staging.is_dir():
-            shutil.rmtree(staging, ignore_errors=True)
-            removed["staging"] = 1
+                    removed["revisions"] += self._prune_body_history(entry_id)
+            if row["generation"] and refs:
+                removed["captures"] = self._clear_covered_captures(row["generation"], refs)
+            revision = row["revision"]
+            self._queue_publication_cleanup(batch_id, revision)
+        removed.update(self._cleanup_publication_staging(batch_id))
         return removed
 
     def _clear_covered_captures(self, generation, batch_refs):
@@ -2298,98 +1679,44 @@ class Store:
         return cleared
 
     def _record_sent_receipts(self, row, batch, *, actual_files=None):
-        """Tiny per-entry last-confirmed receipt, independent of the newest
-        lineage outbox row. No body/history.
-
-        A confirmed receipt is sending history, never publication proof to
-        write from: it records the content identity actually committed (when
-        the publisher reports post-merge file identities) and the cumulative
-        confirmed observation-marker set — enough to prove which additions are
-        still unsent — plus path/PR linkage. The actual remote state is
-        re-read wherever it is used (publication merge, draft restore)."""
-        head = row["head_sha"] if isinstance(row, sqlite3.Row) else row.get("head_sha")
-        if not isinstance(head, str) or not head:
-            return
-        generation = row["generation"] if isinstance(row, sqlite3.Row) else row.get("generation")
-        pr_url = row["pr_url"] if isinstance(row, sqlite3.Row) else row.get("pr_url")
-        batch_id = row["batch_id"] if isinstance(row, sqlite3.Row) else row.get("batch_id")
-        batch_revision = row["revision"] if isinstance(row, sqlite3.Row) else row.get("revision")
-        files = {
-            f.get("path"): f
-            for f in batch.get("files", [])
-            if isinstance(f, dict) and isinstance(f.get("path"), str)
-        }
-        actual = {
-            f.get("path"): f
-            for f in (actual_files or [])
-            if isinstance(f, dict) and isinstance(f.get("path"), str)
-        }
+        """Store the exact current per-file send identities, with no bodies."""
+        row = dict(row)
+        if not isinstance(row.get("head_sha"), str) or not row["head_sha"]:
+            raise ValueError("confirmed contribution has no remote head identity")
+        candidate = {item["path"]: item for item in batch.get("files", [])}
+        actual = {item["path"]: item for item in actual_files or []}
         now = time.time()
         for ref in batch.get("entry_refs", []):
             parsed = _exact_revision_ref(ref)
             if parsed is None:
                 continue
-            entry_id, sent_revision = parsed
-            path = next(
-                (p for p in (f"cases/{entry_id}.md", f"topics/{entry_id}.md")
-                 if p in files or p in actual),
-                None,
-            )
-            if not entry_id or not sent_revision or not path:
-                continue
-            existing = self.db.execute(
-                "SELECT sha256, sent_revision, markers FROM sent_receipts "
-                "WHERE entry_id=? AND batch_revision=?",
-                (entry_id, batch_revision),
-            ).fetchone()
-            payload_file = files.get(path) or {}
-            actual_file = actual.get(path) or {}
-            if actual_file.get("sha256") and actual_file.get("revision"):
-                # What the remote actually committed (post-merge content).
-                sha = actual_file["sha256"]
-                revision = actual_file["revision"]
-            elif existing is not None:
-                # A later re-record of the same confirmed batch (e.g. payload
-                # compaction) must not downgrade actual identities to the
-                # pre-merge candidate values.
-                sha = existing["sha256"]
-                revision = existing["sent_revision"]
-            else:
-                # Legacy rows only: batches confirmed before actual-file
-                # recording existed have no committed identity to recover;
-                # the candidate identity is their best available record.
-                sha = payload_file.get("sha256")
-                revision = sent_revision
-            if not isinstance(sha, str) or not sha:
-                continue
-            if not isinstance(revision, str) or not revision:
-                continue
-            content = payload_file.get("content")
-            payload_markers = (
-                documents.observation_markers(content)
-                if isinstance(content, str) else None
-            )
-            prior_row = self.db.execute(
-                "SELECT markers FROM sent_receipts WHERE entry_id=?", (entry_id,)
-            ).fetchone()
-            prior = []
-            if prior_row is not None and prior_row[0]:
-                prior = _stored_json(prior_row[0], list, "sent markers")
-                if not all(isinstance(marker, str) for marker in prior):
-                    raise ValueError("invalid stored sent markers: expected strings")
-            if payload_markers is None and prior_row is None:
-                markers_value = None
-            else:
-                markers_value = canonical(sorted({*prior, *(payload_markers or [])}))
+            entry_id, revision = parsed
+            prefix = f"tasks/{entry_id}/"
+            index_path = prefix + "index.md"
+            if index_path not in candidate:
+                continue  # a feedback reference is not a task publication
+            files = []
+            for path, item in sorted(candidate.items()):
+                if not path.startswith(prefix):
+                    continue
+                proven = actual.get(path, item)
+                if proven.get("sha256") is not None:
+                    files.append(dict(path=path, sha256=proven["sha256"],
+                                      revision=proven.get("revision") or revision))
+            index = next((item for item in files if item["path"] == index_path), None)
+            if index is None:
+                raise ValueError("confirmed task contribution has no navigation index receipt")
+            # Task packages do not merge observation text during publication:
+            # every accepted file is either byte-identical or an exact-base update.
+            self.db.execute("INSERT OR REPLACE INTO feed_state VALUES(?,?)",
+                            ("sent-package:" + entry_id, canonical(dict(
+                                revision=revision, files=files, head_sha=row["head_sha"],
+                                batch_id=row["batch_id"], batch_revision=row["revision"]))))
             self.db.execute(
-                "INSERT OR REPLACE INTO sent_receipts"
-                "(entry_id, generation, sent_revision, path, sha256, head_sha,"
-                " repository, pr_url, batch_id, updated, markers, batch_revision)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    entry_id, generation, revision, path, sha, head,
-                    None, pr_url, batch_id, now, markers_value, batch_revision,
-                ),
+                "INSERT OR REPLACE INTO sent_receipts(entry_id,generation,sent_revision,path,sha256,"
+                "head_sha,repository,pr_url,batch_id,updated,markers,batch_revision) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (entry_id, row.get("generation"), revision, index_path, index["sha256"],
+                 row["head_sha"], None, row.get("pr_url"), row["batch_id"], now, None, row["revision"]),
             )
 
     def sent_receipt(self, entry_id):
@@ -2407,111 +1734,34 @@ class Store:
         return receipt["sha256"] if receipt else None
 
     def sent_markers(self, entry_id):
-        """Observation markers present in the last confirmed sent body.
+        """Package updates use exact file identities, not observation markers."""
+        return None
 
-        A set proves which additions are still unsent; None means unknown
-        (no receipt, or a receipt written before markers were recorded), in
-        which case no delta may be inferred and publication reconciles the
-        current remote head instead of guessing."""
-        receipt = self.sent_receipt(entry_id)
-        if not receipt:
-            return None
-        raw = receipt.get("markers")
-        if not raw:
-            return None
-        value = _stored_json(raw, list, "sent markers")
-        if not all(isinstance(marker, str) for marker in value):
-            raise ValueError("invalid stored sent markers: expected strings")
-        return set(value)
+    def sent_package_files(self, entry_id):
+        receipt = self.feed_get("sent-package:" + entry_id)
+        if receipt is None:
+            return []
+        files = receipt.get("files")
+        if not isinstance(files, list) or any(not isinstance(item, dict) for item in files):
+            raise ValueError("invalid stored task file receipts")
+        return files
 
     def rebase_draft_on_published(self, entry_id):
-        """Re-seat a local draft onto the authoritative published body.
+        """A package is never text-merged with independently edited public data.
 
-        Submitted content obeys the remote: when the feed-installed body has
-        moved away from the last confirmed send (bot/maintainer edits), the
-        local draft is rebuilt as the published body plus only the
-        not-yet-sent observation blocks (markers absent from the confirmed
-        receipt and from the published body). Blocks the upstream removed are
-        never brought back, and a remote header wins over a local one. When
-        nothing remains unsent the redundant local draft is dropped. Returns
-        the resulting draft doc, or None when there is nothing to rebase (or
-        no draft remains). Never resurrects a withdrawn entry; a legacy
-        receipt without marker knowledge cannot prove the delta and is left
-        for the publication-time head reconciliation instead of guessing."""
-        now = time.time()
+        Exact-base contribution checks surface upstream changes. Only an
+        already identical local revision can be folded into the public one.
+        """
         with self._write_txn():
             row = self._row(entry_id)
-            if (
-                row is None
-                or not row["draft_revision"]
-                or not row["published_revision"]
-                or not row["feed_active"]
-            ):
+            if row is None or not row["draft_revision"] or not row["feed_active"]:
                 return None
-            sent_markers = self.sent_markers(entry_id)
-            if sent_markers is None:
-                return None
-            receipt_hash = self.sent_file_hash(entry_id)
-            published = self._revision_doc(entry_id, row["published_revision"])
-            draft = self._revision_doc(entry_id, row["draft_revision"])
-            if published is None or draft is None:
-                return None
-            published_sha = hashlib.sha256(
-                documents.render_entry(published).encode("utf-8")
-            ).hexdigest()
-            if published_sha == receipt_hash:
-                return None  # remote did not move; the draft base stands
-            split = documents.split_observations(draft["content"])
-            if split is None:
-                return None  # opaque tail: publication reconciles, never guess
-            _base, blocks = split
-            published_markers = set(documents.observation_markers(published["content"]))
-            unsent = [
-                (marker, addition)
-                for marker, addition in blocks
-                if marker not in sent_markers and marker not in published_markers
-            ]
-            if not unsent and not blocks:
-                # The draft predates any observation structure; if it differs
-                # from the published body the divergence is not in transferable
-                # observation form, so it is left for publication-time
-                # reconciliation rather than silently dropped.
-                if draft["content"] != published["content"]:
-                    return None
-            rebuilt = published
-            for marker, addition in unsent:
-                rebuilt, _appended = documents.append_observation(
-                    rebuilt, addition, marker=marker
-                )
-            if rebuilt["revision"] == draft["revision"]:
-                return None  # already seated on the published body
-            if rebuilt["revision"] == published["revision"]:
-                # Nothing unsent: the local copy converges to the remote body.
-                self.db.execute(
-                    "UPDATE entries SET draft_revision=NULL, title=?, updated=? "
-                    "WHERE entry_id=?",
-                    (published["title"], now, entry_id),
-                )
-                try:
-                    (self.root / "drafts" / f"{entry_id}.md").unlink()
-                except OSError:
-                    pass
+            if row["draft_revision"] == row["published_revision"]:
+                self.db.execute("UPDATE entries SET draft_revision=NULL WHERE entry_id=?", (entry_id,))
+                self._material_dirty.add(entry_id)
                 self._prune_body_history(entry_id)
                 return None
-            self._insert_revision(rebuilt, "draft", now)
-            self.db.execute(
-                "INSERT OR REPLACE INTO grants "
-                "SELECT 'draft', identity, ?, generation, ? FROM grants "
-                "WHERE kind='draft' AND identity=? AND revision=?",
-                (rebuilt["revision"], now, entry_id, row["draft_revision"]),
-            )
-            self.db.execute(
-                "UPDATE entries SET draft_revision=?, title=?, updated=? "
-                "WHERE entry_id=?",
-                (rebuilt["revision"], published["title"], now, entry_id),
-            )
-            self._prune_body_history(entry_id)
-            return rebuilt
+            return self._revision_doc(entry_id, row["draft_revision"])
 
     def restore_draft(self, entry_id, doc, *, generation=None):
         """Re-seed a compacted append-base from the exact confirmed remote
@@ -2519,13 +1769,6 @@ class Store:
         local draft, never resurrects a withdrawn entry and never fabricates
         a base from only the new paragraph."""
         documents.validate(doc)
-        # Derived tokenization is computed off the write transaction from the
-        # caller-provided document; the apply writes exactly that content.
-        from mindie_knowledge.retrieval import index_text
-
-        source_text = self._doc_source_text(doc)
-        tokens_text = index_text(source_text)
-        text_digest = self._doc_state_digest(doc)
         now = time.time()
         with self._write_txn():
             row = self._row(entry_id)
@@ -2548,12 +1791,12 @@ class Store:
                 "UPDATE entries SET draft_revision=?, title=?, doc=?, "
                 "updated=?, conditions=? WHERE entry_id=?",
                 (doc["revision"], doc["title"],
-                 canonical(doc) if visible else row["doc"], now,
+                 self._header(doc) if visible else row["doc"], now,
                  canonical(doc["conditions"]) if visible else row["conditions"],
                  entry_id),
             )
             if visible:
-                self._index_upsert_tokens(entry_id, tokens_text, text_digest)
+                self._mark_material_changed(entry_id)
             self._prune_body_history(entry_id)
             return doc
 
@@ -2694,23 +1937,13 @@ class Store:
             ).fetchone()
             if already is not None:
                 return None
-            columns = {
-                row[1] for row in self.db.execute("PRAGMA table_info(regions)")
-            }
-            if "recovery" in columns:
-                self.db.execute(
-                    "INSERT INTO regions(id, capture_id, file_identity, start, "
-                    "finish, digest, status, detail, created, recovery, identity) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,0,?)",
-                    (ident, capture_id, file_identity, start, finish, region_digest,
-                     status, str(detail)[:1000], now, identity or None),
-                )
-            else:
-                self.db.execute(
-                    "INSERT INTO regions VALUES(?,?,?,?,?,?,?,?,?)",
-                    (ident, capture_id, file_identity, start, finish, region_digest,
-                     status, str(detail)[:1000], now),
-                )
+            self.db.execute(
+                "INSERT INTO regions(id, capture_id, file_identity, start, "
+                "finish, digest, status, detail, created, recovery, identity) "
+                "VALUES(?,?,?,?,?,?,?,?,?,0,?)",
+                (ident, capture_id, file_identity, start, finish, region_digest,
+                 status, str(detail)[:1000], now, identity or None),
+            )
             self.db.execute(
                 "INSERT INTO cursors VALUES(?,?,?,?,0,?) "
                 "ON CONFLICT(file_identity) DO UPDATE SET "
@@ -2725,52 +1958,9 @@ class Store:
         with self._write_txn():
             _upsert_continuation(self.db, ident, due, reason[:1000], eligible)
 
-    def arm_apply_continuations(self):
-        """Give a saved apply-pending result a due row if it has none.
-
-        This does not apply the result and does not touch the network.
-        """
-        now = time.time()
-        with self._write_txn():
-            rows = self.db.execute(
-                "SELECT id FROM maintenance_attempts WHERE status='apply' "
-                "AND result IS NOT NULL"
-            ).fetchall()
-            for (attempt_id,) in rows:
-                parts = str(attempt_id).split(":")
-                if len(parts) < 3 or parts[0] != "organize":
-                    continue
-                capture_id = parts[1]
-                found = self.db.execute(
-                    "SELECT 1 FROM continuations WHERE capture_id=?",
-                    (capture_id,),
-                ).fetchone()
-                if found is None:
-                    _upsert_continuation(
-                        self.db, capture_id, now, "apply-pending", True,
-                    )
-
-    def due_application(self):
-        """One saved apply whose continuation is eligible and due."""
-        with self.lock:
-            rows = self.db.execute(
-                "SELECT m.id, q.capture_id FROM maintenance_attempts m "
-                "JOIN continuations q ON m.id LIKE ('organize:' || q.capture_id || ':%') "
-                "JOIN captures c ON c.id = q.capture_id "
-                "WHERE m.status='apply' AND m.result IS NOT NULL "
-                "AND c.status='apply-pending' "
-                "AND COALESCE(q.eligible, 1) != 0 AND COALESCE(q.due, 0) <= ? "
-                "ORDER BY q.due, m.started LIMIT 5",
-                (time.time(),),
-            ).fetchall()
-        for attempt_id, capture_id in rows:
-            prefix = f"organize:{capture_id}:"
-            if attempt_id.startswith(prefix) and len(attempt_id) > len(prefix):
-                return attempt_id
-        return None
 
     def finish_region(self, ident, status, detail=""):
-        ok = status in {"succeeded", "summary-only"}
+        ok = status == "succeeded"
         with self._write_txn():
             row = self.db.execute(
                 "SELECT file_identity, finish FROM regions WHERE id=?", (ident,)
@@ -2801,81 +1991,6 @@ class Store:
                 ).fetchall()
         return [dict(r) for r in rows]
 
-    # ------------------------------------------------- bounded gap recovery
-
-    def schedule_gap_recovery(self, region_id, *, due):
-        """Schedule the one permitted delayed recovery for a deadline-failed
-        region. The recovery counter is persisted BEFORE the continuation so
-        a crash or restart can never grant a third model attempt. Returns the
-        region row when the recovery was scheduled, else None (already
-        recovered, not failed, or unknown region)."""
-        with self._write_txn():
-            row = self.db.execute(
-                "SELECT * FROM regions WHERE id=?", (region_id,)
-            ).fetchone()
-            if (
-                row is None
-                or row["status"] != "failed"
-                or int(row["recovery"] or 0) != 0
-            ):
-                return None
-            self.db.execute(
-                "UPDATE regions SET recovery=1 WHERE id=?", (region_id,)
-            )
-            capture_id = row["capture_id"]
-            detail = f"gap-recovery:{region_id}"
-            self.db.execute(
-                "UPDATE captures SET status='pending', detail=? WHERE id=? "
-                "AND status IN ('queued','pending','deferred','failed','processing')",
-                (detail[:1000], capture_id),
-            )
-            _upsert_continuation(self.db, capture_id, due, detail, True)
-            return dict(row)
-
-    def gap_region(self, region_id):
-        with self.lock:
-            row = self.db.execute(
-                "SELECT * FROM regions WHERE id=?", (region_id,)
-            ).fetchone()
-        return dict(row) if row else None
-
-    def finish_gap_if_unresolved(self, region_id, capture_id, detail):
-        """Record a failed recovery ONLY when no concurrent recovery won.
-
-        Both failure writes are guarded in one transaction: the region must
-        still be ``failed`` (a winner's checkpoint already flipped it to
-        ``succeeded`` atomically with its saved result) and the capture is
-        only flipped while still in the unprocessed family — never over an
-        ``apply-pending`` saved result or an ``organized`` outcome. Returns
-        True when this call landed the failure. A late loser must not
-        downgrade an already recovered success: the OS can preempt it
-        between its failed reservation and these writes.
-        """
-        detail = str(detail)[:1000]
-        with self._write_txn():
-            region = self.db.execute(
-                "SELECT status FROM regions WHERE id=?", (region_id,)
-            ).fetchone()
-            if region is None or region["status"] != "failed":
-                return False
-            self.db.execute(
-                "UPDATE regions SET status='failed', detail=? WHERE id=?",
-                (detail, region_id),
-            )
-            capture = self.db.execute(
-                "SELECT status FROM captures WHERE id=?", (capture_id,)
-            ).fetchone()
-            if capture is not None and capture["status"] in (
-                "queued", "pending", "deferred"
-            ):
-                self.db.execute(
-                    "UPDATE captures SET status='failed', detail=? WHERE id=?",
-                    (detail, capture_id),
-                )
-                self.db.execute(
-                    "DELETE FROM continuations WHERE capture_id=?", (capture_id,)
-                )
-            return True
 
     # ---------------------------------------------------------------- legacy
 
@@ -2901,7 +2016,8 @@ class Store:
                 schema=SCHEMA,
                 entries=counts,
                 transcript_summaries={r[0]: r[1] for r in self.db.execute(
-                    "SELECT summary_status, count(*) FROM transcript_tasks GROUP BY summary_status")},
+                    f"SELECT {SUMMARY_STATUS_SQL} AS visible_status, count(*) "
+                    "FROM transcript_tasks t GROUP BY visible_status")},
                 withdrawn=self.db.execute(
                     "SELECT count(*) FROM entries WHERE published_revision "
                     "IS NOT NULL AND feed_active=0"

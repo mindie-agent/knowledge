@@ -10,6 +10,7 @@ from mindie_knowledge.loop.export import build_batch
 from mindie_knowledge.loop.store import Store
 
 from conftest import write_settings
+from package_fixture import install_documents, package_for
 
 PRODUCER = "b" * 64
 
@@ -53,10 +54,11 @@ def test_explain_paginates_long_bodies_with_explicit_continuation(tmp_path):
         store.close()
 
 
-def test_feed_sync_reseats_draft_onto_moved_remote_keeping_unsent(tmp_path):
-    """A bot/maintainer edit that lands on main and syncs down re-seats the
-    local draft: the published body wins, the bot-removed submitted paragraph
-    is dropped, and only the still-unsent observation survives locally."""
+def test_feed_sync_preserves_unsent_candidate_without_merging_remote_corrections(tmp_path):
+    """Current public material wins retrieval; local work remains a separate
+    candidate. Changed upstream bytes are reconciled by exact-base conflict,
+    never by pretending two independently indexed packages were merged.
+    """
     settings = write_settings(tmp_path / "community.json", enabled=True,
                               roots=[tmp_path])
     store = Store(tmp_path / "store", "test")
@@ -75,29 +77,25 @@ def test_feed_sync_reseats_draft_onto_moved_remote_keeping_unsent(tmp_path):
             title="Edited title", summary="edited summary",
             content="Kept paragraph.",
         )
-        store.install_feed([published], feed_ident="f" * 64)
+        install_documents(store, [published], feed_ident="f" * 64)
         row = store._row(doc["entry_id"])
         draft = store._revision_doc(doc["entry_id"], row["draft_revision"])
-        assert draft["title"] == "Edited title"  # remote header authoritative
-        assert "Kept paragraph." in draft["content"]
-        assert "Removed paragraph." not in draft["content"]
+        assert draft["title"] == doc["title"]
+        assert "Removed paragraph." in draft["content"]
         assert "Unsent observation B." in draft["content"]
-        # The next batch publishes exactly the published body plus the unsent
-        # observation — the removed paragraph is not resurrected.
+        visible = store.get(store.ref(doc["entry_id"]))
+        assert visible["title"] == "Edited title" and visible["content"] == "Kept paragraph."
+        assert store.rebase_draft_on_published(doc["entry_id"])["revision"] == updated["revision"]
         built2 = build_batch(store, settings=settings)
-        item = next(f for f in built2[2]["files"] if f["path"].startswith("cases/"))
-        assert "Removed paragraph." not in item["content"]
-        assert "Unsent observation B." in item["content"]
-        assert "Edited title" in item["content"]
+        item = next(f for f in built2[2]["files"] if f["path"].endswith("/index.md"))
         assert item["base_sha256"] == store.sent_receipt(doc["entry_id"])["sha256"]
+        assert item["base_sha256"] != __import__("hashlib").sha256(package_for(published)["files"]["index.md"].encode()).hexdigest()
     finally:
         store.close()
 
 
-def test_feed_sync_drops_fully_sent_draft_after_remote_caught_up(tmp_path):
-    """A submitted observation the bot removed upstream is not kept locally
-    either: with nothing unsent left, the local copy converges to the
-    published body instead of resurrecting the removed block."""
+def test_feed_sync_drops_only_a_byte_identical_published_candidate(tmp_path):
+    """An exact main package retires its matching candidate without body history."""
     settings = write_settings(tmp_path / "community.json", enabled=True,
                               roots=[tmp_path])
     store = Store(tmp_path / "store", "test")
@@ -110,17 +108,12 @@ def test_feed_sync_drops_fully_sent_draft_after_remote_caught_up(tmp_path):
         built2 = build_batch(store, settings=settings)
         store.mark_batch(built2[0], "submitted", pr_url="https://x/pr/2",
                          head_sha="b" * 40)
-        assert store.sent_markers(doc["entry_id"]) == {"ee" * 16}
-        # Upstream removed the submitted observation before merging.
-        published = documents.make_entry(
-            entry_id=doc["entry_id"], domain="test", kind="experience",
-            title="Sent case", summary="s", content="Base body.",
-        )
-        store.install_feed([published], feed_ident="f" * 64)
+        published = store.get(store.ref(doc["entry_id"]))
+        install_documents(store, [published], feed_ident="f" * 64)
         row = store._row(doc["entry_id"])
         assert row["draft_revision"] is None
         current = store.get(store.ref(doc["entry_id"]))
-        assert current["content"] == "Base body."
+        assert "Base body." in current["content"] and "Observation A." in current["content"]
         assert store.drafts_changed(generation=settings.generation) == []
     finally:
         store.close()
@@ -141,9 +134,9 @@ def test_flush_chunks_oversized_flush_without_dropping(tmp_path, monkeypatch):
                                owner=PRODUCER, generation=settings.generation)
             for i in range(3)
         ]
-        # Serialized accounting: two ~492-byte entry files plus framing fit
-        # under 1600 bytes; the third waits for the next automatic batch.
-        monkeypatch.setattr(export_mod, "MAX_BATCH_BYTES", 1600)
+        from mindie_knowledge.loop.store import canonical
+        costs = [len(canonical(export_mod._task_files(store, doc)).encode()) for doc in docs]
+        monkeypatch.setattr(export_mod, "MAX_BATCH_BYTES", sum(sorted(costs)[-2:]))
         first = build_batch(store, settings=settings)
         assert first is not None
         first_ids = first[3]
@@ -160,57 +153,47 @@ def test_flush_chunks_oversized_flush_without_dropping(tmp_path, monkeypatch):
         store.close()
 
 
-def test_serialized_size_accounting_is_exact(tmp_path):
-    """The planner's proforma measure equals the real canonical batch bytes."""
-    from mindie_knowledge.loop.export import (
-        _batch_serialized_size, _canonical_len, lineage_of,
-    )
-
+def test_frozen_package_preserves_exact_utf8_bytes_and_metadata_only_receipt(tmp_path):
+    from mindie_knowledge.community.batch import batch_revision
+    from mindie_knowledge.materials.publication import load_batch_payload
+    import hashlib
     store = Store(tmp_path, "test")
     try:
-        settings = write_settings(tmp_path / "community.json", enabled=True,
-                                  roots=[tmp_path])
-        doc = store.create_draft(kind="experience", title="Measure",
-                                 summary="s", content="Body with \"escapes\" ü",
-                                 owner=PRODUCER, generation=settings.generation)
-        from mindie_knowledge.loop.export import _filename
-        from mindie_knowledge.loop.documents import render_entry
-
-        file_dict = dict(path=_filename(doc), content=render_entry(doc),
-                         sha256="0" * 64, base_sha256=None, sent_markers=["ab" * 16])
-        ref = store.ref(doc["entry_id"], doc["revision"])
-        lineage = lineage_of("test", settings.generation)
-        summary = "test: 1 entries, 0 votes"
-        measured = _batch_serialized_size(
-            [_canonical_len(file_dict)], [_canonical_len(ref)],
-            summary=summary, domain="test", lineage=lineage,
-        )
-        actual = dict(schema="mindie-contribution/1", batch_id=lineage,
-                      revision="0" * 64, domain="test", base_commit="0" * 64,
-                      entry_refs=[ref], files=[file_dict], summary=summary)
-        from mindie_knowledge.loop.store import canonical
-
-        assert measured == len(canonical(actual).encode("utf-8"))
+        settings = write_settings(tmp_path / "community.json", enabled=True, roots=[tmp_path])
+        store.create_draft(kind="experience", title="Measure", summary="s",
+                          content='Body with "escapes" ü and a newline.\nNext line.',
+                          owner=PRODUCER, generation=settings.generation)
+        built = build_batch(store, settings=settings)
+        payload = load_batch_payload(store, store.batch(built[0]))
+        assert payload == built[2]
+        assert payload["revision"] == batch_revision(payload["files"], "test", payload["base_commit"], payload["entry_refs"])
+        for item in payload["files"]:
+            assert hashlib.sha256(item["content"].encode("utf-8")).hexdigest() == item["sha256"]
+        stored = json.loads(store.batch(built[0])["batch"])
+        assert all("content" not in item for item in stored["files"])
+        assert 'Body with "escapes"' not in "\n".join(store.db.iterdump())
     finally:
         store.close()
 
 
 def test_install_feed_membership_switch_scales_past_sql_variable_ceiling(tmp_path):
-    """33k entries in one atomic switch: no giant NOT IN variable list."""
+    """A real switch exceeds the lowered SQLite variable ceiling without a giant IN list."""
     store = Store(tmp_path, "test")
     try:
+        import sqlite3
+        store.db.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 64)
         docs = [
             documents.make_entry(entry_id=f"{i:05x}" + "0" * 59, domain="test",
                                  kind="experience", title=f"Entry {i}",
                                  summary="s", content=f"body {i}")
-            for i in range(33_000)
+            for i in range(130)
         ]
-        store.install_feed(iter(docs), feed_ident="f" * 64)
-        assert store.query("32999")["results"]
-        store.install_feed(docs[:100], feed_ident="f" * 64)
-        assert store.get(store.ref(docs[2000]["entry_id"]))["withdrawn"] is True
+        install_documents(store, iter(docs), feed_ident="f" * 64)
+        assert store.query("129")["results"]
+        install_documents(store, docs[:100], feed_ident="f" * 64)
+        assert store.get(store.ref(docs[120]["entry_id"]))["withdrawn"] is True
         assert store.query("50")["results"]
-        assert store.query("32999")["results"] == []
+        assert store.query("129")["results"] == []
     finally:
         store.close()
 

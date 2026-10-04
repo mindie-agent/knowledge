@@ -91,6 +91,44 @@ class ScannerUnavailable(OSError):
     """Retry local deterministic work after the scanner becomes available."""
 
 
+_KEY_BEGIN = re.compile(r"-----BEGIN ((?:[A-Z0-9]+ )*PRIVATE KEY)-----")
+
+
+def redact_increment(text, *, state=None, executable, key, private_paths=()):
+    """Redact a complete-message increment, carrying only the open PEM type.
+
+    State contains no source text. The caller commits it with the source cursor
+    and material files; a retry of the same range starts from the same state.
+    A missing or mismatched END keeps subsequent increments masked.
+    """
+    state = dict(state or {})
+    if set(state) - {'private_key'}:
+        raise ValueError('unknown redaction state')
+    opened = state.get('private_key')
+    if opened is not None and not re.fullmatch(r'(?:[A-Z0-9]+ )*PRIVATE KEY', opened):
+        raise ValueError('invalid redaction state')
+    continued = bool(opened)
+    if opened:
+        marker = '-----END ' + opened + '-----'
+        end = text.find(marker)
+        if end < 0:
+            return '[REDACTED_SECRET]', ['credential-private-key'], state
+        text = '[REDACTED_SECRET]' + text[end + len(marker):]
+        opened = None
+    cursor = 0
+    while match := _KEY_BEGIN.search(text, cursor):
+        marker = '-----END ' + match.group(1) + '-----'
+        end = text.find(marker, match.end())
+        if end < 0:
+            opened = match.group(1)
+            break
+        cursor = end + len(marker)
+    clean, rules = redact(text, executable=executable, key=key, private_paths=private_paths)
+    if continued:
+        rules = sorted(set(rules) | {'credential-private-key'})
+    return clean, rules, {'private_key': opened} if opened else {}
+
+
 def redact(text, *, executable, key, private_paths=()):
     if not executable or not Path(executable).is_absolute():
         raise ValueError("transcript redaction requires an installed scanner")
@@ -173,7 +211,10 @@ def redact(text, *, executable, key, private_paths=()):
     cursor = 0
     for start, end, rule in merged:
         token = hmac.new(key, text[start:end].encode(), hashlib.sha256).hexdigest()[:12]
-        pieces.extend((text[cursor:start], f"<redacted:{rule}:{token}>"))
+        # A fixed closed token cannot itself be mistaken for a credential
+        # assignment by the final outbound scan. It contains no user input.
+        placeholder = '[REDACTED_SECRET]' if rule.startswith(('secret-', 'credential-')) else f"<redacted:{rule}:{token}>"
+        pieces.extend((text[cursor:start], placeholder))
         cursor = end
     pieces.append(text[cursor:])
     return ''.join(pieces), rules

@@ -169,7 +169,7 @@ def tree_sha256(work_dir: Path, path: str) -> str | None:
     raw = target.read_bytes()
     if len(raw) > MAX_FILE_BYTES:
         raise CommunityError(f"{path} in the remote branch exceeds the per-file platform envelope")
-    return hashlib.sha256(raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")).hexdigest()
+    return hashlib.sha256(raw).hexdigest()
 
 
 def read_tree_file(work_dir: Path, path: str) -> str | None:
@@ -188,6 +188,12 @@ def apply_files(work_dir: Path, files: Sequence[Mapping[str, Any]]) -> list[str]
     for item in files:
         path = item["path"]
         target = work_dir / path
+        if item.get("delete") is True:
+            if target.is_symlink():
+                raise CommunityError(f"refusing to delete symlink {path}")
+            target.unlink(missing_ok=True)
+            written.append(path)
+            continue
         target.parent.mkdir(parents=True, exist_ok=True)
         raw = lf_bytes(item["content"])
         tmp = target.with_name(target.name + ".tmp")
@@ -208,7 +214,7 @@ def stage_and_commit(
     Git never starts.
     """
     if not paths:
-        return current_head(work_dir, deadline)
+        return None
     spec = b"\0".join(path.encode("utf-8") for path in paths) + b"\0"
     _git(
         # apply_files writes canonical LF bytes. Inheriting a developer's
@@ -304,15 +310,40 @@ def fetch_pr_head(
     return fetch_ref(work_dir, remote, f"refs/pull/{int(number)}/head", deadline, env=env)
 
 
-def ls_tree(work_dir: Path, commit: str, deadline: Deadline, *, env=None) -> dict[str, str]:
-    """Map path -> git mode for one commit; catches symlinks/exec/submodules."""
-    out = _git(["ls-tree", "-r", commit], deadline, cwd=work_dir, env=env)
-    modes: dict[str, str] = {}
-    for line in out.splitlines():
-        meta, _, path = line.partition("\t")
-        parts = meta.split()
-        if len(parts) >= 1 and path:
-            modes[path] = parts[0]
+def ls_tree(work_dir: Path, commit: str, deadline: Deadline, *, env=None,
+            task_ids: set[str] | None = None) -> dict[str, str]:
+    """Read exact path/mode metadata without a whole-catalogue output cap.
+
+    NUL framing preserves unusual filenames so they cannot hide from package
+    validation through Git's quoted display format. Only requested task modes
+    stay in memory when the publisher supplies task_ids.
+    """
+    import tempfile
+    from mindie_knowledge.gitread import iter_file_records, run_stdout_to_file
+
+    remaining = deadline.step("git ls-tree")
+    modes = {}
+    with tempfile.TemporaryDirectory(prefix="mindie-git-tree-") as temporary:
+        target = Path(temporary) / "tree"
+        argv = ["git", "-C", str(work_dir), "ls-tree", "-r", "-z", commit]
+        if task_ids is not None:
+            argv += ["--", "tasks/"]
+        try:
+            run_stdout_to_file(argv, target, timeout=min(DEFAULT_GIT_OP_SECONDS, remaining),
+                               env=_resolve_git_env(env))
+        except (OSError, TimeoutError) as exc:
+            raise TransientError(f"git ls-tree failed: {exc}") from exc
+        for raw in iter_file_records(target):
+            try:
+                meta, path = raw.decode("utf-8", "strict").split("\t", 1)
+                mode, _kind, _oid = meta.split()
+            except (UnicodeDecodeError, ValueError) as exc:
+                raise CommunityError("unreadable Git tree metadata") from exc
+            if task_ids is not None:
+                parts = path.split("/", 2)
+                if len(parts) < 3 or parts[0] != "tasks" or parts[1] not in task_ids:
+                    continue
+            modes[path] = mode
     return modes
 
 

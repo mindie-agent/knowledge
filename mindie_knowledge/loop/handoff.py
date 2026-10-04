@@ -112,7 +112,7 @@ def prepare_schema(config_path):
 
 
 def _store_path(config):
-    return Path(config["root"]).resolve() / config["domain"] / "store-v3.sqlite3"
+    return Path(config["root"]).resolve() / config["domain"] / "state-v4.sqlite3"
 
 
 def _columns(db, table):

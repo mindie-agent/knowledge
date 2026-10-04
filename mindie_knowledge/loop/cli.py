@@ -47,23 +47,22 @@ def validate_config(config):
             "session_activation was removed; configure the neutral "
             "admission_path SQLite file instead"
         )
-    if "agent_command" in config and (
-        not isinstance(config["agent_command"], list)
-        or not all(isinstance(x, str) for x in config["agent_command"])
-    ):
-        raise ValueError("agent_command must be an argv list")
+    if "agent_command" in config:
+        raise ValueError("agent_command was removed; configure summary_command for public transcript indexing")
+    command = config.get("summary_command")
+    if command is not None and (not isinstance(command, list) or not command
+                                or not all(isinstance(x, str) and x for x in command)):
+        raise ValueError("summary_command must be a nonempty argv list")
     if "admission_path" in config and not isinstance(config["admission_path"], str):
         raise ValueError("admission_path must be an explicit SQLite file path")
     adapter = config.get("transcript_adapter")
-    mode = config.get("capture_mode", "organize")
-    if mode not in {"organize", "public-transcript"}:
-        raise ValueError("unknown capture mode")
-    if mode == "public-transcript":
-        scanner = config.get("redactor_executable")
-        if not isinstance(scanner, str) or not Path(scanner).is_absolute():
-            raise ValueError("public transcript mode requires an absolute redactor_executable")
-        if not adapter:
-            raise ValueError("public transcript mode requires a transcript adapter")
+    if config.get("capture_mode", "public-transcript") != "public-transcript":
+        raise ValueError("only public-transcript capture is supported")
+    scanner = config.get("redactor_executable")
+    if not isinstance(scanner, str) or not Path(scanner).is_absolute():
+        raise ValueError("public transcript mode requires an absolute redactor_executable")
+    if not adapter:
+        raise ValueError("public transcript mode requires a transcript adapter")
     if adapter is not None:
         candidate = Path(adapter)
         if (
@@ -79,8 +78,7 @@ def validate_config(config):
 
 def load_transcript_adapter(config):
     """Load the configured trusted parser module exactly once. Missing or
-    invalid configuration means honest summary-only behavior — core never
-    guesses a native format."""
+    invalid configuration fails explicitly; core never guesses a native format."""
     adapter = (config or {}).get("transcript_adapter")
     if not adapter:
         return None
@@ -355,7 +353,7 @@ def _feeds(config, store):
 
 
 def _open_existing_store(config):
-    path = Path(config["root"]) / config["domain"] / "store-v3.sqlite3"
+    path = Path(config["root"]) / config["domain"] / "state-v4.sqlite3"
     if not path.is_file():
         return None
     return Store(config["root"], config["domain"])
@@ -388,9 +386,9 @@ def _serve(config_path, config):
         stage = "transcript_adapter"
         transcript = load_transcript_adapter(config)
         stage = "engine"
-        engine = Engine(store, agent_command=config.get("agent_command"),
+        engine = Engine(store,
                         settings_path=config.get("community_config"), admission=admission,
-                        transcript_adapter=transcript, capture_mode=config.get("capture_mode", "organize"),
+                        transcript_adapter=transcript, capture_mode=config.get("capture_mode", "public-transcript"),
                         redactor_executable=config.get("redactor_executable"),
                         summary_command=config.get("summary_command"))
         stage = "service"
