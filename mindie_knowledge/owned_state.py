@@ -81,7 +81,7 @@ def _file_identity(path):
 def _present(path):
     try:
         path.lstat()
-    except FileNotFoundError:
+    except FileNotFoundError as missing:
         # Windows also reports ENOENT for a child of a regular file. Confirm
         # that the closest existing ancestor can contain a missing path before
         # treating this as a never-initialized store. Other I/O errors escape.
@@ -93,6 +93,8 @@ def _present(path):
             if not stat.S_ISDIR(mode):
                 raise NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR), str(parent)) from None
             break
+        else:
+            raise missing  # No accessible ancestor established first-use absence.
         return False
     return True  # ENOTDIR/permission/I/O errors must not look like first use.
 

@@ -232,6 +232,29 @@ def test_never_initialized_nested_read_does_not_create_directories(tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
+def test_unavailable_ancestors_preserve_original_missing_error(tmp_path, monkeypatch):
+    from pathlib import Path
+    from mindie_knowledge.owned_state import open_database
+    path = tmp_path / 'unavailable' / 'state.sqlite3'
+    missing = FileNotFoundError('original database path unavailable')
+    original_lstat, original_stat = Path.lstat, Path.stat
+    def unavailable_path(candidate, *args, **kwargs):
+        if candidate == path:
+            raise missing
+        return original_lstat(candidate, *args, **kwargs)
+    def unavailable_ancestor(candidate, *args, **kwargs):
+        if candidate in path.parents:
+            raise FileNotFoundError('ancestor root unavailable')
+        return original_stat(candidate, *args, **kwargs)
+    monkeypatch.setattr(Path, 'lstat', unavailable_path)
+    monkeypatch.setattr(Path, 'stat', unavailable_ancestor)
+    with pytest.raises(FileNotFoundError) as caught:
+        open_database(path, schema='test/1', required={}, initialize=lambda db: None,
+                      initialize_missing=False)
+    assert caught.value is missing
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_partial_index_with_same_shape_wrong_predicate_is_not_valid_state(tmp_path):
     with closing(Store(tmp_path, 'demo')) as store:
         store.create_draft(kind='experience', title='Preserved', summary='Uncertain', content='Synthetic full body')
