@@ -421,7 +421,10 @@ def test_production_parsers_preserve_large_public_messages_through_export(tmp_pa
         # Stop, not an assumption that the first synchronous tick finishes.
         engine.start()
         try:
-            wait_until(lambda: store.capture_row(event['id'])['status'] == 'organized')
+            # A scanner attempt alone may take 30 seconds. This checks eventual
+            # complete persistence of large messages, not an eight-second SLA;
+            # allow bounded time for parsing and durable material writes too.
+            wait_until(lambda: store.capture_row(event['id'])['status'] == 'organized', seconds=60)
         except AssertionError:
             pytest.fail(str(store.capture_row(event['id'])))
         finally:
