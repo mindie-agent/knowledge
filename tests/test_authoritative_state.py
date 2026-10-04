@@ -232,6 +232,31 @@ def test_never_initialized_nested_read_does_not_create_directories(tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
+@pytest.mark.parametrize('target_exists', [False, True])
+def test_authority_read_distinguishes_valid_and_dangling_directory_links(tmp_path, target_exists):
+    from mindie_knowledge.owned_state import open_database
+    target, link = tmp_path / 'target', tmp_path / 'link'
+    if target_exists:
+        target.mkdir()
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError as exc:
+        if os.name == 'nt' and exc.winerror == 1314:
+            pytest.skip('native directory symlinks require Windows privilege')
+        raise
+    path = link / 'missing' / 'nested' / 'state.sqlite3'
+    if target_exists:
+        assert open_database(path, schema='test/1', required={}, initialize=lambda db: None,
+                             initialize_missing=False) is None
+        assert list(target.iterdir()) == []
+    else:
+        with pytest.raises(FileNotFoundError):
+            open_database(path, schema='test/1', required={}, initialize=lambda db: None,
+                          initialize_missing=False)
+        assert not target.exists()
+    assert link.is_symlink()
+
+
 def test_unavailable_ancestors_preserve_original_missing_error(tmp_path, monkeypatch):
     from pathlib import Path
     from mindie_knowledge.owned_state import open_database
@@ -241,6 +266,8 @@ def test_unavailable_ancestors_preserve_original_missing_error(tmp_path, monkeyp
     def unavailable_path(candidate, *args, **kwargs):
         if candidate == path:
             raise missing
+        if candidate in path.parents:
+            raise FileNotFoundError('ancestor root unavailable')
         return original_lstat(candidate, *args, **kwargs)
     def unavailable_ancestor(candidate, *args, **kwargs):
         if candidate in path.parents:

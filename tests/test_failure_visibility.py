@@ -27,6 +27,30 @@ def test_unused_diagnostic_read_creates_no_state(tmp_path, monkeypatch):
     assert list(tmp_path.iterdir()) == []
 
 
+@pytest.mark.parametrize('target_exists', [False, True])
+def test_diagnostic_root_distinguishes_valid_and_dangling_directory_links(tmp_path, monkeypatch, target_exists):
+    import os
+    from mindie_knowledge.loop import agent_diagnostics
+    target, link = tmp_path / 'target', tmp_path / 'link'
+    if target_exists:
+        target.mkdir()
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError as exc:
+        if os.name == 'nt' and exc.winerror == 1314:
+            pytest.skip('native directory symlinks require Windows privilege')
+        raise
+    monkeypatch.setenv('MINDIE_DIAGNOSTICS_ROOT', str(link / 'missing' / 'nested'))
+    if target_exists:
+        assert agent_diagnostics.pending() is None
+        assert list(target.iterdir()) == []
+    else:
+        with pytest.raises(FileNotFoundError):
+            agent_diagnostics.pending()
+        assert not target.exists()
+    assert link.is_symlink()
+
+
 def test_unavailable_diagnostic_ancestors_preserve_original_missing_error(tmp_path, monkeypatch):
     from pathlib import Path
     from mindie_knowledge.loop import agent_diagnostics
@@ -37,6 +61,8 @@ def test_unavailable_diagnostic_ancestors_preserve_original_missing_error(tmp_pa
     def unavailable_path(candidate, *args, **kwargs):
         if candidate == path:
             raise missing
+        if candidate in path.parents:
+            raise FileNotFoundError('ancestor root unavailable')
         return original_lstat(candidate, *args, **kwargs)
     def unavailable_ancestor(candidate, *args, **kwargs):
         if candidate in path.parents:

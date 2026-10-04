@@ -36,7 +36,11 @@ def _present(path):
             try:
                 mode = parent.stat().st_mode
             except FileNotFoundError:
-                continue
+                try:
+                    parent.lstat()
+                except FileNotFoundError:
+                    continue
+                raise missing from None  # Existing but unusable, e.g. a dangling directory symlink.
             if not stat.S_ISDIR(mode):
                 raise NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR), str(parent)) from None
             break
