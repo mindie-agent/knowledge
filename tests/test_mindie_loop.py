@@ -41,7 +41,7 @@ def _revision_double(files, domain, base_commit, entry_refs):
                     "entry_refs": sorted(entry_refs)})
 
 
-def test_stable_id_revisions_and_pinned_reads(store):
+def test_stable_id_latest_draft_and_expired_pins(store):
     doc = draft(store)
     updated, appended = store.append_observation(
         doc["entry_id"], "Later: graph mode also fails on multi-device.",
@@ -52,8 +52,8 @@ def test_stable_id_revisions_and_pinned_reads(store):
         doc["entry_id"], "ignored", marker="b" * 32, producer=PRODUCER
     )
     assert not appended and again["revision"] == updated["revision"]
-    old = store.get(store.ref(doc["entry_id"], doc["revision"]))
-    assert old["content"] == doc["content"]  # old ref stays fixed
+    with pytest.raises(ValueError, match="unknown pinned revision"):
+        store.get(store.ref(doc["entry_id"], doc["revision"]))
     assert "Later:" in store.get(store.ref(doc["entry_id"]))["content"]
     with pytest.raises(ValueError, match="owning task"):
         store.append_observation(doc["entry_id"], "foreign", marker="c" * 32,
@@ -112,8 +112,7 @@ def test_title_is_stable_unless_explicitly_corrected(store):
         producer=PRODUCER, header={"title": "Accurate corrected title"},
     )
     assert fixed["title"] == "Accurate corrected title"
-    assert store.get(store.ref(doc["entry_id"], doc["revision"]))["title"] == \
-        "Misleading old title"  # old pinned body untouched
+    assert store.get(store.ref(doc["entry_id"]))["title"] == "Accurate corrected title"
 
 
 def test_short_refs_resolve_exactly_and_ambiguity_fails(store):
@@ -127,11 +126,12 @@ def test_short_refs_resolve_exactly_and_ambiguity_fails(store):
     entry_tok, rev_tok = short.rsplit("/", 1)[-1].split("@")
     assert entry_tok == doc["entry_id"][:16] and rev_tok == updated["revision"][:16]
     assert store.get(short)["revision"] == updated["revision"]
-    # A short prefix pinned to the OLD revision reads the exact old body.
+    # Superseded draft pins expire, including abbreviated references.
     old_pin = f"{doc['entry_id'][:16]}@{doc['revision'][:16]}"
-    assert store.get(old_pin)["content"] == doc["content"]
+    with pytest.raises(ValueError, match="unknown pinned revision"):
+        store.get(old_pin)
     # Full refs keep working.
-    assert store.get(store.ref(doc["entry_id"], doc["revision"]))["content"] == doc["content"]
+    assert store.get(store.ref(doc["entry_id"], updated["revision"]))["content"] == updated["content"]
     # An entry prefix naming two entries fails, never picks the first.
     other = store.create_draft(
         kind="experience", title="Collision entry", summary="s",
@@ -151,7 +151,7 @@ def test_correction_changes_retrieval_header_but_preserves_old_body(store):
         marker='f'*32,producer=PRODUCER,header={'summary':'Workspace underallocated; prefix hypothesis disproven.'})
     assert new['summary'].startswith('Workspace')
     assert 'Initial hypothesis' in new['content'] and 'Later evidence' in new['content']
-    assert store.get(store.ref(old['entry_id'],old['revision']))['summary']==old['summary']
+    assert store.get(store.ref(old['entry_id']))['summary']==new['summary']
 
 
 def test_quota_deferred_material_keeps_cursor_and_resumes(gated,tmp_path):
@@ -490,7 +490,7 @@ def test_transport_loopback_and_identity(tmp_path):
         )
         assert queued["status"] == "queued"  # admission passes; runner is absent
         engine._process(queued["id"])
-        assert store.capture_row(queued["id"])["status"] == "discarded"
+        assert store.capture_row(queued["id"])["status"] == "failed"
         assert engine.budget.status()["calls_last_hour"] == 0  # no model attempt
         from mindie_knowledge.loop.transport import rpc
 

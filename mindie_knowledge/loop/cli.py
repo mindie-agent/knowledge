@@ -395,7 +395,8 @@ def _serve(config_path, config):
                         summary_command=config.get("summary_command"))
         stage = "service"
         service = Service(engine, connection_path=connection_path(config),
-                          admission=admission, feeds=_feeds(config, store))
+                          admission=admission, feeds=_feeds(config, store),
+                          config_path=config_path)
         service.serve()
         return 0
     except Exception as exc:

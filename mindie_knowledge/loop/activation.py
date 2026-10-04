@@ -128,19 +128,23 @@ class Admission:
             return result
 
     def _rows(self, sql="", args=()):
-        """Read-only valid lease rows; empty on any problem, never creates state."""
-        if not self.path.is_file():
+        """Missing state is empty; unreadable state is never inactivity."""
+        try:
+            self.path.stat()
+        except FileNotFoundError:
             return []
+        except OSError as exc:
+            raise AdmissionUnavailable(type(exc).__name__) from exc
         try:
             db = sqlite3.connect(
                 self.path.as_uri() + "?mode=ro", uri=True, timeout=0.1
             )
-        except sqlite3.Error:
-            return []
+        except sqlite3.Error as exc:
+            raise AdmissionUnavailable(type(exc).__name__) from exc
         try:
             columns = {row[1] for row in db.execute("PRAGMA table_info(leases)")}
             if not BASE_COLUMNS <= columns:
-                return []
+                raise AdmissionUnavailable("invalid lease schema")
             names = [row[1] for row in db.execute("PRAGMA table_info(leases)")]
             rows = db.execute(
                 "SELECT * FROM leases WHERE enabled=1 " + sql, args
@@ -151,8 +155,8 @@ class Admission:
                 lease["capture_schema"] = CAPTURE_COLUMNS <= columns
                 result.append(lease)
             return result
-        except sqlite3.Error:
-            return []
+        except sqlite3.Error as exc:
+            raise AdmissionUnavailable(type(exc).__name__) from exc
         finally:
             db.close()
 
@@ -274,7 +278,7 @@ class Admission:
     # ---------------------------------------------------------- lease checks
 
     def leases(self):
-        """Currently valid lease dicts; empty on any read problem."""
+        """Currently valid leases; read faults raise AdmissionUnavailable."""
         return self._rows()
 
     def active_lease(self, session):
@@ -340,7 +344,7 @@ class Admission:
             db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
             columns = [row[1] for row in db.execute("PRAGMA table_info(leases)")]
             if not columns:
-                return {"state": "inactive"}
+                raise AdmissionUnavailable("lease schema is missing")
             if not BASE_COLUMNS <= set(columns):
                 raise AdmissionUnavailable("schema")
             if not CAPTURE_COLUMNS <= set(columns):
@@ -365,8 +369,8 @@ class Admission:
                 return {"state": "schema"}
             try:
                 scope = str(Path(root).expanduser().resolve(strict=False))
-            except OSError:
-                return {"state": "inactive"}
+            except OSError as exc:
+                raise AdmissionUnavailable("lease scope is unreadable") from exc
             root_session = lease.get("root_session") or session
             if not isinstance(root_session, str) or not root_session.strip():
                 root_session = session
@@ -416,7 +420,7 @@ class Admission:
             db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
             columns = [row[1] for row in db.execute("PRAGMA table_info(leases)")]
             if not columns:
-                return {"state": "inactive"}
+                raise AdmissionUnavailable("lease schema is missing")
             if not BASE_COLUMNS <= set(columns):
                 raise AdmissionUnavailable("schema")
             if not CAPTURE_COLUMNS <= set(columns):
@@ -438,8 +442,8 @@ class Admission:
                 return {"state": "schema"}
             try:
                 scope = str(Path(root).expanduser().resolve(strict=False))
-            except OSError:
-                return {"state": "inactive"}
+            except OSError as exc:
+                raise AdmissionUnavailable("lease scope is unreadable") from exc
             root_session = lease.get("root_session") or session
             if not isinstance(root_session, str) or not root_session.strip():
                 root_session = session

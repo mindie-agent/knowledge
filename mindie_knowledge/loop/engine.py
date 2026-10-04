@@ -41,7 +41,7 @@ from pathlib import Path
 from mindie_knowledge.redact import scan_text
 
 from . import settings as settings_mod
-from .activation import activation_epoch
+from .activation import activation_epoch, AdmissionUnavailable as AdmissionUnreadable
 from .budget import BudgetExceeded, MaintenanceBudget
 from .dfx import failure
 from .documents import MAX_FILE_BYTES, DraftFull
@@ -60,10 +60,6 @@ _PARTIAL_LIMIT = 4
 # One delayed recovery attempt for a deadline-failed region; the persisted
 # per-region counter, not wall time, bounds the total model attempts to two.
 GAP_RECOVERY_DELAY = 300.0
-
-
-class AdmissionUnreadable(Exception):
-    """Admission storage could not be read. This is not a revocation."""
 
 
 class GateFault(Exception):
@@ -104,7 +100,7 @@ class Engine:
         """``transcript_adapter`` is the already-loaded trusted parser module
         (absolute local module from engine config ``transcript_adapter``)
         exporting ``FileIdentity``/``identify``/``read_material``. Without it
-        capture degrades to honest summary-only; core never guesses a format."""
+        transcript capture fails explicitly; core never substitutes a summary."""
         if agent_command is not None and (
             not isinstance(agent_command, list)
             or not agent_command
@@ -141,25 +137,17 @@ class Engine:
             target=self._summary_loop, name="mindie-summary", daemon=True
         )
         self.errors = []
+        self.background_errors = {}
         self.last_activity = time.monotonic()
         self._generation = None
         self._worker_failed = False
         self._activity_lock = threading.Lock()
         self._activity = 0
         self._frozen = False
-        try:
-            from mindie_knowledge.community import reconcile_batch, submit_batch
-
-            self.community = dict(submit_batch=submit_batch,
-                                  reconcile_batch=reconcile_batch)
-        except Exception as exc:
-            failure(
-                "community.import",
-                stage="import",
-                category="dependency",
-                exception=exc,
-            )
-            self.community = None
+        # Publication belongs to this package. A broken installation is a
+        # startup failure, not a service with silently missing capabilities.
+        from mindie_knowledge.community import reconcile_batch, submit_batch
+        self.community = dict(submit_batch=submit_batch, reconcile_batch=reconcile_batch)
 
     # -------------------------------------------------------------- settings
 
@@ -514,34 +502,13 @@ class Engine:
             reason=f"apply-retry:{count}", eligible=1,
         )
 
-    def _summary_fallback(self, row, note, fail_detail):
-        """Turn captures may use a bounded summary. Notifications never do."""
-        if self._is_notification(row) or self.capture_mode == "public-transcript":
-            self.store.mark_capture(row["id"], "failed", fail_detail)
-            return "stop"
-        if row["summary"].strip():
-            return ("", True, [note])
-        return False
-
     def _transcript_increment(self, row, settings, lease, region):
         """Read/filter the authorized increment; reserves regions as it goes.
         Returns (text, summary_only, notes) or None when there is no material."""
         parser = self.transcript
         if parser is None:
-            # Missing parser: a turn may use its summary. A notification may not.
-            fallback = self._summary_fallback(
-                row, "no transcript adapter is configured; summary-only",
-                "no transcript adapter is configured; notification summary is forbidden",
-            )
-            if fallback == "stop":
-                return None
-            if fallback is False:
-                self.store.mark_capture(
-                    row["id"], "failed",
-                    "no transcript adapter is configured and no summary",
-                )
-                return None
-            return fallback
+            self.store.mark_capture(row["id"], "failed", "no transcript adapter is configured")
+            return None
         boundary = row["boundary"] or settings.enabled_at
         key = str(Path(row["transcript"]).resolve(strict=False))
         cursor = self.store.cursor(key)
@@ -562,20 +529,8 @@ class Engine:
             )
 
         if cursor is None and boundary is None:
-            # No reliable authorization boundary: never backfill history.
-            fallback = self._summary_fallback(
-                row, "no reliable authorization boundary; summary-only",
-                "no reliable authorization boundary; notification summary is forbidden",
-            )
-            if fallback == "stop":
-                return None
-            if fallback is False:
-                self.store.mark_capture(
-                    row["id"], "failed",
-                    "no reliable authorization boundary and no summary",
-                )
-                return None
-            return fallback
+            self.store.mark_capture(row["id"], "failed", "no reliable authorization boundary")
+            return None
         start = cursor["finish"] if cursor else 0
         expected = None
         if cursor:
@@ -597,27 +552,23 @@ class Engine:
         idtext = inc.get("identity", idtext)
         status = inc["status"]
         region.update(inc=inc, key=key, reserve=reserve)
+        if inc.get("discarded_records"):
+            self.store.mark_capture(row["id"], "failed", canonical(dict(
+                error="incomplete transcript page; cursor unchanged",
+                records=inc["discarded_records"],
+            )))
+            return None
         if status == "ok" and inc["text"].strip():
             if not inc.get("timestamps_reliable", True):
-                # Filtering by the authorization boundary was unreliable:
-                # never admit possibly preauthorization text; degrade instead.
-                fallback = self._summary_fallback(
-                    row, "unreliable record timestamps; summary-only",
-                    "unreliable record timestamps; notification summary is forbidden",
-                )
-                if fallback == "stop":
-                    return None
-                if fallback:
-                    return fallback
                 region_id = reserve(inc["start"], inc["end"], inc["digest"], status="failed")
                 if region_id is None:
                     self._defer_reread(row["id"])
                     return None
                 self.store.finish_region(
-                    region_id, "failed", "unreliable timestamps and no summary",
+                    region_id, "failed", "unreliable transcript timestamps",
                 )
                 self.store.mark_capture(
-                    row["id"], "failed", "unreliable timestamps and no summary",
+                    row["id"], "failed", "unreliable transcript timestamps",
                 )
                 return None
             return (inc["text"], False, [])
@@ -679,24 +630,16 @@ class Engine:
             )
             return None
         if status == "unknown-format":
-            fallback = self._summary_fallback(
-                row, "unknown transcript format; summary-only",
-                "unknown transcript format; notification summary is forbidden",
-            )
-            if fallback == "stop":
-                return None
-            if fallback:
-                return fallback
             region_id = reserve(inc["start"], inc["end"], inc["digest"])
             if region_id is None:
                 self._defer_reread(row["id"])
                 return None
             region["region_id"] = region_id
             self.store.finish_region(
-                region_id, "failed", "unknown transcript format and no summary",
+                region_id, "failed", "unknown transcript format",
             )
             self.store.mark_capture(
-                row["id"], "failed", "unknown transcript format and no summary",
+                row["id"], "failed", "unknown transcript format",
             )
             return None
         if status == "replaced":
@@ -711,17 +654,7 @@ class Engine:
                 )
                 return None
             region["region_id"] = region_id
-            if self._is_notification(row):
-                self.store.mark_capture(
-                    row["id"], "failed",
-                    "transcript replaced; notification summary is forbidden",
-                )
-                return None
-            if row["summary"].strip():
-                return ("", True, ["transcript replaced; summary-only"])
-            self.store.mark_capture(
-                row["id"], "failed", "transcript replaced and no summary",
-            )
+            self.store.mark_capture(row["id"], "failed", "transcript replaced or truncated")
             return None
         if status == "wrong-task":
             self.store.mark_capture(row["id"], "failed",
@@ -733,18 +666,7 @@ class Engine:
             self.store.mark_capture(row["id"], "failed",
                                     "public transcript " + status + "; cursor unchanged")
             return None
-        # missing/unreadable transcript
-        fallback = self._summary_fallback(
-            row, "transcript unreadable; summary-only",
-            "transcript unreadable; notification summary is forbidden",
-        )
-        if fallback == "stop":
-            return None
-        if fallback:
-            return fallback
-        self.store.mark_capture(
-            row["id"], "failed", "transcript unreadable and no summary",
-        )
+        self.store.mark_capture(row["id"], "failed", "transcript read failed: " + status)
         return None
 
     @staticmethod
@@ -1269,7 +1191,11 @@ class Engine:
         if block == "revoked":
             self.store.mark_capture(ident, "cancelled", "sharing disabled while queued")
             return
-        lease = self.admission.active_lease(row["session"]) if self.admission else None
+        try:
+            lease = self.admission.active_lease(row["session"]) if self.admission else None
+        except AdmissionUnreadable:
+            self._defer_admission(ident)
+            return
         if self.admission is not None and lease is None:
             inspected = self.admission.inspect(row["session"])
             if inspected.get("status") == "unavailable":
@@ -1279,7 +1205,7 @@ class Engine:
             return
         if not self.agent_command and self.capture_mode != "public-transcript":
             self.store.mark_capture(
-                ident, "discarded", "no maintenance runner is configured"
+                ident, "failed", "no maintenance runner is configured"
             )
             return
         reason = self.store.continuation_reason(ident) or ""
@@ -1595,7 +1521,7 @@ class Engine:
             self.queue.task_done()
 
     def _summary_loop(self):
-        """Optional metadata never occupies the body capture worker."""
+        """Required transcript metadata runs outside the body capture worker."""
         from .transcript_capture import summarize_due
         while not self.stop.wait(0.5):
             if self._is_frozen():
@@ -1604,6 +1530,8 @@ class Engine:
                 summarize_due(self)
             except Exception as exc:
                 self._unexpected("knowledge.summary", "run", exc)
+                self.background_errors["summary"] = type(exc).__name__
+                self._error(f"summary worker stopped: {type(exc).__name__}")
                 return
 
     # ---------------------------------------------------------------- outbox
@@ -1637,7 +1565,7 @@ class Engine:
             return
         batch = json.loads(batch_row["batch"])
         try:
-            withdrawn = any(self.store.get(ref).get("withdrawn", False)
+            withdrawn = any(self.store.is_withdrawn(ref)
                             for ref in batch["entry_refs"])
         except ValueError:
             self.store.mark_batch(batch_row["batch_id"], "needs_review",
@@ -1678,6 +1606,9 @@ class Engine:
             )
         except Exception as exc:
             self._unexpected("knowledge.publish", "reconcile", exc)
+            self.store.mark_batch(batch_row["batch_id"], "unknown",
+                                  detail=f"reconciliation failed: {type(exc).__name__}")
+            self._error(f"publication reconciliation failed: {type(exc).__name__}")
             return
         self.store.mark_batch(
             batch_row["batch_id"], receipt.get("status", "unknown"),
@@ -1733,8 +1664,11 @@ class Engine:
                 if not self._is_frozen() and self.begin_work():
                     try:
                         self.store.advance_search_index()
+                        self.background_errors.pop("index", None)
                     except Exception as exc:
                         self._unexpected("knowledge.index", "tick", exc)
+                        self.background_errors["index"] = type(exc).__name__
+                        self._error(f"index maintenance failed: {type(exc).__name__}")
                     finally:
                         self.end_work()
                 if generation is not None and not self._is_frozen():
@@ -1766,7 +1700,7 @@ class Engine:
                             finally:
                                 self.end_work()
                     material = self.store.has_changed_drafts(
-                        generation=generation
+                        generation=generation, ready_only=True
                     ) or self.store.unbatched_votes(generation=generation)
                     if material:
                         idle_for = time.monotonic() - self.last_activity
@@ -1864,7 +1798,8 @@ class Engine:
         return dict(
             **self.store.status(),
             capture_pipeline=self.capture_mode,
-            summary_mode="optional-model" if self.summary_command else "source-excerpt",
+            summary_mode=("required-model" if self.summary_command else "configuration-error")
+                         if self.capture_mode == "public-transcript" else "organizer",
             maintenance_pending=self.queue.unfinished_tasks,
             maintenance_budget=self.budget.status(),
             sharing=settings.public_status(),
@@ -1874,6 +1809,7 @@ class Engine:
                 missing=missing, authentication="not-checked",
             ),
             errors=self.errors,
+            background_errors=dict(self.background_errors),
             activity=activity,
             admission_frozen=frozen,
             worker_alive=self.thread.is_alive() and not self._worker_failed,

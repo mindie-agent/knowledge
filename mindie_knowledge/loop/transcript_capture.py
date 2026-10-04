@@ -23,7 +23,7 @@ def excerpt(text, size):
     return text[:size].encode('utf-8')[:size].decode('utf-8', 'ignore').strip()
 
 
-def fallback_header(text):
+def pending_header(text):
     # Clearly an excerpt, not a claim that a semantic summary succeeded.
     first = None
     lines = []
@@ -47,7 +47,7 @@ def capture(engine, row, text, region):
     from .engine import CursorConflict
     store = engine.store
     inc = region.get('inc') or {}
-    if not inc or inc.get('coverage'):
+    if not inc or inc.get('coverage') or inc.get('discarded_records'):
         raise ValueError('public transcript is incomplete; body not saved as complete')
     masked, rules = redact(text, executable=engine.redactor_executable, key=store.redaction_key(),
                            private_paths=(row['scope'], str(Path.home())))
@@ -68,17 +68,21 @@ def capture(engine, row, text, region):
         if reserved is None:
             raise CursorConflict('cursor changed before local body commit')
         if task:
-            title, summary = fallback_header(masked)
+            title, summary = pending_header(masked)
             doc, _ = store.append_observation(entry_id, masked, marker=inc['digest'], producer=owner,
                                               generation=row['generation'], header=dict(title=title, summary='Latest conversation excerpt: ' + summary.removeprefix('Conversation excerpt: ')))
         else:
-            title, summary = fallback_header(masked)
+            title, summary = pending_header(masked)
             doc = store.create_draft(kind='experience', title=title, summary=summary, content=masked,
                                      owner=owner, entry_id=entry_id, generation=row['generation'])
         store.finish_region(reserved, 'succeeded', 'public messages saved; model calls=0')
-        store.db.execute('INSERT OR REPLACE INTO transcript_tasks VALUES(?,?,?,?,?,?,?,?)',
+        store.db.execute('INSERT OR REPLACE INTO transcript_tasks '
+                         '(task_key,entry_id,capture_id,body_digest,summary_status,summary_detail,updated,summary_due) '
+                         'VALUES(?,?,?,?,?,?,?,?)',
                          (task_key, entry_id, row['id'], digest(doc['content']),
-                          'pending' if engine.summary_command else 'excerpt', '', time.time(), time.time() + SUMMARY_SETTLE_SECONDS))
+                          'pending' if engine.summary_command else 'failed',
+                          '' if engine.summary_command else 'configuration: summary worker is not configured',
+                          time.time(), time.time() + SUMMARY_SETTLE_SECONDS))
         detail = canonical(dict(pipeline=MODE, refs=[store.ref(entry_id, doc['revision'])],
                                 redaction_rules=rules, body_model_calls=0,
                                 discarded_records=inc.get('discarded_records', [])))
@@ -102,7 +106,7 @@ def summarize_due(engine):
     reserved = False
     status, detail = 'failed', ''
     try:
-        row = store.capture_row(task['capture_id'])
+        row = json.loads(task['authorization']) if task.get('authorization') else store.capture_row(task['capture_id'])
         engine._summary_cancel.clear()
         engine._gate_live()
         engine._revalidate(row)
@@ -148,8 +152,10 @@ def summarize_due(engine):
                 store.db.execute('UPDATE transcript_tasks SET summary_due=? WHERE task_key=? AND body_digest=?',
                                  (time.time() + 30, task['task_key'], task['body_digest']))
     except Exception as exc:
-        # Provider errors can carry source text/secrets. Persist only a type.
-        detail = type(exc).__name__
+        # Provider errors can carry source text/secrets. Keep only a trusted
+        # process category or an exception type, never its source-bearing text.
+        category = getattr(exc, 'mindie_category', None)
+        detail = 'category=' + category if category in {'configuration', 'deadline', 'native', 'invalid_result', 'output_limit'} else type(exc).__name__
     finally:
         if reserved or status in {'superseded', 'cancelled'}:
             with store._write_txn():

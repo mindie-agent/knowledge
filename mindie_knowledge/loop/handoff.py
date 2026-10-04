@@ -240,8 +240,9 @@ def request_wake(config_path, *, budget_seconds=0.4, session_id, event=None):
         return out
     try:
         lease = Admission(path).active_lease(session_id)
-    except (OSError, ValueError):
-        lease = None
+    except (OSError, ValueError, AdmissionUnavailable):
+        out.update(wake="failed", runtime="unavailable", reason="admission-unreadable")
+        return out
     if lease is None:
         inspected = Admission(path).inspect(session_id)
         if inspected.get("status") == "unavailable":

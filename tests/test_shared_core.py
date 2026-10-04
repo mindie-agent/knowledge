@@ -76,7 +76,7 @@ def test_transcript_adapter_config_seam(tmp_path):
     }
 
 
-def test_missing_adapter_is_honest_summary_only(tmp_path):
+def test_missing_adapter_fails_without_substituting_summary(tmp_path):
     project = tmp_path / "proj"
     project.mkdir()
     settings = write_settings(tmp_path / "community.json", enabled=True,
@@ -104,7 +104,9 @@ def test_missing_adapter_is_honest_summary_only(tmp_path):
                             summary="bounded summary only")
     engine._process(result["id"])
     row = store.capture_row(result["id"])
-    assert row["status"] == "organized", row["detail"]  # summary path, no guess
+    assert row["status"] == "failed" and "no transcript adapter" in row["detail"]
+    assert store.drafts_changed() == []
+    assert store.db.execute("SELECT COUNT(*) FROM maintenance_attempts").fetchone()[0] == 0
     assert store.coverage_gaps() == []  # no transcript region was consumed
     store.close()
 
@@ -169,8 +171,8 @@ def test_compact_confirmed_removes_sent_payload_and_keeps_receipts(tmp_path):
     header = json.loads(row["doc"])
     assert header["title"] == "Sent case" and header["content"] == ""
     assert store._revision_doc(doc["entry_id"], doc["revision"]) is None
-    # The protected older revision referenced by unsent/failed work survives.
-    assert store._revision_doc(doc["entry_id"], other_revision["revision"]) is not None
+    # Outbox payloads no longer pin redundant local draft history.
+    assert store._revision_doc(doc["entry_id"], other_revision["revision"]) is None
     assert store.capture_row(covered["id"])["summary"] == ""
     assert store.capture_row(newer["id"])["summary"] == "newer unsent summary"
     # A different draft's earlier capture is not cleared by timestamp.

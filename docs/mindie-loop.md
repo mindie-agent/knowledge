@@ -77,10 +77,13 @@ no new Stop is required and no unredacted body is published. No model creates,
 shortens or rewrites the body. The GitHub ordinary-Git per-file 100 MiB limit
 remains a visible publication constraint, not a silent truncation rule.
 
-An optional separate worker reads the complete redacted body and returns only
+A required separate worker reads the complete redacted body and returns only
 title and summary. It never holds the body worker, and an old result cannot
 replace metadata after new body content arrives. One settled body version has
-one attempt. Failure keeps a labeled source excerpt and the full body usable.
+one attempt. Failure keeps the local body and unprocessed preview but prevents
+a new export batch from publishing it. Missing summary configuration is a failure,
+not a normal excerpt mode. The current full-input implementation still needs a
+token-aware incremental organization path for long source material.
 Disabling sharing cancels both workers and unsent publication; an unchanged
 enable does nothing. Consent lasts until the user changes it.
 
@@ -118,11 +121,19 @@ the author's own contribution after synchronization. A local-only hit is
 `draft`. A draft that advances beyond its published revision is labeled `supplemental`,
 never a second hit. Withdrawal is deletion from the upstream main tree: after
 a successful sync the entry leaves ordinary search and is never resurrected
-by its local draft, while retained pinned reads return an explicit
-`withdrawn` flag with a readable note. Query references pin short 16-hex
+by its local draft. Its published body is removed, while an unpinned read returns
+a body-free `withdrawn` state marker. Query references pin short 16-hex
 entry/revision prefixes (`mindie://<domain>/<entry>@<revision>`, full hashes
-only on the rare collision) and always read the exact historical body;
-ambiguous prefixes fail instead of guessing.
+only on the rare collision). A retained reference reads its exact body;
+superseded draft and feed references expire rather than reading a newer body.
+Drafts and the feed keep only current content. The outbox owns the
+payload of a pending send, so it does not require draft history. Existing
+stores discard superseded body rows and retired draft mirrors once on opening;
+freed database pages are reused without a full database rewrite on each append.
+The private feed Git cache fetches depth one and prunes obsolete refs and objects
+when its tip changes (or once when an older cache adopts this policy).
+An active published body and genuinely unsent work remain current state, not a
+series of historical revisions. Ambiguous prefixes fail instead of guessing.
 
 ### Local retrieval index
 

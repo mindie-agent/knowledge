@@ -103,13 +103,14 @@ def build_batch(store, *, settings, revision_fn=None):
         return None
     if revision_fn is None:
         revision_fn = _community_revision()
-    drafts = store.drafts_changed(generation=settings.generation)
+    drafts = store.drafts_changed(generation=settings.generation, ready_only=True)
     for doc in drafts:
         store.rebase_draft_on_published(doc["entry_id"])
     if drafts:
         # A rebase may have advanced or dropped drafts; fingerprint the
         # content that will actually be sent.
-        drafts = store.drafts_changed(generation=settings.generation)
+        drafts = store.drafts_changed(generation=settings.generation, ready_only=True)
+    drafts = [doc for doc in drafts if store.summary_ready(doc)]
     votes = store.unbatched_votes(generation=settings.generation)
     if not drafts and not votes:
         return None
