@@ -8,6 +8,7 @@ import pytest
 from mindie_knowledge.loop.store import Store
 from mindie_knowledge.community.ledger import Ledger, LEDGER_NAME
 from mindie_knowledge.materials.summarizer import SummaryLedger
+from authority_support import damage_database
 
 
 def bodies(root):
@@ -129,13 +130,14 @@ def test_cached_authority_cannot_read_or_authorize_effect_after_damage(tmp_path,
             authorize = lambda: owner.create_draft(kind='experience', title='must not appear', summary='s', content='synthetic')
     marker = path.with_name(path.name + '.owner')
     try:
+        closed = False
         if damage == 'missing_db':
-            path.unlink()
+            closed = damage_database(owner.db, path, read=read)
         elif damage == 'replaced_db':
             replacement = path.with_name('replacement.sqlite3')
             with closing(sqlite3.connect(replacement)) as copy:
                 owner.db.backup(copy)
-            os.replace(replacement, path)
+            closed = damage_database(owner.db, path, read=read, replacement=replacement)
         elif damage == 'missing_marker':
             marker.unlink()
         elif damage == 'replaced_marker':
@@ -146,9 +148,17 @@ def test_cached_authority_cannot_read_or_authorize_effect_after_damage(tmp_path,
             marker.write_text('wrong\n')
         else:
             _remove_constraints(path, table)
-        for operation in (read, authorize):
-            with pytest.raises((OSError, ValueError), match='state|owner|schema|No such file'):
+        # POSIX exercises cached public reads and effect intents after real
+        # live-file damage. Windows prevents that damage; after the explicit
+        # native protection check above, validate this same owner's guard.
+        operations = (owner.db.assert_authority,) if closed else (read, authorize)
+        for operation in operations:
+            with pytest.raises((OSError, ValueError)) as caught:
                 operation()
+            if damage in {'missing_db', 'missing_marker'}:
+                assert isinstance(caught.value, FileNotFoundError)
+            else:
+                assert isinstance(caught.value, ValueError)
     finally:
         owner.close()
 

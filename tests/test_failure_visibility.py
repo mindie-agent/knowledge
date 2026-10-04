@@ -163,6 +163,7 @@ def test_outbox_reports_a_new_failure_after_recovery_without_repeating_unchanged
 
 def test_store_close_preserves_committed_effect_error_over_cleanup(tmp_path, monkeypatch):
     store = Store(tmp_path / 'store', 'test')
+    close_materials = store.materials.close
     original = OSError('pointer promotion failed after metadata commit')
     original.metadata_committed = True
     def promotion_failed():
@@ -171,9 +172,12 @@ def test_store_close_preserves_committed_effect_error_over_cleanup(tmp_path, mon
         raise ValueError('derived cleanup failed')
     monkeypatch.setattr(store, '_finish_material_writes', promotion_failed)
     monkeypatch.setattr(store.materials, 'close', index_close_failed)
-    with pytest.raises(OSError) as caught:
-        store.close()
-    assert caught.value is original and caught.value.metadata_committed
-    assert 'ValueError' in ' '.join(caught.value.__notes__)
-    with pytest.raises(sqlite3.ProgrammingError):
-        store.db.execute('SELECT 1')
+    try:
+        with pytest.raises(OSError) as caught:
+            store.close()
+        assert caught.value is original and caught.value.metadata_committed
+        assert 'ValueError' in ' '.join(caught.value.__notes__)
+        with pytest.raises(sqlite3.ProgrammingError):
+            store.db.execute('SELECT 1')
+    finally:
+        close_materials()  # The intentionally failed cleanup must not leak handles.

@@ -6,7 +6,6 @@ boundary. Dev-transport success is mechanism evidence, not GitHub acceptance.
 """
 
 import json
-import os
 import sqlite3
 import threading
 from pathlib import Path
@@ -16,6 +15,7 @@ import pytest
 from mindie_knowledge.community import reconcile_batch, submit_batch
 from mindie_knowledge.community.common import CommunityError, UnknownOutcome
 from mindie_knowledge.community.ledger import Ledger
+from authority_support import damage_database
 
 from .conftest import (
     entry_file,
@@ -109,7 +109,8 @@ def test_live_authority_loss_blocks_next_real_external_write(
                 replacement = path.with_name('replacement.sqlite3')
                 with closing(sqlite3.connect(replacement)) as copy:
                     db.backup(copy)
-                os.replace(replacement, path)
+                read = (lambda: self.get_publication(batch_id, revision)) if authority == 'publication' else owner.status
+                damage_database(db, path, read=read, replacement=replacement)
         return result
     monkeypatch.setattr(Ledger, 'record_step', damage_after_intent)
     batch = make_batch('lost-authority', [entry_file(make_entry())])
