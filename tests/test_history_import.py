@@ -99,7 +99,7 @@ def test_duplicate_and_explicit_extension_keep_one_latest_entry(case):
     append(source, message('second historical observation'))
     assert 'second historical' not in engine.store.drafts_changed()[0]['content']
     second = contribute(case)
-    assert second['status'] == 'extended' and second['ref'] != first['ref']
+    assert second['status'] == 'extended' and second['ref'] == first['ref'] and second['feedback_ref'] != first['feedback_ref']
     docs = engine.store.drafts_changed()
     assert len(docs) == 1 and docs[0]['content'].count('first historical observation') == 1
     assert 'second historical observation' in docs[0]['content']
@@ -228,8 +228,9 @@ def test_repeat_after_header_change_returns_current_reference(case):
                                      title='Better retrieval title', summary='Updated retrieval summary',
                                      generation=engine._settings().generation)
     result = contribute(case)
-    assert result['status'] == 'unchanged' and result['ref'] != first['ref']
-    assert engine.store.explain(result['ref'])['content'] == doc['content']
+    assert result['status'] == 'unchanged' and result['ref'] == first['ref'] and result['feedback_ref'] != first['feedback_ref']
+    navigation = engine.store.explain(result['ref'])
+    assert engine.store.explain(navigation['first_block_ref'])['content'] == doc['content']
 
 
 def test_receipt_rolls_back_with_failed_body_commit(case, monkeypatch):

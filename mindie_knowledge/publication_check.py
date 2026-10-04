@@ -34,6 +34,7 @@ from .loop import documents
 from .loop.documents import MAX_FILE_BYTES
 from .materials.store import BLOCK_SCHEMA, _parse, _parse_manifest, _parse_block, _sha
 from .redact import scan_text
+from .publication_contract import read_git_contract
 
 def _git_env():
     return with_windows_longpaths({'GIT_TERMINAL_PROMPT':'0','GIT_CONFIG_COUNT':'1',
@@ -56,6 +57,7 @@ _TRUSTED_SOURCES = (
     'redact.py',
     'gitread.py',
     'publication_check.py',
+    'publication_contract.py',
     'loop/documents.py',
     'community/batch.py',
     'community/common.py',
@@ -268,12 +270,52 @@ def _validate_slice(repo,revision,domain,state_path,context,verified,stats):
     _save_checkpoint(state_path,revision,context,verified)
     return stats
 
-def validate(repo,revision,domain,state=None):
+def classify_changes(repo, base_revision, revision):
+    """Separate ordinary data PRs from development changes at exact commits.
+
+    A valid task tree does not authorize changing workflow, contract or policy.
+    Return a classification; maintainers can review development PRs normally,
+    but the content Bot must not auto-merge them.
+    """
+    for name, value in (("base_revision", base_revision), ("revision", revision)):
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{40}", value):
+            raise ValueError(f"{name} must be an immutable Git commit")
+    with tempfile.TemporaryDirectory(prefix="mindie-publication-diff-") as directory:
+        listing = Path(directory) / "paths"
+        run_stdout_to_file(
+            ["git", "-C", str(repo), "diff", "--no-renames", "--name-status", "-z", base_revision, revision, "--"],
+            listing, timeout=SLICE_SECONDS, env=_git_env(),
+        )
+        count, development = 0, []
+        records = iter(iter_file_records(listing, separator=b"\0"))
+        for raw in records:
+            if not raw:
+                continue
+            status = raw.decode("ascii", "strict")
+            path = next(records).decode("utf-8", "strict")
+            count += 1
+            if status == "M" and re.fullmatch(r"tasks/[0-9a-f]{64}/blocks/[0-9a-f]{64}\.md", path):
+                raise ValueError(f"{path}: immutable block changed under the same identity; replace it with a new block")
+            try:
+                check_path(path)
+            except (ValueError, CommunityError):
+                development.append(path)
+    return {"base_commit": base_revision, "changed_files": count,
+            "content_only": bool(count) and not development,
+            "review_mode": "development" if development else "content",
+            "development_paths": development}
+
+
+def validate(repo,revision,domain,state=None,*,base_revision=None,expected_contract_sha256=None):
     if not re.fullmatch(r'[0-9a-f]{40}',revision):
         raise ValueError('revision must be a full immutable Git commit SHA')
     if _git(repo,['cat-file','-t',revision],4096,time.monotonic()+SLICE_SECONDS).strip()!=b'commit':
         raise ValueError('revision must identify a commit')
+    contract = read_git_contract(repo, revision, domain,
+                                 expected_sha256=expected_contract_sha256,
+                                 deadline=time.monotonic()+SLICE_SECONDS, env=_git_env())
     context=_validator_context(domain)
+    context['publication_contract_sha256'] = contract['sha256']
     state_path=state if state is not None else _default_state_path(repo)
     verified=_load_checkpoint(state_path,revision,context)
     stats={'count':0,'bytes':0,'entries':{},'blocks':{},'feedback':0,'done_paths':set()}
@@ -289,18 +331,25 @@ def validate(repo,revision,domain,state=None):
             if stalled>=2:
                 raise ValueError('no validation progress across bounded slices') from None
     _validate_task_sets(stats)
-    return {'commit':revision,'entries':len(stats['entries']),
-            'feedback_files':stats['feedback'],'bytes':stats['bytes']}
+    result = {'commit':revision,'entries':len(stats['entries']),
+              'feedback_files':stats['feedback'],'bytes':stats['bytes'],
+              'contract_sha256': contract['sha256'], 'content_only': None}
+    if base_revision is not None:
+        result.update(classify_changes(repo, base_revision, revision))
+    return result
 
 def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--repo',type=Path,required=True)
     parser.add_argument('--revision',required=True)
     parser.add_argument('--domain',default='vllm-ascend')
+    parser.add_argument('--base-revision', help='exact trusted base for content-only PR classification')
+    parser.add_argument('--contract-sha256', help='publication declaration pinned by the product')
     parser.add_argument('--state',default=None,
                         help='checkpoint file override (default: the candidate repo Git metadata dir)')
     args=parser.parse_args(argv)
-    try:result=validate(args.repo,args.revision,args.domain,state=args.state)
+    try:result=validate(args.repo,args.revision,args.domain,state=args.state,
+                        base_revision=args.base_revision, expected_contract_sha256=args.contract_sha256)
     except (ValueError,CommunityError,OSError,UnicodeError) as exc:
         parser.exit(1,f'Invalid publication: {str(exc)[:500]}\n')
     print(json.dumps(result,sort_keys=True))

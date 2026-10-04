@@ -1,4 +1,4 @@
-"""Unsent-observation lifecycle: pagination, rebase onto moved remotes,
+"""Unsent-observation lifecycle: reconciliation with moved remotes,
 flush chunking and per-vote admission scanning. Real SQLite, no network."""
 
 import json
@@ -26,38 +26,9 @@ def _sent_entry(store, settings, *, content="the sent body", title="Sent case"):
     return doc, built
 
 
-def test_explain_paginates_long_bodies_with_explicit_continuation(tmp_path):
-    store = Store(tmp_path, "vllm-ascend")
-    try:
-        body = "x" * (store.EXPLAIN_PAGE_CHARS * 3)
-        doc = store.create_draft(kind="experience", title="Long case",
-                                 summary="s", content=body, owner=PRODUCER)
-        page = store.explain(store.ref(doc["entry_id"]))
-        assert len(page["content"]) == store.EXPLAIN_PAGE_CHARS
-        assert page["content_offset"] == 0
-        assert page["content_length"] == len(body)
-        assert page["next_offset"] == store.EXPLAIN_PAGE_CHARS
-        rest = store.explain(store.ref(doc["entry_id"]),
-                             offset=page["next_offset"],
-                             limit=store.EXPLAIN_MAX_LIMIT)
-        assert len(rest["content"]) == len(body) - store.EXPLAIN_PAGE_CHARS
-        assert rest["next_offset"] is None
-        short = store.create_draft(kind="experience", title="Short case",
-                                   summary="s", content="short body",
-                                   owner=PRODUCER)
-        whole = store.explain(store.ref(short["entry_id"]))
-        assert whole["content"] == "short body" and whole["next_offset"] is None
-        with pytest.raises(ValueError, match="limit"):
-            store.explain(store.ref(short["entry_id"]),
-                          limit=store.EXPLAIN_MAX_LIMIT + 1)
-    finally:
-        store.close()
-
-
-def test_feed_sync_preserves_unsent_candidate_without_merging_remote_corrections(tmp_path):
-    """Current public material wins retrieval; local work remains a separate
-    candidate. Changed upstream bytes are reconciled by exact-base conflict,
-    never by pretending two independently indexed packages were merged.
+def test_rewritten_whole_document_cannot_guess_unsent_parts_after_remote_correction(tmp_path):
+    """A whole-document rewrite lacks stable sent blocks and cannot be safely
+    separated into old removed text and new observations.
     """
     settings = write_settings(tmp_path / "community.json", enabled=True,
                               roots=[tmp_path])
@@ -85,11 +56,11 @@ def test_feed_sync_preserves_unsent_candidate_without_merging_remote_corrections
         assert "Unsent observation B." in draft["content"]
         visible = store.get(store.ref(doc["entry_id"]))
         assert visible["title"] == "Edited title" and visible["content"] == "Kept paragraph."
-        assert store.rebase_draft_on_published(doc["entry_id"])["revision"] == updated["revision"]
-        built2 = build_batch(store, settings=settings)
-        item = next(f for f in built2[2]["files"] if f["path"].endswith("/index.md"))
-        assert item["base_sha256"] == store.sent_receipt(doc["entry_id"])["sha256"]
-        assert item["base_sha256"] != __import__("hashlib").sha256(package_for(published)["files"]["index.md"].encode()).hexdigest()
+        with pytest.raises(ValueError, match="not an append-only extension"):
+            store.rebase_draft_on_published(doc["entry_id"])
+        with pytest.raises(ValueError, match="not an append-only extension"):
+            build_batch(store, settings=settings)
+        assert store._row(doc["entry_id"])["draft_revision"] == updated["revision"]
     finally:
         store.close()
 
@@ -202,11 +173,11 @@ def test_publishable_vote_reason_is_scanned_at_admission(store):
     doc = store.create_draft(kind="experience", title="Voted", summary="s",
                              content="body", owner=PRODUCER)
     with pytest.raises(ValueError, match="privacy scan"):
-        store.record_vote(root_hash="9" * 64, ref=store.ref(doc["entry_id"]),
+        store.record_vote(root_hash="9" * 64, ref=store.ref(doc["entry_id"], doc["revision"]),
                           rating="down", reason="token: ghp_" + "A" * 30,
                           publishable=True, generation="gen-1")
     # A local-only vote with the same text stays private and is never scanned.
-    local = store.record_vote(root_hash="9" * 64, ref=store.ref(doc["entry_id"]),
+    local = store.record_vote(root_hash="9" * 64, ref=store.ref(doc["entry_id"], doc["revision"]),
                               rating="down", reason="token: ghp_" + "A" * 30,
                               publishable=False)
     assert local["publishable"] is False

@@ -113,6 +113,13 @@ def validate_settings(data: Mapping[str, Any]) -> dict[str, Any]:
         raise CommunityError("token_env must name an environment variable, never a token")
     out["token_env"] = token_env
 
+    if "publication_contract_sha256" in data:
+        import re
+        value = data["publication_contract_sha256"]
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise CommunityError("publication_contract_sha256 must be a complete SHA256 digest")
+        out["publication_contract_sha256"] = value
+
     return out
 
 

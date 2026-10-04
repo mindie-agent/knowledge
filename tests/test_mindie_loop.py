@@ -76,7 +76,7 @@ def test_same_title_entries_keep_distinct_identities(store):
     second = draft(store, title="Shared symptom title")
     assert first["entry_id"] != second["entry_id"]
     hits = store.query("Shared symptom title")["results"]
-    assert {h["ref"].split("@")[0].rsplit("/", 1)[-1] for h in hits} == {
+    assert {h["entry_id"] for h in hits} == {
         first["entry_id"], second["entry_id"]
     }
 
@@ -126,35 +126,30 @@ def test_title_is_stable_unless_explicitly_corrected(store):
     assert store.get(store.ref(doc["entry_id"]))["title"] == "Accurate corrected title"
 
 
-def test_short_refs_resolve_exactly_and_ambiguity_fails(store):
+def test_query_returns_distinct_full_block_and_feedback_references(store):
+    from mindie_knowledge.materials.references import parse_read_ref, parse_feedback_ref
+
     doc = draft(store)
     updated, _ = store.append_observation(
         doc["entry_id"], "Later: second revision.", marker="b" * 32,
         producer=PRODUCER,
     )
-    short = store.query("ACL graph")["results"][0]["ref"]
-    # Query pins a short ref: 16-hex prefixes, no separate revision field.
-    entry_tok, rev_tok = short.rsplit("/", 1)[-1].split("@")
-    assert entry_tok == doc["entry_id"] and rev_tok == updated["revision"]
-    assert store.get(f"{entry_tok[:16]}@{rev_tok[:16]}")["revision"] == updated["revision"]
-    assert store.get(short)["revision"] == updated["revision"]
-    # Superseded draft pins expire, including abbreviated references.
-    old_pin = f"{doc['entry_id'][:16]}@{doc['revision'][:16]}"
-    with pytest.raises(ValueError, match="unknown pinned revision"):
-        store.get(old_pin)
-    # Full refs keep working.
-    assert store.get(store.ref(doc["entry_id"], updated["revision"]))["content"] == updated["content"]
-    # An entry prefix naming two entries fails, never picks the first.
+    hit = store.query("ACL graph")["results"][0]
+    parsed = parse_read_ref(hit["ref"], domain=store.domain)
+    assert parsed["kind"] == "block" and parsed["task_id"] == doc["entry_id"]
+    assert len(parsed["block_id"]) == 64 and len(parsed["sha256"]) == 64
+    assert parse_feedback_ref(hit["feedback_ref"])["revision"] == updated["revision"]
+    assert store.explain(hit["ref"])["current_revision"] == updated["revision"]
+    with pytest.raises(ValueError, match="feedback only"):
+        store.explain(hit["feedback_ref"])
+    with pytest.raises(ValueError, match="reference"):
+        store.explain(doc["entry_id"][:16])
     other = store.create_draft(
         kind="experience", title="Collision entry", summary="s",
         content="c", entry_id=doc["entry_id"][:16] + "f" * 48,
     )
-    with pytest.raises(ValueError, match="ambiguous"):
-        store.get(doc["entry_id"][:16])
-    assert store.get(doc["entry_id"])["entry_id"] == doc["entry_id"]
-    # The colliding entry's query ref falls back to its full identity.
-    refs = {h["ref"] for h in store.query("Collision entry")["results"]}
-    assert any(other["entry_id"] + "@" in ref for ref in refs)
+    collision = store.query("Collision entry")["results"][0]
+    assert parse_read_ref(collision["ref"])["task_id"] == other["entry_id"]
 
 
 def test_correction_changes_retrieval_header_but_preserves_old_body(store):
@@ -184,9 +179,9 @@ def test_pending_index_uses_saved_material_without_reopening_source(gated, tmp_p
 
 def test_vote_replaces_per_root_and_stays_opaque(store):
     doc = draft(store)
-    first = store.record_vote(root_hash=session_key("root-1"), ref=doc["entry_id"],
+    first = store.record_vote(root_hash=session_key("root-1"), ref=store.ref(doc["entry_id"], doc["revision"]),
                               rating="up", reason="helped", publishable=False)
-    second = store.record_vote(root_hash=session_key("root-1"), ref=doc["entry_id"],
+    second = store.record_vote(root_hash=session_key("root-1"), ref=store.ref(doc["entry_id"], doc["revision"]),
                                rating="down", reason="stale", publishable=True,
                                generation="gen-1")
     assert first["vote_id"] == second["vote_id"]
@@ -195,7 +190,7 @@ def test_vote_replaces_per_root_and_stays_opaque(store):
     votes = store.unbatched_votes(generation="gen-1")
     assert len(votes) == 1 and votes[0]["rating"] == "down"
     assert store.unbatched_votes(generation="gen-2") == []
-    other = store.record_vote(root_hash=session_key("root-2"), ref=doc["entry_id"],
+    other = store.record_vote(root_hash=session_key("root-2"), ref=store.ref(doc["entry_id"], doc["revision"]),
                               rating="up", reason="", publishable=True,
                               generation="gen-1")
     assert other["vote_id"] != first["vote_id"]
@@ -254,7 +249,7 @@ def test_capture_preserves_public_transcript_without_a_query(gated):
     assert row["status"] == "organized", row["detail"]
     hits = store.query("device mapping")["results"]
     assert hits and hits[0]["origin"] == "draft"
-    assert "logical 0" in store.get(hits[0]["ref"])["content"]
+    assert "logical 0" in store.explain(hits[0]["ref"])["content"]
 
 
 def test_two_turn_increment_keeps_failure_detail(gated, tmp_path):
@@ -361,7 +356,7 @@ def test_outbox_coalesces_and_disable_cancels_unsent(gated, tmp_path):
     current = settings_mod.load(tmp_path / "community.json")
     doc_entry = store.get(store.ref(doc["entry_id"]))
     store.grant("draft", doc["entry_id"], doc_entry["revision"], current.generation)
-    vote = store.record_vote(root_hash=session_key("root-1"), ref=doc["entry_id"],
+    vote = store.record_vote(root_hash=session_key("root-1"), ref=store.ref(doc["entry_id"], doc["revision"]),
                              rating="up", reason="", publishable=True,
                              generation=current.generation)
     built = build_batch(store, settings=current, revision_fn=_revision_double)
@@ -455,12 +450,12 @@ def test_transport_loopback_and_identity(tmp_path):
         hit = service.call("query", dict(query="graph", _session_id="manual-A",
                                          _session_verified=True))
         assert doc["entry_id"][:16] in hit["results"][0]["ref"]
-        assert "@" in hit["results"][0]["ref"]  # refs pin their observed revision
-        # The short pinned ref resolves back to the exact same document.
+        assert "@" in hit["results"][0]["ref"]  # block refs pin exact file bytes
+        # The block reference resolves without assembling the full task.
         assert service.call("explain", dict(ref=hit["results"][0]["ref"],
                                             _session_id="manual-A",
                                             _session_verified=True))["entry_id"] == doc["entry_id"]
-        vote = service.call("feedback", dict(ref=doc["entry_id"], rating="up",
+        vote = service.call("feedback", dict(ref=hit["results"][0]["feedback_ref"], rating="up",
                                              reason="", _session_id="manual-A",
                                              _session_verified=True))
         assert vote["publishable"] is True
@@ -554,10 +549,10 @@ def test_current_generation_draft_and_vote_publish(gated, tmp_path):
     store, engine, _, _ = gated
     current = settings_mod.load(tmp_path / "community.json")
     doc = draft(store, generation=current.generation)
-    store.record_vote(root_hash=session_key("root-9"), ref=doc["entry_id"],
+    store.record_vote(root_hash=session_key("root-9"), ref=store.ref(doc["entry_id"], doc["revision"]),
                       rating="up", reason="", publishable=True,
                       generation=current.generation)
-    store.record_vote(root_hash=session_key("root-9"), ref=doc["entry_id"],
+    store.record_vote(root_hash=session_key("root-9"), ref=store.ref(doc["entry_id"], doc["revision"]),
                       rating="down", reason="counterexample", publishable=True,
                       generation=current.generation)
     built = build_batch(store, settings=current, revision_fn=_revision_double)

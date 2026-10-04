@@ -7,6 +7,7 @@ import subprocess
 import pytest
 
 from mindie_knowledge.publication_check import validate
+from mindie_knowledge.publication_contract import make_contract, render_contract
 from mindie_knowledge.loop.documents import make_entry
 from mindie_knowledge.materials import MaterialStore
 
@@ -15,7 +16,8 @@ def git(repo, *args, timeout=10):
     return subprocess.check_output(['git', '-C', str(repo), *args], text=True, timeout=timeout).strip()
 
 
-def publish(tmp_path, files, *, write_timeout=10):
+def publish(tmp_path, files, *, write_timeout=10, domain="vllm-ascend"):
+    files = {"publication-contract.json": render_contract(make_contract(domain, "a" * 40)), **files}
     repo = tmp_path / 'repo'
     repo.mkdir()
     git(repo, 'init', '-q', '-b', 'main')
@@ -132,6 +134,8 @@ def test_checkpoint_resume_skips_reverified_blobs(tmp_path, monkeypatch):
     real_read, reads, armed = gitread.CatFileBatch.read, [], [True]
 
     def counting_read(self, rev, **kwargs):
+        if rev == git(repo, "rev-parse", sha + ":publication-contract.json"):
+            return real_read(self, rev, **kwargs)
         if armed[0] and len(reads) == 40:
             armed[0] = False
             reads.append(rev)
@@ -174,7 +178,7 @@ def test_same_blob_under_another_path_is_not_cache_skipped(tmp_path):
 
 def test_checkpoint_bound_to_domain_and_validator_context(tmp_path, monkeypatch):
     from mindie_knowledge import gitread
-    repo, sha = publish(tmp_path, task_files(domain='npu'))
+    repo, sha = publish(tmp_path, task_files(domain='npu'), domain='npu')
     state = tmp_path / 'state.json'
     assert validate(repo, sha, 'npu', state=state)['entries'] == 1
     with pytest.raises(ValueError, match='domain'):
@@ -182,6 +186,8 @@ def test_checkpoint_bound_to_domain_and_validator_context(tmp_path, monkeypatch)
     real_read, reads = gitread.CatFileBatch.read, []
 
     def counting(self, rev, **kwargs):
+        if rev == git(repo, "rev-parse", sha + ":publication-contract.json"):
+            return real_read(self, rev, **kwargs)
         reads.append(rev)
         return real_read(self, rev, **kwargs)
 
@@ -206,7 +212,7 @@ def test_checkpoint_binds_installed_sources_and_privacy_scan(tmp_path, monkeypat
         target = copied / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(package_root / relative, target)
-    repo, sha = publish(tmp_path, task_files(domain='npu', body='Body contains policy-canary-1.'))
+    repo, sha = publish(tmp_path, task_files(domain='npu', body='Body contains policy-canary-1.'), domain='npu')
     state = tmp_path / 'state.json'
     assert validate(repo, sha, 'npu', state=state)['entries'] == 1
     original = pc._validator_context('npu')
@@ -252,6 +258,8 @@ def test_validate_advances_bounded_slices_in_one_call(tmp_path, monkeypatch):
     reads, slices, counts = [], [], {}
 
     def bounded_read(self, rev, **kwargs):
+        if rev == git(repo, "rev-parse", sha + ":publication-contract.json"):
+            return real_read(self, rev, **kwargs)
         done = counts.get(id(self), 0)
         if done >= boundary:
             raise TimeoutError('controlled boundary before this read')

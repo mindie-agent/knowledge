@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from pathlib import Path
 
 from reme.components import ApplicationContext
@@ -24,6 +25,8 @@ from reme.utils.jsonl_zst import read_jsonl_zst, write_jsonl_zst
 from ..loop.locks import StartLock
 from ..retrieval import tokens
 from .store import _canonical, _digest, _parse_block
+from .provenance import POLICY, body_tokens, citations, group_matches, page_groups
+from .references import block_ref, feedback_ref, parse_read_ref, task_ref
 
 
 class StrictFileGraph(LocalFileGraph):
@@ -69,8 +72,9 @@ class StrictFileStore(LocalFileStore):
 
 
 class ReMeIndex:
-    def __init__(self, root):
+    def __init__(self, root, domain):
         self.root = Path(root)
+        self.domain = domain
         self.runner = asyncio.Runner()
         self.components = []
         self.store = None
@@ -147,7 +151,8 @@ class ReMeIndex:
             for block in task["blocks"]:
                 rel = f"tasks/{task_id}/blocks/{block['block_id']}.md"
                 stat = (self.root / rel).stat()
-                desired[rel] = dict(descriptor=_digest(block), mtime_ns=stat.st_mtime_ns, size=stat.st_size)
+                desired[rel] = dict(descriptor=_digest(block), mtime_ns=stat.st_mtime_ns,
+                                    size=stat.st_size, policy=POLICY)
         deleted = set(self.bindings) - set(desired)
         changed = [path for path in desired if self.bindings.get(path) != desired[path]]
         if not changed and not deleted:
@@ -160,12 +165,17 @@ class ReMeIndex:
             # Validate authoritative bytes before ReMe's derived text
             # normalization; universal-newline reads would hide corruption.
             text = (self.root / rel).read_bytes().decode("utf-8")
-            _parse_block(text, block)
+            body = _parse_block(text, block)
+            direct_tokens = body_tokens(body)
+            cites = citations(body)
             node, chunks = self.runner.run(self.chunker.chunk(self.root / rel))
             # Fallible block headers travel with the package. Consumers reuse
             # them locally and never pay another model to summarize the body.
             for chunk in chunks:
-                chunk.text = block["title"] + "\n" + block["summary"] + "\n" + chunk.text
+                prefix = block["title"] + "\n" + block["summary"] + "\n"
+                chunk.metadata.update(mindie_policy=POLICY, mindie_body_offset=len(prefix),
+                                      mindie_body_tokens=direct_tokens, mindie_cites=cites)
+                chunk.text = prefix + chunk.text
                 chunk.set_hash_id()
             node.chunk_ids = [chunk.id for chunk in chunks]
             self.runner.run(self.store.upsert([(node, chunks)]))
@@ -188,7 +198,39 @@ class ReMeIndex:
         self.bindings = desired
         self._stamp_revision = _digest(raw)
 
-    def search(self, tasks, query, limit, conditions, allowed_ids):
+    @staticmethod
+    def _excerpt(body, query_terms):
+        # Keep source wording, but choose a window around an actual query term
+        # instead of returning the prepended fallible index metadata.
+        lower = body.casefold()
+        positions = [lower.find(term) for term in query_terms if term in lower]
+        start = max(0, min(positions) - 120) if positions else 0
+        return ("…" if start else "") + body[start:start + 1200]
+
+    def _exact_paths(self, tasks, eligible, query):
+        if re.fullmatch(r"[0-9a-f]{64}", query):
+            parsed = dict(kind="task", domain=self.domain, task_id=query)
+        else:
+            try:
+                parsed = parse_read_ref(query)
+            except ValueError:
+                return None
+        if parsed["domain"] != self.domain or parsed["task_id"] not in tasks:
+            return []
+        task_id = parsed["task_id"]
+        paths = []
+        for descriptor in tasks[task_id]["blocks"]:
+            path = f"tasks/{task_id}/blocks/{descriptor['block_id']}.md"
+            if path not in eligible:
+                continue
+            if parsed["kind"] == "block" and (
+                descriptor["block_id"] != parsed["block_id"] or descriptor["sha256"] != parsed["sha256"]
+            ):
+                continue
+            paths.append(path)
+        return paths
+
+    def search(self, tasks, query, limit, conditions, allowed_ids, continuation=None):
         lock = StartLock(self.root / ".index.lock")
         lock.acquire(wait=3)
         try:
@@ -207,27 +249,67 @@ class ReMeIndex:
                     continue
                 for block in task["blocks"]:
                     eligible[f"tasks/{ident}/blocks/{block['block_id']}.md"] = (ident, task, block)
-            if not eligible:
-                return []
+            fingerprint = _digest(dict(policy=POLICY, domain=self.domain,
+                                       tasks={ident: (task["entry"]["revision"], task["source"])
+                                              for ident, task in tasks.items()},
+                                       eligible=sorted(eligible)))
+            exact_paths = self._exact_paths(tasks, eligible, query)
             # ReMe filters before ranking. Fetch all matching chunks to select
-            # the best one per task without allowing a long task to hide others.
-            matches = self.runner.run(self.store.keyword_search(
-                query, limit=max(1, len(self.store.file_chunks)), search_filter={"paths": list(eligible)}))
+            # source anchors and preserve every related match for pagination.
+            if exact_paths is not None:
+                matches = [chunk for chunk in self.store.file_chunks.values() if chunk.path in exact_paths]
+            elif eligible:
+                matches = self.runner.run(self.store.keyword_search(
+                    query, limit=max(1, len(self.store.file_chunks)), search_filter={"paths": list(eligible)}))
+            else:
+                matches = []
             output = {}
+            query_terms = set(tokens(query))
             for chunk in matches:
                 ident, task, block = eligible[chunk.path]
-                if ident in output:
+                metadata = chunk.metadata
+                if (metadata.get("mindie_policy") != POLICY
+                        or type(metadata.get("mindie_body_offset")) is not int
+                        or not 0 <= metadata["mindie_body_offset"] <= len(chunk.text)
+                        or not isinstance(metadata.get("mindie_body_tokens"), list)
+                        or not isinstance(metadata.get("mindie_cites"), list)):
+                    raise ValueError("ReMe citation metadata is inconsistent; rebuild the index")
+                body = chunk.text[metadata["mindie_body_offset"]:]
+                matched_terms = set(metadata["mindie_body_tokens"]) & query_terms
+                chunk_terms = set(body_tokens(body)) & query_terms
+                # If a header-only chunk outscored the body-containing chunk,
+                # still show the latter's actual evidence to the reader.
+                selection_rank = (bool(chunk_terms), chunk.score)
+                if chunk.path in output and output[chunk.path]["_selection_rank"] >= selection_rank:
                     continue
                 entry = task["entry"]
-                output[ident] = dict(entry_id=ident, revision=entry["revision"], source=task["source"],
-                                     kind=entry["kind"], title=entry["title"], summary=entry["summary"],
-                                     conditions=entry["conditions"], score=chunk.score,
-                                     excerpt=chunk.text[:1200], block_id=block["block_id"],
-                                     block_title=block["title"], block_summary=block["summary"],
-                                     navigation=task["navigation"], source_range=block["source_range"])
-                if len(output) >= limit:
-                    break
-            return list(output.values())
+                output[chunk.path] = dict(
+                    entry_id=ident, revision=entry["revision"], source=task["source"],
+                    kind=entry["kind"], title=entry["title"], summary=entry["summary"],
+                    conditions=entry["conditions"], score=chunk.score if exact_paths is None else 1.0,
+                    excerpt=self._excerpt(body, query_terms), block_id=block["block_id"],
+                    block_title=block["title"], block_summary=block["summary"],
+                    navigation=task["navigation"], source_range=block["source_range"],
+                    ref=block_ref(self.domain, ident, block["block_id"], block["sha256"]),
+                    task_ref=task_ref(self.domain, ident),
+                    feedback_ref=feedback_ref(self.domain, ident, entry["revision"]),
+                    match_basis="identity" if exact_paths is not None else "body" if matched_terms else "index",
+                    _body_terms=matched_terms, _cites=metadata["mindie_cites"],
+                    _selection_rank=selection_rank)
+            if exact_paths:
+                # Exact lookup is navigation of the requested object. It must
+                # never be redirected to a cited source by lexical grouping.
+                from .provenance import resolve_citations
+                exact = [output[path] for path in exact_paths if path in output]
+                for item in exact:
+                    item["cites"] = resolve_citations(item["_cites"], tasks, self.domain)
+                public = [{key: value for key, value in item.items() if not key.startswith("_")} for item in exact]
+                groups = ([dict(public[0], related=public[1:], group_score=1.0, group_basis="task")]
+                          if public else [])
+            else:
+                groups = group_matches(list(output.values()), tasks, self.domain)
+            return page_groups(groups, query=query, conditions=conditions, fingerprint=fingerprint,
+                               limit=limit, continuation=continuation)
         finally:
             lock.release()
 

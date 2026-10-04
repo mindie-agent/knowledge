@@ -5,6 +5,7 @@ import pytest
 from mindie_knowledge.loop.activation import Admission, AdmissionUnavailable
 from mindie_knowledge.loop.store import Store
 from mindie_knowledge.community.transport import FileTransport
+from mindie_knowledge.materials.references import MaterialReadError
 
 
 @pytest.mark.parametrize('operation', ['leases', 'active_lease', 'check', 'resolve'])
@@ -37,8 +38,10 @@ def test_corrupt_material_pointer_is_not_empty_success(tmp_path, bad):
         store.create_draft(kind='experience', title='Preserved', summary='Observation', content='material canary')
         path = store.materials.root / 'current.json'
         path.write_text(bad)
-        with pytest.raises(ValueError):
+        with pytest.raises(MaterialReadError) as caught:
             store.query('material')
+        assert caught.value.code == 'material_corrupt'
+        assert isinstance(caught.value.__cause__, ValueError)
         assert path.read_text() == bad
 
 

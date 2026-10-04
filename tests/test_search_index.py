@@ -55,7 +55,7 @@ def test_feed_overlay_returns_published_revision_header_and_body(tmp_path):
         hit = store.query('calibration')['results'][0]
         assert hit['title'] == 'Published observation'
         assert hit['revision'] == doc['revision'] and hit['supplemental']
-        assert store.get(hit['ref'])['content'] == 'calibration original'
+        assert store.explain(hit['ref'])['content'] == 'calibration original'
         assert store.query('unverifiedclaim')['results'] == []
 
 
@@ -67,8 +67,8 @@ def test_withdrawal_removes_searchable_body_and_old_pinned_read(tmp_path):
         store.install_feed([], feed_ident='f' * 64)
         assert store.query('withdrawable')['results'] == []
         assert store.get(store.ref(p['task_id']))['withdrawn']
-        with pytest.raises(ValueError, match='unknown pinned revision'):
-            store.get(pinned)
+        with pytest.raises(ValueError, match='withdrawn'):
+            store.explain(pinned)
 
 
 def test_warm_queries_do_not_rechunk_unchanged_material(store, monkeypatch):

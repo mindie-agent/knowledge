@@ -23,6 +23,10 @@ from pathlib import Path
 
 from . import documents
 from .documents import DraftFull
+from ..materials.references import (
+    MaterialReadError, ReadReferenceError, block_ref, feedback_ref,
+    parse_feedback_ref, parse_read_ref, task_ref,
+)
 
 SCHEMA = "mindie-store/4"
 MAX_VOTE_REASON = 1000
@@ -279,6 +283,8 @@ class Store:
             CREATE TABLE IF NOT EXISTS revisions(entry_id TEXT NOT NULL,
                 revision TEXT NOT NULL, doc TEXT NOT NULL, source TEXT NOT NULL,
                 created REAL NOT NULL, PRIMARY KEY(entry_id, revision));
+            CREATE TABLE IF NOT EXISTS known_revisions(entry_id TEXT NOT NULL,
+                revision TEXT NOT NULL, PRIMARY KEY(entry_id, revision));
             CREATE TABLE IF NOT EXISTS captures(id TEXT PRIMARY KEY,
                 root_session TEXT NOT NULL, session TEXT NOT NULL, turn TEXT NOT NULL,
                 transcript TEXT, summary TEXT NOT NULL, status TEXT NOT NULL,
@@ -373,6 +379,9 @@ class Store:
                     revisions['feed'] = row['published_revision']
                 snapshot[row['entry_id']] = revisions
             self.materials.recover_snapshot(snapshot)
+            self.db.executemany("INSERT OR IGNORE INTO known_revisions VALUES(?,?)",
+                                [(entry_id, revision) for entry_id, revisions in snapshot.items()
+                                 for revision in set(revisions.values())])
         except Exception:
             self.db.rollback()
             raise
@@ -582,8 +591,11 @@ class Store:
         )
 
     def get(self, ref):
-        """Exact current document; superseded body references expire.
-        A withdrawn entry has a body-free state marker, not a historical copy."""
+        """Internal document inspection for storage/publication verification.
+
+        This is not the public reading interface. ``explain`` reads current
+        navigation or one exact block and never calls this whole-body helper.
+        """
         with self.lock:
             entry_id, revision = self._parse_ref(ref)
             row = self._row(entry_id)
@@ -613,37 +625,52 @@ class Store:
                 raise ValueError("unknown reference in this domain")
             return self._withdrawn(row)
 
-    # One-call response protection for the native wire (the MCP wrappers
-    # duplicate the body as content.text plus structuredContent, so 32 Ki
-    # non-BMP characters already cost 256 KiB before JSON overhead): a long
-    # body is paginated with the explicit continuation shape
-    # (content_offset/content_length/next_offset) instead of failing at
-    # transport serialization or being silently truncated. This is a
-    # per-call budget, not a document cap. Short bodies return whole.
-    EXPLAIN_PAGE_CHARS = 8 * 1024
-    EXPLAIN_MAX_LIMIT = 32 * 1024
+    def explain(self, ref):
+        """Current task navigation or one immutable, currently admitted block.
 
-    def explain(self, ref, *, offset=0, limit=None):
-        doc = self.get(ref)
-        if type(offset) is not int or offset < 0:
-            raise ValueError("offset must be a nonnegative integer")
-        if limit is not None and (
-            type(limit) is not int or not 1 <= limit <= self.EXPLAIN_MAX_LIMIT
-        ):
-            raise ValueError(
-                f"limit must be between 1 and {self.EXPLAIN_MAX_LIMIT} characters"
+        Block identity binds file bytes, independently of changing task
+        navigation. No full-document assembly, historical package or old
+        offset-based reading path is reachable through this interface.
+        """
+        parsed = parse_read_ref(ref, domain=self.domain)
+        entry_id = parsed["task_id"]
+        navigation_ref = task_ref(self.domain, entry_id)
+        with self.lock:
+            row = self._row(entry_id)
+            if row is not None and self._withdrawn(row):
+                raise ReadReferenceError("withdrawn", "The task was withdrawn; its material is unavailable.")
+            if row is None or not (row["feed_active"] or row["draft_revision"]):
+                raise ReadReferenceError("removed_or_superseded", "The task is not present in the current material collection.")
+            source = "feed" if row["feed_active"] else "draft"
+            revision = row["published_revision"] if source == "feed" else row["draft_revision"]
+            material = self.materials.read_current(
+                entry_id, source=source, revision=revision,
+                block_id=parsed.get("block_id"), sha256=parsed.get("sha256"),
             )
-        body = doc["content"]
-        total = len(body)
-        if limit is None and total - offset > self.EXPLAIN_PAGE_CHARS:
-            limit = self.EXPLAIN_PAGE_CHARS
-        sliced = body[offset : offset + limit if limit is not None else None]
-        next_offset = offset + len(sliced)
-        return dict(
-            doc, content=sliced, content_offset=offset, content_length=total,
-            next_offset=next_offset if next_offset < total else None,
-            ref=self.ref(doc["entry_id"], doc["revision"]),
-        )
+            header = material["header"]
+            entry, blocks = header["entry"], header["blocks"]
+
+            def reference(descriptor):
+                return block_ref(self.domain, entry_id, descriptor["block_id"], descriptor["sha256"])
+
+            navigation = dict(ref=navigation_ref, title=entry["title"], summary=header["navigation"],
+                              revision=revision, advisory=True)
+            result = dict(kind=parsed["kind"], ref=ref, task_ref=navigation_ref,
+                          entry_id=entry_id, domain=self.domain, source=source,
+                          current_revision=revision, current_navigation=navigation,
+                          feedback_ref=feedback_ref(self.domain, entry_id, revision),
+                          block_count=len(blocks),
+                          note="Reference material. Current navigation is fallible metadata, not verification of a block's claims.")
+            if parsed["kind"] == "task":
+                return dict(result, title=entry["title"], navigation=header["navigation"],
+                            first_block_ref=reference(blocks[0]) if blocks else None)
+            position = material["position"]
+            descriptor = material["block"]
+            return dict(result, block_id=descriptor["block_id"], sha256=descriptor["sha256"],
+                        title=descriptor["title"], summary=descriptor["summary"],
+                        source_range=descriptor["source_range"], content=material["content"],
+                        previous_block_ref=reference(blocks[position - 1]) if position else None,
+                        next_block_ref=reference(blocks[position + 1]) if position + 1 < len(blocks) else None)
 
     # ---------------------------------------------------------------- drafts
 
@@ -700,6 +727,9 @@ class Store:
             current = self._row(entry_id)
             if self._withdrawn(current):
                 raise ValueError('task was withdrawn from the current public feed; not resurrecting it')
+            if current and current['feed_active']:
+                self.rebase_draft_on_published(entry_id)
+                current = self._row(entry_id)
             revision = ((current['draft_revision'] or
                          (current['published_revision'] if current['feed_active'] else None))
                         if current else None)
@@ -790,6 +820,12 @@ class Store:
             "WHERE published_revision IS NOT NULL AND feed_active=0" + entry_scope,
             args,
         )
+        # Feedback can arrive after a newer revision retires these headers.
+        # Preserve only the two identities, never historical prose or bodies.
+        self.db.execute(
+            "INSERT OR IGNORE INTO known_revisions SELECT entry_id,revision FROM revisions AS r WHERE 1=1"
+            + revision_scope, args,
+        )
         removed = self.db.execute(
             "DELETE FROM revisions AS r WHERE 1=1" + revision_scope +
             " AND NOT EXISTS (SELECT 1 FROM entries AS e WHERE e.entry_id=r.entry_id"
@@ -811,6 +847,8 @@ class Store:
         self._record_material_revision(doc, source, created)
 
     def _record_material_revision(self, doc, source, created):
+        self.db.execute('INSERT OR IGNORE INTO known_revisions VALUES(?,?)',
+                        (doc['entry_id'], doc['revision']))
         self.db.execute(
             'INSERT INTO revisions VALUES(?,?,?,?,?) ON CONFLICT(entry_id, revision) DO UPDATE SET '
             "source=CASE WHEN revisions.source='feed' THEN 'feed' ELSE excluded.source END",
@@ -1029,25 +1067,36 @@ class Store:
 
     # ---------------------------------------------------------------- search
 
-    def query(self, query, limit=5, conditions=None):
-        if not isinstance(query, str) or not query.strip() or len(query) > 2000:
-            raise ValueError('query must be nonempty text of at most 2000 characters')
-        if type(limit) is not int or not 1 <= limit <= 20:
-            raise ValueError('limit must be between 1 and 20')
+    def query(self, query=None, limit=5, conditions=None, continuation=None):
+        from ..materials.provenance import QueryContinuationError, query_request
+        query_request(query, limit, conditions, continuation)
         with self.lock:
             rows = {r['entry_id']: dict(r) for r in self.db.execute(
                 'SELECT * FROM entries WHERE ' + self._VISIBLE_SQL)}
             allowed = {key: r['published_revision'] if r['feed_active'] else r['draft_revision']
                        for key, r in rows.items()}
-            found = self.materials.search(query, limit=limit, conditions=conditions, allowed_ids=allowed)
+            try:
+                found = self.materials.search(query, limit=limit, conditions=conditions, allowed_ids=allowed,
+                                              continuation=continuation)
+            except QueryContinuationError:
+                raise
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                raise MaterialReadError("Current material could not be searched; inspect service diagnostics.") from exc
+            def observable(item):
+                row = rows[item['entry_id']]
+                result = dict(item, origin='feed' if row['feed_active'] else row['origin'],
+                              supplemental=bool(row['feed_active'] and row['draft_revision']))
+                if 'related' in item:
+                    result['related'] = [observable(match) for match in item['related']]
+                return result
             results = []
             for item in found:
-                row = rows[item['entry_id']]
-                results.append(dict(item, ref=self.ref(item['entry_id'], item['revision']),
-                                    origin='feed' if row['feed_active'] else row['origin'],
-                                    supplemental=bool(row['feed_active'] and row['draft_revision'])))
+                results.append(observable(item))
         return dict(domain=self.domain, retrieval='reme-bm25', results=results,
-                    note='Reference material, including failed attempts and uncertainty. Scores are not factual confidence.')
+                    page='related' if continuation is not None else 'groups',
+                    note='Reference material, including failed attempts and uncertainty. Citation groups are navigation, '
+                         'not independent evidence or factual confidence. Current source links do not reproduce an '
+                         'unavailable cited revision. Use each match ref to read its actual block.')
 
     # ------------------------------------------------------------ feed switch
 
@@ -1185,14 +1234,15 @@ class Store:
                 raise ValueError(
                     f"publishable vote reason fails the privacy scan: {rules}"
                 )
+        observed = parse_feedback_ref(ref, domain=self.domain)
         with self._write_txn():
-            entry_id, pinned = self._parse_ref(ref)
+            entry_id, revision = observed['task_id'], observed['revision']
             row = self._row(entry_id)
             if row is None:
                 raise ValueError("unknown reference in this domain")
-            revision = pinned or json.loads(row["doc"])["revision"]
-            if self._revision_doc(entry_id, revision) is None:
-                raise ValueError("unknown pinned revision in this domain")
+            if self.db.execute('SELECT 1 FROM known_revisions WHERE entry_id=? AND revision=?',
+                               (entry_id, revision)).fetchone() is None:
+                raise ValueError("unknown observed revision in this domain")
             opaque = self.opaque_for(root_hash)
             self.db.execute(
                 "INSERT OR REPLACE INTO votes VALUES(?,?,?,?,?,?,NULL,?)",
@@ -1358,7 +1408,7 @@ class Store:
             )
 
     def create_batch(self, *, batch_id, revision, batch, entry_ids, vote_keys,
-                     generation=None):
+                     generation=None, source_revisions=None, entry_revisions=None):
         """Record one built batch as pending and bind its material.
 
         Material bound to a batch is never silently re-batched: only a newer
@@ -1368,6 +1418,8 @@ class Store:
         # Only identities enter SQLite; publication reads the frozen files.
         if any("content" in item for item in batch.get("files", [])):
             raise ValueError("outbox descriptors cannot contain file bodies")
+        if set(entry_revisions or {}) != set(entry_ids):
+            raise ValueError("frozen task revisions differ from task package identities")
         from mindie_knowledge.materials.publication import staging_path
         frozen = staging_path(self.root, batch_id, revision) / "manifest.json"
         if not frozen.is_file():
@@ -1394,12 +1446,18 @@ class Store:
                 (batch_id, revision, canonical(batch), "pending", "", now, now,
                  generation),
             )
+            if source_revisions is not None:
+                if set(source_revisions) != set(entry_ids):
+                    raise ValueError("prepared feed identities differ from task package identities")
+                self.feed_set("prepared-package-bases:" + batch_id,
+                              dict(batch_revision=revision, source_revisions=source_revisions,
+                                   entry_revisions=entry_revisions))
             for entry_id in entry_ids:
                 row = self._row(entry_id)
                 if row is not None:
                     self.db.execute(
                         "UPDATE entries SET batched_revision=? WHERE entry_id=?",
-                        (row["draft_revision"], entry_id),
+                        (entry_revisions[entry_id], entry_id),
                     )
             for opaque, entry_id, revision in vote_keys:
                 self.db.execute(
@@ -1702,12 +1760,23 @@ class Store:
             raise ValueError("confirmed contribution has no remote head identity")
         candidate = {item["path"]: item for item in batch.get("files", [])}
         actual = {item["path"]: item for item in actual_files or []}
+        prepared = self.feed_get("prepared-package-bases:" + row["batch_id"])
+        task_ids = {path.split("/")[1] for path in candidate
+                    if path.startswith("tasks/") and path.endswith("/index.md")}
+        if task_ids and (not isinstance(prepared, dict) or prepared.get("batch_revision") != row["revision"]
+                         or set(prepared.get("source_revisions", {})) != task_ids
+                         or set(prepared.get("entry_revisions", {})) != task_ids):
+            raise ValueError("confirmed task publication lacks its exact prepared package/base identity receipt")
+        sources = prepared["source_revisions"] if task_ids else {}
+        frozen_entries = prepared["entry_revisions"] if task_ids else {}
         now = time.time()
         for ref in batch.get("entry_refs", []):
             parsed = _exact_revision_ref(ref)
             if parsed is None:
                 continue
             entry_id, revision = parsed
+            if entry_id in frozen_entries and revision != frozen_entries[entry_id]:
+                continue  # a vote on a past observation is not this task package
             prefix = f"tasks/{entry_id}/"
             index_path = prefix + "index.md"
             if index_path not in candidate:
@@ -1725,10 +1794,12 @@ class Store:
                 raise ValueError("confirmed task contribution has no navigation index receipt")
             # Task packages do not merge observation text during publication:
             # every accepted file is either byte-identical or an exact-base update.
+            receipt = dict(revision=revision, files=files, head_sha=row["head_sha"],
+                           batch_id=row["batch_id"], batch_revision=row["revision"])
+            if entry_id in sources:
+                receipt["source_published_revision"] = sources[entry_id]
             self.db.execute("INSERT OR REPLACE INTO feed_state VALUES(?,?)",
-                            ("sent-package:" + entry_id, canonical(dict(
-                                revision=revision, files=files, head_sha=row["head_sha"],
-                                batch_id=row["batch_id"], batch_revision=row["revision"]))))
+                            ("sent-package:" + entry_id, canonical(receipt)))
             self.db.execute(
                 "INSERT OR REPLACE INTO sent_receipts(entry_id,generation,sent_revision,path,sha256,"
                 "head_sha,repository,pr_url,batch_id,updated,markers,batch_revision) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -1764,21 +1835,85 @@ class Store:
         return files
 
     def rebase_draft_on_published(self, entry_id):
-        """A package is never text-merged with independently edited public data.
+        """Adopt a changed confirmed feed without restoring sent/removed blocks.
 
-        Exact-base contribution checks surface upstream changes. Only an
-        already identical local revision can be folded into the public one.
+        Frozen or uncertain sends stay intact. Open-PR edits are still checked
+        against their actual remote head by the publisher and may conflict;
+        this method never treats main as an edited PR's replacement base.
         """
         with self._write_txn():
             row = self._row(entry_id)
-            if row is None or not row["draft_revision"] or not row["feed_active"]:
+            if row is None or not row["feed_active"]:
                 return None
-            if row["draft_revision"] == row["published_revision"]:
-                self.db.execute("UPDATE entries SET draft_revision=NULL WHERE entry_id=?", (entry_id,))
-                self._material_dirty.add(entry_id)
+            previous = self.feed_get("continuation-base:" + entry_id)
+            if previous and previous["published_revision"] == row["published_revision"]:
+                return self.materials.read_task(entry_id, row["draft_revision"], "draft")["entry"] if row["draft_revision"] else None
+            if self.db.execute("SELECT 1 FROM transcript_tasks WHERE entry_id=? AND summary_status!='complete'",
+                               (entry_id,)).fetchone():
+                # A saved/in-flight index result still owns its local input.
+                # Let that existing attempt settle first; publication already
+                # requires complete indexes, then adopts remote navigation.
+                return self.materials.read_task(entry_id, row["draft_revision"], "draft")["entry"] if row["draft_revision"] else None
+            # A frozen candidate is owned by its pending/uncertain operation.
+            # It is never invalidated by feed synchronization or new capture.
+            for operation in self.db.execute("SELECT status,batch FROM outbox"):
+                if operation["status"] in REPLACEABLE_BATCH:
+                    continue
+                descriptor = _stored_json(operation["batch"], dict, "outbox batch")
+                if any((_exact_revision_ref(ref) or (None,))[0] == entry_id
+                       for ref in descriptor.get("entry_refs", [])):
+                    return self.materials.read_task(entry_id, row["draft_revision"], "draft")["entry"] if row["draft_revision"] else None
+            sent = self.sent_receipt(entry_id)
+            if sent is None:
+                return self.materials.read_task(entry_id, row["draft_revision"], "draft")["entry"] if row["draft_revision"] else None
+            sent_package = self.feed_get("sent-package:" + entry_id)
+            if not isinstance(sent_package, dict) or "source_published_revision" not in sent_package:
+                raise ValueError("confirmed sent package lacks its prepared feed identity")
+            if sent_package["source_published_revision"] == row["published_revision"]:
+                # Main has not advanced since this PR was sent. Its blocks
+                # may still await merge; a stale main must not discard them.
+                return self.materials.read_task(entry_id, row["draft_revision"], "draft")["entry"] if row["draft_revision"] else None
+            public = self.materials.read_task(entry_id, revision=row["published_revision"], source="feed")
+            files = [dict(path=f"tasks/{entry_id}/index.md", sha256=hashlib.sha256(
+                self.materials._manifest_path(entry_id, row["published_revision"]).read_bytes()).hexdigest())]
+            files.extend(dict(path=f"tasks/{entry_id}/blocks/{block['block_id']}.md", sha256=block["sha256"])
+                         for block in public["blocks"])
+            if row["draft_revision"] and row["draft_revision"] != row["published_revision"]:
+                rebased = self.materials.rebase_unsent_blocks(
+                    entry_id, draft_revision=row["draft_revision"], published_revision=row["published_revision"],
+                    sent_files=self.sent_package_files(entry_id))
+                doc = rebased["header"]["entry"]
+                if rebased["additions"]:
+                    self._record_material_revision(doc, "draft", time.time())
+                    self.db.execute("INSERT OR REPLACE INTO grants SELECT kind,identity,?,generation,created "
+                                    "FROM grants WHERE kind='draft' AND identity=? AND revision=?",
+                                    (doc["revision"], entry_id, row["draft_revision"]))
+                    self.db.execute("UPDATE entries SET draft_revision=? WHERE entry_id=?",
+                                    (doc["revision"], entry_id))
+                    # Existing indexes still cover the same unsent blocks.
+                    # No model call or replay is needed to adopt remote metadata.
+                    self.db.execute("UPDATE transcript_tasks SET body_digest=? WHERE entry_id=? "
+                                    "AND summary_status='complete'",
+                                    (doc["material_digest"], entry_id))
+                else:
+                    self.db.execute("UPDATE entries SET draft_revision=NULL WHERE entry_id=?", (entry_id,))
                 self._prune_body_history(entry_id)
-                return None
-            return self._revision_doc(entry_id, row["draft_revision"])
+            elif row["draft_revision"]:
+                self.db.execute("UPDATE entries SET draft_revision=NULL WHERE entry_id=?", (entry_id,))
+                self._prune_body_history(entry_id)
+            self.feed_set("continuation-base:" + entry_id, dict(
+                published_revision=row["published_revision"], sent_head_sha=sent["head_sha"], files=files))
+            current = self._row(entry_id)
+            return self.materials.read_task(entry_id, current["draft_revision"], "draft")["entry"] if current["draft_revision"] else None
+
+    def contribution_base_files(self, entry_id):
+        """Exact confirmed base used by the current append-only candidate."""
+        with self.lock:
+            base = self.feed_get("continuation-base:" + entry_id)
+            sent = self.sent_receipt(entry_id)
+            if base and sent and base["sent_head_sha"] == sent["head_sha"]:
+                return base["files"]
+            return self.sent_package_files(entry_id)
 
     def restore_draft(self, entry_id, doc, *, generation=None):
         """Re-seed a compacted append-base from the exact confirmed remote

@@ -13,6 +13,7 @@ from pathlib import Path
 from .activation import activation_epoch
 from .store import digest, session_key
 from ..materials.ingest import prepare_increment
+from ..materials.references import task_ref, feedback_ref
 
 
 class HistoryImportError(ValueError):
@@ -135,7 +136,9 @@ def import_transcript(engine, *, session_id, token, source, source_session,
                              "WHERE entry_id=?", (time.time(), entry_id))
     task = store.transcript_task(key)
     return dict(status=(('extended' if was_existing else 'imported') if added else 'unchanged') if row else 'empty',
-                ref=store.ref(entry_id, row['draft_revision'] or row['published_revision']) if row else None,
+                ref=task_ref(store.domain, entry_id) if row else None,
+                feedback_ref=feedback_ref(store.domain, entry_id,
+                                          row['draft_revision'] or row['published_revision']) if row else None,
                 summary=(dict(status=task['summary_status'], detail=task['summary_detail']) if task else
                          dict(status='missing', detail='material index job is missing') if row else None),
                 publication='pending' if row else None, snapshot_bytes=identity.size,

@@ -118,12 +118,46 @@ Current draft and feed revisions remain available, while obsolete manifests and
 unreferenced blocks are retired. Pending publication owns an immutable staging
 package and a small descriptor, not a second database body.
 
+After main publishes a correction, continuation adopts the confirmed current
+package and only provably unsent local blocks. The local candidate must preserve
+all last-sent block identities; a whole-body rewrite cannot be split into safe
+additions mechanically and remains a visible conflict. Remote navigation replaces
+claims about removed material, while new blocks keep their own indexes. This
+operation reads manifests and file identities, not unrelated block bodies. A
+small preparation receipt binds the observed feed revision to the frozen send;
+confirmation after a newer feed sync cannot rewrite that base. Pending or unknown
+sends remain frozen, and unfinished index results settle before reorganization.
+Existing open-PR edits still require their actual current head: conflicting edits
+remain `needs_review` with no write, rather than using main as a replacement base.
+
 Search follows the visible current revision and folds draft/feed lineage.
 Withdrawal comes from a successful public-feed refresh: the entry leaves search
-and a local draft cannot resurrect it. Query references pin short entry/revision
-prefixes; an exact current reference reads that package, and superseded revisions
-expire instead of returning a different body. Conditions describe observed
-versions or commits; they do not make an experience universally applicable.
+and a local draft cannot resurrect it. Query returns a directly readable block
+reference and a separate `feedback_ref` for the observed task revision.
+Conditions describe observed versions or commits; they do not make an experience
+universally applicable.
+
+### Reading material
+
+`knowledge_explain(ref)` accepts two full canonical reference forms:
+
+- `mindie://DOMAIN/TASK`: current fallible navigation, `current_revision`,
+  `block_count` and `first_block_ref`; it returns no assembled body.
+- `mindie://DOMAIN/TASK/blocks/BLOCK@FILE_SHA256`: one current member block,
+  its `content`, `previous_block_ref` and `next_block_ref`. `current_navigation`
+  and `current_revision` describe the current task separately from the fixed
+  block bytes. Appending blocks or revising navigation preserves unchanged
+  block references.
+
+Task IDs, block IDs and hashes are full 64-character identities. Membership is
+checked in the current manifest before opening exactly the selected block.
+`removed_or_superseded` means that the selected block no longer belongs to the
+current package; `withdrawn` means the task was removed upstream. Missing required
+files, unsafe paths and mismatching bytes fail as `material_corrupt`, never as
+empty or expired material. Old files awaiting cleanup do not grant read access.
+A returned `read_ref` suggests current navigation when available; it does not
+substitute another body. Historical task-revision references are accepted only
+for feedback, and short references and the old `offset`/`limit` reader are removed.
 
 ### Local retrieval index
 
@@ -136,11 +170,53 @@ There is no ReMe agent, provider, watcher, service, separate transcript store or
 model invocation in consumer retrieval. The SQLite runtime must still satisfy
 the package's supported runtime prerequisite checks.
 
+### Query matches and citation groups
+
+`knowledge_query(query, limit?, conditions?)` returns groups of current block
+matches; `limit` counts groups, from 1 to 20. Each match has its own readable
+block `ref`, current task `task_ref`, and separate observed `feedback_ref`.
+`match_basis` distinguishes an actual body match from fallible index metadata
+or an exact identity lookup. Excerpts come from material, not generated summaries.
+
+Only literal, full canonical MindIE references in block bodies produce `cites`.
+Titles, summaries and task navigation cannot create citation relationships. A
+resolvable single-source chain groups matching blocks only when the source body
+independently matches and covers every query term matched in the citing body.
+A newly observed term absent from the source therefore keeps its own result.
+The group presents the source anchor and related matches with their own excerpts,
+readable references and feedback references. Failed reuse and corrections remain
+readable; a citation group and its `related_count` express navigation, not factual
+confidence or independent corroboration. Citation counts never increase scores.
+
+Historical `mindie://DOMAIN/TASK@REVISION` literals stay unchanged in `cites`.
+When that revision is unavailable, `citation_status=version_unavailable` and a
+separate `current_source_ref` may identify the current task for navigation and
+query-specific grouping. It does not make the historical bytes readable. Multiple
+source tasks, cycles, unavailable blocks, missing sources and cross-domain
+citations remain ordinary matches with citation information. Failure to read or
+validate a present source is an operational failure, never a missing citation.
+Exact task/block references and complete task IDs preserve the requested object
+instead of redirecting to its cited source.
+
+The first group includes a bounded related-match preview, `related_count` and,
+when more matches exist, `related_next`. Continue with
+`knowledge_query(continuation=related_next, limit=20)`, sending only that token and
+an optional `limit`; `query` and `conditions` must be omitted. The token binds the
+original query, filters, anchor and current corpus. `continuation_invalid` rejects
+malformed or conflicting requests; `continuation_expired` means the corpus changed
+and a new query is required. Continuation recomputes from the replaceable index
+without storing durable query results or rereading unchanged block bodies.
+
 ## Optional feedback
 
 `knowledge_feedback(ref, rating, reason?)` records one current `up`/`down`
 vote per opaque root and entry (a new vote replaces the old, including its
-revision); the reason is optional, at most 1000 characters. Raw native
+revision). Supply the exact `feedback_ref` returned with the observation:
+`mindie://DOMAIN/TASK@REVISION`. Task and block read references are rejected,
+so a delayed vote cannot silently attach to a newer task revision. A minimal
+identity receipt retains only task/revision hashes after old packages are
+pruned; voting does not read or retain historical bodies. The reason is optional,
+at most 1000 characters. Raw native
 session IDs never leave the store — public exports carry only the random
 opaque root ID. Votes recorded while sharing is off stay local
 (`publishable=0`) and are never backfilled; a vote while off also never wakes
@@ -208,11 +284,11 @@ Native MCP dispatch belongs to the harness adapters; the former core MCP host
 shim (bound to Codex-only turn metadata) is retired. Core keeps the
 authenticated loopback RPC the adapters forward to (`query`, `explain`,
 `feedback`, `capture`), each still bound to a verified per-call identity and
-re-checked against the admission store. Bodies are no longer size-capped by a
-business limit, so `explain` paginates long content by default (8 Ki
-characters per page, explicit `limit` up to 32 Ki characters) using the
-existing `offset`/`limit` shape with `content_offset`, `content_length` and
-`next_offset` continuations — a per-call wire budget, not a document cap.
+re-checked against the admission store. `explain` takes only `ref` and reads
+one existing material block per request. Adjacent block references allow explicit
+traversal without assembling a whole task or discarding long-task content.
+Read rejection codes and material corruption remain visible through the RPC
+boundary; they do not become successful empty responses.
 
 ## Commands
 

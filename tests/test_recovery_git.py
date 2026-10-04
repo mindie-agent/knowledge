@@ -198,6 +198,8 @@ def _import_pipeline(tmp_path):
     _git(["config", "user.email", "fixture@example.invalid"], repo)
     _git(["config", "user.name", "fixture"], repo)
     (repo / "README.md").write_text("# Public package fixture\n")
+    from mindie_knowledge.publication_contract import make_contract, render_contract
+    (repo / "publication-contract.json").write_text(render_contract(make_contract("test", "a" * 40)))
     _git(["add", "."], repo)
     _git(["commit", "-qm", "initialize"], repo)
     settings = write_settings(tmp_path / "community.json", enabled=True, roots=[tmp_path],

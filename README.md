@@ -31,11 +31,20 @@ compatibility tests; their summary workers have not been migrated to this
 protocol. Parser compatibility does not establish complete Harness support.
 Component checks and native end-to-end acceptance remain separate evidence.
 
+Every public feed declares `publication-contract.json`: domain, exact task/block
+schemas, immutable validator and Bot review contract. Publication reads it at
+the upstream base before recording a new send intent; feed sync checks it before
+promoting data. Product-managed feeds and community settings also bind its exact
+SHA256. A mismatch reports `contract_mismatch`, preserves current data and frozen
+work, and recovers when a matching deployment is available. Code is never loaded
+from a content PR. The [Bot contract](docs/repository-bot-contract.md) separates
+ordinary task/feedback contributions from contract, workflow and policy changes.
+
 ## Boundaries
 
 - The adapters ask for a contribution choice only once after installation and persist it in the shared profile. New tasks and forks bind internally without asking again; ordinary failures do not revoke the choice.
 - Community contribution is a single explicit switch (`mindie-community-config/1`). Off means no capture, extraction or sanitization at all — not local-only capture. Retrieval, updates and sync keep working.
-- Entries have stable opaque IDs and internally computed content revisions. Drafts and the subscribed feed retain current bodies only; superseded references expire. Pending contributions freeze their send files separately; the outbox holds only descriptors. Upstream deletion removes the published body and leaves a withdrawal marker. Local drafts update by append-only observations and never restore withdrawn content. The private feed Git cache retains one shallow tip, without old revision objects.
+- Entries have stable opaque IDs and internally computed content revisions. Drafts and the subscribed feed retain current packages only. A block reference remains readable across appends or navigation changes while its exact bytes remain a current member; replaced blocks and withdrawn tasks are unavailable. Pending contributions freeze their send files separately; the outbox holds only descriptors. Upstream deletion removes the published body and leaves a withdrawal marker. Local drafts update by append-only observations and never restore withdrawn content. The private feed Git cache retains one shallow tip, without old revision objects.
 - Harness adapters expose `knowledge_query`, `knowledge_explain` and optional `knowledge_feedback`; each adapter verifies native task identity and the core rechecks its shared admission grant. Feedback is fully optional up/down with an optional one-line reason; there is no judge and no voting weight.
 - Raw task records stay with the user's Harness. Complete mechanically redacted material, fallible block titles/summaries, current navigation and optional vote files reach contribution staging.
 - Temporary publication or sync failures recover through the existing background worker with persisted backoff. Packaging, submission and consumer retrieval make no model calls. The index worker summarizes only new blocks plus prior navigation, retains returned output through local apply failures, and records failed or uncertain invocations without automatically repeating them. Confirmed submissions retain minimal receipts; the current remote PR or upstream main provides the published body.

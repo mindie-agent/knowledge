@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 
+from mindie_knowledge.publication_contract import make_contract, render_contract
 from mindie_knowledge.loop import documents  # integrated package is required
 
 from mindie_knowledge.community import entrydoc  # noqa: F401  (delegates to core documents)
@@ -81,7 +82,8 @@ def make_remote(tmp_path: Path, name: str) -> str:
     work = tmp_path / f"{name}-seed"
     git(["clone", str(bare), str(work)])
     (work / "README.md").write_text(f"# {name}\n", encoding="utf-8")
-    git(["add", "README.md"], cwd=work)
+    (work / "publication-contract.json").write_text(render_contract(make_contract("npu", "a" * 40)), encoding="utf-8")
+    git(["add", "README.md", "publication-contract.json"], cwd=work)
     git(["-c", "user.name=seed", "-c", "user.email=seed@example.invalid",
          "commit", "-m", "init"], cwd=work)
     git(["push", "origin", "main"], cwd=work)

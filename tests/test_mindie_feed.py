@@ -14,12 +14,15 @@ from mindie_knowledge.loop.feed import Feed
 from mindie_knowledge.loop.store import Store
 from mindie_knowledge.gitread import with_windows_longpaths
 
+from mindie_knowledge.publication_contract import make_contract, render_contract
+
 PRODUCER = "a" * 64
 
 
 def init_repo(path):
     path.mkdir(parents=True)
     (path / ".gitattributes").write_bytes(b"* -text\n")
+    (path / "publication-contract.json").write_text(render_contract(make_contract("vllm-ascend", "a" * 40)), encoding="utf-8")
 
     def git(*args):
         return subprocess.check_output(["git", "-C", str(path), *args], text=True).strip()
@@ -72,16 +75,16 @@ def test_sync_keeps_only_current_published_body(env):
     assert receipt["status"] == "synced" and receipt["commit"] == first
     hits = store.query("Device gate")["results"]
     assert hits and hits[0]["origin"] == "feed"
-    v1 = store.get(hits[0]["ref"])["revision"]
+    v1 = store.explain(hits[0]["ref"])["current_revision"]
     assert feed.sync()["status"] == "unchanged"
     revised = entry_doc("1" * 64, "Device gate revised")
     second = commit_docs(git, repo, [revised])
     assert feed.sync()["commit"] == second
     # A stale pin expires instead of silently resolving to another revision.
-    with pytest.raises(ValueError, match='unknown pinned revision'):
-        store.get(hits[0]["ref"])
-    current = store.get(store.query("Device gate")["results"][0]["ref"])
-    assert current["revision"] == revised["revision"]
+    with pytest.raises(ValueError, match='no longer a member'):
+        store.explain(hits[0]["ref"])
+    current = store.explain(store.query("Device gate")["results"][0]["ref"])
+    assert current["current_revision"] == revised["revision"]
     with pytest.raises(ValueError, match='unknown pinned revision'):
         store.get(store.ref("1" * 64, v1))
     assert store.db.execute('SELECT count(*) FROM revisions').fetchone()[0] == 1
@@ -98,11 +101,12 @@ def test_upstream_deletion_removes_body_and_expires_pinned_reads(env):
     hits = store.query("Old driver")["results"]
     assert hits and hits[0]["summary"].startswith("Summary of")  # published body wins
     pinned = hits[0]["ref"]
+    observed_feedback = hits[0]["feedback_ref"]
     commit_docs(git, repo, [])  # deleted from the upstream main tree
     assert feed.sync()["entries"] == 0
     assert store.query("Old driver")["results"] == []  # gone from retrieval
-    with pytest.raises(ValueError, match='unknown pinned revision'):
-        store.get(pinned)
+    with pytest.raises(ValueError, match='withdrawn'):
+        store.explain(pinned)
     doc = store.get(store.ref("2" * 64))
     assert doc["withdrawn"] is True and "withdrawn" in doc["note"]
     assert doc['content'] == ''
@@ -111,10 +115,10 @@ def test_upstream_deletion_removes_body_and_expires_pinned_reads(env):
     # The stale local draft neither resurrects the entry in search nor
     # becomes a new publication candidate.
     assert store.drafts_changed(generation="gen-1") == []
-    # Feedback cannot pretend an expired body is still present.
-    with pytest.raises(ValueError, match='unknown pinned revision'):
-        store.record_vote(root_hash="9" * 64, ref=pinned, rating="down",
-                          reason="superseded", publishable=True, generation="gen-1")
+    # An observed revision stays a valid feedback target, but withdrawn entries
+    # cannot be sent again. No old body is retained for the vote.
+    store.record_vote(root_hash="9" * 64, ref=observed_feedback, rating="down",
+                      reason="superseded", publishable=True, generation="gen-1")
     assert store.unbatched_votes(generation="gen-1") == []
 
 
@@ -286,7 +290,7 @@ def test_same_commit_refresh_drops_stale_unavailable_recovery_fields(env):
     assert "detail" not in receipt
     assert "retained_commit" not in receipt
     hits = store.query("Recovered same commit")["results"]
-    assert hits and "Recovered same commit" in store.get(hits[0]["ref"])["title"]
+    assert hits and "Recovered same commit" in store.explain(hits[0]["ref"])["title"]
 
 
 def test_interrupted_candidate_resumes_from_staged_progress(env, monkeypatch):
@@ -301,7 +305,11 @@ def test_interrupted_candidate_resumes_from_staged_progress(env, monkeypatch):
     real_read = gitread.CatFileBatch.read
     fail = {"armed": True}
 
+    contract_blob = git("rev-parse", commit + ":publication-contract.json")
+
     def counting_read(self, rev, **kwargs):
+        if rev == contract_blob:
+            return real_read(self, rev, **kwargs)
         if fail["armed"] and len(reads) == 3:
             fail["armed"] = False
             reads.append(rev)

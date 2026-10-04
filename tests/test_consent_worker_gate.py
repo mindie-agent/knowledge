@@ -328,7 +328,7 @@ def test_blocked_consent_keeps_local_retrieval(tmp_path):
         )
         found = world["store"].query("READCTRL")
         assert found["results"], found
-        body = world["store"].get(found["results"][0]["ref"])
+        body = world["store"].explain(found["results"][0]["ref"])
         assert "READCTRL" in body["content"]
         assert document["entry_id"]
     finally:

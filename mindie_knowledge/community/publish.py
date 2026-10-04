@@ -19,6 +19,7 @@ Ordering guarantees, all backed by the durable ledger in ``state_dir``:
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -46,6 +47,7 @@ from .common import (
 from .ledger import Ledger
 from .settings import live_gate, sharing_enabled
 from .transport import Transport, transport_from_settings
+from mindie_knowledge.publication_contract import ContractMismatch, read_git_contract
 
 RECEIPT_STATUSES = (
     "submitted",
@@ -223,6 +225,26 @@ def _submit(batch, settings, state_dir, ledger, *, cancel, transport) -> dict[st
     elif prior:
         branch = f"{branch}-{revision[:8]}"
 
+    # The repository/data contract is a read-only prerequisite, not an
+    # attempted publication. A deployment mismatch cannot create an unknown
+    # write or consume a frozen payload before any remote mutation happens.
+    try:
+        prepared = _publication_base(checked, settings, state_dir, deadline,
+                                     repository=repository, write_repo=write_repo,
+                                     remote_url=remote_url)
+    except ContractMismatch as exc:
+        return _receipt(checked, status="unavailable", detail=str(exc), extras={
+            "error_code": exc.code, "failed_stage": "publication-contract",
+            "external_write_attempted": False,
+        })
+    except (OSError, TimeoutError) as exc:
+        return _receipt(checked, status="unavailable", detail=str(exc), extras={
+            "failed_stage": "publication-contract", "external_write_attempted": False,
+        })
+    except CommunityError as exc:
+        return _receipt(checked, status=exc.status, detail=str(exc), retry_at=exc.retry_at,
+                        extras={"failed_stage": "publication-contract", "external_write_attempted": False})
+
     ledger.record_intent(
         batch_id=batch_id, revision=revision, domain=checked["domain"],
         repository=repository, branch=branch,
@@ -232,7 +254,7 @@ def _submit(batch, settings, state_dir, ledger, *, cancel, transport) -> dict[st
             checked, settings, state_dir, ledger, deadline, transport,
             repository=repository, write_repo=write_repo, remote_url=remote_url,
             branch=branch, pr_title=pr_title, pr_body=pr_body, commit_message=commit_message,
-            prior=prior,
+            prior=prior, prepared=prepared,
         )
     except UnknownOutcome as exc:
         ledger.finish_publication(batch_id, revision, status="unknown", detail=str(exc))
@@ -254,15 +276,10 @@ def _submit(batch, settings, state_dir, ledger, *, cancel, transport) -> dict[st
                     extras={"files": result.get("files")})
 
 
-def _publish(checked, settings, state_dir, ledger, deadline, transport, *,
-             repository, write_repo, remote_url, branch, pr_title, pr_body, commit_message,
-             prior):
-    batch_id, revision = checked["batch_id"], checked["revision"]
+def _publication_base(checked, settings, state_dir, deadline, *, repository, write_repo, remote_url):
+    """Select and validate the exact upstream base before publication intent."""
     base_branch = settings.get("branch", "main")
-
-    ledger.record_step(batch_id, revision, "gate:before-git")
     _settings_gate(settings)
-    ledger.record_step(batch_id, revision, "git:clone-fetch")
     genv = gitops.git_env(settings)
     work_dir = gitops.ensure_clone(
         remote_url, state_dir / "git" / write_repo.replace("/", "_"), deadline, env=genv
@@ -277,6 +294,23 @@ def _publish(checked, settings, state_dir, ledger, deadline, transport, *,
         base_tip = gitops.fetch_ref(
             work_dir, read_url, f"refs/heads/{base_branch}", deadline, env=genv
         )
+    contract = read_git_contract(
+        work_dir, base_tip, checked["domain"],
+        expected_sha256=settings.get("publication_contract_sha256"),
+        deadline=time.monotonic() + deadline.remaining(), env=genv,
+    )
+    return dict(work_dir=work_dir, genv=genv, base_tip=base_tip,
+                read_url=read_url, base_branch=base_branch, contract=contract)
+
+
+def _publish(checked, settings, state_dir, ledger, deadline, transport, *,
+             repository, write_repo, remote_url, branch, pr_title, pr_body, commit_message,
+             prior, prepared):
+    batch_id, revision = checked["batch_id"], checked["revision"]
+    work_dir, genv = prepared["work_dir"], prepared["genv"]
+    base_tip, read_url = prepared["base_tip"], prepared["read_url"]
+    base_branch = prepared["base_branch"]
+    ledger.record_step(batch_id, revision, "publication-contract:validated", prepared["contract"]["sha256"])
     if checked["base_commit"] and checked["base_commit"] != base_tip:
         ledger.record_step(batch_id, revision, "git:base-diverged",
                            f"batch base {checked['base_commit'][:12]} != remote {base_tip[:12]}")
@@ -316,6 +350,19 @@ def _publish(checked, settings, state_dir, ledger, deadline, transport, *,
             own_resume = True
         else:
             checkout_ref = base_tip
+
+    # Updating an open contribution must not carry an independently changed
+    # workflow/data policy from its head. Inspect before checkout or a write.
+    selected_commit = gitops._git(["rev-parse", checkout_ref], deadline, cwd=work_dir, env=genv).strip()
+    try:
+        read_git_contract(work_dir, selected_commit, checked["domain"],
+                          expected_sha256=prepared["contract"]["sha256"],
+                          deadline=time.monotonic() + deadline.remaining(), env=genv)
+    except ContractMismatch as exc:
+        raise CommunityError(f"contribution head contract differs from its upstream base: {exc}",
+                             status="needs_review") from exc
+    except (OSError, TimeoutError) as exc:
+        raise TransientError(f"cannot verify the contribution head contract: {exc}") from exc
 
     # Inspect Git objects before asking the host to materialize them. A path
     # or mode conflict must stay needs_review even when checkout cannot create

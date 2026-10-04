@@ -371,6 +371,56 @@ class MaterialStore:
         return dict(descriptor, text=self._read_block(task_id, descriptor),
                     navigation=header["navigation"], task_revision=header["entry"]["revision"])
 
+    def read_current(self, task_id, *, source, revision, block_id=None, sha256=None):
+        """Read current metadata and, when requested, exactly one member block.
+
+        The metadata owner supplies its visible source/revision. The material
+        lock prevents promotion/pruning during membership validation and the
+        one body read. A retained file outside that current manifest grants no
+        read access. Missing required files are faults, not expired references.
+        """
+        from .references import MaterialReadError, ReadReferenceError, task_ref
+
+        navigation_ref = task_ref(self.domain, task_id)
+        lock = self._lock()
+        with self._mutex:
+            lock.acquire(wait=3)
+            try:
+                pointers = self.root / "current.json"
+                if pointers.is_symlink():
+                    raise ValueError("current material pointers cannot be a symlink")
+                state = self._pointers()
+                if state[_source(source)].get(task_id) != revision:
+                    raise ValueError("visible metadata and current material pointers differ")
+                manifest = self._manifest_path(task_id, revision)
+                if manifest.is_symlink():
+                    raise ValueError("current manifest cannot be a symlink")
+                header = self._header(task_id, revision, source)
+                if block_id is None:
+                    return dict(header=header)
+                position = next((i for i, item in enumerate(header["blocks"])
+                                 if item["block_id"] == block_id), None)
+                if position is None or header["blocks"][position]["sha256"] != sha256:
+                    raise ReadReferenceError(
+                        "removed_or_superseded", "The requested block is no longer a member of the current task package.",
+                        read_ref=navigation_ref,
+                    )
+                descriptor = header["blocks"][position]
+                path = self._task_root(task_id) / "blocks" / (block_id + ".md")
+                if path.is_symlink():
+                    raise ValueError("current material block cannot be a symlink")
+                text = self._read_block(task_id, descriptor)
+                return dict(header=header, block=dict(descriptor), content=text, position=position)
+            except ReadReferenceError:
+                raise
+            except (OSError, ValueError, KeyError) as exc:
+                raise MaterialReadError(
+                    "Required current material could not be read or verified (" + type(exc).__name__ + ").",
+                    read_ref=navigation_ref,
+                ) from exc
+            finally:
+                lock.release()
+
     def read_task(self, task_id, revision=None, source="draft", *, include_body=False):
         if include_body:
             return self.get_document(task_id, revision, source)
@@ -412,6 +462,47 @@ class MaterialStore:
                 lock.release()
 
     update_indexes = update_blocks
+
+    def rebase_unsent_blocks(self, task_id, *, draft_revision, published_revision, sent_files):
+        """Stage confirmed public blocks plus provably unsent local additions.
+
+        This is an identity operation, never a text merge. The local package
+        must still contain every last-sent block unchanged, or its additions
+        cannot be separated safely from a rewritten old body.
+        """
+        lock = self._lock()
+        with self._mutex:
+            lock.acquire(wait=3)
+            try:
+                draft = self._header(task_id, draft_revision, "draft")
+                public = self._header(task_id, published_revision, "feed")
+                prefix = f"tasks/{task_id}/blocks/"
+                sent = {item["path"][len(prefix):-3]: item["sha256"] for item in sent_files
+                        if item["path"].startswith(prefix) and item["path"].endswith(".md")}
+                local = {item["block_id"]: item for item in draft["blocks"]}
+                if not sent or any(ident not in local or local[ident]["sha256"] != sha
+                                   for ident, sha in sent.items()):
+                    raise ValueError("local candidate is not an append-only extension of its confirmed sent blocks; "
+                                     "cannot separate unsent material from a rewritten old body")
+                remote = {item["block_id"]: item for item in public["blocks"]}
+                additions = []
+                for item in draft["blocks"]:
+                    ident = item["block_id"]
+                    if ident in remote:
+                        if remote[ident]["sha256"] != item["sha256"]:
+                            raise ValueError("current remote changed immutable block bytes")
+                    elif ident not in sent:
+                        additions.append(item)
+                if not additions:
+                    return dict(header=public, additions=0)
+                # Remote navigation replaced claims about removed material.
+                # New blocks retain their own already-produced indexes.
+                result = self._write_manifest(public["entry"], [*public["blocks"], *additions],
+                                              public["navigation"], draft["status"])
+                return dict(header=self._header(task_id, result["revision"], "draft"),
+                            additions=len(additions))
+            finally:
+                lock.release()
 
     def current_revisions(self, entry_id):
         state = self._pointers()
@@ -560,11 +651,9 @@ class MaterialStore:
                     **{k: (v, "feed") for k, v in state["feed"].items()}}
         return {ident: dict(self._header(ident, rev), source=source) for ident, (rev, source) in selected.items()}
 
-    def search(self, query, limit=5, conditions=None, allowed_ids=None):
-        if not isinstance(query, str) or not query.strip() or len(query) > 2000:
-            raise ValueError("query must contain 1..2000 characters")
-        if type(limit) is not int or not 1 <= limit <= 20:
-            raise ValueError("limit must be between 1 and 20")
+    def search(self, query=None, limit=5, conditions=None, allowed_ids=None, continuation=None):
+        from .provenance import QueryContinuationError, query_request
+        query, conditions = query_request(query, limit, conditions, continuation)
         from .reme_index import ReMeIndex
         with self._mutex:
             tasks = self.visible_tasks()
@@ -576,9 +665,13 @@ class MaterialStore:
                 ):
                     raise ValueError("metadata and current material revision differ")
             if self._index is None:
-                self._index = ReMeIndex(self.root)
+                self._index = ReMeIndex(self.root, self.domain)
             try:
-                results = self._index.search(tasks, query, limit, conditions, allowed_ids)
+                results = self._index.search(tasks, query, limit, conditions, allowed_ids,
+                                             continuation=continuation)
+            except QueryContinuationError:
+                # A stale/invalid caller cursor is not a broken derived index.
+                raise
             except Exception as exc:
                 self._index_failure = type(exc).__name__
                 self._index_verified = None
@@ -606,7 +699,7 @@ class MaterialStore:
             if self._index_verified == fingerprint:
                 return self.index_status()
             if self._index is None:
-                self._index = ReMeIndex(self.root)
+                self._index = ReMeIndex(self.root, self.domain)
             try:
                 self._index.refresh(tasks)
             except Exception as exc:

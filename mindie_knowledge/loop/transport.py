@@ -20,6 +20,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from mindie_knowledge.markdown import _atomic_write_text
+from mindie_knowledge.materials.references import MaterialReadError, ReadReferenceError
+from mindie_knowledge.materials.provenance import QueryContinuationError
 
 from .dfx import attach_reference, failure
 from .store import canonical, session_key
@@ -29,6 +31,11 @@ MAX_BODY = 2 * 1024 * 1024
 
 class RequestRejected(ValueError):
     """A structured request rejection, distinct from wire/runtime failure."""
+
+    def __init__(self, message, *, error_code="read_rejected", read_ref=None):
+        super().__init__(message)
+        self.error_code = error_code
+        self.read_ref = read_ref
 
 
 def rpc(connection, method, arguments=None, *, timeout=10):
@@ -63,8 +70,10 @@ def rpc(connection, method, arguments=None, *, timeout=10):
     if not ok:
         error = result.get("error", "knowledge request failed")
         if result.get("error_kind") == "invalid_request":
-            raise RequestRejected(error)
-        exception = RuntimeError(error)
+            raise RequestRejected(error, error_code=result.get("error_code", "read_rejected"),
+                                  read_ref=result.get("read_ref"))
+        exception = (MaterialReadError(error, read_ref=result.get("read_ref"))
+                     if result.get("error_code") == "material_corrupt" else RuntimeError(error))
         attach_reference(exception, result.get("diagnostic"))
         raise exception
     try:
@@ -159,6 +168,21 @@ class Service:
                         ok=True,
                         result=service.call(payload["method"], payload["arguments"]),
                     )
+                except QueryContinuationError as exc:
+                    result = dict(ok=False, error_kind="invalid_request", error=str(exc), error_code=exc.code)
+                except ReadReferenceError as exc:
+                    result = dict(ok=False, error_kind="invalid_request", error=str(exc), error_code=exc.code)
+                    if exc.read_ref is not None:
+                        result["read_ref"] = exc.read_ref
+                except MaterialReadError as exc:
+                    failure("knowledge.rpc", stage="query" if payload["method"] == "query" else "read",
+                            category="material_corrupt", exception=exc)
+                    result = dict(ok=False, error_kind="operation_failed", error=str(exc), error_code=exc.code)
+                    if exc.read_ref is not None:
+                        result["read_ref"] = exc.read_ref
+                    diagnostic = getattr(exc, "mindie_diagnostic", None)
+                    if diagnostic is not None:
+                        result["diagnostic"] = diagnostic
                 except (ValueError, TypeError) as exc:
                     result = dict(ok=False, error_kind="invalid_request", error=str(exc)[:500])
                 except (TimeoutError, OSError):
@@ -267,13 +291,14 @@ class Service:
             args, session, lease = self._identify(args, capture=method == "capture")
         if method == "query":
             return self.store.query(
-                args["query"], limit=args.get("limit", 5),
+                args.get("query"), limit=args.get("limit", 5),
                 conditions=args.get("conditions"),
+                continuation=args.get("continuation"),
             )
         if method == "explain":
-            return self.store.explain(
-                args["ref"], offset=args.get("offset", 0), limit=args.get("limit")
-            )
+            if set(args) != {"ref"}:
+                raise ValueError("explain accepts only ref; whole-document offset/limit reading is unavailable")
+            return self.store.explain(args["ref"])
         if method == "feedback":
             settings = self.engine._settings()
             root_session = (lease or {}).get("root_session") or session
