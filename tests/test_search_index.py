@@ -87,7 +87,7 @@ def test_warm_queries_do_not_rechunk_unchanged_material(store, monkeypatch):
     store.append_observation(doc['entry_id'], 'subsequent correction marker', marker='b' * 32)
     assert store.query('subsequent correction')['results']
     assert len(changed) == 1
-    assert 'correction' in changed[0].read_text()
+    assert 'correction' in changed[0].read_text(encoding='utf-8')
 
 
 def test_readiness_is_unverified_after_restart_until_actual_reme_load(tmp_path):
