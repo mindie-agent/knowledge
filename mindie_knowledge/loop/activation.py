@@ -10,8 +10,9 @@ adapter, never by a model argument or a newest-session fallback.
 Core owns the minimal schema (one lease per native session plus durable
 attempt identities). Construction and all read-only checks
 (``check``/``capture_lease``/``active_lease``/``leases``/``scope_root``/
-``allows_hash``/``resolve``) never create the file; only the mutating calls
-(``activate``/``claim``/``finish``/``deactivate``) do. The store holds grants
+``allows_hash``/``resolve``) never create the database; only the first
+``activate``/``associate`` does. A complete existing database can acquire its
+ownership marker without changing grants or receipts. The store holds grants
 and attempt receipts only: no transcript payload or body history. The file
 and its directory get restrictive permissions (0700/0600), like any token or
 config state.
@@ -19,7 +20,7 @@ config state.
 Canonical semantics (shared by every adapter):
 
 - A lease is an internal identity binding for one native task, established
-  automatically by the adapter when the user invokes the entry. It is not a
+  automatically by the adapter for a verified, authorized native event. It is not a
   consent prompt: the installation-level shared settings file is the only
   persistent user choice. A binding lasts until an explicit ``deactivate``
   or an actual project-scope change. There is no wall-clock expiry, no
@@ -53,6 +54,9 @@ import time
 from pathlib import Path
 
 from .store import session_key
+from .locks import StartInProgress
+
+from ..owned_state import open_database
 
 BASE_COLUMNS = {"session", "token", "enabled", "failures"}
 CAPTURE_COLUMNS = BASE_COLUMNS | {"project_root", "root_session", "activated_at"}
@@ -86,6 +90,10 @@ CREATE TABLE IF NOT EXISTS attempts(
 """
 
 
+def _initialize_admission(db):
+    db.executescript(_SCHEMA)
+
+
 class Admission:
     def __init__(self, path):
         candidate = Path(path)
@@ -99,20 +107,30 @@ class Admission:
 
     # ------------------------------------------------------------- internals
 
-    def _write(self, fn):
-        """Mutating path: BEGIN IMMEDIATE so concurrent processes serialize
-        the read+modify of activate/claim/finish (a deferred transaction
-        would let two healthy activates both observe the empty row and
-        issue distinct tokens)."""
+    def _database(self, *, initialize_missing=False, timeout=0.1):
+        """Use the shared authority contract; absence is valid only before use."""
+        try:
+            return open_database(
+                self.path, schema="mindie-admission/1",
+                required={"leases": CAPTURE_COLUMNS,
+                          "attempts": {"session", "kind", "identity", "created"}},
+                initialize=_initialize_admission, initialize_missing=initialize_missing,
+                timeout=timeout,
+            )
+        except (OSError, sqlite3.Error, ValueError, StartInProgress) as exc:
+            raise AdmissionUnavailable(str(exc)) from exc
+
+    def _write(self, fn, *, initialize_missing=False, missing_error=None):
+        """Serialize read+modify while preserving leases and attempt receipts."""
         with self._lock:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
+            db = self._database(initialize_missing=initialize_missing, timeout=5.0)
+            if db is None:
+                if missing_error is not None:
+                    raise ValueError(missing_error)
+                return False
             try:
                 self.path.parent.chmod(0o700)
-            except OSError:
-                pass
-            db = sqlite3.connect(self.path, timeout=5.0)
-            try:
-                db.executescript(_SCHEMA)
+                self.path.chmod(0o600)
                 db.execute("BEGIN IMMEDIATE")
                 try:
                     result = fn(db)
@@ -120,44 +138,22 @@ class Admission:
                 except BaseException:
                     db.rollback()
                     raise
+                return result
+            except (OSError, sqlite3.Error) as exc:
+                raise AdmissionUnavailable(str(exc)) from exc
             finally:
                 db.close()
-            try:
-                self.path.chmod(0o600)
-            except OSError:
-                pass
-            return result
 
     def _rows(self, sql="", args=()):
-        """Missing state is empty; unreadable state is never inactivity."""
-        try:
-            self.path.stat()
-        except FileNotFoundError:
+        """A missing unused store is empty; lost authority is never inactivity."""
+        db = self._database()
+        if db is None:
             return []
-        except OSError as exc:
-            raise AdmissionUnavailable(type(exc).__name__) from exc
         try:
-            db = sqlite3.connect(
-                self.path.as_uri() + "?mode=ro", uri=True, timeout=0.1
-            )
-        except sqlite3.Error as exc:
-            raise AdmissionUnavailable(type(exc).__name__) from exc
-        try:
-            columns = {row[1] for row in db.execute("PRAGMA table_info(leases)")}
-            if not BASE_COLUMNS <= columns:
-                raise AdmissionUnavailable("invalid lease schema")
-            names = [row[1] for row in db.execute("PRAGMA table_info(leases)")]
-            rows = db.execute(
-                "SELECT * FROM leases WHERE enabled=1 " + sql, args
-            ).fetchall()
-            result = []
-            for row in rows:
-                lease = dict(zip(names, row))
-                lease["capture_schema"] = CAPTURE_COLUMNS <= columns
-                result.append(lease)
-            return result
-        except sqlite3.Error as exc:
-            raise AdmissionUnavailable(type(exc).__name__) from exc
+            rows = db.execute("SELECT * FROM leases WHERE enabled=1 " + sql, args).fetchall()
+            return [{**dict(row), "capture_schema": True} for row in rows]
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            raise AdmissionUnavailable(str(exc)) from exc
         finally:
             db.close()
 
@@ -175,8 +171,9 @@ class Admission:
             return dict(status="unavailable", enabled=False, error_class="ValueError")
         db = None
         try:
-            self.path.stat()
-            db = sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True, timeout=0.1)
+            db = self._database()
+            if db is None:
+                return result
             row = db.execute(
                 "SELECT enabled, failures, project_root FROM leases WHERE session=? LIMIT 1",
                 (session,),
@@ -186,9 +183,7 @@ class Admission:
                 result = dict(status="active" if enabled else "inactive",
                               enabled=bool(enabled), failures=failures,
                               project_root=project_root)
-        except FileNotFoundError:
-            pass
-        except (OSError, sqlite3.Error, TypeError) as exc:
+        except (AdmissionUnavailable, OSError, sqlite3.Error, ValueError, TypeError) as exc:
             result = dict(status="unavailable", enabled=False, error_class=type(exc).__name__)
         finally:
             if db is not None:
@@ -248,7 +243,7 @@ class Admission:
                 "SELECT * FROM leases WHERE session=?", (session,)
             ).fetchone()
 
-        row = self._write(op)
+        row = self._write(op, initialize_missing=True)
         return {
             "session": row[0],
             "token": row[1],
@@ -275,8 +270,6 @@ class Admission:
         failure state) is kept for audit; a fresh activate rotates the token
         and boundary. Returns True when a live lease was disabled."""
         if not isinstance(session, str) or not session:
-            return False
-        if not self.path.is_file():
             return False
 
         def op(db):
@@ -308,15 +301,15 @@ class Admission:
         activation token is supplied it must also match exactly."""
         lease = self.active_lease(session)
         if lease is None:
-            raise ValueError("session is not manually activated")
+            raise ValueError("task binding is not active")
         if token is not None and not hmac.compare_digest(lease["token"], token):
-            raise ValueError("session is not manually activated")
+            raise ValueError("task binding is not active")
         return lease
 
     def capture_lease(self, session, token):
         """Lease check for capture; fails closed on the old lease schema."""
         if not isinstance(token, str):
-            raise ValueError("manual session activation required")
+            raise ValueError("task binding token required")
         lease = self.check(session, token)
         if not lease.get("capture_schema"):
             raise ValueError(
@@ -342,15 +335,10 @@ class Admission:
             or len(token) > 512
         ):
             return {"state": "inactive"}
-        if not self.path.is_file():
-            return {"state": "inactive"}
         timeout = max(0.05, min(float(timeout), 0.25))
-        try:
-            db = sqlite3.connect(
-                self.path.as_uri() + "?mode=ro", uri=True, timeout=timeout
-            )
-        except sqlite3.Error as exc:
-            raise AdmissionUnavailable(type(exc).__name__) from None
+        db = self._database(timeout=timeout)
+        if db is None:
+            return {"state": "inactive"}
         try:
             db.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
             columns = [row[1] for row in db.execute("PRAGMA table_info(leases)")]
@@ -395,8 +383,8 @@ class Admission:
             }
         except AdmissionUnavailable:
             raise
-        except sqlite3.Error as exc:
-            raise AdmissionUnavailable(type(exc).__name__) from None
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            raise AdmissionUnavailable(str(exc)) from exc
         finally:
             db.close()
 
@@ -416,15 +404,10 @@ class Admission:
             or len(session) > 256
         ):
             return {"state": "inactive"}
-        if not self.path.is_file():
-            return {"state": "inactive"}
         timeout = max(0.05, min(float(timeout), 0.25))
-        try:
-            db = sqlite3.connect(
-                self.path.as_uri() + "?mode=ro", uri=True, timeout=timeout
-            )
-        except sqlite3.Error as exc:
-            raise AdmissionUnavailable(type(exc).__name__) from None
+        db = self._database(timeout=timeout)
+        if db is None:
+            return {"state": "inactive"}
         try:
             db.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
             deadline = time.monotonic() + timeout
@@ -468,8 +451,8 @@ class Admission:
             }
         except AdmissionUnavailable:
             raise
-        except sqlite3.Error as exc:
-            raise AdmissionUnavailable(type(exc).__name__) from None
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            raise AdmissionUnavailable(str(exc)) from exc
         finally:
             db.close()
 
@@ -511,12 +494,10 @@ class Admission:
         transaction so a revoke racing this claim cannot admit after the
         lease is gone."""
         if not isinstance(session, str) or not session.strip():
-            raise ValueError("session is not manually activated")
+            raise ValueError("task binding is not active")
         for value, name in ((kind, "kind"), (identity, "identity")):
             if not isinstance(value, str) or not value.strip() or len(value) > 256:
                 raise ValueError(f"{name} must be nonempty text")
-        if not self.path.is_file():
-            raise ValueError("session is not manually activated")
 
         def op(db):
             row = db.execute(
@@ -524,19 +505,19 @@ class Admission:
                 (session,),
             ).fetchone()
             if row is None or row[1] != 1:
-                raise ValueError("session is not manually activated")
+                raise ValueError("task binding is not active")
             if token is not None and (
                 not isinstance(token, str)
                 or not hmac.compare_digest(row[0], token)
             ):
-                raise ValueError("session is not manually activated")
+                raise ValueError("task binding is not active")
             cursor = db.execute(
                 "INSERT OR IGNORE INTO attempts VALUES(?,?,?,?)",
                 (session, kind.strip(), identity.strip(), time.time()),
             )
             return cursor.rowcount == 1
 
-        return self._write(op)
+        return self._write(op, missing_error="task binding is not active")
 
     def finish(self, session, activation_token, succeeded):
         """Record the outcome of one admitted call in the task's
@@ -547,8 +528,6 @@ class Admission:
         if not isinstance(session, str) or not session:
             raise ValueError("invalid activation token")
         if not isinstance(activation_token, str) or not activation_token:
-            raise ValueError("invalid activation token")
-        if not self.path.is_file():
             raise ValueError("invalid activation token")
 
         def op(db):
@@ -576,4 +555,4 @@ class Admission:
                     (session, activation_token),
                 )
 
-        self._write(op)
+        self._write(op, missing_error="invalid activation token")

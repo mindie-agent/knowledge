@@ -44,6 +44,9 @@ def test_locked_admission_is_not_empty(tmp_path):
     gate.activate('active', project_root=str(tmp_path))
     db = sqlite3.connect(gate.path)
     try:
+        # WAL can safely read the preceding committed snapshot during an
+        # exclusive writer. DELETE mode supplies a real blocked read here.
+        db.execute('PRAGMA journal_mode=DELETE')
         db.execute('BEGIN EXCLUSIVE')
         with pytest.raises(AdmissionUnavailable):
             gate.leases()
