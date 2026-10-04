@@ -40,6 +40,8 @@ Skill before allowing an ordinary PR to merge.
    block, and recomputes its file hash, manifest descriptor, task revision and
    navigation; changing the file alone is invalid. Metadata-only corrections
    preserve block identity. Validate the complete new head after any edit.
+   If a valid replacement cannot be prepared, explain the blocker and leave
+   the PR unmerged.
    Otherwise proceed with publication;
    merging an experience is not a certification of every technical claim.
 4. Before merging, confirm that the current head is the reviewed head, its
