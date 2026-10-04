@@ -29,7 +29,7 @@ PLUGIN_REPO = "acme/mindie-plugin"
 
 def git(argv, cwd=None):
     result = subprocess.run(
-        ["git", *argv],
+        ["git", "-c", "core.longpaths=true", *argv],
         cwd=cwd,
         capture_output=True,
         text=True,
