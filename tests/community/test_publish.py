@@ -373,10 +373,11 @@ def test_contract_mismatch_before_intent_or_remote_write_and_same_payload_recove
     assert transport.list_open_pull_requests(settings['repository'], deadline=_deadline()) == []
     work = tmp_path / 'repair-contract'
     git(['clone', remote_url, str(work)])
-    (work / 'publication-contract.json').write_text(wanted)
+    (work / 'publication-contract.json').write_bytes(wanted.encode('utf-8'))
     git(['add', '.'], cwd=work)
     git(['-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid',
          'commit', '-m', 'reviewed deployment combination'], cwd=work)
     git(['push', 'origin', 'main'], cwd=work)
     # Identical frozen payload, no explicit retry or new batch identity needed.
-    assert submit_batch(batch, settings, state_dir, transport=transport)['status'] == 'submitted'
+    receipt = submit_batch(batch, settings, state_dir, transport=transport)
+    assert receipt['status'] == 'submitted', receipt

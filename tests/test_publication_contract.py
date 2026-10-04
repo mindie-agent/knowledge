@@ -56,7 +56,7 @@ def test_review_path_distinguishes_valid_development_from_content(tmp_path):
     for name, content in task_files().items():
         path = repo / name
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content)
+        path.write_bytes(content.encode('utf-8'))
     git(repo, 'add', '.')
     git(repo, 'commit', '-qm', 'ordinary contribution')
     head = git(repo, 'rev-parse', 'HEAD')
@@ -85,7 +85,7 @@ def test_feed_contract_change_preserves_current_and_new_requirement_recovers(tmp
         feed = Feed(store, {**config, 'contract_sha256': old_hash})
         assert feed.sync()['status'] == 'synced'
         changed = render_contract(make_contract('vllm-ascend', 'b' * 40))
-        (repo / 'publication-contract.json').write_text(changed)
+        (repo / 'publication-contract.json').write_bytes(changed.encode('utf-8'))
         second = commit_docs(run, repo, [entry_doc('1' * 64, 'Later evidence')])
         for force in (False, True):
             receipt = feed.sync(force=force)
@@ -106,10 +106,11 @@ def test_self_consistent_block_rewrite_needs_new_identity_across_commits(tmp_pat
     header = _parse_manifest(index.read_text(), 'vllm-ascend')
     block = header['blocks'][0]
     body_path = index.parent / 'blocks' / (block['block_id'] + '.md')
-    body_path.write_text(body_path.read_text().replace('Complete public evidence.', 'Changed public evidence.'))
-    block['sha256'] = _sha(body_path.read_text())
+    changed = body_path.read_bytes().decode('utf-8').replace('Complete public evidence.', 'Changed public evidence.')
+    body_path.write_bytes(changed.encode('utf-8'))
+    block['sha256'] = _sha(changed)
     _, manifest = _make_manifest(header['entry'], header['blocks'], header['navigation'], header['status'])
-    index.write_text(manifest)
+    index.write_bytes(manifest.encode('utf-8'))
     git(repo, 'add', '.')
     git(repo, 'commit', '-qm', 'rewrote an immutable block')
     head = git(repo, 'rev-parse', 'HEAD')

@@ -22,7 +22,7 @@ PRODUCER = "a" * 64
 def init_repo(path):
     path.mkdir(parents=True)
     (path / ".gitattributes").write_bytes(b"* -text\n")
-    (path / "publication-contract.json").write_text(render_contract(make_contract("vllm-ascend", "a" * 40)), encoding="utf-8")
+    (path / "publication-contract.json").write_bytes(render_contract(make_contract("vllm-ascend", "a" * 40)).encode("utf-8"))
 
     def git(*args):
         return subprocess.check_output(["git", "-C", str(path), *args], text=True).strip()
