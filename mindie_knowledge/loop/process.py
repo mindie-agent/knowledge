@@ -10,8 +10,8 @@ Process-tree cleanup: POSIX uses a new session and ``killpg``. Windows
 assigns the spawned process to a Job Object so descendants stay owned, then
 ``TerminateJobObject``. A suspended start establishes Job ownership before
 the child can create descendants; community Git/gh calls share this mechanism.
-Real Windows tests cover both normal exit and inherited-pipe timeout after
-the leader exits, for this runner and the community subprocess caller.
+Real Windows tests verify descendant cleanup after leader exit for this runner
+and after an explicit inherited-pipe deadline for the community caller.
 """
 
 import os
