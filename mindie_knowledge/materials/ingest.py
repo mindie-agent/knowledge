@@ -28,20 +28,20 @@ def split_material(text, maximum=BLOCK_BYTES):
     """
     if type(maximum) is not int or maximum < 256:
         raise ValueError('invalid block byte limit')
-    remaining = text
-    while remaining:
-        encoded = remaining.encode('utf-8')
-        if len(encoded) <= maximum:
-            yield remaining
+    encoded = text.encode('utf-8')
+    offset = 0
+    while offset < len(encoded):
+        if len(encoded) - offset <= maximum:
+            yield encoded[offset:].decode('utf-8')
             return
-        piece = encoded[:maximum].decode('utf-8', 'ignore')
+        piece = encoded[offset:offset + maximum].decode('utf-8', 'ignore')
         boundary = max(piece.rfind('\n\n### '), piece.rfind('\n\n'))
         if boundary >= len(piece) // 2:
             piece = piece[:boundary + 2]
         if not piece:
             raise ValueError('block limit cannot hold a Unicode character')
         yield piece
-        remaining = remaining[len(piece):]
+        offset += len(piece.encode('utf-8'))
 
 
 def prepare_increment(*, task_id, text, start, end, source_digest, scanner_state,

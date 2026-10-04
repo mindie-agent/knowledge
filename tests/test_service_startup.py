@@ -128,7 +128,13 @@ def test_serve_starts_with_actual_configured_parser(tmp_path):
     )))
     diagnostics = tmp_path / "service.log"
     bootstrap = (
-        "import faulthandler, runpy, socket; "
+        "import builtins, faulthandler, runpy, socket\n"
+        "original_import = builtins.__import__\n"
+        "def without_retrieval(name, *args, **kwargs):\n"
+        "    if name == 'reme' or name.startswith('reme.'):\n"
+        "        raise RuntimeError('startup must not initialize retrieval')\n"
+        "    return original_import(name, *args, **kwargs)\n"
+        "builtins.__import__ = without_retrieval\n"
         "socket.getfqdn = lambda *a, **k: (_ for _ in ()).throw("
         "RuntimeError('loopback bind must not reverse-DNS')); "
         "faulthandler.dump_traceback_later(8, repeat=False); "
@@ -152,6 +158,7 @@ def test_serve_starts_with_actual_configured_parser(tmp_path):
             connection = json.loads(connection_path.read_text())
             status = rpc(connection, "status", timeout=5)
             assert status["domain"] == "test"
+            assert status["background_errors"] == {}
             result = rpc(connection, "stop_if_idle", timeout=5)
             assert result["idle"] is True
             assert result["status"] == "stopping"

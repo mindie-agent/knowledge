@@ -746,19 +746,9 @@ class Engine:
                         self._cancel.clear()
                 if block != "fault":
                     self._generation = generation
-                # Local read-only index maintenance: runs even with community
-                # contribution off (no capture/model/publication), in bounded
-                # resumable slices, off the query path.
-                if not self._is_frozen() and self.begin_work():
-                    try:
-                        self.store.advance_search_index()
-                        self.background_errors.pop("index", None)
-                    except Exception as exc:
-                        self._unexpected("knowledge.index", "tick", exc)
-                        self.background_errors["index"] = type(exc).__name__
-                        self._error(f"index maintenance failed: {type(exc).__name__}")
-                    finally:
-                        self.end_work()
+                # ReMe refreshes on query or an explicit index operation. The
+                # retired FTS scheduler must not import/index a whole library
+                # under the state lock during capture or service startup.
                 if generation is not None and not self._is_frozen():
                     for row in self.store.outbox_unresolved(limit=2, due_only=True):
                         if self._is_frozen():

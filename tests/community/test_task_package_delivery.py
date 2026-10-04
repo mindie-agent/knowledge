@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -61,6 +63,37 @@ def consumer(tmp_path, settings, remote_url):
 
 def forbid_model(*_args, **_kwargs):
     raise AssertionError("public synchronization or retrieval must not invoke a model")
+
+
+def commit_tree_file(repository, parent, path, content):
+    """Add a Git path without asking the host filesystem to represent it."""
+    def object_git(*args, data=None):
+        result = subprocess.run(
+            ["git", *args], cwd=repository, input=data, capture_output=True,
+            env={**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+                 "GIT_AUTHOR_NAME": "fixture", "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
+                 "GIT_COMMITTER_NAME": "fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid"},
+        )
+        assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
+        return result.stdout
+
+    blob = object_git("hash-object", "-w", "--stdin", data=content).strip()
+
+    def replace(tree, parts):
+        records = [record for record in object_git("ls-tree", "-z", tree).split(b"\0") if record]
+        entries = {record.partition(b"\t")[2]: record for record in records}
+        name = parts[0]
+        if len(parts) == 1:
+            entries[name] = b"100644 blob " + blob + b"\t" + name
+        else:
+            child = entries[name].partition(b"\t")[0].split()[2].decode("ascii")
+            updated = replace(child, parts[1:])
+            entries[name] = b"040000 tree " + updated + b"\t" + name
+        return object_git("mktree", "-z", data=b"\0".join(entries.values()) + b"\0").strip()
+
+    tree = replace(parent + "^{tree}", path.encode("utf-8").split(b"/"))
+    return object_git("commit-tree", tree.decode("ascii"), "-p", parent,
+                      data=b"Add unsupported task path\n").strip().decode("ascii")
 
 
 def test_complete_package_repeat_stop_and_resume(settings, state_dir, transport, remote_url, tmp_path, monkeypatch):
@@ -418,11 +451,10 @@ def test_feed_rejects_unusual_task_path_and_preserves_primary_error(settings, st
         merge(transport, settings, receipt)
         assert feed.sync()["status"] == "synced"
         edit = tmp_path / "unusual-path-edit"
-        git(["clone", "-q", remote_url, str(edit)])
-        (edit / "tasks" / TASK / "blocks" / "unreferenced\nblock.md").write_text("Not referenced by the task index.\n")
-        git(["add", "-A"], cwd=edit)
-        git(["commit", "-qm", "Add unsupported task path"], cwd=edit)
-        git(["push", "-q", "origin", "main"], cwd=edit)
+        git(["clone", "--bare", "-q", remote_url, str(edit)])
+        commit = commit_tree_file(edit, "HEAD", f"tasks/{TASK}/blocks/unreferenced\nblock.md",
+                                  b"Not referenced by the task index.\n")
+        git(["push", "-q", "origin", f"{commit}:refs/heads/main"], cwd=edit)
         real_unlink = Path.unlink
         def refuse_listing(path, *args, **kwargs):
             if cleanup_failure and path == feed.dir / "listing.tmp":
@@ -456,16 +488,18 @@ def test_remote_package_changes_are_never_overwritten(settings, state_dir, trans
         index = work / "tasks" / TASK / "index.md"
         if remote_change == "unreferenced-block":
             # A retained file outside the index is not ours to silently delete.
-            extra = index.parent / "blocks" / "foreign\nblock.md"
-            extra.write_text("Independent maintainer material.\n", encoding="utf-8")
+            commit = commit_tree_file(work, "HEAD", f"tasks/{TASK}/blocks/foreign\nblock.md",
+                                      b"Independent maintainer material.\n")
+            git(["update-ref", "HEAD", commit], cwd=work)
         elif remote_change == "symlink-index":
             index.unlink()
             index.symlink_to("../../README.md")
         else:
             index.write_bytes(index.read_bytes().replace(b"\n", b"\r\n"))
-        git(["add", "-A"], cwd=work)
-        git(["-c", "user.name=maintainer", "-c", "user.email=fixture@example.invalid",
-             "-c", "core.autocrlf=false", "commit", "-m", "change current package"], cwd=work)
+        if remote_change != "unreferenced-block":
+            git(["add", "-A"], cwd=work)
+            git(["-c", "user.name=maintainer", "-c", "user.email=fixture@example.invalid",
+                 "-c", "core.autocrlf=false", "commit", "-m", "change current package"], cwd=work)
         git(["push", "origin", "HEAD"], cwd=work)
         git(["push", "origin", "HEAD:refs/pull/1/head"], cwd=work)
         before = git(["rev-parse", "HEAD"], cwd=work)
