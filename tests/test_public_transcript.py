@@ -527,3 +527,173 @@ def test_k3_live_split_secret_carries_only_scanner_state_between_stops(pipeline)
     assert all(value not in body for value in ('first-secret', 'SPLIT_SECRET_CANARY', 'still-secret', 'FINAL_SECRET_CANARY'))
     state = store.db.execute('SELECT redaction_state FROM material_streams').fetchone()[0]
     assert 'secret' not in state.lower() and 'PRIVATE KEY' not in state
+
+
+@pytest.fixture
+def paged_capture(tmp_path, scanner, monkeypatch):
+    """Real Kimi parser, with a one-record page budget for deterministic yields."""
+    session = SESSIONS['kimi']
+    settings = tmp_path / 'community.json'
+    write_settings(settings, roots=[tmp_path])
+    admission = Admission(make_admission(tmp_path, project_root=tmp_path, session=session))
+    path = transcript_path('kimi', tmp_path, session)
+    parser = load_parser('kimi')
+    read_material = parser.read_material
+    monkeypatch.setattr(parser, 'read_material',
+                        lambda *args, **kwargs: read_material(*args, **kwargs, max_scan_bytes=1))
+    root = tmp_path / 'store'
+    store = Store(root, 'test')
+    args = dict(settings_path=settings, admission=admission, transcript_adapter=parser,
+                redactor_executable=scanner)
+    box = dict(store=store, engine=Engine(store, **args), root=root, args=args,
+               path=path, session=session)
+    yield box
+    box['store'].close()
+
+
+def append_kimi_noise(box):
+    record = dict(type='context.append_message', time=int(time.time() * 1000),
+                  message=dict(role='assistant', content=[]))
+    with box['path'].open('ab') as stream:
+        stream.write(json.dumps(record).encode() + b'\n')
+
+
+def reopen_capture(box):
+    box['store'].close()
+    box['store'] = Store(box['root'], 'test')
+    box['engine'] = Engine(box['store'], **box['args'])
+
+
+def begin_paged_body(box):
+    write_transcript('kimi', box['path'], box['session'], ['event-body-canary'],
+                     authorized_message_time(box['engine'], box['session']))
+    append_kimi_noise(box)
+    event = box['engine'].capture(session_id=box['session'], turn_id='paged',
+                                  transcript_path=str(box['path']), harness='kimi')
+    box['engine']._process(event['id'])
+    assert box['store'].capture_row(event['id'])['status'] == 'pending'
+    assert box['store'].continuation_reason(event['id']) == 'more public transcript bytes'
+    return event
+
+
+@pytest.mark.parametrize('restart', [False, True])
+def test_body_event_keeps_receipt_through_noise_eof_and_duplicate_handoff(paged_capture, restart, monkeypatch):
+    from mindie_knowledge.loop.cli import capture_hook
+    box = paged_capture
+    event = begin_paged_body(box)
+    receipt = box['store'].capture_material_receipt(event['id'])
+    assert receipt['body_model_calls'] == 0
+    assert box['store'].status()['captures'][0]['material_receipt'] == receipt
+    if restart:
+        reopen_capture(box)
+    for _ in range(4):
+        box['engine']._process(event['id'])
+    row = box['store'].capture_row(event['id'])
+    assert row['status'] == 'organized'
+    assert json.loads(row['detail']) == receipt
+    assert box['store'].capture_material_receipt(event['id']) == receipt
+    assert box['store'].drafts_changed()[0]['content'] == '### user\nevent-body-canary\n\n'
+    assert box['store'].cursor(str(box['path'].resolve()))['ok_finish'] == box['path'].stat().st_size
+    assert box['engine'].status()['summary_usage']['model_calls'] == 0
+    config = box['root'].parent / 'engine.json'
+    config.write_text(json.dumps(dict(root=str(box['root']), domain='test',
+        community_config=str(box['args']['settings_path']),
+        admission_path=str(box['args']['admission'].path), capture_mode='public-transcript',
+        redactor_executable=box['args']['redactor_executable'],
+        transcript_adapter=box['args']['transcript_adapter'].__file__)), encoding='utf-8')
+    def no_wake(*args, **kwargs):
+        raise AssertionError('completed duplicate must not start a service')
+    monkeypatch.setattr('mindie_knowledge.loop.handoff.request_wake', no_wake)
+    result = capture_hook(config, dict(hook_event_name='Stop', identity_kind='turn',
+        session_id=box['session'], turn_id='paged', harness='kimi',
+        mindie_activation=box['args']['admission'].active_lease(box['session'])['token'],
+        transcript_path=str(box['path']), budget_seconds=0.8))
+    assert result['stage'] == 'organized' and result['duplicate'] is True
+    assert result['capture_id'] == event['id']
+    assert json.loads(box['store'].capture_row(event['id'])['detail']) == receipt
+
+
+@pytest.mark.parametrize('prior_body', [False, True])
+def test_noise_only_event_does_not_borrow_another_events_body(paged_capture, prior_body):
+    box = paged_capture
+    box['path'].write_bytes(b'')
+    if prior_body:
+        write_transcript('kimi', box['path'], box['session'], ['earlier-event-body'],
+                         authorized_message_time(box['engine'], box['session']))
+        earlier = box['engine'].capture(session_id=box['session'], turn_id='earlier',
+                                        transcript_path=str(box['path']), harness='kimi')
+        box['engine']._process(earlier['id'])
+        assert box['store'].capture_material_receipt(earlier['id']) is not None
+    append_kimi_noise(box)
+    event = box['engine'].capture(session_id=box['session'], turn_id='noise-only',
+                                  transcript_path=str(box['path']), harness='kimi')
+    for _ in range(4):
+        box['engine']._process(event['id'])
+    assert box['store'].capture_row(event['id'])['status'] == 'no-new-material'
+    assert box['store'].capture_material_receipt(event['id']) is None
+    assert len(box['store'].drafts_changed()) == int(prior_body)
+    assert box['engine'].status()['summary_usage']['model_calls'] == 0
+
+
+def test_committed_body_and_later_parser_failure_are_both_visible_after_restart(paged_capture, monkeypatch):
+    box = paged_capture
+    event = begin_paged_body(box)
+    receipt = box['store'].capture_material_receipt(event['id'])
+    read_material = box['args']['transcript_adapter'].read_material
+    def fail_tail(*args, **kwargs):
+        raise ValueError('synthetic tail parser failure')
+    monkeypatch.setattr(box['args']['transcript_adapter'], 'read_material', fail_tail)
+    box['engine']._process(event['id'])
+    reopen_capture(box)
+    status = box['store'].status()['captures'][0]
+    assert status['status'] == 'failed'
+    assert status['detail'] == 'ValueError: synthetic tail parser failure'
+    assert status['material_receipt'] == receipt
+    assert box['store'].drafts_changed()[0]['content'] == '### user\nevent-body-canary\n\n'
+    # Existing internal requeue, not a public retry API or an automatic retry.
+    monkeypatch.setattr(box['args']['transcript_adapter'], 'read_material', read_material)
+    box['store'].defer_capture(event['id'], due=0, reason='explicit local requeue')
+    for _ in range(4):
+        box['engine']._process(event['id'])
+    assert box['store'].capture_row(event['id'])['status'] == 'organized'
+    assert json.loads(box['store'].capture_row(event['id'])['detail']) == receipt
+    assert box['engine'].status()['summary_usage']['model_calls'] == 0
+
+
+@pytest.mark.parametrize('invalid_receipt', ['{broken', '{"refs":[]}'])
+def test_invalid_saved_capture_receipt_is_visible_and_cannot_become_empty(paged_capture, invalid_receipt):
+    box = paged_capture
+    event = begin_paged_body(box)
+    with box['store']._write_txn():
+        box['store'].db.execute('UPDATE state SET value=? WHERE key=?',
+                                (invalid_receipt, 'capture-material:' + event['id']))
+    box['store'].mark_capture(event['id'], 'failed', 'original independent page failure')
+    status = box['store'].status()['captures'][0]
+    assert status['detail'] == 'original independent page failure'
+    assert 'invalid stored capture material receipt' in status['material_receipt_error']
+    box['store'].defer_capture(event['id'], due=0, reason='explicit local requeue')
+    for _ in range(4):
+        box['engine']._process(event['id'])
+    assert box['store'].capture_row(event['id'])['status'] == 'failed'
+    assert 'invalid stored capture material receipt' in box['store'].capture_row(event['id'])['detail']
+    assert box['store'].drafts_changed()[0]['content'] == '### user\nevent-body-canary\n\n'
+
+
+def test_capture_receipt_failure_rolls_back_body_and_cursor(paged_capture, monkeypatch):
+    box = paged_capture
+    original = box['store'].record_capture_material
+    def fail_after_receipt(*args, **kwargs):
+        original(*args, **kwargs)
+        raise OSError('synthetic receipt commit interruption')
+    monkeypatch.setattr(box['store'], 'record_capture_material', fail_after_receipt)
+    event = box['engine'].capture(
+        session_id=box['session'], turn_id='receipt-failure',
+        transcript_path=str(box['path']), harness='kimi')
+    write_transcript('kimi', box['path'], box['session'], ['receipt-rollback-canary'],
+                     authorized_message_time(box['engine'], box['session']))
+    box['engine']._process(event['id'])
+    assert box['store'].capture_row(event['id'])['status'] == 'pending'
+    assert box['store'].continuation_reason(event['id']).startswith('public-io:')
+    assert box['store'].capture_material_receipt(event['id']) is None
+    assert box['store'].cursor(str(box['path'].resolve())) is None
+    assert box['store'].drafts_changed() == []

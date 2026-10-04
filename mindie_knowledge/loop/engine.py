@@ -229,7 +229,7 @@ class Engine:
             if dormant_reason:
                 self.store.dormant_capture(ident, reason=dormant_reason)
             elif terminal:
-                self.store.mark_capture(ident, terminal[0], terminal[1])
+                terminal()
             return
         self.store.defer_capture(
             ident, due=time.time() + min(8, 2 ** (count - 1)),
@@ -250,7 +250,7 @@ class Engine:
         """A clean EOF may still be unflushed. Recheck a few times, with no model."""
         self._defer_counted(
             ident, "eof-settle", _EOF_SETTLE_LIMIT,
-            terminal=("no-new-material", "eof settled; no new material"),
+            terminal=lambda: self.store.finish_capture_eof(ident),
         )
 
     def _defer_admission(self, ident):

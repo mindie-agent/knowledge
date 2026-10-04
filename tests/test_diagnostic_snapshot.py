@@ -272,6 +272,57 @@ def test_missing_material_batch_diagnostic_is_scoped_and_read_only(tmp_path):
         assert store.db.execute("SELECT COUNT(*) FROM transcript_tasks WHERE summary_status='pending'").fetchone()[0] == 3
 
 
+@pytest.mark.parametrize('capture_status', ['organized', 'failed'])
+@pytest.mark.parametrize('receipt_state', ['valid', 'bad-json', 'bad-reference', 'oversize'])
+def test_capture_material_receipt_reaches_read_only_adapter_snapshot(tmp_path, monkeypatch, capture_status, receipt_state):
+    path, data = config(tmp_path)
+    ref = 'mindie://test/' + 'a' * 64 + '@' + 'b' * 64
+    receipt = dict(pipeline='public-transcript', refs=[ref], body_model_calls=0,
+                   redaction_rules=['private-scanner-label-canary'])
+    # Synthetic small metadata only; no parser, model, service or body is run.
+    with closing(Store(data['root'], 'test')) as store:
+        own = store.add_capture(root_session=session_key('task-A'), session='task-A',
+                                turn='one', transcript=None, summary='')
+        other = store.add_capture(root_session=session_key('task-B'), session='task-B',
+                                  turn='two', transcript=None, summary='')
+        store.record_capture_material(own['id'], receipt)
+        if capture_status == 'failed':
+            store.mark_capture(own['id'], 'failed', 'RuntimeError: private-parser-error-canary')
+        with store._write_txn():
+            store.db.execute('INSERT INTO state VALUES(?,?)',
+                             ('capture-material:' + other['id'], 'foreign-receipt-canary'))
+            if receipt_state != 'valid':
+                raw = ('{private-receipt-canary' if receipt_state == 'bad-json' else
+                       json.dumps(dict(receipt, refs=['mindie://other/' + 'a' * 64 + '@' + 'b' * 64]))
+                       if receipt_state == 'bad-reference' else 'private-receipt-canary' * diagnostics.MAX_JSON)
+                store.db.execute('UPDATE state SET value=? WHERE key=?',
+                                 (raw, 'capture-material:' + own['id']))
+    dbpath = tmp_path / 'state/test/state-v4.sqlite3'
+    before = dbpath.read_bytes()
+    def no_store_initialization(*args, **kwargs):
+        raise AssertionError('diagnostics must not initialize a writable Store')
+    monkeypatch.setattr(Store, '__init__', no_store_initialization)
+    result = diagnostics.snapshot(path, session='task-A')
+    assert dbpath.read_bytes() == before
+    assert [row['id'] for row in result['captures']] == [own['id']]
+    row = result['captures'][0]
+    assert row['status'] == capture_status
+    if capture_status == 'failed':
+        assert row['error_class'] == 'RuntimeError'
+    if receipt_state == 'valid':
+        assert row['material_receipt'] == {key: receipt[key] for key in ('pipeline', 'refs', 'body_model_calls')}
+        assert result['maintenance']['status'] == 'ok'
+    else:
+        assert 'material_receipt' not in row
+        assert row['material_receipt_error']['stage'] == 'capture-receipt'
+        assert row['material_receipt_error']['reason'] == 'invalid-material-receipt'
+        assert result['maintenance']['status'] == 'degraded'
+        assert any('capture-receipt fault' in hint for hint in result['hints'])
+    raw = json.dumps(result)
+    assert all(secret not in raw for secret in ('private-scanner-label-canary', 'private-parser-error-canary',
+                                                'private-receipt-canary', 'foreign-receipt-canary', other['id']))
+
+
 def test_summary_ledger_scopes_usage_and_unknown_without_loading_private_outputs(tmp_path, monkeypatch):
     from mindie_knowledge.materials.summarizer import SummaryLedger
     from test_material_summarizer import request, returned

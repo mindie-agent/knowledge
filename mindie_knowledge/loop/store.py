@@ -116,6 +116,23 @@ def _capture_revision_refs(detail):
     return covered if covered else None
 
 
+def validate_capture_material_receipt(receipt, domain):
+    """Validate only small event metadata, without resolving or loading bodies."""
+    fields = {"pipeline", "refs", "redaction_rules", "body_model_calls"}
+    if (not isinstance(receipt, dict) or set(receipt) != fields
+            or receipt["pipeline"] != "public-transcript"
+            or type(receipt["body_model_calls"]) is not int
+            or receipt["body_model_calls"] != 0
+            or not isinstance(receipt["refs"], list) or len(receipt["refs"]) != 1
+            or not isinstance(receipt["refs"][0], str)
+            or not re.fullmatch(re.escape(f"mindie://{domain}/") +
+                                r"[0-9a-f]{64}@[0-9a-f]{64}", receipt["refs"][0])
+            or not isinstance(receipt["redaction_rules"], list)
+            or not all(isinstance(rule, str) and rule for rule in receipt["redaction_rules"])):
+        raise ValueError("invalid stored capture material receipt")
+    return receipt
+
+
 def new_identity():
     return secrets.token_hex(32)
 
@@ -1842,6 +1859,40 @@ class Store:
             ).fetchone()
         return dict(row) if row else None
 
+    def capture_material_receipt(self, ident):
+        """One event's body receipt; errors and continuation reasons are separate.
+
+        Capture identities remain durable for duplicate suppression, so this
+        bounded metadata has the same lifetime. It never contains body text.
+        An invalid saved receipt is a fault, not evidence of an empty event.
+        """
+        with self.lock:
+            row = self.db.execute("SELECT value FROM state WHERE key=?",
+                                  ("capture-material:" + ident,)).fetchone()
+        if row is None:
+            return None
+        receipt = _stored_json(row[0], dict, "capture material receipt")
+        return validate_capture_material_receipt(receipt, self.domain)
+
+    def record_capture_material(self, ident, receipt):
+        """Commit the receipt in the same transaction as the body and cursor."""
+        receipt = validate_capture_material_receipt(receipt, self.domain)
+        with self._write_txn():
+            if self.capture_row(ident) is None:
+                raise ValueError("capture material receipt has no capture event")
+            self.capture_material_receipt(ident)
+            self.db.execute("INSERT OR REPLACE INTO state VALUES(?,?)",
+                            ("capture-material:" + ident, canonical(receipt)))
+            self.mark_capture(ident, "organized", canonical(receipt))
+
+    def finish_capture_eof(self, ident):
+        with self._write_txn():
+            receipt = self.capture_material_receipt(ident)
+            if receipt is not None:
+                self.mark_capture(ident, "organized", canonical(receipt))
+            else:
+                self.mark_capture(ident, "no-new-material", "eof settled; no new material")
+
     def mark_capture(self, ident, status, detail=""):
         with self._write_txn():
             if status in {"cancelled", "discarded"}:
@@ -1994,12 +2045,20 @@ class Store:
 
     # ---------------------------------------------------------------- legacy
 
-    # Legacy public migration was cancelled by explicit user steering (the
-    # public knowledge base is being cleared and restarts empty in the new
-    # format). There is intentionally no legacy import/mapping API; private
-    # pre-existing user files simply stay inert on disk.
+    # Older runtime databases remain inert on disk; there is no runtime
+    # compatibility layer. Explicitly selected transcript imports use the
+    # current public-material pipeline rather than reading legacy databases.
 
     # ---------------------------------------------------------------- status
+
+    def _capture_status(self, row):
+        result = dict(row)
+        try:
+            result["material_receipt"] = self.capture_material_receipt(row["id"])
+        except ValueError as exc:
+            # Keep a page's actual error alongside the separate receipt fault.
+            result["material_receipt_error"] = str(exc)
+        return result
 
     def status(self):
         with self.lock:
@@ -2023,7 +2082,7 @@ class Store:
                     "IS NOT NULL AND feed_active=0"
                 ).fetchone()[0],
                 captures=[
-                    dict(r)
+                    self._capture_status(r)
                     for r in self.db.execute(
                         "SELECT id, status, detail FROM captures "
                         "ORDER BY created DESC LIMIT 20"

@@ -68,9 +68,9 @@ def capture(engine, row, text, region):
                                                source_identity=inc.get('identity', ''), authorization=row,
                                                owner=store.opaque_for(row['root_session']), observed_stream=prior)
         store.finish_region(reserved, 'succeeded', 'redacted material committed; model calls=0')
-        store.mark_capture(row['id'], 'organized', canonical(dict(
+        store.record_capture_material(row['id'], dict(
             pipeline=MODE, refs=[store.ref(entry_id, doc['revision'])],
-            redaction_rules=prepared['redaction_rules'], body_model_calls=0)))
+            redaction_rules=prepared['redaction_rules'], body_model_calls=0))
         if inc.get('more'):
             store.defer_capture(row['id'], due=time.time(), reason='more public transcript bytes')
     engine.last_activity = time.monotonic()

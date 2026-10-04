@@ -16,7 +16,8 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from mindie_knowledge.markdown import _atomic_write_text
-from .store import MISSING_MATERIAL_JOB_DETAIL, SUMMARY_STATUS_SQL, session_key
+from .store import (MISSING_MATERIAL_JOB_DETAIL, SUMMARY_STATUS_SQL, session_key,
+                    validate_capture_material_receipt)
 from .process import AGENT_ERROR_EXIT_CODES
 
 MAX_JSON = 64 * 1024
@@ -426,6 +427,22 @@ def _summary_diagnostics(db, session, roots, result):
     result['summary_usage'] = dict(scope='task', **totals)
 
 
+def _capture_diagnostic(row, domain):
+    result = dict(id=row["id"],
+                  status=row["status"] if row["status"] in _CAPTURE_STATUSES else "unknown",
+                  **failure(row["detail"]))
+    if row["has_material_receipt"]:
+        try:
+            receipt = validate_capture_material_receipt(json.loads(row["material_receipt"]), domain)
+            # Only exact public references and fixed protocol values cross this
+            # diagnostic boundary; scanner labels are not needed by the caller.
+            result["material_receipt"] = {key: receipt[key] for key in ("pipeline", "refs", "body_model_calls")}
+        except (ValueError, TypeError):
+            result["material_receipt_error"] = dict(stage="capture-receipt", reason="invalid-material-receipt",
+                error_class="ValueError", message="stored capture material receipt is invalid")
+    return result
+
+
 def _store(config, session, result):
     path = Path(config["root"]) / config["domain"] / "state-v4.sqlite3"
     try:
@@ -447,12 +464,17 @@ def _store(config, session, result):
             roots = _task_roots(config, session)
             placeholders = ",".join("?" for _ in roots)
             rows = db.execute(
-                f"SELECT substr(id,1,129) AS id,substr(status,1,64) AS status,substr(detail,1,1000) AS detail FROM captures "
-                f"WHERE session=? OR root_session IN ({placeholders}) ORDER BY created DESC LIMIT 5",
+                f"SELECT substr(c.id,1,129) AS id,substr(c.status,1,64) AS status,substr(c.detail,1,1000) AS detail, "
+                f"s.key IS NOT NULL AS has_material_receipt, "
+                f"CASE WHEN length(CAST(s.value AS BLOB))<={MAX_JSON} THEN s.value END AS material_receipt "
+                f"FROM captures c LEFT JOIN state s ON s.key='capture-material:' || c.id "
+                f"WHERE c.session=? OR c.root_session IN ({placeholders}) ORDER BY c.created DESC LIMIT 5",
                 (session, *roots),
             )
-            result["captures"] = [dict(id=row["id"], status=row["status"] if row["status"] in _CAPTURE_STATUSES else "unknown", **failure(row["detail"]))
+            result["captures"] = [_capture_diagnostic(row, config["domain"])
                                    for row in rows if isinstance(row["id"], str) and _SAFE_ID.fullmatch(row["id"])]
+            if any("material_receipt_error" in row for row in result["captures"]):
+                result["maintenance"]["status"] = "degraded"
             if "transcript_tasks" in tables:
                 rows = db.execute(f"""
                     SELECT {SUMMARY_STATUS_SQL} AS visible_status, substr(t.summary_detail,1,1024) AS detail
@@ -558,6 +580,8 @@ def snapshot(config_path, *, session=None):
         result["hints"].append("Use this task's contributions batch_id for recover inspect; reconcile unknown writes before any explicit retry.")
     if result["startup"].get("status") == "failed":
         result["hints"].append("Inspect the reported configured startup component and installation.")
+    if any("material_receipt_error" in row for row in result["captures"]):
+        result["hints"].append("A stored capture material receipt is invalid; inspect the capture-receipt fault. Status does not classify it as empty or retry work.")
     if any(row["status"] in {"failed", "unknown", "outcome_unknown", "missing"} for row in result["summaries"]):
         result["hints"].append("Required material indexing has not completed; local material is retained and publication is blocked.")
     if result["summary_usage"] and result["summary_usage"]["unknown_calls"]:
