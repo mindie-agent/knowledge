@@ -131,8 +131,11 @@ def test_notification_without_token_and_locked_admission(tmp_path, monkeypatch):
     assert accepted["stage"] in {"accepted-local", "accepted-runtime"}
     assert "token" not in accepted
     held = sqlite3.connect(admission)
-    held.execute("BEGIN EXCLUSIVE")
     try:
+        # WAL readers can use the committed snapshot during an exclusive writer.
+        # DELETE mode makes this fixture exercise an actually blocked read.
+        assert held.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
+        held.execute("BEGIN EXCLUSIVE")
         blocked = capture_hook(config, dict(
             event, event_id="22222222-2222-4222-8222-222222222222",
         ))
