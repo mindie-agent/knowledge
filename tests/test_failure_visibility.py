@@ -8,6 +8,19 @@ from mindie_knowledge.community.transport import FileTransport
 from mindie_knowledge.materials.references import MaterialReadError
 
 
+def test_diagnostic_marker_has_canonical_bytes_on_creation_and_adoption(tmp_path, monkeypatch):
+    from mindie_knowledge.loop import agent_diagnostics
+    monkeypatch.setenv('MINDIE_DIAGNOSTICS_ROOT', str(tmp_path / 'diagnostics'))
+    marker = agent_diagnostics.root() / 'agent-delivery.sqlite3.owner'
+    for expected_count in (1, 2):
+        agent_diagnostics.enqueue('mindie-knowledge', 'capture', 'projection', 'invalid_record',
+                                  dict(logging_failed=True))
+        assert marker.read_bytes() == b'mindie-agent-delivery/1\n'
+        assert agent_diagnostics.pending()['items'][0]['count'] == expected_count
+        if expected_count == 1:
+            marker.unlink()
+
+
 @pytest.mark.parametrize('damage', ['missing', 'empty', 'table'])
 def test_diagnostic_delivery_damage_is_not_no_pending_incidents(tmp_path, monkeypatch, damage):
     from mindie_knowledge.loop import agent_diagnostics

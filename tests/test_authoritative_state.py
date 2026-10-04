@@ -15,6 +15,21 @@ def bodies(root):
     return {str(path.relative_to(root)): path.read_bytes() for path in root.rglob('*.md')}
 
 
+def test_authority_marker_has_canonical_bytes_on_creation_and_adoption(tmp_path):
+    from mindie_knowledge.owned_state import open_database
+    path = tmp_path / 'fixture.sqlite3'
+    marker = path.with_name(path.name + '.owner')
+    def initialize(db):
+        db.execute('CREATE TABLE fixture (key TEXT PRIMARY KEY)')
+    for existing in (False, True):
+        with closing(open_database(path, schema='fixture/1', required={'fixture': {'key'}},
+                                   initialize=initialize)) as db:
+            assert marker.read_bytes() == b'fixture/1\n'
+            assert db.execute('SELECT * FROM fixture').fetchall() == []
+        if not existing:
+            marker.unlink()  # A valid existing database may acquire its marker.
+
+
 @pytest.mark.parametrize('damage', ['missing', 'empty', 'missing_entries', 'missing_attempts',
                                    'missing_schema', 'wrong_schema', 'lost_rows', 'missing_marker_and_db'])
 def test_runtime_damage_preserves_all_material_and_never_rebuilds(tmp_path, damage):

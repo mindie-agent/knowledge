@@ -222,7 +222,7 @@ def open_database(path, *, schema, required, initialize, residue=(), validate=No
         if fresh:
             # A crash during initialization remains an explicit incomplete
             # store; later calls may not reinterpret it as never initialized.
-            marker.write_text(expected, encoding='utf-8')
+            marker.write_bytes(expected.encode('utf-8'))
             marker.chmod(0o600)
             initialize(db)
             db.commit()
@@ -233,7 +233,7 @@ def open_database(path, *, schema, required, initialize, residue=(), validate=No
         # Existing valid state can acquire its ownership marker without
         # changing its schema, rows, or business effects.
         if not marker.exists():
-            marker.write_text(expected, encoding='utf-8')
+            marker.write_bytes(expected.encode('utf-8'))
             marker.chmod(0o600)
         db.execute('PRAGMA journal_mode=WAL')
         db.bind_authority(path, marker, expected.encode(), initialize, validate_current)

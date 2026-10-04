@@ -47,7 +47,7 @@ def _open(create=False):
         if not columns:
             if existed or marker.exists():
                 raise ValueError('diagnostic delivery schema is missing; pending incidents were not rebuilt')
-            marker.write_text(expected, encoding='utf-8')
+            marker.write_bytes(expected.encode('utf-8'))
             marker.chmod(0o600)
             db.execute('CREATE TABLE pending (key TEXT PRIMARY KEY, generation INTEGER NOT NULL, delivered INTEGER NOT NULL, value TEXT NOT NULL)')
         expected_columns = {
@@ -60,7 +60,7 @@ def _open(create=False):
         if any(actual_columns.get(name) != value for name, value in expected_columns.items()):
             raise ValueError('diagnostic delivery schema or constraints are incomplete')
         if not marker.exists():
-            marker.write_text(expected, encoding='utf-8')
+            marker.write_bytes(expected.encode('utf-8'))
             marker.chmod(0o600)
         db.commit()
         path.chmod(0o600)
