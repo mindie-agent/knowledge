@@ -355,13 +355,13 @@ def test_checkout_preserves_package_blobs_under_host_newline_settings(tmp_path, 
 
     def assert_original_blobs(work):
         for item in files:
-            blob = subprocess.check_output(["git", "show", "HEAD:" + item["path"]], cwd=work)
+            blob = subprocess.check_output(["git", "-c", "core.longpaths=true", "show", "HEAD:" + item["path"]], cwd=work)
             assert blob == item["content"].encode("utf-8")
             assert (work / item["path"]).read_bytes() == blob
             assert gitops.tree_sha256(work, item["path"]) == hashlib.sha256(blob).hexdigest()
         assert _prepare_files({"files": files}, work)[1] is None
         assert configuration.read_bytes() == raw_config
-        assert subprocess.check_output(["git", "config", "core.autocrlf"], cwd=work).strip() == b"true"
+        assert subprocess.check_output(["git", "-c", "core.longpaths=true", "config", "core.autocrlf"], cwd=work).strip() == b"true"
 
     fresh = gitops.ensure_clone(remote, tmp_path / "fresh", Deadline(30, 10))
     assert_original_blobs(fresh)
@@ -369,7 +369,7 @@ def test_checkout_preserves_package_blobs_under_host_newline_settings(tmp_path, 
     # host. Updating the command policy alone does not refresh cached files.
     for operation in ("new", "existing"):
         legacy = tmp_path / ("legacy-" + operation)
-        subprocess.run(["git", "clone", "--quiet", remote, str(legacy)], check=True)
+        subprocess.run(["git", "-c", "core.longpaths=true", "clone", "--quiet", remote, str(legacy)], check=True)
         assert b"\r\n" in (legacy / files[0]["path"]).read_bytes()
         gitops.ensure_clone(remote, legacy, Deadline(30, 10))
         if operation == "new":

@@ -33,31 +33,37 @@ def test_append_preserves_complete_unicode_and_never_reads_prior_body(tmp_path, 
     store = MaterialStore(tmp_path, "demo")
     first = append(store, [block(0, "  early\n\n中段证据\n")])
     old_path = store.root / "tasks" / TASK / "blocks" / (first["blocks"][0]["block_id"] + ".md")
-    original = Path.read_text
+    original = Path.read_bytes
 
     def guarded(path, *args, **kwargs):
         if path == old_path:
             raise AssertionError("append reread an earlier material body")
         return original(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "read_text", guarded)
+    monkeypatch.setattr(Path, "read_bytes", guarded)
     task = append(store, [block(1, "late correction\n\n")])
     assert len(task["blocks"]) == 2
-    monkeypatch.setattr(Path, "read_text", original)
-    assert store.get_document(TASK)["content"] == "  early\n\n中段证据\nlate correction\n\n"
+    monkeypatch.setattr(Path, "read_bytes", original)
+    expected = "  early\n\n中段证据\nlate correction\n\n"
+    assert store.get_document(TASK)["content"] == expected
+    package = store.export_task(TASK)
+    consumer = MaterialStore(tmp_path / "consumer", "demo")
+    consumer.install_packages([package])
+    assert consumer.get_document(TASK)["content"].encode("utf-8") == expected.encode("utf-8")
+    assert consumer.export_task(TASK, source="feed")["files"] == package["files"]
 
 
 def test_index_headers_change_manifest_without_touching_body(tmp_path, monkeypatch):
     store = MaterialStore(tmp_path, "demo")
     task = append(store, [block(0, "A hypothesis, not a validated result.\n")])
-    original = Path.read_text
+    original = Path.read_bytes
 
     def no_blocks(path, *args, **kwargs):
         if path.parent.name == "blocks":
             raise AssertionError("index update read material body")
         return original(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "read_text", no_blocks)
+    monkeypatch.setattr(Path, "read_bytes", no_blocks)
     updated = store.update_indexes(TASK, [dict(block_id=task["blocks"][0]["block_id"],
                                                title="Unresolved hypothesis", summary="No acceptance yet.")],
                                    "The proposed cause remains unverified.")
@@ -102,6 +108,41 @@ def test_feed_validation_is_atomic_and_independent_consumer_needs_no_model(tmp_p
     assert not (consumer.root / "session").exists()
     assert consumer.search("middle evidence")[0]["source"] == "feed"
     consumer.close()
+
+
+@pytest.mark.parametrize("changed_file", ["block", "manifest"])
+def test_crlf_mutation_of_authoritative_file_is_rejected_before_export_or_index(tmp_path, changed_file):
+    store = MaterialStore(tmp_path, "demo")
+    task = append(store, [block(0, "Complete UTF-8 evidence 中段.\n")])
+    package = store.export_task(TASK)
+    assert store.search("evidence")[0]["entry_id"] == TASK
+    pointer = (store.root / "current.json").read_bytes()
+    snapshot = store.root / ".reme-index" / "snapshot.json"
+    indexed = snapshot.read_bytes()
+    task_root = store.root / "tasks" / TASK
+    target = (task_root / "blocks" / (task["blocks"][0]["block_id"] + ".md")
+              if changed_file == "block" else
+              task_root / "manifests" / (task["entry"]["revision"] + ".md"))
+    original = target.read_bytes()
+    changed = original.replace(b"\n", b"\r\n")
+    assert hashlib.sha256(changed).digest() != hashlib.sha256(original).digest()
+    target.write_bytes(changed)
+    error = "material block hash mismatch" if changed_file == "block" else "canonical YAML frontmatter"
+    try:
+        for operation in (lambda: store.get_document(TASK), lambda: store.export_task(TASK),
+                          lambda: store.search("evidence")):
+            with pytest.raises(ValueError, match=error):
+                operation()
+            assert target.read_bytes() == changed
+            assert (store.root / "current.json").read_bytes() == pointer
+            assert snapshot.read_bytes() == indexed
+        with pytest.raises(ValueError, match="immutable material identity conflicts"):
+            store.install_packages([package], source_revision="2" * 40)
+        assert (store.root / "current.json").read_bytes() == pointer
+        assert snapshot.read_bytes() == indexed
+        assert target.read_bytes() == changed
+    finally:
+        store.close()
 
 
 def test_candidates_do_not_replace_current_before_metadata_commit(tmp_path):

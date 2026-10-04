@@ -259,7 +259,7 @@ class MaterialStore:
                 raise KeyError(task_id)
         path = self._manifest_path(task_id, revision)
         try:
-            text = path.read_text(encoding="utf-8")
+            text = path.read_bytes().decode("utf-8")
         except FileNotFoundError:
             raise KeyError(f"expired or missing material {task_id}@{revision}") from None
         header = _parse_manifest(text, self.domain)
@@ -279,7 +279,7 @@ class MaterialStore:
         descriptor["sha256"] = _sha(payload)
         path = self._task_root(task_id) / "blocks" / (ident + ".md")
         if path.exists():
-            if path.read_text(encoding="utf-8") != payload:
+            if path.read_bytes().decode("utf-8") != payload:
                 raise ValueError("stable material block identity was reused with different content or metadata")
         else:
             self._atomic(path, payload)
@@ -361,7 +361,7 @@ class MaterialStore:
 
     def _read_block(self, task_id, descriptor):
         path = self._task_root(task_id) / "blocks" / (descriptor["block_id"] + ".md")
-        return _parse_block(path.read_text(encoding="utf-8"), descriptor)
+        return _parse_block(path.read_bytes().decode("utf-8"), descriptor)
 
     def read_block(self, task_id, block_id, *, revision=None, source=None):
         header = self._header(task_id, revision, source)
@@ -497,10 +497,10 @@ class MaterialStore:
 
     def export_task(self, task_id, source="draft", revision=None):
         header = self._header(task_id, revision, source)
-        files = {"index.md": self._manifest_path(task_id, header["entry"]["revision"]).read_text(encoding="utf-8")}
+        files = {"index.md": self._manifest_path(task_id, header["entry"]["revision"]).read_bytes().decode("utf-8")}
         for block in header["blocks"]:
             path = f"blocks/{block['block_id']}.md"
-            files[path] = (self._task_root(task_id) / path).read_text(encoding="utf-8")
+            files[path] = (self._task_root(task_id) / path).read_bytes().decode("utf-8")
         return validate_package_files(files, self.domain)
 
     def export_files(self, entry_id, **kwargs):
@@ -534,7 +534,7 @@ class MaterialStore:
                     task_id = package["task_id"]
                     for path, text in package["files"].items():
                         target = self._manifest_path(task_id, package["revision"]) if path == "index.md" else self._task_root(task_id) / path
-                        if target.exists() and target.read_text(encoding="utf-8") != text:
+                        if target.exists() and target.read_bytes().decode("utf-8") != text:
                             raise ValueError("immutable material identity conflicts with installed package")
                         if not target.exists():
                             self._atomic(target, text)

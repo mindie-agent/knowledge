@@ -157,7 +157,9 @@ class ReMeIndex:
         for rel in changed:
             task_id, block_id = rel.split("/")[1], Path(rel).stem
             block = next(b for b in tasks[task_id]["blocks"] if b["block_id"] == block_id)
-            text = (self.root / rel).read_text(encoding="utf-8")
+            # Validate authoritative bytes before ReMe's derived text
+            # normalization; universal-newline reads would hide corruption.
+            text = (self.root / rel).read_bytes().decode("utf-8")
             _parse_block(text, block)
             node, chunks = self.runner.run(self.chunker.chunk(self.root / rel))
             # Fallible block headers travel with the package. Consumers reuse
