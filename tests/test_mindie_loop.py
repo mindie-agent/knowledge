@@ -564,18 +564,19 @@ def test_current_generation_draft_and_vote_publish(gated, tmp_path):
     assert len(votes) == 1 and votes[0]["rating"] == "down"
 
 
-def test_v4_store_keeps_old_private_files_inert_and_persists_capture_floor(tmp_path):
+def test_v4_store_keeps_old_private_files_inert_and_retains_ownership(tmp_path):
     root = tmp_path / 'test'
     root.mkdir()
     prior = root / 'store-v2.sqlite3'
     prior.write_bytes(b'old private state; do not open, migrate or delete')
     before = prior.read_bytes()
     first = Store(tmp_path, 'test')
-    floor = first.capture_floor
+    marker = root / "state-v4.sqlite3.owner"
+    identity = marker.read_bytes()
     assert first.query('old private')['results'] == []
     first.close()
     second = Store(tmp_path, 'test')
-    assert second.capture_floor == floor
+    assert marker.read_bytes() == identity
     assert prior.read_bytes() == before
     assert (root / 'state-v4.sqlite3').is_file()
     second.close()

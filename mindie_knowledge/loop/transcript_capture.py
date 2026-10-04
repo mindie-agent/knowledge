@@ -12,7 +12,7 @@ from .transcript_redaction import ScannerUnavailable, redact
 from ..materials.ingest import prepare_increment
 from ..materials.summarizer import (
     SummaryLedger, MAX_RESPONSE_BYTES, make_request,
-    partition_blocks, validate_identity, validate_result, batch_identity, failure_detail, outcome,
+    partition_blocks, validate_identity, validate_result, validate_outcome, batch_identity, failure_detail, outcome,
 )
 
 MODE = 'public-transcript'
@@ -164,8 +164,16 @@ def summarize_due(engine):
                 cleanup_receipt = {}
                 def save_result(raw):
                     response = json.loads(raw)
-                    with store._write_txn():
-                        ledger.record(attempt['attempt_id'], response)
+                    validate_outcome(response, request)
+                    try:
+                        with store._write_txn():
+                            ledger.record(attempt['attempt_id'], response)
+                    except Exception as exc:
+                        exc.mindie_execution = 'completed'
+                        exc.mindie_result_status = response['status']
+                        diagnostic_failure('index.summary', stage='receipt', category='summary_completed_recording_failed', exception=exc)
+                        raise
+                store.db.assert_authority()
                 raw = bounded_run(engine.summary_command, canonical(request), timeout=None,
                                   max_output=MAX_RESPONSE_BYTES * 3, cancel=engine._summary_cancel,
                                   cleanup_receipt=cleanup_receipt, on_result=save_result)
@@ -180,16 +188,20 @@ def summarize_due(engine):
                 if response.get('cleanup_failed'):
                     diagnostic_failure('index.summary', stage='cleanup', category='cleanup_failed')
             except Exception as exc:
-                with store._write_txn():
-                    current = ledger.get(attempt['attempt_id'])
-                    if current['status'] == 'invoking':
-                        if getattr(exc, 'mindie_execution', None) == 'not_started':
-                            ledger.record(attempt['attempt_id'], outcome(request, status='failed',
-                                error='configuration', model_calls=0, error_reason='native_start_failed'))
-                        else:
-                            category = getattr(exc, 'mindie_category', 'unknown')
-                            ledger.uncertain(attempt['attempt_id'], category if category in {
-                                'deadline', 'cancelled', 'invalid_result', 'output_limit', 'native'} else 'unknown')
+                try:
+                    with store._write_txn():
+                        current = ledger.get(attempt['attempt_id'])
+                        if current['status'] == 'invoking':
+                            if getattr(exc, 'mindie_execution', None) == 'not_started':
+                                ledger.record(attempt['attempt_id'], outcome(request, status='failed',
+                                    error='configuration', model_calls=0, error_reason='native_start_failed'))
+                            else:
+                                category = getattr(exc, 'mindie_category', 'unknown')
+                                ledger.uncertain(attempt['attempt_id'], category if category in {
+                                    'deadline', 'cancelled', 'invalid_result', 'output_limit', 'native'} else 'unknown')
+                except Exception as receipt_error:
+                    exc.add_note('summary attempt receipt also failed: ' + type(receipt_error).__name__)
+                    raise exc from receipt_error
                 raise
         attempt = ledger.get(attempt['attempt_id'])
         if attempt['status'] != 'returned':
@@ -257,17 +269,21 @@ def summarize_due(engine):
         if getattr(exc, 'metadata_committed', False):
             engine._error('Material metadata committed; current-file promotion or cleanup failed (' + type(exc).__name__ + ').')
             return
-        with store._write_txn():
-            state = ledger.get(attempt['attempt_id'])['status'] if ledger and attempt else 'failed'
-            if state == 'returned':
-                ledger.local_failure(attempt['attempt_id'], 'apply_failed')
-                store.db.execute('UPDATE transcript_tasks SET summary_detail=?,summary_due=? WHERE entry_id=?',
-                                 ('local index apply failed: ' + type(exc).__name__, time.time() + 30, batch['entry_id']))
-            else:
-                state = 'outcome_unknown' if state in {'invoking', 'outcome_unknown'} else 'failed'
-                detail = 'configuration: summary worker is not configured' if not engine.summary_command else type(exc).__name__
-                store.db.execute('UPDATE material_batches SET status=?,detail=? WHERE batch_id=?',
-                                 (state, detail, batch['batch_id']))
-                _settle_task(store, batch['entry_id'])
+        try:
+            with store._write_txn():
+                state = ledger.get(attempt['attempt_id'])['status'] if ledger and attempt else 'failed'
+                if state == 'returned':
+                    ledger.local_failure(attempt['attempt_id'], 'apply_failed')
+                    store.db.execute('UPDATE transcript_tasks SET summary_detail=?,summary_due=? WHERE entry_id=?',
+                                     ('local index apply failed: ' + type(exc).__name__, time.time() + 30, batch['entry_id']))
+                else:
+                    state = 'outcome_unknown' if state in {'invoking', 'outcome_unknown'} else 'failed'
+                    detail = 'configuration: summary worker is not configured' if not engine.summary_command else type(exc).__name__
+                    store.db.execute('UPDATE material_batches SET status=?,detail=? WHERE batch_id=?',
+                                     (state, detail, batch['batch_id']))
+                    _settle_task(store, batch['entry_id'])
+        except Exception as receipt_error:
+            exc.add_note('summary state could not record this failure: ' + type(receipt_error).__name__)
+            raise exc from receipt_error
     finally:
         engine.end_work()

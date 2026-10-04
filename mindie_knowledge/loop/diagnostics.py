@@ -210,6 +210,8 @@ def record_delivery_failure(config, *, stage, cause, capture_id=None, event=None
         status="unresolved", component="knowledge.capture", stage=stage, cause=cause,
         config_fingerprint=_fingerprint(config),
     )
+    from .dfx import failure as report_failure
+    report_failure('knowledge.capture', stage=stage, category=cause.replace('-', '_'), reportable=False)
     if isinstance(capture_id, str) and _SAFE_ID.fullmatch(capture_id):
         payload["capture_id"] = capture_id
     if isinstance(event, str) and _SAFE_ID.fullmatch(event):

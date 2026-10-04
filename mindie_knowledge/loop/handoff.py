@@ -124,19 +124,11 @@ def _required_schema(db):
         raise SchemaNotReady()
     if "eligible" not in _columns(db, "continuations"):
         raise SchemaNotReady()
-    if "capture_floor" not in {
-        row[0] for row in db.execute("SELECT key FROM meta")
-    }:
-        raise SchemaNotReady()
 
 
 def _accept_row(db, *, namespace, root_hash, session, turn, transcript, summary,
                 generation, boundary, scope, epoch, kind, event_key):
     _required_schema(db)
-    floor = float(db.execute(
-        "SELECT value FROM meta WHERE key='capture_floor'"
-    ).fetchone()[0])
-    boundary = max(boundary, floor)
     db.execute("BEGIN IMMEDIATE")
     try:
         result = commit_capture(
@@ -152,7 +144,7 @@ def _accept_row(db, *, namespace, root_hash, session, turn, transcript, summary,
         raise
 
 
-def _probe(config, timeout):
+def _probe(config, timeout, *, config_path=None):
     from .cli import connect
     from .locks import lock_held
     from .transport import rpc
@@ -162,10 +154,19 @@ def _probe(config, timeout):
     # a released lifetime lock is stronger evidence than a short TCP probe.
     consumer = Path(config["root"]) / config["domain"] / "consumer.lock"
     owner = lock_held(consumer)
+    if owner is None:
+        try:
+            consumer.stat()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return 'unknown'
+        else:
+            return 'unknown'
     if owner is False:
         return "absent"
     try:
-        connection = connect(config)
+        connection = connect(config, config_path=config_path)
     except FileNotFoundError:
         return "starting" if owner is True else "absent"
     except (OSError, ValueError):
@@ -211,6 +212,7 @@ def request_wake(config_path, *, session_id, event=None):
     from . import settings as settings_mod
     from .cli import config_at
     from .locks import StartInProgress, StartLock
+    from .lifecycle import require_active, ServiceRetired
 
     out = dict(wake="not-requested", runtime="not-applicable", reason="not-requested", recovery=None)
     if not isinstance(session_id, str) or not session_id.strip():
@@ -218,11 +220,20 @@ def request_wake(config_path, *, session_id, event=None):
         return out
     try:
         config = config_at(config_path)
+        require_active(config_path, config)
+    except ServiceRetired:
+        out.update(wake='not-applicable', runtime='retired', reason='service-retired')
+        return out
     except (OSError, ValueError):
         out.update(wake="failed", runtime="unavailable", reason="configuration")
         return out
     settings = settings_mod.from_engine_config(config)
     if not settings.allows_capture():
+        if settings.capture_block_kind() == 'fault':
+            from .dfx import failure
+            failure('knowledge.capture', stage='authorization', category='authority_unavailable', reportable=False)
+            out.update(wake='failed', runtime='unavailable', reason='authority-unavailable')
+            return out
         out.update(wake="not-applicable", reason="sharing-disabled")
         return out
     path = config.get("admission_path")
@@ -241,7 +252,7 @@ def request_wake(config_path, *, session_id, event=None):
             return out
         out.update(wake="not-applicable", reason="not-activated")
         return out
-    state = _probe(config, None)
+    state = _probe(config, None, config_path=config_path)
     if state == "ready":
         out.update(wake="running", runtime="ready", reason="worker-ready")
         return out
@@ -256,6 +267,7 @@ def request_wake(config_path, *, session_id, event=None):
         out.update(wake="coalesced", runtime="unavailable", reason="coalesced")
         return out
     try:
+        require_active(config_path, config)
         # wake.json pids are diagnostic. Ownership is wake.request.lock here
         # and start.lock / consumer.lock in the helper. A reused pid is not
         # a running service and must not suppress this wake.
@@ -286,6 +298,7 @@ def run_wake(config_path, event=None):
     """Detached owner of the same readiness operation used by normal calls."""
     from .cli import config_at, ensure_service
     from .diagnostics import clear_delivery_event, record_delivery_failure
+    from .lifecycle import ServiceRetired
 
     try:
         config = config_at(config_path)
@@ -293,6 +306,8 @@ def run_wake(config_path, event=None):
         return 0
     try:
         ensure_service(config_path, _from_detached_starter=True)
+    except ServiceRetired:
+        return 0  # An already-spawned old helper is expected after retirement.
     except (OSError, ValueError, RuntimeError):
         record_delivery_failure(config, stage="wake", cause="wake-failed", event=event)
         return 0
@@ -347,9 +362,16 @@ def accept_stop(config_path, event):
     try:
         config = config_at(config_path)
     except (OSError, ValueError):
+        from .dfx import failure
+        failure('knowledge.capture', stage='handoff', category='configuration_unavailable')
         return _result(stage="unavailable", reason="configuration", cause="internal")
     settings = settings_mod.from_engine_config(config)
     if not settings.allows_capture():
+        if settings.capture_block_kind() == 'fault':
+            from .dfx import failure
+            failure('knowledge.capture', stage='authorization', category='authority_unavailable')
+            return _result(stage='unavailable', reason='authority-unavailable',
+                           cause='authority-unavailable', summary_dropped=dropped)
         return _result(stage="inert", reason="sharing-disabled", summary_dropped=dropped)
     session = event.get("session_id")
     kind, key = _identity(event)
@@ -491,7 +513,7 @@ def accept_stop(config_path, event):
             reason="stored", summary_dropped=dropped,
         )
     if status == "processing":
-        state = _probe(config, None)
+        state = _probe(config, None, config_path=config_path)
         return _result(
             stage="processing", capture_id=capture_id, duplicate=duplicate,
             wake="not-applicable",
@@ -504,7 +526,7 @@ def accept_stop(config_path, event):
         stage_name = "accepted-local"
     else:
         stage_name = "accepted-local"
-    state = _probe(config, None)
+    state = _probe(config, None, config_path=config_path)
     if state == "ready" and status in _UNPROCESSED_CAPTURE | {"pending", "deferred", "queued"}:
         clear_delivery_event(config, event_id)
         return _result(

@@ -8,6 +8,26 @@ from mindie_knowledge.community.transport import FileTransport
 from mindie_knowledge.materials.references import MaterialReadError
 
 
+@pytest.mark.parametrize('damage', ['missing', 'empty', 'table'])
+def test_diagnostic_delivery_damage_is_not_no_pending_incidents(tmp_path, monkeypatch, damage):
+    from mindie_knowledge.loop import agent_diagnostics
+    monkeypatch.setenv('MINDIE_DIAGNOSTICS_ROOT', str(tmp_path / 'diagnostics'))
+    agent_diagnostics.enqueue('mindie-knowledge', 'capture', 'projection', 'invalid_record',
+                              dict(logging_failed=True))
+    path = agent_diagnostics.root() / 'agent-delivery.sqlite3'
+    if damage == 'missing':
+        path.unlink()
+    elif damage == 'empty':
+        path.write_bytes(b'')
+    else:
+        with closing(sqlite3.connect(path)) as db, db:
+            db.execute('DROP TABLE pending')
+    before = path.read_bytes() if path.exists() else None
+    with pytest.raises(ValueError, match='missing'):
+        agent_diagnostics.pending()
+    assert (path.read_bytes() if path.exists() else None) == before
+
+
 @pytest.mark.parametrize('operation', ['leases', 'active_lease', 'check', 'resolve'])
 def test_corrupt_admission_is_not_inactive(tmp_path, operation):
     path = tmp_path / 'admission.sqlite3'
@@ -110,6 +130,32 @@ def test_summary_worker_failure_is_visible_in_status(tmp_path, monkeypatch):
         status = engine.status()
         assert status['background_errors'] == {'summary': 'OSError'}
         assert status['errors'] == ['summary worker stopped: OSError']
+
+
+def test_outbox_reports_a_new_failure_after_recovery_without_repeating_unchanged_fault(tmp_path, monkeypatch):
+    from mindie_knowledge.loop import agent_diagnostics, settings
+    from mindie_knowledge.loop.engine import Engine
+    monkeypatch.setenv('MINDIE_DIAGNOSTICS_ROOT', str(tmp_path / 'diagnostics'))
+    shared = settings.write(tmp_path / 'sharing.json', enabled=True,
+                            repository='owner/repo', project_roots=[tmp_path])
+    with closing(Store(tmp_path / 'store', 'test')) as store:
+        engine = Engine(store, settings_path=shared.path)
+        ticks = []
+        def read_pending(**kwargs):
+            ticks.append(1)
+            if len(ticks) in {1, 2, 4}:
+                raise OSError('synthetic receipt access failure')
+            return []
+        def next_tick(_):
+            if len(ticks) == 5:
+                engine.stop.set()
+            return engine.stop.is_set()
+        monkeypatch.setattr(store, 'outbox_unresolved', read_pending)
+        monkeypatch.setattr(engine.stop, 'wait', next_tick)
+        engine._outbox_loop()
+        errors = [item for item in agent_diagnostics.pending()['items']
+                  if item['code'] == 'publication_worker_failed']
+        assert len(errors) == 1 and errors[0]['count'] == 2
 
 
 def test_store_close_preserves_committed_effect_error_over_cleanup(tmp_path, monkeypatch):

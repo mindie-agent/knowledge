@@ -123,7 +123,8 @@ class _BoundedHTTPServer(ThreadingHTTPServer):
 
 class Service:
     def __init__(self, engine, *, connection_path=None, admission=None, feeds=(),
-                 max_workers=8, request_timeout=None, config_path=None):
+                 max_workers=8, request_timeout=None, config_path=None,
+                 config_fingerprint=None):
         self.engine, self.store = engine, engine.store
         self.admission = admission
         self.feeds = list(feeds)
@@ -222,6 +223,8 @@ class Service:
             token=self.token,
             domain=self.store.domain,
         )
+        if config_fingerprint is not None:
+            self.connection['config_fingerprint'] = config_fingerprint
 
     # -------------------------------------------------------------- routing
 
@@ -304,6 +307,9 @@ class Service:
             return self.store.explain(args["ref"])
         if method == "feedback":
             settings = self.engine._settings()
+            if settings.capture_block_kind() == 'fault':
+                self.engine._fault('knowledge.feedback', 'authorization', 'authority_unavailable')
+                raise RuntimeError(settings.contribution_block_reason())
             root_session = (lease or {}).get("root_session") or session
             scope = self.admission.scope_root(session) if self.admission else None
             publishable = bool(

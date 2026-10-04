@@ -25,7 +25,7 @@ PUBLISH_UNRESOLVED = ("intent", "unknown")
 
 
 class Ledger:
-    def __init__(self, state_dir: Path):
+    def __init__(self, state_dir: Path, *, authority_guard=None):
         root = Path(state_dir)
         root.mkdir(parents=True, exist_ok=True)
         try:
@@ -33,45 +33,47 @@ class Ledger:
         except OSError:
             pass
         self.lock = threading.RLock()
-        self.db = sqlite3.connect(root / LEDGER_NAME, check_same_thread=False)
-        self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS publication(
-                batch_id TEXT NOT NULL,
-                revision TEXT NOT NULL,
-                domain TEXT NOT NULL,
-                repository TEXT NOT NULL,
-                branch TEXT NOT NULL,
-                pr_number INTEGER,
-                pr_url TEXT,
-                head_sha TEXT,
-                status TEXT NOT NULL,
-                detail TEXT NOT NULL,
-                created REAL NOT NULL,
-                updated REAL NOT NULL,
-                PRIMARY KEY(batch_id, revision));
-            CREATE TABLE IF NOT EXISTS publication_step(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                batch_id TEXT NOT NULL,
-                revision TEXT NOT NULL,
-                step TEXT NOT NULL,
-                detail TEXT NOT NULL,
-                at REAL NOT NULL);
-            CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            """
+        self._owner_authority = authority_guard
+        from ..owned_state import open_database
+        self.db = open_database(
+            root / LEDGER_NAME, schema='mindie-community-ledger/1',
+            required={
+                'publication': 'batch_id revision domain repository branch pr_number pr_url head_sha status detail created updated actual_files'.split(),
+                'publication_step': 'id batch_id revision step detail at'.split(),
+                'state': 'key value'.split(),
+            },
+            initialize=self._initialize, residue=(root / 'git',),
         )
-        columns = {
-            row[1] for row in self.db.execute("PRAGMA table_info(publication)")
-        }
-        if columns and "actual_files" not in columns:
-            self.db.execute("ALTER TABLE publication ADD COLUMN actual_files TEXT")
-        self.db.commit()
+
+    @staticmethod
+    def _initialize(db):
+        db.executescript("""
+            CREATE TABLE publication(
+                batch_id TEXT NOT NULL, revision TEXT NOT NULL, domain TEXT NOT NULL,
+                repository TEXT NOT NULL, branch TEXT NOT NULL, pr_number INTEGER,
+                pr_url TEXT, head_sha TEXT, status TEXT NOT NULL, detail TEXT NOT NULL,
+                created REAL NOT NULL, updated REAL NOT NULL, actual_files TEXT,
+                PRIMARY KEY(batch_id, revision));
+            CREATE TABLE publication_step(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, batch_id TEXT NOT NULL,
+                revision TEXT NOT NULL, step TEXT NOT NULL, detail TEXT NOT NULL,
+                at REAL NOT NULL);
+            CREATE TABLE state(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        """)
 
     def close(self) -> None:
         with self.lock:
             self.db.close()
+
+    def assert_authority(self):
+        """Both the publication intent and its runtime source must still exist."""
+        from .common import TransientError
+        try:
+            self.db.assert_authority()
+            if self._owner_authority is not None:
+                self._owner_authority()
+        except (OSError, ValueError, sqlite3.Error) as exc:
+            raise TransientError('publication authority is unavailable before the next remote write') from exc
 
     # ------------------------------------------------------------------ #
     # Publication intents and receipts
@@ -169,19 +171,20 @@ class Ledger:
     @staticmethod
     def parse_actual_files(row: Mapping[str, Any]) -> list[dict[str, Any]] | None:
         raw = row.get("actual_files")
-        if not raw:
-            return None
+        if raw is None:
+            return None  # No files were prepared before this intent.
         try:
             value = json.loads(raw)
-        except ValueError:
-            return None
-        if not isinstance(value, list):
-            return None
-        out = []
-        for item in value:
-            if isinstance(item, dict) and isinstance(item.get("path"), str):
-                out.append(item)
-        return out
+        except (ValueError, TypeError) as exc:
+            raise ValueError("publication file receipt is corrupt; external outcome must be reconciled") from exc
+        if not isinstance(value, list) or any(
+                not isinstance(item, dict) or not isinstance(item.get('path'), str)
+                or not ((item.get('sha256') is None and item.get('revision') is None)
+                        or (isinstance(item.get('sha256'), str) and len(item['sha256']) == 64
+                            and isinstance(item.get('revision'), str) and len(item['revision']) == 64))
+                for item in value):
+            raise ValueError("publication file receipt is invalid; external outcome must be reconciled")
+        return value
 
     def steps_for(self, batch_id: str, revision: str) -> list[dict[str, Any]]:
         with self.lock:

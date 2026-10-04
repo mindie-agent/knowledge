@@ -114,7 +114,7 @@ class MaterialSummarizerTests(unittest.TestCase):
 
     def test_k3_04_returned_output_survives_scanner_failure_without_recalling_model(self):
         db = sqlite3.connect(":memory:")
-        ledger, req, model = summary.SummaryLedger(db), request("K3-04"), RecordingModel("K3-04")
+        ledger, req, model = summary.SummaryLedger(db, initialize=True), request("K3-04"), RecordingModel("K3-04")
         with db:
             attempt = ledger.prepare(req)
             ledger.claim(attempt["attempt_id"])
@@ -138,7 +138,7 @@ class MaterialSummarizerTests(unittest.TestCase):
 
     def test_k3_04_interruption_is_unknown_until_explicit_retry_and_cost_accumulates(self):
         db = sqlite3.connect(":memory:")
-        ledger, req = summary.SummaryLedger(db), request("K3-04")
+        ledger, req = summary.SummaryLedger(db, initialize=True), request("K3-04")
         with db:
             attempt = ledger.prepare(req)
             ledger.claim(attempt["attempt_id"])
@@ -164,7 +164,7 @@ class MaterialSummarizerTests(unittest.TestCase):
 
     def test_k3_04_policy_upgrade_cannot_reuse_a_prior_attempt_silently(self):
         db = sqlite3.connect(":memory:")
-        ledger, req = summary.SummaryLedger(db), request("K3-04")
+        ledger, req = summary.SummaryLedger(db, initialize=True), request("K3-04")
         with db:
             ledger.prepare(req)
         changed = summary.make_request(task_id=req["task_id"], body_version=req["body_version"], blocks=req["blocks"],
@@ -177,7 +177,7 @@ class MaterialSummarizerTests(unittest.TestCase):
 
     def test_k3_01_rejected_route_attempt_has_unknown_usage_but_no_unknown_paid_call(self):
         db = sqlite3.connect(":memory:")
-        ledger, req = summary.SummaryLedger(db), request("K3-01")
+        ledger, req = summary.SummaryLedger(db, initialize=True), request("K3-01")
         with db:
             attempt = ledger.prepare(req)
             ledger.claim(attempt["attempt_id"])

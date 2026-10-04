@@ -16,6 +16,7 @@ from typing import Any, Mapping
 from .common import (
     optional_timeout,
     CommunityError,
+    TransientError,
     check_account,
     check_repository,
 )
@@ -78,6 +79,8 @@ def validate_settings(data: Mapping[str, Any]) -> dict[str, Any]:
     for key in ("enabled", "generation", "enabled_at", "repository", "branch",
                 "project_roots", "idle_seconds"):
         out[key] = shared_normalized[key]
+    if shared.CONSENT_FIELD in shared_normalized:
+        out[shared.CONSENT_FIELD] = shared_normalized[shared.CONSENT_FIELD]
 
     config_path = data.get("config_path")
     if config_path is not None:
@@ -157,8 +160,14 @@ def live_gate(settings: Mapping[str, Any]) -> None:
     if not isinstance(path, str) or not path or not Path(path).is_absolute():
         raise SharingDisabled("publication requires the actual absolute shared config path")
     live = load_settings_file(Path(path))
-    if live.get("enabled") is not True:
-        raise SharingDisabled("community sharing was disabled")
+    from mindie_knowledge.loop import settings as shared
+    authority = shared.load(path)
+    if authority.capture_block_kind() == 'fault':
+        raise TransientError(authority.contribution_block_reason())
+    if authority.capture_block_kind() == 'revoked':
+        raise SharingDisabled(authority.contribution_block_reason())
+    if live.get(shared.CONSENT_FIELD) != settings.get(shared.CONSENT_FIELD):
+        raise TransientError('publication consent authority changed since admission; no write was started')
     live_generation = live.get("generation")
     if not (isinstance(live_generation, str) and live_generation):
         raise SharingDisabled("live config carries no admitted nonempty generation")

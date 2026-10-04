@@ -106,7 +106,7 @@ def test_flush_chunks_oversized_flush_without_dropping(tmp_path, monkeypatch):
             for i in range(3)
         ]
         from mindie_knowledge.loop.store import canonical
-        costs = [len(canonical(export_mod._task_files(store, doc)).encode()) for doc in docs]
+        costs = [len(canonical([dict(item) for item in export_mod._task_files(store, doc)]).encode()) for doc in docs]
         monkeypatch.setattr(export_mod, "MAX_BATCH_BYTES", sum(sorted(costs)[-2:]))
         first = build_batch(store, settings=settings)
         assert first is not None

@@ -107,10 +107,15 @@ def connection_path(config):
     return Path(config["root"]) / config["domain"] / "connection.json"
 
 
-def connect(config):
-    connection = json.loads(connection_path(config).read_text())
+def connect(config, *, config_path=None):
+    from .diagnostics import _bytes
+    connection = json.loads(_bytes(connection_path(config)))
     if connection.get("domain") != config["domain"]:
         raise ValueError("connection is for another domain")
+    if config_path is not None:
+        from .lifecycle import config_fingerprint
+        if connection.get('config_fingerprint') != config_fingerprint(config_path, config):
+            raise ValueError('connection is for another service configuration')
     return connection
 
 
@@ -120,12 +125,14 @@ def ensure_service(config_path, *, _from_detached_starter=False):
     from .locks import StartLock
     from .process import spawn_service, terminate_tree
     from .diagnostics import clear_startup_failure
+    from .lifecycle import require_active
 
     config = config_at(config_path)
-    state = _probe(config, None)
+    require_active(config_path, config)
+    state = _probe(config, None, config_path=config_path)
     if state == "ready":
         clear_startup_failure(config_path, config)
-        return connect(config)
+        return connect(config, config_path=config_path)
     if state in {"unknown", "worker-dead"}:
         raise RuntimeError("knowledge service is " + state + "; not starting a second service")
     lock = StartLock(connection_path(config).with_name("start.lock"))
@@ -135,14 +142,15 @@ def ensure_service(config_path, *, _from_detached_starter=False):
     # A slow initializer remains the sole owner for any duration.
     lock.acquire(wait=None)
     try:
+        require_active(config_path, config)
         while True:
             if process is not None and process.poll() is not None:
                 raise RuntimeError("knowledge service exited during startup; no retry")
-            state = _probe(config, None)
+            state = _probe(config, None, config_path=config_path)
             if state == "ready":
                 ready = True
                 clear_startup_failure(config_path, config)
-                return connect(config)
+                return connect(config, config_path=config_path)
             if state in {"unknown", "worker-dead"}:
                 raise RuntimeError("knowledge service is " + state + "; startup failed")
             if state == "absent" and process is None:
@@ -299,16 +307,9 @@ def _serve(config_path, config):
     """
     from .activation import Admission
     from .diagnostics import record_startup_failure
-    from .locks import StartInProgress, StartLock
+    from .lifecycle import acquire_consumer, config_fingerprint
 
-    consumer = StartLock(connection_path(config).with_name("consumer.lock"))
-    try:
-        # lock_held briefly acquires a free lock to observe it. An observer
-        # racing this startup is not proof of an existing service. Use the
-        # OS lock to wait for ownership, never spawn again.
-        consumer.acquire(wait=None)
-    except StartInProgress:
-        return 0
+    consumer = acquire_consumer(config_path, config)
     stage = "store"
     store = service = engine = None
     try:
@@ -326,7 +327,8 @@ def _serve(config_path, config):
         stage = "service"
         service = Service(engine, connection_path=connection_path(config),
                           admission=admission, feeds=_feeds(config, store),
-                          config_path=config_path)
+                          config_path=config_path,
+                          config_fingerprint=config_fingerprint(config_path, config))
         service.serve()
         return 0
     except Exception as exc:

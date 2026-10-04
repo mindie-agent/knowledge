@@ -41,8 +41,7 @@ def world(tmp_path, request, scanner):
     args = dict(settings_path=settings, admission=admission, transcript_adapter=parser,
                 redactor_executable=scanner)
     engine = Engine(store, **args)
-    when = max(engine._settings().enabled_at, admission.active_lease(session)['activated_at'],
-               store.capture_floor) + 1
+    when = max(engine._settings().enabled_at, admission.active_lease(session)['activated_at']) + 1
     write_transcript(name, path, session, ['EARLYCTRL 原始观测; acceptance remains incomplete.'], when)
     box = dict(name=name, session=session, path=path, when=when, store=store, args=args,
                engine=engine, calls=tmp_path / 'calls', root=tmp_path / 'store')

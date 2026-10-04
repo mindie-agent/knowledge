@@ -159,14 +159,17 @@ def test_withdrawal_is_distinct_from_removed_member(corpus):
         assert caught.value.code == "withdrawn" and caught.value.read_ref is None
 
 
-def test_current_identity_is_available_after_opening_an_existing_v4_store(corpus):
+def test_lost_revision_authority_is_not_silently_recreated(corpus):
     store, _ = corpus
-    ref = store.explain(selected_ref(store))["feedback_ref"]
-    with store.db:
-        store.db.execute("DROP TABLE known_revisions")
-    with closing(Store(store.root.parent, DOMAIN)) as reopened:
-        vote = reopened.record_vote(root_hash="root", ref=ref, rating="up", reason="", publishable=False)
-        assert vote["revision"] == parse_feedback_ref(ref)["revision"]
+    before = {path: path.read_bytes() for path in store.materials.root.rglob('*.md')}
+    import sqlite3
+    with closing(sqlite3.connect(store.root / 'state-v4.sqlite3')) as damaged, damaged:
+        damaged.execute("DROP TABLE known_revisions")
+    with pytest.raises(ValueError, match='known_revisions'):
+        Store(store.root.parent, DOMAIN)
+    assert {path: path.read_bytes() for path in store.materials.root.rglob('*.md')} == before
+    with closing(sqlite3.connect(store.root / 'state-v4.sqlite3')) as damaged:
+        assert not damaged.execute("SELECT 1 FROM sqlite_master WHERE name='known_revisions'").fetchone()
 
 
 @pytest.mark.parametrize("damage", ["missing", "modified", "symlink"])

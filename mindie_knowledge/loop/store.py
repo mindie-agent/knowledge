@@ -29,6 +29,140 @@ from ..materials.references import (
 )
 
 SCHEMA = "mindie-store/4"
+
+_STATE_COLUMNS = {
+    'meta': 'key value'.split(),
+    'entries': 'entry_id kind title origin draft_revision published_revision feed_active batched_revision doc updated conditions'.split(),
+    'revisions': 'entry_id revision doc source created'.split(),
+    'known_revisions': 'entry_id revision'.split(),
+    'captures': 'id root_session session turn transcript summary status detail created generation boundary scope activation_epoch identity_kind event_key'.split(),
+    'regions': 'id capture_id file_identity start finish digest status detail created recovery identity'.split(),
+    'cursors': 'file_identity identity finish digest ok_finish updated'.split(),
+    'votes': 'root_opaque entry_id revision rating reason publishable batch_id updated'.split(),
+    'opaque_roots': 'root_hash opaque created'.split(),
+    'outbox': 'batch_id revision batch status detail pr_url head_sha created attempted updated reconciliations next_attempt generation'.split(),
+    'feed_state': 'key value'.split(),
+    'state': 'key value'.split(),
+    'continuations': 'capture_id due reason eligible'.split(),
+    'grants': 'kind identity revision generation created'.split(),
+    'owners': 'entry_id owner created'.split(),
+    'sent_receipts': 'entry_id generation sent_revision path sha256 head_sha repository pr_url batch_id updated markers batch_revision'.split(),
+    'entry_quarantine': 'entry_id kind detail created'.split(),
+    'transcript_tasks': 'task_key entry_id capture_id body_digest summary_status summary_detail updated summary_due authorization'.split(),
+    'material_streams': 'stream_key entry_id source_cursor source_identity redaction_state generation authorization updated'.split(),
+    'material_batches': 'batch_id stream_key entry_id block_ids status detail authorization created'.split(),
+}
+
+def _initialize_state(db):
+    db.executescript("""
+            CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS entries(entry_id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL, title TEXT NOT NULL,
+                origin TEXT NOT NULL, draft_revision TEXT, published_revision TEXT,
+                feed_active INTEGER NOT NULL DEFAULT 0, batched_revision TEXT,
+                doc TEXT NOT NULL, updated REAL NOT NULL,
+                conditions TEXT NOT NULL DEFAULT '{}');
+            CREATE TABLE IF NOT EXISTS revisions(entry_id TEXT NOT NULL,
+                revision TEXT NOT NULL, doc TEXT NOT NULL, source TEXT NOT NULL,
+                created REAL NOT NULL, PRIMARY KEY(entry_id, revision));
+            CREATE TABLE IF NOT EXISTS known_revisions(entry_id TEXT NOT NULL,
+                revision TEXT NOT NULL, PRIMARY KEY(entry_id, revision));
+            CREATE TABLE IF NOT EXISTS captures(id TEXT PRIMARY KEY,
+                root_session TEXT NOT NULL, session TEXT NOT NULL, turn TEXT NOT NULL,
+                transcript TEXT, summary TEXT NOT NULL, status TEXT NOT NULL,
+                detail TEXT NOT NULL, created REAL NOT NULL,
+                generation TEXT, boundary REAL, scope TEXT,
+                activation_epoch TEXT, identity_kind TEXT, event_key TEXT);
+            CREATE TABLE IF NOT EXISTS regions(id TEXT PRIMARY KEY,
+                capture_id TEXT NOT NULL, file_identity TEXT NOT NULL,
+                start INTEGER NOT NULL, finish INTEGER NOT NULL, digest TEXT NOT NULL,
+                status TEXT NOT NULL, detail TEXT NOT NULL, created REAL NOT NULL,
+                recovery INTEGER NOT NULL DEFAULT 0, identity TEXT);
+            CREATE TABLE IF NOT EXISTS cursors(file_identity TEXT PRIMARY KEY,
+                identity TEXT NOT NULL, finish INTEGER NOT NULL, digest TEXT NOT NULL,
+                ok_finish INTEGER NOT NULL, updated REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS votes(root_opaque TEXT NOT NULL,
+                entry_id TEXT NOT NULL, revision TEXT NOT NULL, rating TEXT NOT NULL,
+                reason TEXT NOT NULL, publishable INTEGER NOT NULL, batch_id TEXT,
+                updated REAL NOT NULL,
+                PRIMARY KEY(root_opaque, entry_id, revision));
+            CREATE TABLE IF NOT EXISTS opaque_roots(root_hash TEXT PRIMARY KEY,
+                opaque TEXT NOT NULL, created REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS outbox(batch_id TEXT PRIMARY KEY,
+                revision TEXT NOT NULL, batch TEXT NOT NULL, status TEXT NOT NULL,
+                detail TEXT NOT NULL, pr_url TEXT, head_sha TEXT,
+                created REAL NOT NULL, attempted REAL, updated REAL NOT NULL,
+                reconciliations INTEGER NOT NULL DEFAULT 0,
+                next_attempt REAL, generation TEXT);
+            CREATE TABLE IF NOT EXISTS feed_state(key TEXT PRIMARY KEY,
+                value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY,
+                value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS continuations(capture_id TEXT PRIMARY KEY,
+                due REAL NOT NULL, reason TEXT NOT NULL,
+                eligible INTEGER NOT NULL DEFAULT 1);
+            CREATE TABLE IF NOT EXISTS grants(kind TEXT NOT NULL,
+                identity TEXT NOT NULL, revision TEXT NOT NULL,
+                generation TEXT NOT NULL, created REAL NOT NULL,
+                PRIMARY KEY(kind, identity, revision));
+            CREATE TABLE IF NOT EXISTS owners(entry_id TEXT PRIMARY KEY,
+                owner TEXT NOT NULL, created REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS sent_receipts(
+                entry_id TEXT PRIMARY KEY,
+                generation TEXT,
+                sent_revision TEXT NOT NULL,
+                path TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                head_sha TEXT NOT NULL,
+                repository TEXT,
+                pr_url TEXT,
+                batch_id TEXT,
+                updated REAL NOT NULL, markers TEXT, batch_revision TEXT);
+            CREATE TABLE IF NOT EXISTS entry_quarantine(
+                entry_id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                created REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS transcript_tasks(
+                task_key TEXT PRIMARY KEY, entry_id TEXT NOT NULL,
+                capture_id TEXT NOT NULL, body_digest TEXT NOT NULL,
+                summary_status TEXT NOT NULL, summary_detail TEXT NOT NULL,
+                updated REAL NOT NULL, summary_due REAL NOT NULL, authorization TEXT);
+        """)
+    db.executescript("""
+            CREATE INDEX IF NOT EXISTS captures_by_status ON captures(status, created);
+            CREATE INDEX IF NOT EXISTS summaries_pending ON transcript_tasks(summary_due, updated)
+                WHERE summary_status='pending';
+            CREATE INDEX IF NOT EXISTS summaries_by_entry ON transcript_tasks(entry_id);
+            CREATE INDEX IF NOT EXISTS outbox_by_status ON outbox(status, next_attempt, created);
+            CREATE TABLE IF NOT EXISTS material_streams(
+                stream_key TEXT PRIMARY KEY, entry_id TEXT NOT NULL,
+                source_cursor INTEGER NOT NULL, source_identity TEXT NOT NULL,
+                redaction_state TEXT NOT NULL, generation TEXT NOT NULL,
+                authorization TEXT NOT NULL, updated REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS material_batches(
+                batch_id TEXT PRIMARY KEY, stream_key TEXT NOT NULL,
+                entry_id TEXT NOT NULL, block_ids TEXT NOT NULL,
+                status TEXT NOT NULL, detail TEXT NOT NULL,
+                authorization TEXT NOT NULL, created REAL NOT NULL);
+            CREATE INDEX IF NOT EXISTS material_batches_due ON material_batches(created,batch_id,entry_id)
+                WHERE status IN ('pending','retry-requested');
+            CREATE INDEX IF NOT EXISTS material_batches_by_entry ON material_batches(entry_id,status);
+        """)
+    from ..materials.summarizer import SummaryLedger
+    SummaryLedger(db, initialize=True)
+    db.execute("INSERT INTO meta VALUES('schema', ?)", (SCHEMA,))
+
+def _validate_schema_identity(db):
+    row = db.execute("SELECT value FROM meta WHERE key='schema'").fetchone()
+    if row is None or row[0] != SCHEMA:
+        raise ValueError("authoritative runtime schema is missing or incompatible; state was not rebuilt")
+
+def _validate_state(db):
+    _validate_schema_identity(db)
+    from ..materials.summarizer import SummaryLedger
+    SummaryLedger(db)
+
 MAX_VOTE_REASON = 1000
 RATINGS = ("up", "down")
 # Shared read-only projection; callers alias transcript_tasks as t. Missing
@@ -267,110 +401,15 @@ class Store:
         from mindie_knowledge.materials.store import MaterialStore
         self.materials = MaterialStore(self.root / "materials", domain=domain)
         self._material_dirty = set()
-        self.db = sqlite3.connect(
-            self.root / "state-v4.sqlite3", check_same_thread=False
+        from ..owned_state import open_database
+        self.db = open_database(
+            self.root / "state-v4.sqlite3", schema=SCHEMA,
+            required=_STATE_COLUMNS, initialize=_initialize_state, validate=_validate_state,
+            validate_current=_validate_schema_identity,
+            residue=(self.root / "materials" / "current.json",
+                     self.root / "materials" / ".current-catalog.sqlite3",
+                     self.root / "materials" / "tasks", self.root / "outbox"),
         )
-        self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.executescript("""
-            CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS entries(entry_id TEXT PRIMARY KEY,
-                kind TEXT NOT NULL, title TEXT NOT NULL,
-                origin TEXT NOT NULL, draft_revision TEXT, published_revision TEXT,
-                feed_active INTEGER NOT NULL DEFAULT 0, batched_revision TEXT,
-                doc TEXT NOT NULL, updated REAL NOT NULL,
-                conditions TEXT NOT NULL DEFAULT '{}');
-            CREATE TABLE IF NOT EXISTS revisions(entry_id TEXT NOT NULL,
-                revision TEXT NOT NULL, doc TEXT NOT NULL, source TEXT NOT NULL,
-                created REAL NOT NULL, PRIMARY KEY(entry_id, revision));
-            CREATE TABLE IF NOT EXISTS known_revisions(entry_id TEXT NOT NULL,
-                revision TEXT NOT NULL, PRIMARY KEY(entry_id, revision));
-            CREATE TABLE IF NOT EXISTS captures(id TEXT PRIMARY KEY,
-                root_session TEXT NOT NULL, session TEXT NOT NULL, turn TEXT NOT NULL,
-                transcript TEXT, summary TEXT NOT NULL, status TEXT NOT NULL,
-                detail TEXT NOT NULL, created REAL NOT NULL,
-                generation TEXT, boundary REAL, scope TEXT,
-                activation_epoch TEXT, identity_kind TEXT, event_key TEXT);
-            CREATE TABLE IF NOT EXISTS regions(id TEXT PRIMARY KEY,
-                capture_id TEXT NOT NULL, file_identity TEXT NOT NULL,
-                start INTEGER NOT NULL, finish INTEGER NOT NULL, digest TEXT NOT NULL,
-                status TEXT NOT NULL, detail TEXT NOT NULL, created REAL NOT NULL,
-                recovery INTEGER NOT NULL DEFAULT 0, identity TEXT);
-            CREATE TABLE IF NOT EXISTS cursors(file_identity TEXT PRIMARY KEY,
-                identity TEXT NOT NULL, finish INTEGER NOT NULL, digest TEXT NOT NULL,
-                ok_finish INTEGER NOT NULL, updated REAL NOT NULL);
-            CREATE TABLE IF NOT EXISTS votes(root_opaque TEXT NOT NULL,
-                entry_id TEXT NOT NULL, revision TEXT NOT NULL, rating TEXT NOT NULL,
-                reason TEXT NOT NULL, publishable INTEGER NOT NULL, batch_id TEXT,
-                updated REAL NOT NULL,
-                PRIMARY KEY(root_opaque, entry_id, revision));
-            CREATE TABLE IF NOT EXISTS opaque_roots(root_hash TEXT PRIMARY KEY,
-                opaque TEXT NOT NULL, created REAL NOT NULL);
-            CREATE TABLE IF NOT EXISTS outbox(batch_id TEXT PRIMARY KEY,
-                revision TEXT NOT NULL, batch TEXT NOT NULL, status TEXT NOT NULL,
-                detail TEXT NOT NULL, pr_url TEXT, head_sha TEXT,
-                created REAL NOT NULL, attempted REAL, updated REAL NOT NULL,
-                reconciliations INTEGER NOT NULL DEFAULT 0,
-                next_attempt REAL, generation TEXT);
-            CREATE TABLE IF NOT EXISTS feed_state(key TEXT PRIMARY KEY,
-                value TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY,
-                value TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS continuations(capture_id TEXT PRIMARY KEY,
-                due REAL NOT NULL, reason TEXT NOT NULL,
-                eligible INTEGER NOT NULL DEFAULT 1);
-            CREATE TABLE IF NOT EXISTS grants(kind TEXT NOT NULL,
-                identity TEXT NOT NULL, revision TEXT NOT NULL,
-                generation TEXT NOT NULL, created REAL NOT NULL,
-                PRIMARY KEY(kind, identity, revision));
-            CREATE TABLE IF NOT EXISTS owners(entry_id TEXT PRIMARY KEY,
-                owner TEXT NOT NULL, created REAL NOT NULL);
-            CREATE TABLE IF NOT EXISTS sent_receipts(
-                entry_id TEXT PRIMARY KEY,
-                generation TEXT,
-                sent_revision TEXT NOT NULL,
-                path TEXT NOT NULL,
-                sha256 TEXT NOT NULL,
-                head_sha TEXT NOT NULL,
-                repository TEXT,
-                pr_url TEXT,
-                batch_id TEXT,
-                updated REAL NOT NULL, markers TEXT, batch_revision TEXT);
-            CREATE TABLE IF NOT EXISTS entry_quarantine(
-                entry_id TEXT PRIMARY KEY,
-                kind TEXT NOT NULL,
-                detail TEXT NOT NULL,
-                created REAL NOT NULL);
-            CREATE TABLE IF NOT EXISTS transcript_tasks(
-                task_key TEXT PRIMARY KEY, entry_id TEXT NOT NULL,
-                capture_id TEXT NOT NULL, body_digest TEXT NOT NULL,
-                summary_status TEXT NOT NULL, summary_detail TEXT NOT NULL,
-                updated REAL NOT NULL, summary_due REAL NOT NULL, authorization TEXT);
-        """)
-        self.db.executescript("""
-            CREATE INDEX IF NOT EXISTS captures_by_status ON captures(status, created);
-            CREATE INDEX IF NOT EXISTS summaries_pending ON transcript_tasks(summary_due, updated)
-                WHERE summary_status='pending';
-            CREATE INDEX IF NOT EXISTS summaries_by_entry ON transcript_tasks(entry_id);
-            CREATE INDEX IF NOT EXISTS outbox_by_status ON outbox(status, next_attempt, created);
-            CREATE TABLE IF NOT EXISTS material_streams(
-                stream_key TEXT PRIMARY KEY, entry_id TEXT NOT NULL,
-                source_cursor INTEGER NOT NULL, source_identity TEXT NOT NULL,
-                redaction_state TEXT NOT NULL, generation TEXT NOT NULL,
-                authorization TEXT NOT NULL, updated REAL NOT NULL);
-            CREATE TABLE IF NOT EXISTS material_batches(
-                batch_id TEXT PRIMARY KEY, stream_key TEXT NOT NULL,
-                entry_id TEXT NOT NULL, block_ids TEXT NOT NULL,
-                status TEXT NOT NULL, detail TEXT NOT NULL,
-                authorization TEXT NOT NULL, created REAL NOT NULL);
-            CREATE INDEX IF NOT EXISTS material_batches_due ON material_batches(created,batch_id,entry_id)
-                WHERE status IN ('pending','retry-requested');
-            CREATE INDEX IF NOT EXISTS material_batches_by_entry ON material_batches(entry_id,status);
-        """)
-        self.db.execute("INSERT OR REPLACE INTO meta VALUES('schema', ?)", (SCHEMA,))
-        self.db.execute("INSERT OR IGNORE INTO meta VALUES('capture_floor', ?)", (str(time.time()),))
-        self.capture_floor = float(self.db.execute("SELECT value FROM meta WHERE key='capture_floor'").fetchone()[0])
-        self.db.commit()
         self.db.execute('BEGIN IMMEDIATE')
         try:
             snapshot = {}
@@ -381,12 +420,17 @@ class Store:
                 if row['feed_active'] and row['published_revision']:
                     revisions['feed'] = row['published_revision']
                 snapshot[row['entry_id']] = revisions
+            current = self.materials._pointers()
+            if (set(current['draft']) | set(current['feed'])) - set(snapshot):
+                raise ValueError('committed material has no runtime metadata; existing files were preserved')
             self.materials.recover_snapshot(snapshot)
             self.db.executemany("INSERT OR IGNORE INTO known_revisions VALUES(?,?)",
                                 [(entry_id, revision) for entry_id, revisions in snapshot.items()
                                  for revision in set(revisions.values())])
         except Exception:
             self.db.rollback()
+            self.db.close()
+            self.materials.close()
             raise
         self.db.commit()
 
@@ -1037,7 +1081,7 @@ class Store:
         with self.lock:
             return self._changed_draft_refs(generation, limit=1, ready_only=ready_only).fetchone() is not None
 
-    def drafts_changed(self, *, generation=None, ready_only=False):
+    def drafts_changed(self, *, generation=None, ready_only=False, include_content=True):
         """Draft revision bodies not yet included in any outbox batch.
 
         Read from the revisions table, never the visible ``entries.doc``: for a
@@ -1051,6 +1095,9 @@ class Store:
         out of automatic batches."""
         with self.lock:
             rows = self._changed_draft_refs(generation, ready_only=ready_only).fetchall()
+            if not include_content:
+                return [self.materials.read_task(r['entry_id'], revision=r['draft_revision'])['entry']
+                        for r in rows]
             return [self._revision_doc(r["entry_id"], r["draft_revision"])
                     for r in rows]
 
@@ -1123,7 +1170,7 @@ class Store:
             row = self.db.execute(
                 "SELECT value FROM feed_state WHERE key=?", (key,)
             ).fetchone()
-        return json.loads(row[0]) if row else None
+        return _stored_json(row[0], dict, 'feed state') if row else None
 
     def feed_set(self, key, value):
         with self._write_txn():
@@ -1135,26 +1182,25 @@ class Store:
     def install_feed(self, packages, *, feed_ident, source_revision=None):
         """Install one whole Git snapshot into the current file material store.
 
-        All package bytes validate and stage before the metadata transaction;
-        the root transaction promotes the selected revisions together after
-        commit. Only entry headers and memberships are retained in SQLite.
+        All package bytes validate and stage before changing current metadata;
+        the root transaction excludes concurrent snapshot pruning and promotes
+        the selected revisions together after commit. Only entry headers and
+        memberships are retained in SQLite.
         """
         from mindie_knowledge.materials import validate_package_files
 
-        checked, seen = [], set()
-        for package in packages:
-            value = validate_package_files(package["files"], self.domain)
-            if value["task_id"] in seen:
-                raise ValueError("duplicate task identity in feed")
-            seen.add(value["task_id"])
-            checked.append(value)
-        self.materials.install_packages(checked, source="feed",
-                                        source_revision=source_revision, promote=False)
+        headers = []
+        def candidates():
+            for package in packages:
+                value = validate_package_files(package['files'], self.domain)
+                headers.append(value['entry'])
+                yield value
         now = time.time()
         with self._write_txn():
+            self.materials.install_packages(candidates(), source="feed",
+                                            source_revision=source_revision, promote=False)
             self.db.execute("UPDATE entries SET feed_active=0 WHERE feed_active=1")
-            for package in checked:
-                doc = package["entry"]
+            for doc in headers:
                 row = self._row(doc["entry_id"])
                 self._record_material_revision(doc, "feed", now)
                 if row is None:
@@ -1177,7 +1223,7 @@ class Store:
             if source_revision is not None:
                 self.db.execute("INSERT OR REPLACE INTO feed_state VALUES(?,?)",
                                 ("published-commit", canonical(dict(commit=source_revision, feed=feed_ident))))
-        return dict(entries=len(seen))
+        return dict(entries=len(headers))
 
     def retry_feed_cleanup(self):
         """Retry only retiring unused material files after a committed switch."""
@@ -1555,6 +1601,11 @@ class Store:
                          str(detail)[:500] or "contribution PR closed unmerged",
                          time.time()),
                     )
+        if previous is not None and previous['status'] != status and status in {
+                'failed', 'unknown', 'unavailable', 'needs_review', 'rejected'}:
+            from .dfx import failure
+            failure('knowledge.publish', stage='receipt', category='publication_' + status,
+                    reportable=False)
 
     def batch(self, batch_id):
         with self.lock:
@@ -1714,6 +1765,9 @@ class Store:
                 detail = (updated.get("detail", "cleanup finished")
                           + f"; cleanup receipt could not be saved: {type(exc).__name__}: {exc}")
                 raise CleanupReceiptError(batch_id, detail) from exc
+            if failures:
+                from .dfx import failure
+                failure('knowledge.publish', stage='cleanup', category='publication_cleanup_failed', reportable=False)
             return result
 
     def compact_confirmed(self, batch_id):
@@ -2046,8 +2100,9 @@ class Store:
             else:
                 self.mark_capture(ident, "no-new-material", "eof settled; no new material")
 
-    def mark_capture(self, ident, status, detail=""):
+    def mark_capture(self, ident, status, detail="", *, error_code='capture_failed', failed_stage='projection'):
         with self._write_txn():
+            previous = self.capture_row(ident)
             if status in {"cancelled", "discarded"}:
                 self.db.execute(
                     "UPDATE captures SET status=?, detail=?, transcript=NULL, "
@@ -2061,6 +2116,9 @@ class Store:
                 )
             if status not in {"queued", "pending", "deferred"}:
                 self.db.execute("DELETE FROM continuations WHERE capture_id=?", (ident,))
+        if status == 'failed' and previous is not None and previous['status'] != 'failed':
+            from .dfx import failure
+            failure('knowledge.capture', stage=failed_stage, category=error_code, reportable=False)
 
     def continuation_reason(self, ident):
         with self.lock:

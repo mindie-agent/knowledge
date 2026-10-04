@@ -452,8 +452,30 @@ class SummaryLedger:
     A returned output is necessary recovery state, cleared after application.
     """
 
-    def __init__(self, db: sqlite3.Connection):
-        self.db = db
+    def __init__(self, db: sqlite3.Connection, *, initialize=False):
+        self._db = db
+        from ..owned_state import require_schema
+        if initialize:
+            self._initialize(db)
+        require_schema(db, self._initialize)
+        self._schema_cookie = db.execute('PRAGMA schema_version').fetchone()[0]
+
+    @property
+    def db(self):
+        # Production owns a guarded runtime connection; standalone component
+        # users still cannot keep using a changed paid-attempt table.
+        if hasattr(self._db, 'assert_authority'):
+            self._db.assert_authority()
+        else:
+            cookie = self._db.execute('PRAGMA schema_version').fetchone()[0]
+            if cookie != self._schema_cookie:
+                from ..owned_state import require_schema
+                require_schema(self._db, self._initialize)
+                self._schema_cookie = cookie
+        return self._db
+
+    @staticmethod
+    def _initialize(db):
         db.execute("""CREATE TABLE IF NOT EXISTS material_summary_attempts (
             attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, batch_id TEXT NOT NULL,
             body_version TEXT NOT NULL, input_digest TEXT NOT NULL, policy_identity TEXT NOT NULL,

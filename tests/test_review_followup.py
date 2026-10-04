@@ -180,6 +180,18 @@ def test_live_pid_in_wake_json_does_not_coalesce(tmp_path, monkeypatch):
     assert spawned
 
 
+def test_wake_authority_damage_is_visible_and_never_claims_disabled(tmp_path, monkeypatch):
+    from mindie_knowledge.loop import agent_diagnostics
+    monkeypatch.setenv('MINDIE_DIAGNOSTICS_ROOT', str(tmp_path / 'diagnostics'))
+    config, _admission, _project, settings = _ready(tmp_path)
+    settings.write_text('{broken')
+    result = request_wake(config, session_id='manual-A')
+    assert result['wake'] == 'failed' and result['reason'] == 'authority-unavailable'
+    items = agent_diagnostics.pending()['items']
+    assert any(item['operation'] == 'knowledge.capture' and item['code'] == 'authority_unavailable'
+               for item in items)
+
+
 def _force_cas_races(store, count):
     """Make the in-transaction base check see a moved draft ``count`` times."""
     real_row = store._row

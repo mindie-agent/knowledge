@@ -5,6 +5,7 @@ native harness parser is a fixture here; its production conformance cases
 live with the Codex adapter. No fake model can prove the body was preserved.
 """
 import json
+import sqlite3
 import sys
 import time
 from contextlib import closing
@@ -50,6 +51,41 @@ def append(path, text):
         stream.write(json.dumps(record, ensure_ascii=False) + '\n')
 
 
+@pytest.mark.parametrize('handoff', [False, True])
+def test_authorized_first_turn_survives_late_runtime_initialization(tmp_path, scanner, handoff):
+    """The first body exists before the runtime DB, after its actual authority."""
+    from mindie_knowledge.loop.handoff import _accept_row
+    from mindie_knowledge.loop.activation import activation_epoch
+    now = time.time()
+    settings = tmp_path / 'community.json'
+    write_settings(settings, roots=[tmp_path])
+    data = json.loads(settings.read_text())
+    data['enabled_at'] = now - 120
+    settings.write_text(json.dumps(data))
+    admission = Admission(tmp_path / 'admission.sqlite3')
+    lease = admission.associate('manual-A', project_root=str(tmp_path), not_before=now - 60)
+    path = tmp_path / 'native.jsonl'
+    records = [dict(type='session_meta', payload=dict(id='manual-A')),
+               dict(type='response_item', timestamp=datetime.fromtimestamp(now - 30, timezone.utc).isoformat(),
+                    payload=dict(type='message', role='user', content=[
+                        dict(type='input_text', text='FIRST_AUTHORIZED_BODY full correction survives')]))]
+    path.write_text(''.join(json.dumps(item) + '\n' for item in records))
+    with closing(Store(tmp_path / 'store', 'test')) as store:
+        engine = Engine(store, settings_path=settings, admission=admission,
+                        transcript_adapter=load_parser('codex'), redactor_executable=scanner)
+        if handoff:
+            received = _accept_row(store.db, namespace='codex', root_hash='a' * 64,
+                                  session='manual-A', turn='first', transcript=str(path), summary='',
+                                  generation=data['generation'], boundary=now - 60, scope=str(tmp_path),
+                                  epoch=activation_epoch(lease['token']), kind='turn', event_key=None)
+        else:
+            received = engine.capture(session_id='manual-A', turn_id='first', transcript_path=str(path))
+        engine._process(received['id'])
+        assert store.capture_row(received['id'])['status'] == 'organized'
+        assert 'FIRST_AUTHORIZED_BODY full correction survives' in store.drafts_changed()[0]['content']
+        assert store.cursor(str(path.resolve()))['ok_finish'] == path.stat().st_size
+
+
 def process(engine, path, turn, **kwargs):
     result = engine.capture(session_id='manual-A', turn_id=turn, transcript_path=str(path), **kwargs)
     engine._process(result['id'])
@@ -82,6 +118,49 @@ def test_capture_saves_body_but_export_waits_for_summary(pipeline):
     payload = load_batch_payload(store, batch)
     package = validate_package_files({item['path'].split('/', 2)[2]: item['content'] for item in payload['files']})
     assert package_body(package) == docs[0]['content']
+
+
+@pytest.mark.parametrize('failure_point', ['before-invoke', 'returned'])
+def test_summary_checks_cached_authority_and_preserves_returned_effect(pipeline, monkeypatch, tmp_path, failure_point):
+    from mindie_knowledge.loop import agent_diagnostics
+    monkeypatch.setenv('MINDIE_DIAGNOSTICS_ROOT', str(tmp_path / 'diagnostics'))
+    engine, store, path = pipeline
+    engine.summary_command = summary_command(title='Synthetic call')
+    append(path, 'Synthetic full material for an authority-loss probe.')
+    process(engine, path, 'first')
+    engine.last_activity = 0
+    with store._write_txn():
+        store.db.execute('UPDATE transcript_tasks SET summary_due=0')
+    marker = store.root / 'state-v4.sqlite3.owner'
+    original_commit, original_run = store.db.commit, transcript_capture.bounded_run
+    calls, removed = [], []
+    def remove_after_claim_commit():
+        original_commit()
+        rows = sqlite3.Connection.execute(store.db, "SELECT count(*) FROM material_summary_attempts WHERE status='invoking'").fetchone()[0]
+        if failure_point == 'before-invoke' and rows and not removed:
+            marker.unlink()
+            removed.append(True)
+    def run_with_actual_return(command, payload, **kwargs):
+        if '--identity' not in command:
+            calls.append(command)
+            if failure_point == 'returned':
+                save = kwargs['on_result']
+                def lose_authority(raw):
+                    marker.unlink()
+                    return save(raw)
+                kwargs['on_result'] = lose_authority
+        return original_run(command, payload, **kwargs)
+    monkeypatch.setattr(store.db, 'commit', remove_after_claim_commit)
+    monkeypatch.setattr(transcript_capture, 'bounded_run', run_with_actual_return)
+    with pytest.raises(FileNotFoundError) as caught:
+        transcript_capture.summarize_due(engine)
+    assert len(calls) == int(failure_point == 'returned')
+    if failure_point == 'returned':
+        assert caught.value.mindie_execution == 'completed'
+        assert caught.value.mindie_result_status == 'returned'
+        assert any(item['code'] == 'summary_completed_recording_failed'
+                   for item in agent_diagnostics.pending()['items'])
+    assert sqlite3.Connection.execute(store.db, 'SELECT status FROM material_summary_attempts').fetchone()[0] == 'invoking'
 
 
 def test_missing_summary_is_configuration_failure_not_publishable_excerpt(pipeline):
@@ -370,8 +449,7 @@ def authorized_message_time(engine, session):
     # Initialization can take longer than a guessed future offset. Construct
     # public messages only after all persisted authorization boundaries exist.
     return max(engine._settings().enabled_at,
-               engine.admission.active_lease(session)['activated_at'],
-               engine.store.capture_floor) + 1
+               engine.admission.active_lease(session)['activated_at']) + 1
 
 
 def test_slow_summary_does_not_hold_new_body_and_stale_result_is_discarded(pipeline):

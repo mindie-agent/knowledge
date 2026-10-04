@@ -16,7 +16,7 @@ dependencies = [
   "PyYAML>=6.0",
   "reme-ai[as] @ git+https://github.com/agentscope-ai/ReMe@4c54c2b650038eff2a5d0d77aaa61b3e836f1b18",
   "langmem==0.0.30",
-  "mindie-diagnostics @ git+https://github.com/mindie-agent/diagnostics@1f460de7d796b966d54201b3f852a33412803d9e",
+  "mindie-diagnostics @ git+https://github.com/mindie-agent/diagnostics@7eed6cdb9935f2922b5b280e9d78ad8eb823f5ce",
 ]
 
 [project.optional-dependencies]

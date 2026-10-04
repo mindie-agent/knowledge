@@ -396,10 +396,22 @@ Candidate repository Python is never imported or executed.
 
 The current material format uses fresh `state-v4.sqlite3` metadata and Markdown
 packages. Old private databases and organizer checkpoints are not imported or
-used for recovery. The persisted capture floor combines sharing and activation
-timestamps, so normal Stop capture does not backfill earlier material. Explicit
+used for recovery. Capture boundaries combine the saved sharing timestamp and
+the verified native task/fork boundary. Creating an internal database adds no
+new boundary and cannot discard a legitimate first turn. Explicit
 selected-history import is a separately authorized source operation. Existing
 failed/unknown current-format publication receipts remain non-replayable.
+
+Authoritative runtime, paid-attempt and publication databases are initialized
+only on demonstrable first use. A missing database with an ownership marker or
+material residue, an empty database, or a missing required table is an error;
+opening the runtime must not recreate receipts or prune Markdown from an empty
+replacement snapshot. Derived search checkpoints remain rebuildable.
+The declared types, defaults, nullability, primary keys and indexes are part of
+that contract, not merely the column names. Cached connections recheck the live
+database/marker identity and schema cookie; missing or replaced authority cannot
+authorize another model or remote write. Changed schema triggers structural
+validation, while unchanged operations avoid repeating that full inspection.
 
 ## Confirmed payload cleanup and idle updates
 
@@ -417,8 +429,27 @@ all earlier blocks. There is no organizer-triggered remote restoration path.
 Successful upstream withdrawal blocks resurrection, and exact-base publication
 checks surface remote edits instead of silently merging them.
 
+Publication selection reads headers. Complete task packages, frozen candidates,
+batch validation, outbound scanning and worktree application use hash-bound file
+views, loading one file at a time. Public descriptors contain metadata only;
+every later access verifies the exact frozen file digest. An expired or modified
+candidate fails visibly rather than reading a newer current task. Feed intake
+likewise stages one package/file at a time and promotes only after the complete
+snapshot validates. Metadata still grows with the number of blocks and tasks.
+
+A successful push or PR write stays a known completed step if recording its
+receipt fails. The result includes the known head/PR and `recording_failed`;
+Agent diagnostics report the failed receipt separately. Unknown writes remain
+read-only reconciliation work even when an `explicit_retry` flag is supplied.
+
 The authenticated local `stop_if_idle` RPC freezes admission and initiates
 shutdown only when no actual call, worker or admitted capture work remains.
 Idle authorization grants and pending/unknown durable PR receipts alone do
 not block a version switch. Adapters protect each complete call with their
-operation lock and use this RPC instead of status-then-stop inference.
+operation lock and call core `lifecycle.retire_service` for a version switch.
+That operation owns the startup/admission locks and records retirement of the
+exact configuration path and fingerprint before deciding whether the service
+is absent or idle. Already spawned late helpers and direct `serve` processes
+consult the same record. A busy result rolls back only that retirement;
+restoration accepts only its exact completed receipt. A lost stop response
+remains uncertain, and a later receipt/cleanup failure cannot erase a known stop.

@@ -92,8 +92,10 @@ class StartLock:
                     if exc.errno not in (errno.EACCES, errno.EAGAIN) or remaining is not None and remaining <= 0:
                         raise
                     time.sleep(.01 if remaining is None else min(.01, remaining))
-        except OSError:
+        except OSError as exc:
             os.close(fd)
+            if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                raise
             try:
                 holder = json.loads(self.path.read_text() or "{}")
             except (OSError, ValueError):

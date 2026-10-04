@@ -90,6 +90,44 @@ def test_sync_keeps_only_current_published_body(env):
     assert store.db.execute('SELECT count(*) FROM revisions').fetchone()[0] == 1
 
 
+def test_streamed_candidate_failure_keeps_entire_prior_snapshot(env):
+    git, repo, store, feed = env
+    first = commit_docs(git, repo, [entry_doc('1' * 64, 'Existing evidence')])
+    assert feed.sync()['commit'] == first
+    before = (store.materials.root / 'current.json').read_bytes()
+    def candidates():
+        yield package_for(entry_doc('2' * 64, 'Candidate two'))
+        yield package_for(entry_doc('3' * 64, 'Candidate three'))
+        raise OSError('last package read failed')
+    with pytest.raises(OSError, match='last package'):
+        store.install_feed(candidates(), feed_ident=feed.ident, source_revision='f' * 40)
+    assert (store.materials.root / 'current.json').read_bytes() == before
+    assert store.feed_get('published-commit')['commit'] == first
+    assert [row[0] for row in store.db.execute('SELECT entry_id FROM entries WHERE feed_active=1')] == ['1' * 64]
+    assert store.query('Existing evidence')['results']
+
+
+def test_feed_does_not_keep_prior_package_bodies_in_memory(env, monkeypatch):
+    import weakref
+    _, _, store, feed = env
+    class ObservedText(str):
+        pass
+    refs = []
+    def candidates():
+        for number in range(1, 6):
+            # At most the current/previous task may still be on iterator frames.
+            # Holding all earlier bodies would make a large corpus require its
+            # complete byte size in RAM before any install can finish.
+            assert sum(ref() is not None for ref in refs) <= 2
+            package = package_for(entry_doc(str(number) * 64, 'Streaming evidence ' + str(number)))
+            path = next(path for path in package['files'] if path.startswith('blocks/'))
+            value = ObservedText(package['files'][path])
+            refs.append(weakref.ref(value))
+            package['files'][path] = value
+            yield package
+    assert store.install_feed(candidates(), feed_ident=feed.ident)['entries'] == 5
+
+
 def test_upstream_deletion_removes_body_and_expires_pinned_reads(env):
     git, repo, store, feed = env
     # A local draft of the same entry exists before publication.

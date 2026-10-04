@@ -293,6 +293,7 @@ class Feed:
 
     def _packages(self, commit, entries):
         from mindie_knowledge.materials import validate_package_files
+        from mindie_knowledge.materials.file_source import FileContents
 
         grouped = {}
         for path, _size, _object_id in entries:
@@ -300,8 +301,7 @@ class Feed:
             grouped.setdefault(task_id, []).append(relative)
         staging = self._staging_dir(commit)
         for task_id, names in sorted(grouped.items()):
-            files = {relative: (staging / "tasks" / task_id / relative).read_text(encoding="utf-8")
-                     for relative in names}
+            files = FileContents.from_paths(staging / 'tasks' / task_id, names)
             checked = validate_package_files(files, self.store.domain)
             package = checked
             if not package["ready"]:
@@ -454,12 +454,13 @@ class Feed:
                 # The candidate switched atomically only when every blob of
                 # the exact commit was verified and staged; the switch itself
                 # is a short local transaction with no Git IO inside.
-                packages = list(self._packages(commit, listing))
+                packages = self._packages(commit, listing)
                 installed = self.store.install_feed(packages, feed_ident=self.ident, source_revision=commit)
             except MaterialCleanupError as exc:
                 # The new pointers and metadata are already committed. Preserve
                 # this outcome separately from retiring superseded local files.
-                installed = dict(entries=len(packages), cleanup_error=str(exc)[:300])
+                installed = dict(entries=len({path.split('/')[1] for path, _, _ in listing}),
+                                 cleanup_error=str(exc)[:300])
             except ValueError as exc:
                 if getattr(exc, "metadata_committed", False):
                     return self._partial_promotion(commit, self.repository, exc)

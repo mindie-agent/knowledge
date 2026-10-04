@@ -167,7 +167,8 @@ def _parse_block(text, descriptor):
 
 def validate_package_files(files, domain=None):
     """Validate the complete canonical package; never trust paths from a peer."""
-    if not isinstance(files, dict) or "index.md" not in files:
+    from .file_source import FileContents
+    if not isinstance(files, (dict, FileContents)) or "index.md" not in files:
         raise ValueError("material package requires index.md")
     header = _parse_manifest(files["index.md"], domain)
     expected = {"index.md"} | {f"blocks/{b['block_id']}.md" for b in header["blocks"]}
@@ -177,7 +178,7 @@ def validate_package_files(files, domain=None):
         _parse_block(files[f"blocks/{block['block_id']}.md"], block)
     return dict(schema=PACKAGE_SCHEMA, task_id=header["task_id"],
                 revision=header["entry"]["revision"], package_hash=header["entry"]["revision"],
-                files=dict(files), entry=dict(header["entry"]),
+                files=files if isinstance(files, FileContents) else dict(files), entry=dict(header["entry"]),
                 ready=all(block["indexed"] for block in header["blocks"]))
 
 
@@ -627,8 +628,17 @@ class MaterialStore:
 
     delete_task = delete_document
 
-    def export_task(self, task_id, source="draft", revision=None):
+    def export_task(self, task_id, source="draft", revision=None, *, streaming=False):
         header = self._header(task_id, revision, source)
+        if streaming:
+            from .file_source import FileContents, FileText
+            files = {'index.md': FileText(self._manifest_path(task_id, header['entry']['revision']),
+                                         root=self._task_root(task_id), metadata={'path': 'index.md'})}
+            for block in header['blocks']:
+                path = f"blocks/{block['block_id']}.md"
+                files[path] = FileText(self._task_root(task_id) / path, root=self._task_root(task_id),
+                                       sha256=block['sha256'], metadata={'path': path})
+            return validate_package_files(FileContents(files), self.domain)
         files = {"index.md": self._manifest_path(task_id, header["entry"]["revision"]).read_bytes().decode("utf-8")}
         for block in header["blocks"]:
             path = f"blocks/{block['block_id']}.md"
@@ -643,18 +653,14 @@ class MaterialStore:
         return self.install_packages([package], source=source, source_revision=source_revision, replace=False)
 
     def install_packages(self, packages, source="feed", source_revision="", *, replace=True, promote=True):
-        """Validate all packages, write candidates, then atomically switch source."""
+        """Stage each package, then switch only after the entire input validates.
+
+        Retain identities rather than corpus bodies. An invalid later package
+        leaves the current pointers unchanged; unselected candidate files are
+        cleaned by the existing snapshot recovery path.
+        """
         _source(source)
-        validated = []
         seen = set()
-        for package in packages:
-            value = validate_package_files(package["files"], self.domain)
-            if any(package.get(k, value[k]) != value[k] for k in ("task_id", "revision", "package_hash")):
-                raise ValueError("package envelope identity differs from its files")
-            if value["task_id"] in seen:
-                raise ValueError("duplicate task in package snapshot")
-            seen.add(value["task_id"])
-            validated.append(value)
         lock = self._lock()
         with self._mutex:
             lock.acquire(wait=None)
@@ -662,7 +668,13 @@ class MaterialStore:
                 state = self._pointers()
                 old_ids = set(state[source])
                 updated = {} if replace else dict(state[source])
-                for package in validated:
+                for original in packages:
+                    package = validate_package_files(original['files'], self.domain)
+                    if any(original.get(k, package[k]) != package[k] for k in ('task_id', 'revision', 'package_hash')):
+                        raise ValueError('package envelope identity differs from its files')
+                    if package['task_id'] in seen:
+                        raise ValueError('duplicate task in package snapshot')
+                    seen.add(package['task_id'])
                     task_id = package["task_id"]
                     for path, text in package["files"].items():
                         target = self._manifest_path(task_id, package["revision"]) if path == "index.md" else self._task_root(task_id) / path
@@ -682,7 +694,7 @@ class MaterialStore:
                             self._prune_task(task_id, revisions)
                     except Exception as exc:
                         raise MaterialCleanupError("package snapshot committed; cleanup of unused files failed") from exc
-                return len(validated)
+                return len(seen)
             finally:
                 lock.release()
 

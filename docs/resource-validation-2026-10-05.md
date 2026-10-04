@@ -102,3 +102,37 @@ configuration. JSON output includes CPU, elapsed time, RSS, threads,
 descriptors, child processes, authoritative file reads/writes, changed
 checkpoint rows, storage and restart observations. Full-suite results and
 cross-platform CI must be bound to the final committed revision separately.
+
+## Full task publication memory
+
+The subsequent runtime audit exercises one 1,024-block task containing
+16,384,000 synthetic UTF-8 body bytes. The same process selects the complete
+task, freezes it, reloads the outbox descriptor, validates the complete package,
+scans every file and applies it to a local worktree. All 1,024 block files and
+the task manifest arrive. `tracemalloc` measured 2,901,898 retained Python bytes
+and a 15,053,494-byte peak across these operations in the full-suite run.
+
+Production selection and publication retain file metadata and hash-bound file
+views; each content access rereads and verifies one exact file. They do not
+retain the entire task body or serialize a complete task-sized JSON payload.
+The full feed follows the same file-backed package path and stages packages
+one at a time. Metadata, the current manifest and matching results still scale
+with their actual descriptors. These are Python allocation observations, not
+an RSS ceiling or a constant-memory claim.
+
+The probe also found and removed an avoidable allocation: requesting the
+100 MiB platform ceiling from `BufferedReader` reserved that much memory for
+each 16 KiB block before EOF. The reader now requests the observed file size
+plus one byte and rejects concurrent size or digest changes. A changed frozen
+file fails during worktree application before remote publication, and FIFO input fails before opening a blocking
+stream. A frozen task remains readable after the mutable current generation
+is retired; after successful publication its staging lifetime ends.
+
+```sh
+PYTHONPATH=. python -m pytest -q tests/test_streamed_publication.py
+```
+
+The one-task size in this probe is a measurement workload, not an admission
+limit. No transcript, model, remote API or live contribution was used. The
+existing individual GitHub file envelope remains distinct from the per-flush
+grouping budget; a complete legal task may exceed that grouping budget.

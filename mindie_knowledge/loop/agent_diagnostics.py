@@ -26,7 +26,15 @@ def root():
 
 def _open(create=False):
     path = root() / 'agent-delivery.sqlite3'
-    if not create and not path.exists():
+    marker = path.with_name(path.name + '.owner')
+    expected = 'mindie-agent-delivery/1\n'
+    existed = path.exists()
+    if marker.is_symlink() or (marker.exists() and (not marker.is_file() or marker.stat().st_size != len(expected)
+                                                   or marker.read_text(encoding='utf-8') != expected)):
+        raise ValueError('diagnostic projection ownership marker is invalid')
+    if not existed and marker.exists():
+        raise ValueError('diagnostic delivery state is missing; pending incidents were not rebuilt')
+    if not create and not existed:
         return None
     if path.is_symlink() or (path.exists() and not path.is_file()):
         raise ValueError('diagnostic projection must be a regular local file')
@@ -34,7 +42,27 @@ def _open(create=False):
     db = sqlite3.connect(path, timeout=0.1)
     try:
         db.row_factory = sqlite3.Row
-        db.execute('CREATE TABLE IF NOT EXISTS pending (key TEXT PRIMARY KEY, generation INTEGER NOT NULL, delivered INTEGER NOT NULL, value TEXT NOT NULL)')
+        db.execute('BEGIN IMMEDIATE')
+        columns = {row[1] for row in db.execute('PRAGMA table_info(pending)')}
+        if not columns:
+            if existed or marker.exists():
+                raise ValueError('diagnostic delivery schema is missing; pending incidents were not rebuilt')
+            marker.write_text(expected, encoding='utf-8')
+            marker.chmod(0o600)
+            db.execute('CREATE TABLE pending (key TEXT PRIMARY KEY, generation INTEGER NOT NULL, delivered INTEGER NOT NULL, value TEXT NOT NULL)')
+        expected_columns = {
+            'key': ('key', 'TEXT', 0, None, 1),
+            'generation': ('generation', 'INTEGER', 1, None, 0),
+            'delivered': ('delivered', 'INTEGER', 1, None, 0),
+            'value': ('value', 'TEXT', 1, None, 0),
+        }
+        actual_columns = {row[1]: tuple(row[1:]) for row in db.execute('PRAGMA table_info(pending)')}
+        if any(actual_columns.get(name) != value for name, value in expected_columns.items()):
+            raise ValueError('diagnostic delivery schema or constraints are incomplete')
+        if not marker.exists():
+            marker.write_text(expected, encoding='utf-8')
+            marker.chmod(0o600)
+        db.commit()
         path.chmod(0o600)
         return db
     except BaseException:

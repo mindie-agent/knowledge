@@ -143,6 +143,7 @@ def test_failed_first_send_then_new_observation_is_a_creation(tmp_path):
         built = build_batch(store, settings=settings)
         batch_id = built[0]
 
+
         class RefusedTransport(FileTransport):
             def create_pull_request(self, repo, **kwargs):
                 from mindie_knowledge.community.common import CommunityError
@@ -150,8 +151,8 @@ def test_failed_first_send_then_new_observation_is_a_creation(tmp_path):
                 raise CommunityError("HTTP 403: token lacks authority")
 
         engine.community = {
-            "submit_batch": lambda batch, cfg, sd, cancel=None: submit_batch(
-                batch, cfg, sd, cancel=cancel,
+            "submit_batch": lambda batch, cfg, sd, cancel=None, authority_guard=None: submit_batch(
+                batch, cfg, sd, cancel=cancel, authority_guard=authority_guard,
                 transport=RefusedTransport(store.root / "outbox" / "dev-github.json",
                                            {REPO: remote_url}),
             ),
@@ -277,6 +278,9 @@ def test_rejected_pr_quarantines_its_material_and_new_entries_flow(tmp_path):
         )
         built = build_batch(store, settings=settings)
         batch_id = built[0]
+        # Retain this small caller fixture for the resend check. Runtime file
+        # views expire with resolved staging and keep no old bodies in RAM.
+        rejected_payload = dict(built[2], files=[dict(item) for item in built[2]['files']])
 
         class LostResponse(FileTransport):
             def create_pull_request(self, repo, **kwargs):
@@ -284,8 +288,8 @@ def test_rejected_pr_quarantines_its_material_and_new_entries_flow(tmp_path):
                 raise UnknownOutcome("connection lost after PR creation")
 
         engine.community = {
-            "submit_batch": lambda batch, cfg, sd, cancel=None: submit_batch(
-                batch, cfg, sd, cancel=cancel,
+            "submit_batch": lambda batch, cfg, sd, cancel=None, authority_guard=None: submit_batch(
+                batch, cfg, sd, cancel=cancel, authority_guard=authority_guard,
                 transport=LostResponse(store.root / "outbox" / "dev-github.json",
                                        {REPO: remote_url}),
             ),
@@ -332,7 +336,7 @@ def test_rejected_pr_quarantines_its_material_and_new_entries_flow(tmp_path):
         assert "maintainer refused" not in content
         # The rejected batch is never auto-resent; explicit retry remains the
         # only operator escape.
-        again = submit_batch(built[2], settings.as_dict(), store.root / "outbox",
+        again = submit_batch(rejected_payload, settings.as_dict(), store.root / "outbox",
                              transport=_transport(store, remote_url))
         assert again["status"] == "rejected"
     finally:
@@ -364,8 +368,8 @@ def test_unknown_write_confirmed_by_ancestry_after_head_advances(tmp_path):
                 raise UnknownOutcome("connection lost after push")
 
         engine.community = {
-            "submit_batch": lambda batch, cfg, sd, cancel=None: submit_batch(
-                batch, cfg, sd, cancel=cancel,
+            "submit_batch": lambda batch, cfg, sd, cancel=None, authority_guard=None: submit_batch(
+                batch, cfg, sd, cancel=cancel, authority_guard=authority_guard,
                 transport=LostPush(store.root / "outbox" / "dev-github.json",
                                    {REPO: remote_url}),
             ),
@@ -471,8 +475,8 @@ def test_reconcile_recovers_actual_file_identity_after_response_loss(tmp_path):
                 raise UnknownOutcome("connection lost after push")
 
         engine.community = {
-            "submit_batch": lambda batch, cfg, sd, cancel=None: submit_batch(
-                batch, cfg, sd, cancel=cancel,
+            "submit_batch": lambda batch, cfg, sd, cancel=None, authority_guard=None: submit_batch(
+                batch, cfg, sd, cancel=cancel, authority_guard=authority_guard,
                 transport=LostUpdate(store.root / "outbox" / "dev-github.json",
                                      {REPO: remote_url}),
             ),
@@ -538,8 +542,8 @@ def test_transient_environment_failure_resubmits_the_stored_batch(tmp_path):
             raise TransientError("git clone failed: could not resolve host")
 
         engine.community = {
-            "submit_batch": lambda batch, cfg, sd, cancel=None: submit_batch(
-                batch, cfg, sd, cancel=cancel,
+            "submit_batch": lambda batch, cfg, sd, cancel=None, authority_guard=None: submit_batch(
+                batch, cfg, sd, cancel=cancel, authority_guard=authority_guard,
                 transport=_transport(store, remote_url),
             ),
             "reconcile_batch": reconcile_batch,

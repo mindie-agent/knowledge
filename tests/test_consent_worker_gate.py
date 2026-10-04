@@ -177,8 +177,7 @@ def _world(tmp_path, *, enabled, consent):
         admission=Admission(admission),
         transcript_adapter=parser,
     )
-    when = max(parsed.enabled_at or 0, engine.admission.active_lease(SESSION)['activated_at'],
-               store.capture_floor) + 1
+    when = max(parsed.enabled_at or 0, engine.admission.active_lease(SESSION)['activated_at']) + 1
     write_transcript(PARSER_NAME, log, SESSION, [TOKEN], when)
     world = {
         "store": store,
@@ -253,7 +252,7 @@ def test_non_contribute_consent_stops_read_and_model_while_enabled(tmp_path, con
         _cleanup(world)
 
 
-def _assert_skipped(world, captured):
+def _assert_faulted(world, captured):
     reads = world["parser"]._grok_core_calls["n"]
     spawns = world["marker"].read_text().count("x") if world["marker"].exists() else 0
     evidence = {
@@ -263,7 +262,8 @@ def _assert_skipped(world, captured):
         "reads": reads,
         "model_spawns": spawns,
     }
-    assert captured.get("status") == "skipped", evidence
+    assert captured.get("status") == "failed", evidence
+    assert captured.get("error_code") == "authority_unavailable", evidence
     assert not captured.get("id"), evidence
     assert (reads, spawns) == (0, 0), evidence
     assert TOKEN not in "\n".join(entry_documents(world["store"])), evidence
@@ -276,7 +276,7 @@ def test_malformed_gate_skips_a_new_stop(tmp_path, consent):
     world = _world(tmp_path, enabled=True, consent=consent)
     try:
         captured = _stop(world)
-        _assert_skipped(world, captured)
+        _assert_faulted(world, captured)
     finally:
         _cleanup(world)
 

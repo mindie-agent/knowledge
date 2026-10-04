@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import tempfile
@@ -15,6 +16,7 @@ from pathlib import Path
 
 from mindie_knowledge.community.batch import check_path
 from mindie_knowledge.community.common import MAX_FILE_BYTES, canonical
+from .file_source import FileText
 
 STAGING_SCHEMA = "mindie-staged-contribution/1"
 
@@ -39,7 +41,7 @@ def metadata_only(batch: dict) -> dict:
     """Return a JSON-safe outbox descriptor, with no file contents."""
     value = {key: item for key, item in batch.items() if key != "files"}
     value["files"] = [
-        {key: item for key, item in file.items() if key != "content"}
+        {key: file[key] for key in file if key != "content"}
         for file in batch["files"]
     ]
     return value
@@ -91,7 +93,7 @@ def load_batch_payload(root, row: dict) -> dict:
     ``root`` may be the state Path or Store. ``row`` may be an outbox row
     containing its JSON ``batch`` descriptor, or the descriptor itself.
     """
-    root = Path(root.root if hasattr(root, "root") else root)
+    root = Path(root if isinstance(root, (str, os.PathLike)) else root.root)
     descriptor = row.get("batch", row)
     if isinstance(descriptor, str):
         descriptor = json.loads(descriptor)
@@ -112,10 +114,9 @@ def load_batch_payload(root, row: dict) -> dict:
         file = target / "files" / path
         if file.is_symlink() or not file.is_file() or not file.resolve().is_relative_to(target.resolve()):
             raise ValueError(f"missing or unsafe frozen contribution file: {path}")
-        raw = file.read_bytes()
-        if len(raw) > MAX_FILE_BYTES or hashlib.sha256(raw).hexdigest() != item["sha256"]:
-            raise ValueError(f"frozen contribution file identity mismatch: {path}")
-        result["files"].append(dict(item, content=raw.decode("utf-8")))
+        source = FileText(file, root=target, sha256=item['sha256'], metadata=item)
+        source['content']  # Validate immediately and again on every later use.
+        result['files'].append(source)
     return result
 
 
