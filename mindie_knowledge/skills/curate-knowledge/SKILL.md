@@ -33,7 +33,7 @@ the knowledge service, or authorize a public contribution.
 ## Ordinary use (not this skill)
 
 - `knowledge_query(query?, limit?, conditions?, continuation?)` — search current blocks and group resolvable reference echoes. Each hit has a readable block `ref` and separate observed `feedback_ref`; related matches can be requested with their continuation. Published revisions win; `supplemental: true` marks a private draft overlay.
-- `knowledge_explain(ref)` — current task navigation for `mindie://DOMAIN/TASK`, or one current member block for `mindie://DOMAIN/TASK/blocks/BLOCK@FILE_SHA256`. Follow `first_block_ref`, `previous_block_ref` and `next_block_ref` as needed. Current navigation is advisory and separate from fixed block bytes. Appends preserve unchanged block references; removed blocks and withdrawn tasks are unavailable, while required missing or corrupt files are operational failures.
+- `knowledge_explain(ref)` — current task navigation for `mindie://DOMAIN/TASK`, or one current member block for `mindie://DOMAIN/TASK/blocks/<block-id>@<file-sha256>`. Follow `first_block_ref`, `previous_block_ref` and `next_block_ref` as needed. Current navigation is advisory and separate from fixed block bytes. Appends preserve unchanged block references; removed blocks and withdrawn tasks are unavailable, while required missing or corrupt files are operational failures.
 - `knowledge_feedback(ref, rating, reason?)` — optional up/down using the observation's separate `feedback_ref`, with an optional one-line reason. Never required; silence is not a signal; there is no follow-up form.
 
 Calls are bound to the host's per-call task metadata; a host that does not

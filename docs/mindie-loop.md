@@ -143,7 +143,7 @@ universally applicable.
 
 - `mindie://DOMAIN/TASK`: current fallible navigation, `current_revision`,
   `block_count` and `first_block_ref`; it returns no assembled body.
-- `mindie://DOMAIN/TASK/blocks/BLOCK@FILE_SHA256`: one current member block,
+- `mindie://DOMAIN/TASK/blocks/<block-id>@<file-sha256>`: one current member block,
   its `content`, `previous_block_ref` and `next_block_ref`. `current_navigation`
   and `current_revision` describe the current task separately from the fixed
   block bytes. Appending blocks or revising navigation preserves unchanged
@@ -188,7 +188,7 @@ readable references and feedback references. Failed reuse and corrections remain
 readable; a citation group and its `related_count` express navigation, not factual
 confidence or independent corroboration. Citation counts never increase scores.
 
-Historical `mindie://DOMAIN/TASK@REVISION` literals stay unchanged in `cites`.
+Historical `mindie://DOMAIN/<task-id>@<observed-revision>` literals stay unchanged in `cites`.
 When that revision is unavailable, `citation_status=version_unavailable` and a
 separate `current_source_ref` may identify the current task for navigation and
 query-specific grouping. It does not make the historical bytes readable. Multiple
@@ -212,7 +212,7 @@ without storing durable query results or rereading unchanged block bodies.
 `knowledge_feedback(ref, rating, reason?)` records one current `up`/`down`
 vote per opaque root and entry (a new vote replaces the old, including its
 revision). Supply the exact `feedback_ref` returned with the observation:
-`mindie://DOMAIN/TASK@REVISION`. Task and block read references are rejected,
+`mindie://DOMAIN/<task-id>@<observed-revision>`. Task and block read references are rejected,
 so a delayed vote cannot silently attach to a newer task revision. A minimal
 identity receipt retains only task/revision hashes after old packages are
 pruned; voting does not read or retain historical bodies. The reason is optional,
