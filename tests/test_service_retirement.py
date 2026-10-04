@@ -137,3 +137,21 @@ def test_known_stop_survives_retirement_receipt_cleanup_failure(tmp_path, monkey
     assert result['idle'] and result['service'] == 'stopped' and result['cleanup_failed']
     assert result['retirement']['status'] == 'retired'
     assert lifecycle.inspect_retirement(path)['status'] == 'retiring'
+
+    assert result['cleanup_error'] == dict(stage='retirement_receipt', error_type='OSError',
+                                           errno=None, operation_completed=True)
+
+
+def test_known_stop_retains_failed_consumer_observation_stage(tmp_path, monkeypatch):
+    path, config = configuration(tmp_path)
+    cli.ensure_service(path)
+    def unavailable(_config):
+        raise PermissionError(13, 'private path must not appear in result')
+    monkeypatch.setattr(lifecycle, '_consumer_state', unavailable)
+    result = lifecycle.retire_service(path)
+    assert result['idle'] and result['service'] == 'stopped'
+    assert result['cleanup_failed']
+    assert result['cleanup_error'] == dict(stage='consumer_ownership', error_type='PermissionError',
+                                           errno=13, operation_completed=True)
+    assert lifecycle.inspect_retirement(path)['status'] == 'retired'
+    assert 'private path' not in json.dumps(result)

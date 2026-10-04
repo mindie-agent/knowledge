@@ -142,13 +142,17 @@ def retire_service(config_path):
             receipt['status'] = 'retired'
             try:
                 _atomic_write_text(_marker(config_path), json.dumps(receipt, sort_keys=True) + '\n')
-            except OSError:
-                return dict(outcome, retirement=receipt, cleanup_failed=True)
+            except OSError as exc:
+                return dict(outcome, retirement=receipt, cleanup_failed=True,
+                            cleanup_error=dict(stage='retirement_receipt', error_type=type(exc).__name__,
+                                               errno=exc.errno, operation_completed=True))
             try:
                 while _consumer_state(config):
                     time.sleep(.05)
-            except OSError:
-                return dict(outcome, retirement=receipt, cleanup_failed=True)
+            except OSError as exc:
+                return dict(outcome, retirement=receipt, cleanup_failed=True,
+                            cleanup_error=dict(stage='consumer_ownership', error_type=type(exc).__name__,
+                                               errno=exc.errno, operation_completed=True))
             return dict(outcome, retirement=receipt)
         finally:
             admission.release()
