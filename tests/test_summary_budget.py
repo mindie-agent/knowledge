@@ -14,6 +14,7 @@ from mindie_knowledge.loop.engine import Engine
 from mindie_knowledge.loop.transcript_capture import _admit_summary
 from mindie_knowledge.materials.summarizer import SummaryLedger, SummaryConflict, outcome
 from test_material_summarizer import request, returned
+from test_public_transcript import pipeline, scanner, append
 
 
 @pytest.fixture
@@ -72,6 +73,7 @@ def test_returned_result_survives_restart_with_no_model_replay(store, ledger, mo
     monkeypatch.setattr(engine, 'revoke_stale', lambda: None)
     monkeypatch.setattr(engine.thread, 'start', lambda: None)
     monkeypatch.setattr(engine.outbox_thread, 'start', lambda: None)
+    monkeypatch.setattr(engine.summary_thread, 'start', lambda: None)
     engine.start()
     resumed = ledger.get(attempt['attempt_id'])
     assert resumed['status'] == 'returned'
@@ -107,3 +109,32 @@ def test_legacy_configuration_is_rejected_and_public_pipeline_is_default(tmp_pat
         validate_config(dict(config, capture_mode='organize'))
     with pytest.raises(ValueError, match='only public-transcript'):
         Engine(store, capture_mode='organize')
+
+
+def test_service_without_summary_command_fails_due_work_and_becomes_idle(pipeline):
+    engine, store, path = pipeline
+    append(path, "Anonymous K3-04 resumed material requires an index before publication.")
+    engine.start()
+    try:
+        engine.capture(session_id="manual-A", turn_id="missing-summary-worker", transcript_path=str(path))
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            with store.lock:
+                row = store.db.execute("SELECT summary_status,summary_detail FROM transcript_tasks").fetchone()
+            if row and row["summary_status"] == "failed":
+                break
+            time.sleep(.05)
+        assert row and row["summary_status"] == "failed"
+        assert row["summary_detail"] == "index-summary failed: configuration: summary worker is not configured"
+        assert engine.status()["summary_usage"]["model_calls"] == 0
+        from mindie_knowledge.loop.export import build_batch
+        assert build_batch(store, settings=engine._settings()) is None
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            idle = engine.stop_if_idle()
+            if idle["idle"]:
+                break
+            time.sleep(.05)
+        assert idle["idle"] and idle["due_summary"] is False
+    finally:
+        engine.shutdown()

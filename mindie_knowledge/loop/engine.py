@@ -522,8 +522,10 @@ class Engine:
         self.revoke_stale()
         self.thread.start()
         self.outbox_thread.start()
-        if self.summary_command:
-            self.summary_thread.start()
+        # Missing configuration is a required-stage failure. The queue worker
+        # must settle it explicitly rather than leaving due material pending
+        # forever and preventing an otherwise idle service from stopping.
+        self.summary_thread.start()
 
     def revoke_stale(self):
         """Restart/poll-edge safety net: when sharing is enabled, pending
