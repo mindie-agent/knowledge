@@ -148,7 +148,7 @@ def test_checkpoint_resume_skips_reverified_blobs(tmp_path, monkeypatch):
     for path, text in task_files(71).items():
         file = repo / path
         file.parent.mkdir(parents=True, exist_ok=True)
-        file.write_text(text)
+        file.write_bytes(text.encode('utf-8'))
     git(repo, 'add', '.')
     git(repo, 'commit', '-qm', 'more')
     assert pc.validate(repo, git(repo, 'rev-parse', 'HEAD'), 'vllm-ascend', state=state)['entries'] == 71

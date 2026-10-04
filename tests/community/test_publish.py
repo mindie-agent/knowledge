@@ -115,6 +115,41 @@ def test_failed_revision_never_resent(settings, state_dir, transport):
     assert retried["status"] == "submitted"
 
 
+@pytest.mark.parametrize("timed_out", [False, True])
+def test_existing_branch_checkout_failure_stops_all_writes(
+    settings, state_dir, transport, remote_url, monkeypatch, timed_out,
+):
+    from mindie_knowledge.community import gitops
+    from mindie_knowledge.community.common import ProcessResult
+
+    class RefusedPullRequest(type(transport)):
+        def create_pull_request(self, repo, **kwargs):
+            raise CommunityError("synthetic PR permission refusal")
+
+    batch = make_batch("checkout-failure", [entry_file(make_entry())])
+    first = submit_batch(batch, settings, state_dir,
+                         transport=RefusedPullRequest(transport.path, transport.remotes))
+    assert first["status"] == "failed", first
+    branch = "mindie-contrib/npu/checkout-failure"
+    before = git(["ls-remote", remote_url, f"refs/heads/{branch}"])
+    assert before
+    real_run = gitops.run_argv
+
+    def failed_checkout(argv, **kwargs):
+        if "checkout" in argv:
+            return ProcessResult(128, b"", b"synthetic existing checkout failure", timed_out)
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(gitops, "run_argv", failed_checkout)
+    for name in ("apply_files", "stage_and_commit", "push_branch"):
+        monkeypatch.setattr(gitops, name, lambda *_args, **_kwargs: pytest.fail("write after failed checkout"))
+    result = submit_batch({**batch, "explicit_retry": True}, settings, state_dir, transport=transport)
+    assert result["status"] == ("unavailable" if timed_out else "failed"), result
+    assert ("timed out" if timed_out else "synthetic existing checkout failure") in result["detail"]
+    assert git(["ls-remote", remote_url, f"refs/heads/{branch}"]) == before
+    assert transport.list_open_pull_requests(settings["repository"], deadline=_deadline()) == []
+
+
 def test_missing_publication_executable_resumes_identical_batch_after_repair(
     settings, state_dir, transport, tmp_path,
 ):

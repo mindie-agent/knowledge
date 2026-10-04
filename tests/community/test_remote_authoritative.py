@@ -67,7 +67,7 @@ def _branch_task(remote_url, branch, task_id, tmp_path, name):
     work = tmp_path / name
     git(["clone", "--quiet", "-b", branch, remote_url, str(work)])
     root = work / "tasks" / task_id
-    files = {str(path.relative_to(root)): path.read_text(encoding="utf-8")
+    files = {path.relative_to(root).as_posix(): path.read_bytes().decode("utf-8")
              for path in root.rglob("*.md")}
     validate_package_files(files, "npu")
     return "\n".join(files.values())
@@ -82,7 +82,7 @@ def _bot_package(remote_url, branch, doc, tmp_path, name):
     for item in package_files(doc):
         target = work / item["path"]
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(item["content"], encoding="utf-8")
+        target.write_bytes(item["content"].encode("utf-8"))
     git(["add", "-A"], cwd=work)
     git(["-c", "user.name=bot", "-c", "user.email=bot@example.invalid",
          "commit", "-m", "correct current task package"], cwd=work)

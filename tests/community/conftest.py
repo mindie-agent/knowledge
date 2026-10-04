@@ -43,6 +43,37 @@ def git(argv, cwd=None):
     return result.stdout.strip()
 
 
+def commit_tree_file(repository, parent, path, content):
+    """Add a Git path without asking the host filesystem to represent it."""
+    def object_git(*args, data=None):
+        result = subprocess.run(
+            ["git", *args], cwd=repository, input=data, capture_output=True,
+            env={**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+                 "GIT_AUTHOR_NAME": "fixture", "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
+                 "GIT_COMMITTER_NAME": "fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid"},
+        )
+        assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
+        return result.stdout
+
+    blob = object_git("hash-object", "-w", "--stdin", data=content).strip()
+
+    def replace(tree, parts):
+        records = [record for record in object_git("ls-tree", "-z", tree).split(b"\0") if record]
+        entries = {record.partition(b"\t")[2]: record for record in records}
+        name = parts[0]
+        if len(parts) == 1:
+            entries[name] = b"100644 blob " + blob + b"\t" + name
+        else:
+            child = entries[name].partition(b"\t")[0].split()[2].decode("ascii")
+            updated = replace(child, parts[1:])
+            entries[name] = b"040000 tree " + updated + b"\t" + name
+        return object_git("mktree", "-z", data=b"\0".join(entries.values()) + b"\0").strip()
+
+    tree = replace(parent + "^{tree}", path.encode("utf-8").split(b"/"))
+    return object_git("commit-tree", tree.decode("ascii"), "-p", parent,
+                      data=b"Add unsupported task path\n").strip().decode("ascii")
+
+
 def make_remote(tmp_path: Path, name: str) -> str:
     """A real bare remote with one initial commit on main."""
     bare = tmp_path / f"{name}.git"

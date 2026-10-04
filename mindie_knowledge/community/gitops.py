@@ -25,6 +25,7 @@ from .common import (
 from mindie_knowledge.gitread import with_windows_longpaths
 
 MAX_GIT_OUTPUT = 256 * 1024
+_CANONICAL_CHECKOUT = ["-c", "core.autocrlf=false", "-c", "core.eol=lf"]
 
 # stderr shapes that mean the environment (network/DNS/rate limit), not the
 # content or the authorization. Only these make an attempt retryable as
@@ -107,7 +108,11 @@ def _git(
     env: Mapping[str, str] | None = None,
     input_bytes: bytes | None = None,
 ) -> str:
-    remaining = deadline.step(f"git {argv[0]}")
+    command_index = 0
+    while argv[command_index] == "-c":
+        command_index += 2
+    operation = argv[command_index]
+    remaining = deadline.step(f"git {operation}")
     result = run_argv(
         ["git", *argv],
         timeout=min(DEFAULT_GIT_OP_SECONDS, remaining),
@@ -118,13 +123,13 @@ def _git(
     )
     if result.timed_out:
         if unknown_on_timeout:
-            raise UnknownOutcome(f"git {argv[0]} timed out; remote outcome unknown")
-        raise TransientError(f"git {argv[0]} timed out")
+            raise UnknownOutcome(f"git {operation} timed out; remote outcome unknown")
+        raise TransientError(f"git {operation} timed out")
     if result.code != 0:
         detail = result.err_text.strip()[:300]
         if _is_transient_git_error(detail):
-            raise TransientError(f"git {argv[0]} failed: {detail}")
-        raise CommunityError(f"git {argv[0]} failed: {detail}")
+            raise TransientError(f"git {operation} failed: {detail}")
+        raise CommunityError(f"git {operation} failed: {detail}")
     return result.out_text
 
 
@@ -139,27 +144,29 @@ def ensure_clone(remote_url: str, work_dir: Path, deadline: Deadline, *, env=Non
         _git(["fetch", "origin", "--prune"], deadline, cwd=work_dir, env=env)
     else:
         work_dir.parent.mkdir(parents=True, exist_ok=True)
-        _git(["clone", "--quiet", remote_url, str(work_dir)], deadline, env=env)
+        # Package hashes describe repository LF bytes. A host's checkout
+        # conversion must not look like an independent maintainer edit.
+        _git([*_CANONICAL_CHECKOUT, "clone", "--quiet", remote_url, str(work_dir)], deadline, env=env)
     return work_dir
 
 
 def checkout_new(work_dir: Path, branch: str, base_ref: str, deadline: Deadline, *, env=None) -> None:
-    _git(["checkout", "--quiet", "-B", branch, base_ref], deadline, cwd=work_dir, env=env)
+    # This is the private publication clone, reconstructed from the proven
+    # remote revision. Force also rematerializes an older clone's CRLF files;
+    # merely changing autocrlf can leave Git's cached worktree bytes untouched.
+    _git([*_CANONICAL_CHECKOUT, "checkout", "--force", "--quiet", "-B", branch, base_ref],
+         deadline, cwd=work_dir, env=env)
 
 
 def checkout_existing(work_dir: Path, branch: str, deadline: Deadline, *, env=None) -> bool:
-    """Check out our existing remote branch tip. False when it does not exist."""
-    remaining = deadline.step("git checkout existing branch")
-    from .common import run_argv as _run
-
-    result = _run(
-        ["git", "checkout", "--quiet", "-B", branch, f"origin/{branch}"],
-        timeout=min(DEFAULT_GIT_OP_SECONDS, remaining),
-        max_output=MAX_GIT_OUTPUT,
+    """Check out the already-proven remote branch; every failure is visible."""
+    _git(
+        [*_CANONICAL_CHECKOUT, "checkout", "--force", "--quiet", "-B", branch, f"origin/{branch}"],
+        deadline,
         cwd=work_dir,
-        env=_resolve_git_env(env),
+        env=env,
     )
-    return result.code == 0
+    return True
 
 
 def tree_sha256(work_dir: Path, path: str) -> str | None:
@@ -221,7 +228,7 @@ def stage_and_commit(
         # autocrlf=true emits a warning for every LF file on staging, which can
         # exhaust the output budget for a valid large batch. Scope this policy
         # to this command; do not rewrite repository or user Git settings.
-        ["-c", "core.autocrlf=false", "add", "--pathspec-from-file=-", "--pathspec-file-nul"],
+        [*_CANONICAL_CHECKOUT, "add", "--pathspec-from-file=-", "--pathspec-file-nul"],
         deadline,
         cwd=work_dir,
         env=env,
@@ -237,8 +244,15 @@ def stage_and_commit(
         cwd=work_dir,
         env=_resolve_git_env(env),
     )
+    if diff.timed_out:
+        raise TransientError("git diff cached timed out")
     if diff.code == 0:
         return None
+    if diff.code != 1:
+        detail = diff.err_text.strip()[:300]
+        if _is_transient_git_error(detail):
+            raise TransientError(f"git diff cached failed: {detail}")
+        raise CommunityError(f"git diff cached failed with exit {diff.code}: {detail}")
     _commit(work_dir, message, deadline, env=env)
     return current_head(work_dir, deadline)
 

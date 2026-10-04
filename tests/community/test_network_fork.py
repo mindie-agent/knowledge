@@ -12,13 +12,15 @@ import time
 import pytest
 
 import json
+import hashlib
+import subprocess
 from urllib.parse import parse_qs, urlsplit
 
 from mindie_knowledge.community import gitops, transport
 from mindie_knowledge.community.batch import contribution_branch
 from mindie_knowledge.community.common import CommunityError, Deadline, finite_epoch
 
-from .conftest import entry_file, package_files, git, make_batch, make_entry
+from .conftest import commit_tree_file, entry_file, package_files, git, make_batch, make_entry
 
 # Extensionless shebang children are a POSIX process mechanism. They are not
 # Windows process coverage.
@@ -281,7 +283,8 @@ def test_open_update_does_not_write_without_proven_head(settings, state_dir, tra
     assert moved != before
 
 
-def test_feed_reads_current_main_without_reconstructing_a_leftover_pr(tmp_path):
+@pytest.mark.parametrize("autocrlf", ["false", "true", "input"])
+def test_feed_reads_current_main_without_reconstructing_a_leftover_pr(tmp_path, autocrlf):
     """A retained PR branch never overrides main's absence or withdrawal."""
     import shutil
     from mindie_knowledge.loop.feed import Feed
@@ -290,11 +293,12 @@ def test_feed_reads_current_main_without_reconstructing_a_leftover_pr(tmp_path):
     remote = make_remote(tmp_path, "source")
     work = tmp_path / "writer"
     git(["clone", "--quiet", remote, str(work)])
+    git(["config", "core.autocrlf", autocrlf], cwd=work)
     doc = make_entry(content="Current source material, independent of old PR state.")
     for item in package_files(doc):
         target = work / item["path"]
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(item["content"], encoding="utf-8")
+        target.write_bytes(item["content"].encode("utf-8"))
     git(["add", "-A"], cwd=work)
     git(["-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
          "commit", "-m", "propose task"], cwd=work)
@@ -304,21 +308,77 @@ def test_feed_reads_current_main_without_reconstructing_a_leftover_pr(tmp_path):
     store = Store(tmp_path / "reader", "npu")
     feed = Feed(store, dict(repository="acme/npu-knowledge", ref="main", domain="npu", url=remote))
     try:
-        assert feed.sync()["entries"] == 0  # open/closed PR flags cannot install a body
+        result = feed.sync()
+        assert result["status"] == "synced", result
+        assert result["entries"] == 0  # open/closed PR flags cannot install a body
         git(["push", "origin", "HEAD:refs/heads/main"], cwd=work)
-        assert feed.sync()["entries"] == 1
+        result = feed.sync()
+        assert result["status"] == "synced", result
+        assert result["entries"] == 1
         assert "Current source material" in store.get(store.ref(doc["entry_id"]))["content"]
         shutil.rmtree(work / "tasks")
         git(["add", "-A"], cwd=work)
         git(["-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
              "commit", "-m", "withdraw task"], cwd=work)
         git(["push", "origin", "HEAD:refs/heads/main"], cwd=work)
-        assert feed.sync()["entries"] == 0
+        result = feed.sync()
+        assert result["status"] == "synced", result
+        assert result["entries"] == 0
         assert store.get(store.ref(doc["entry_id"]))["withdrawn"] is True
         assert git(["ls-remote", remote, "refs/heads/proposal"]).split()[0] == proposed
         assert store.query("Current source material")["results"] == []
     finally:
         store.close()
+
+
+def test_checkout_preserves_package_blobs_under_host_newline_settings(tmp_path, monkeypatch):
+    from .conftest import make_remote
+    from mindie_knowledge.community.publish import _prepare_files
+
+    remote = make_remote(tmp_path, "canonical-source")
+    writer = tmp_path / "writer"
+    git(["clone", "--quiet", remote, str(writer)])
+    files = package_files(make_entry(content="Canonical package bytes stay authoritative.\n"))
+    for item in files:
+        path = writer / item["path"]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(item["content"].encode("utf-8"))
+    git(["add", "-A"], cwd=writer)
+    git(["-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
+         "commit", "-qm", "canonical task"], cwd=writer)
+    git(["push", "origin", "HEAD:refs/heads/main"], cwd=writer)
+    configuration = tmp_path / "host.gitconfig"
+    raw_config = b"[core]\n autocrlf=true\n eol=crlf\n safecrlf=true\n"
+    configuration.write_bytes(raw_config)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(configuration))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+
+    def assert_original_blobs(work):
+        for item in files:
+            blob = subprocess.check_output(["git", "show", "HEAD:" + item["path"]], cwd=work)
+            assert blob == item["content"].encode("utf-8")
+            assert (work / item["path"]).read_bytes() == blob
+            assert gitops.tree_sha256(work, item["path"]) == hashlib.sha256(blob).hexdigest()
+        assert _prepare_files({"files": files}, work)[1] is None
+        assert configuration.read_bytes() == raw_config
+        assert subprocess.check_output(["git", "config", "core.autocrlf"], cwd=work).strip() == b"true"
+
+    fresh = gitops.ensure_clone(remote, tmp_path / "fresh", Deadline(30, 10))
+    assert_original_blobs(fresh)
+    # Simulate a clone produced by the previous release on a Windows-style
+    # host. Updating the command policy alone does not refresh cached files.
+    for operation in ("new", "existing"):
+        legacy = tmp_path / ("legacy-" + operation)
+        subprocess.run(["git", "clone", "--quiet", remote, str(legacy)], check=True)
+        assert b"\r\n" in (legacy / files[0]["path"]).read_bytes()
+        gitops.ensure_clone(remote, legacy, Deadline(30, 10))
+        if operation == "new":
+            gitops.checkout_new(legacy, "proposal", "origin/main", Deadline(30, 10))
+        else:
+            assert gitops.checkout_existing(legacy, "main", Deadline(30, 10))
+        assert_original_blobs(legacy)
+        assert gitops.stage_and_commit(legacy, [item["path"] for item in files],
+                                       "unchanged", Deadline(30, 10)) is None
 
 
 # Recorded public list shape: state closed, merged_at set, no merged field.
@@ -416,7 +476,6 @@ def test_stage_and_commit_many_paths_exceeding_argv_limit(tmp_path):
     paths = [f"wide/{i:04d}-{stem}" for i in range(4300)]
     assert sum(len(path.encode()) + 1 for path in paths) > 1_048_576
     paths.append("wide/name with space.txt")
-    paths.append("wide/name-with\nnewline.txt")
     for path in paths:
         target = work / path
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -424,10 +483,40 @@ def test_stage_and_commit_many_paths_exceeding_argv_limit(tmp_path):
     committed = gitops.stage_and_commit(work, paths, "many paths", Deadline(60, 10))
     assert committed and committed != seeded
     listed = set(git(["ls-files"], cwd=work).splitlines())
-    assert set(paths) - {"wide/name-with\nnewline.txt"} <= listed
+    assert set(paths) <= listed
     modes = gitops.ls_tree(work, committed, Deadline(60, 10))
     assert set(paths) <= set(modes)
     assert set(modes.values()) == {"100644"}
     assert "wide/name with space.txt" in listed
     assert git(["config", "core.autocrlf"], cwd=work) == "true"
     assert gitops.stage_and_commit(work, paths, "unchanged", Deadline(60, 10)) is None
+
+
+def test_tree_reads_preserve_newline_paths_without_host_filenames(tmp_path):
+    from .conftest import make_remote
+    remote = Path(make_remote(tmp_path, "newline-object"))
+    path = "name-with\nnewline.md"
+    body = b"A real Git blob whose name Windows cannot materialize.\n"
+    commit = commit_tree_file(remote, "HEAD", path, body)
+    assert gitops.ls_tree(remote, commit, Deadline(30, 10))[path] == "100644"
+    assert gitops.show_file(remote, commit, path, Deadline(30, 10)) == body.decode("utf-8")
+
+
+@pytest.mark.parametrize("timed_out", [False, True])
+def test_cached_diff_failure_does_not_commit(tmp_path, monkeypatch, timed_out):
+    from mindie_knowledge.community import common
+    path = tmp_path / "file.md"
+    git(["init", "-q"], cwd=tmp_path)
+    path.write_bytes(b"New canonical bytes.\n")
+    real_run = common.run_argv
+
+    def failed_diff(argv, **kwargs):
+        if argv[:4] == ["git", "diff", "--cached", "--quiet"]:
+            return common.ProcessResult(128, b"", b"synthetic cached diff failure", timed_out)
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(common, "run_argv", failed_diff)
+    monkeypatch.setattr(gitops, "_commit", lambda *_args, **_kwargs: pytest.fail("committed after failed diff"))
+    with pytest.raises(CommunityError, match="git diff cached timed out" if timed_out else "synthetic cached diff failure") as caught:
+        gitops.stage_and_commit(tmp_path, [path.name], "must not commit", Deadline(30, 10))
+    assert caught.value.status == ("unavailable" if timed_out else "failed")
