@@ -364,6 +364,8 @@ def test_checkout_preserves_package_blobs_under_host_newline_settings(tmp_path, 
         assert subprocess.check_output(["git", "-c", "core.longpaths=true", "config", "core.autocrlf"], cwd=work).strip() == b"true"
 
     fresh = gitops.ensure_clone(remote, tmp_path / "fresh", Deadline(30, 10))
+    assert not (fresh / files[0]["path"]).exists()
+    gitops.checkout_new(fresh, "proposal", "origin/main", Deadline(30, 10))
     assert_original_blobs(fresh)
     # Simulate a clone produced by the previous release on a Windows-style
     # host. Updating the command policy alone does not refresh cached files.

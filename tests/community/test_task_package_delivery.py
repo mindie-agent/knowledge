@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import closing
 from types import SimpleNamespace
 
 import pytest
@@ -441,7 +442,9 @@ def test_feed_rejects_unusual_task_path_and_preserves_primary_error(settings, st
 
 @pytest.mark.parametrize("remote_change", ["unreferenced-block", "symlink-index", "crlf-index"])
 def test_remote_package_changes_are_never_overwritten(settings, state_dir, transport,
-                                                      remote_url, tmp_path, remote_change):
+                                                      remote_url, tmp_path, remote_change, monkeypatch):
+    from mindie_knowledge.community import gitops
+    from mindie_knowledge.community.ledger import Ledger
     store = Store(tmp_path / "producer", "npu")
     try:
         append_parts(store, "Original task evidence.\n")
@@ -457,23 +460,33 @@ def test_remote_package_changes_are_never_overwritten(settings, state_dir, trans
             # A retained file outside the index is not ours to silently delete.
             commit = commit_tree_file(work, "HEAD", f"tasks/{TASK}/blocks/foreign\nblock.md",
                                       b"Independent maintainer material.\n")
-            git(["update-ref", "HEAD", commit], cwd=work)
         elif remote_change == "symlink-index":
-            index.unlink()
-            index.symlink_to("../../README.md")
+            commit = commit_tree_file(work, "HEAD", f"tasks/{TASK}/index.md",
+                                      b"../../README.md", mode="120000")
         else:
-            index.write_bytes(index.read_bytes().replace(b"\n", b"\r\n"))
-        if remote_change != "unreferenced-block":
-            git(["add", "-A"], cwd=work)
-            git(["-c", "user.name=maintainer", "-c", "user.email=fixture@example.invalid",
-                 "-c", "core.autocrlf=false", "commit", "-m", "change current package"], cwd=work)
+            commit = commit_tree_file(work, "HEAD", f"tasks/{TASK}/index.md",
+                                      index.read_bytes().replace(b"\n", b"\r\n"))
+        git(["update-ref", "HEAD", commit], cwd=work)
         git(["push", "origin", "HEAD"], cwd=work)
         git(["push", "origin", "HEAD:refs/pull/1/head"], cwd=work)
         before = git(["rev-parse", "HEAD"], cwd=work)
         append_parts(store, "Later local evidence awaiting conflict review.\n")
         next_batch = build(store)[2]
+        def no_write(*args, **kwargs):
+            pytest.fail("remote package conflict reached a write or unsupported checkout")
+        for operation in ("apply_files", "stage_and_commit", "push_branch"):
+            monkeypatch.setattr(gitops, operation, no_write)
+        monkeypatch.setattr(transport, "update_pull_request", no_write)
+        if remote_change != "crlf-index":
+            monkeypatch.setattr(gitops, "checkout_new", no_write)
+            monkeypatch.setattr(gitops, "checkout_existing", no_write)
         refused = submit_batch(next_batch, settings, state_dir, transport=transport)
-        assert refused["status"] == "needs_review", refused
+        assert refused["status"] == "needs_review", json.dumps(refused, sort_keys=True)
+        with closing(Ledger(state_dir)) as ledger:
+            row = ledger.get_publication(batch_id, next_batch["revision"])
+            assert row["status"] == "needs_review"
+            steps = {step["step"] for step in ledger.steps_for(batch_id, next_batch["revision"])}
+            assert not steps.intersection({"git:apply-files", "git:commit", "git:push", "github:update-pr"})
         assert git(["ls-remote", remote_url, f"refs/heads/{branch}"]).split()[0] == before
         assert len(transport.list_open_pull_requests(settings["repository"], deadline=Deadline(120, 60))) == 1
     finally:

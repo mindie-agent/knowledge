@@ -293,16 +293,14 @@ def _publish(checked, settings, state_dir, ledger, deadline, transport, *,
         # No checkout, commit, push, or PR write until the API head and the
         # upstream PR ref are the same commit. A retained fork branch is not
         # a substitute, for a fork or for a same-repository PR.
-        proven = _proven_open_head(
+        checkout_ref = _proven_open_head(
             work_dir, prior, branch, settings, read_url, deadline, genv
         )
-        gitops.checkout_new(work_dir, branch, proven, deadline, env=genv)
     elif checked["explicit_retry"] and gitops.remote_tip(remote_url, f"refs/heads/{branch}", deadline, env=genv):
         # Explicit retry with the branch already pushed: resume from the remote
         # tip and its recorded steps instead of re-pushing earlier commits.
-        gitops.checkout_existing(work_dir, branch, deadline, env=genv)
+        checkout_ref = f"origin/{branch}"
         resumed = True
-        ledger.record_step(batch_id, revision, "git:resumed-branch", branch)
     else:
         # A prior attempt of THIS lineage may have pushed the branch before
         # failing (e.g. auth refused the PR creation). Building on top of our
@@ -314,15 +312,28 @@ def _publish(checked, settings, state_dir, ledger, deadline, transport, *,
         if prior_push is not None:
             resumed_files = {item["path"]: item.get("sha256")
                              for item in Ledger.parse_actual_files(prior_push) or []}
-            gitops.checkout_existing(work_dir, branch, deadline, env=genv)
+            checkout_ref = f"origin/{branch}"
             own_resume = True
-            ledger.record_step(batch_id, revision, "git:resume-own-branch", tip)
         else:
-            gitops.checkout_new(work_dir, branch, base_tip, deadline, env=genv)
+            checkout_ref = base_tip
 
-    tree_modes = (gitops.ls_tree(work_dir, "HEAD", deadline, env=genv,
+    # Inspect Git objects before asking the host to materialize them. A path
+    # or mode conflict must stay needs_review even when checkout cannot create
+    # that path (for example a newline filename or symlink on Windows).
+    tree_modes = (gitops.ls_tree(work_dir, checkout_ref, deadline, env=genv,
                                   task_ids=set(checked["task_revisions"]))
                   if checked["task_revisions"] else {})
+    conflict = _task_tree_conflict(checked, tree_modes, own_branch_resume=own_resume,
+                                   resumed_files=resumed_files)
+    if conflict:
+        raise CommunityError(conflict, status="needs_review")
+    if resumed or own_resume:
+        gitops.checkout_existing(work_dir, branch, deadline, env=genv)
+        ledger.record_step(batch_id, revision,
+                           "git:resumed-branch" if resumed else "git:resume-own-branch",
+                           branch if resumed else tip)
+    else:
+        gitops.checkout_new(work_dir, branch, checkout_ref, deadline, env=genv)
     files, conflict = _prepare_files(checked, work_dir, own_branch_resume=own_resume,
                                      resumed_files=resumed_files, tree_modes=tree_modes)
     if conflict:
@@ -421,6 +432,27 @@ def _actual_entry_files(checked, work_dir):
             "revision": revision,
         })
     return actual
+
+
+def _task_tree_conflict(checked, tree_modes, *, own_branch_resume=False, resumed_files=None):
+    """Reject unsupported package shape from object metadata before checkout."""
+    expected = {item["path"] for item in checked["files"]}
+    for path, mode in tree_modes.items():
+        if mode != "100644":
+            return f"{path!r} is not a regular task material file; not overwriting"
+        try:
+            check_path(path)
+        except CommunityError:
+            return f"{path!r} is an unsupported task material path; not checking out"
+        if path not in expected:
+            parts = path.split("/", 2)
+            if (own_branch_resume and path.startswith(f"tasks/{parts[1]}/blocks/")
+                    and (resumed_files or {}).get(path) is not None):
+                # Exact byte identity is still checked after checkout before
+                # deleting a file from our own unconfirmed earlier push.
+                continue
+            return f"{path!r} is outside the new package and has no proven deletion base; not deleting"
+    return None
 
 
 def _prepare_files(checked, work_dir, *, own_branch_resume=False, resumed_files=None, tree_modes=None):

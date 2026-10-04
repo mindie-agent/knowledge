@@ -43,7 +43,7 @@ def git(argv, cwd=None):
     return result.stdout.strip()
 
 
-def commit_tree_file(repository, parent, path, content):
+def commit_tree_file(repository, parent, path, content, *, mode="100644"):
     """Add a Git path without asking the host filesystem to represent it."""
     def object_git(*args, data=None):
         result = subprocess.run(
@@ -62,7 +62,7 @@ def commit_tree_file(repository, parent, path, content):
         entries = {record.partition(b"\t")[2]: record for record in records}
         name = parts[0]
         if len(parts) == 1:
-            entries[name] = b"100644 blob " + blob + b"\t" + name
+            entries[name] = mode.encode("ascii") + b" blob " + blob + b"\t" + name
         else:
             child = entries[name].partition(b"\t")[0].split()[2].decode("ascii")
             updated = replace(child, parts[1:])
@@ -231,4 +231,3 @@ def state_dir(tmp_path):
 def transport(settings, state_dir):
     state_dir.mkdir(parents=True, exist_ok=True)
     return FileTransport(state_dir / "dev-github.json", settings["dev_remotes"])
-

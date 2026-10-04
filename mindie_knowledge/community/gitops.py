@@ -139,14 +139,14 @@ def remote_tip(remote_url: str, ref: str, deadline: Deadline, *, env=None) -> st
 
 
 def ensure_clone(remote_url: str, work_dir: Path, deadline: Deadline, *, env=None) -> Path:
-    """Clone once, fetch afterwards; the clone lives under the private state dir."""
+    """Fetch objects into the private clone, without materializing unvalidated paths."""
     if (work_dir / ".git").is_dir():
         _git(["fetch", "origin", "--prune"], deadline, cwd=work_dir, env=env)
     else:
         work_dir.parent.mkdir(parents=True, exist_ok=True)
         # Package hashes describe repository LF bytes. A host's checkout
         # conversion must not look like an independent maintainer edit.
-        _git([*_CANONICAL_CHECKOUT, "clone", "--quiet", remote_url, str(work_dir)], deadline, env=env)
+        _git([*_CANONICAL_CHECKOUT, "clone", "--no-checkout", "--quiet", remote_url, str(work_dir)], deadline, env=env)
     return work_dir
 
 
