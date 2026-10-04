@@ -194,13 +194,42 @@ def test_cached_runtime_rechecks_schema_identity_value(tmp_path):
             store.status()
 
 
-def test_invalid_parent_is_not_a_never_initialized_read(tmp_path):
+@pytest.mark.parametrize('suffix', ['state.sqlite3', 'missing/nested/state.sqlite3'])
+def test_invalid_parent_is_not_a_never_initialized_read(tmp_path, suffix):
     from mindie_knowledge.owned_state import open_database
     parent = tmp_path / 'not-a-directory'
     parent.write_text('synthetic')
     with pytest.raises(NotADirectoryError):
-        open_database(parent / 'state.sqlite3', schema='test/1', required={},
+        open_database(parent / suffix, schema='test/1', required={},
                       initialize=lambda db: None, initialize_missing=False)
+    assert parent.read_text() == 'synthetic'
+
+
+def test_file_not_found_still_checks_real_parent_kind(tmp_path, monkeypatch):
+    """Windows' lstat error category must not hide the actual file ancestor."""
+    from pathlib import Path
+    from mindie_knowledge.owned_state import open_database
+    parent = tmp_path / 'not-a-directory'
+    parent.write_text('synthetic')
+    path = parent / 'state.sqlite3'
+    original = Path.lstat
+    def missing_category(candidate, *args, **kwargs):
+        if candidate == path:
+            raise FileNotFoundError(str(path))
+        return original(candidate, *args, **kwargs)
+    monkeypatch.setattr(Path, 'lstat', missing_category)
+    with pytest.raises(NotADirectoryError):
+        open_database(path, schema='test/1', required={}, initialize=lambda db: None,
+                      initialize_missing=False)
+    assert parent.read_text() == 'synthetic'
+
+
+def test_never_initialized_nested_read_does_not_create_directories(tmp_path):
+    from mindie_knowledge.owned_state import open_database
+    parent = tmp_path / 'missing' / 'nested'
+    assert open_database(parent / 'state.sqlite3', schema='test/1', required={},
+                         initialize=lambda db: None, initialize_missing=False) is None
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_partial_index_with_same_shape_wrong_predicate_is_not_valid_state(tmp_path):

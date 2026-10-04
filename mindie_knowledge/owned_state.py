@@ -5,6 +5,7 @@ business data and cannot repair a missing database. Existing schema is checked
 before any CREATE, so lost receipt tables never become permission to replay.
 """
 from functools import lru_cache
+import errno
 import os
 from pathlib import Path
 import re
@@ -81,6 +82,17 @@ def _present(path):
     try:
         path.lstat()
     except FileNotFoundError:
+        # Windows also reports ENOENT for a child of a regular file. Confirm
+        # that the closest existing ancestor can contain a missing path before
+        # treating this as a never-initialized store. Other I/O errors escape.
+        for parent in path.parents:
+            try:
+                mode = parent.stat().st_mode
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISDIR(mode):
+                raise NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR), str(parent)) from None
+            break
         return False
     return True  # ENOTDIR/permission/I/O errors must not look like first use.
 
