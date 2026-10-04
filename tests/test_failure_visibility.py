@@ -8,6 +8,73 @@ from mindie_knowledge.community.transport import FileTransport
 from mindie_knowledge.materials.references import MaterialReadError
 
 
+@pytest.mark.parametrize('suffix', ['', 'missing/nested'])
+def test_invalid_diagnostic_root_is_not_no_pending_incidents(tmp_path, monkeypatch, suffix):
+    from mindie_knowledge.loop import agent_diagnostics
+    parent = tmp_path / 'not-a-directory'
+    parent.write_bytes(b'unchanged authority ancestor')
+    monkeypatch.setenv('MINDIE_DIAGNOSTICS_ROOT', str(parent / suffix))
+    with pytest.raises(NotADirectoryError):
+        agent_diagnostics.pending()
+    assert parent.read_bytes() == b'unchanged authority ancestor'
+    assert list(tmp_path.iterdir()) == [parent]
+
+
+def test_unused_diagnostic_read_creates_no_state(tmp_path, monkeypatch):
+    from mindie_knowledge.loop import agent_diagnostics
+    monkeypatch.setenv('MINDIE_DIAGNOSTICS_ROOT', str(tmp_path / 'missing' / 'nested'))
+    assert agent_diagnostics.pending() is None
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_unavailable_diagnostic_ancestors_preserve_original_missing_error(tmp_path, monkeypatch):
+    from pathlib import Path
+    from mindie_knowledge.loop import agent_diagnostics
+    monkeypatch.setenv('MINDIE_DIAGNOSTICS_ROOT', str(tmp_path / 'unavailable'))
+    path = agent_diagnostics.root() / 'agent-delivery.sqlite3'
+    missing = FileNotFoundError('original projection path unavailable')
+    original_lstat, original_stat = Path.lstat, Path.stat
+    def unavailable_path(candidate, *args, **kwargs):
+        if candidate == path:
+            raise missing
+        return original_lstat(candidate, *args, **kwargs)
+    def unavailable_ancestor(candidate, *args, **kwargs):
+        if candidate in path.parents:
+            raise FileNotFoundError('ancestor root unavailable')
+        return original_stat(candidate, *args, **kwargs)
+    monkeypatch.setattr(Path, 'lstat', unavailable_path)
+    monkeypatch.setattr(Path, 'stat', unavailable_ancestor)
+    with pytest.raises(FileNotFoundError) as caught:
+        agent_diagnostics.pending()
+    assert caught.value is missing
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_delivery_projection_can_load_without_installed_core(tmp_path):
+    import subprocess
+    import sys
+    from mindie_knowledge.loop import agent_diagnostics
+    blocked = tmp_path / 'not-a-directory'
+    blocked.write_bytes(b'unchanged ancestor')
+    program = '''import os, runpy, sys
+module = runpy.run_path(sys.argv[1])
+os.environ['MINDIE_DIAGNOSTICS_ROOT'] = sys.argv[2]
+assert module['pending']() is None
+os.environ['MINDIE_DIAGNOSTICS_ROOT'] = sys.argv[3]
+try:
+    module['pending']()
+except NotADirectoryError:
+    pass
+else:
+    raise AssertionError('invalid root became no pending incidents')
+'''
+    result = subprocess.run([sys.executable, '-I', '-S', '-c', program, agent_diagnostics.__file__,
+                             str(tmp_path / 'missing' / 'nested'), str(blocked)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert blocked.read_bytes() == b'unchanged ancestor'
+    assert list(tmp_path.iterdir()) == [blocked]
+
+
 def test_diagnostic_marker_has_canonical_bytes_on_creation_and_adoption(tmp_path, monkeypatch):
     from mindie_knowledge.loop import agent_diagnostics
     monkeypatch.setenv('MINDIE_DIAGNOSTICS_ROOT', str(tmp_path / 'diagnostics'))
