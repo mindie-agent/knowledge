@@ -26,10 +26,13 @@ or configures that bot, and no model is ever called here.
 
 ## Publication semantics
 
-- Batch schema `mindie-contribution/1`; paths restricted to `cases/*.md`,
-  `topics/*.md`, `feedback/*.json`; per-file sha256 and the batch revision
-  digest are re-verified; PR title/body/commit text are deterministic
-  templates (zero model).
+- Batch schema `mindie-contribution/1`; contributions contain complete
+  `tasks/<task-id>/index.md` manifests and their exact declared
+  `tasks/<task-id>/blocks/*.md` sets, or `feedback/*.json`. Task manifests use
+  `mindie-material-task/1` with a `mindie-entry/3` header, blocks use
+  `mindie-material-block/1`, and feedback uses `mindie-feedback/1`. Per-file
+  sha256, package references and revisions, and the batch revision digest are
+  re-verified; PR title/body/commit text are deterministic templates (zero model).
 - Outbound redaction re-scan (core `mindie_knowledge.redact`) covers file
   content, PR title/body and the commit message; findings fail closed and are
   recorded masked.
@@ -47,11 +50,11 @@ or configures that bot, and no model is ever called here.
   PR; unavailable evidence stays `unknown`, never a confirmed failure.
 - Our own open PR is updated in place (fast-forward only, never forced). A
   merged prior PR plus a genuine delta opens a follow-up PR on a fresh
-  branch. Remote content that moved away from the declared base receives only
-  the not-yet-confirmed observation delta onto the current body (the remote
-  body and header stay authoritative); when the delta cannot be proven from
-  confirmed marker identities the batch parks as `needs_review` — nothing is
-  overwritten. A closed-unmerged PR is a proven `rejected` verdict: the
+  branch. Each complete task package updates only its exact declared file
+  bases; remote corrections or withdrawals that conflict with those bases
+  park the candidate as `needs_review`. The publisher does not merge an
+  observation delta into the remote body or restore withdrawn files. A
+  closed-unmerged PR is a proven `rejected` verdict: the
   contributor side quarantines exactly that content instead of resurrecting
   it with a new PR.
 - The upstream repository is the content authority; a fork is only the
