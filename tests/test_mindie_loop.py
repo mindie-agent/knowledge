@@ -353,6 +353,26 @@ def test_disable_while_queued_cancels_without_model(gated, tmp_path):
     assert store.db.execute("SELECT count(*) FROM material_batches").fetchone()[0] == 0
 
 
+def test_reenable_after_disabled_start_clears_cancel(tmp_path):
+    config = tmp_path / "community.json"
+    write_settings(config, enabled=False, roots=[tmp_path])
+    store = Store(tmp_path / "store", "test")
+    engine = Engine(store, settings_path=config)
+    engine.start()
+    try:
+        assert engine._cancel.is_set()
+        enabled = write_settings(config, enabled=True, roots=[tmp_path])
+        for _ in range(40):
+            if engine._generation == enabled.generation:
+                break
+            time.sleep(0.05)
+        assert engine._generation == enabled.generation
+        assert not engine._cancel.is_set()
+    finally:
+        engine.shutdown()
+        store.close()
+
+
 def test_outbox_coalesces_and_disable_cancels_unsent(gated, tmp_path):
     store, engine, _, _ = gated
     doc = draft(store)
