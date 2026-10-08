@@ -571,14 +571,14 @@ def test_v4_store_keeps_old_private_files_inert_and_retains_ownership(tmp_path):
     prior.write_bytes(b'old private state; do not open, migrate or delete')
     before = prior.read_bytes()
     first = Store(tmp_path, 'test')
-    marker = root / "state-v4.sqlite3.owner"
+    marker = first.root / "state-v4.sqlite3.owner"
     identity = marker.read_bytes()
     assert first.query('old private')['results'] == []
     first.close()
     second = Store(tmp_path, 'test')
     assert marker.read_bytes() == identity
     assert prior.read_bytes() == before
-    assert (root / 'state-v4.sqlite3').is_file()
+    assert (first.root / 'state-v4.sqlite3').is_file()
     second.close()
 
 

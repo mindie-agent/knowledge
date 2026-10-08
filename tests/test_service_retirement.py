@@ -52,7 +52,7 @@ def test_retirement_bars_already_spawned_late_helper_and_direct_serve(tmp_path):
                                  'serve', '--config', str(path)], capture_output=True, timeout=5)
         assert direct.returncode != 0 and b'configuration is retired' in direct.stderr
         assert not cli.connection_path(config).exists()
-        assert not (tmp_path / 'data/test/state-v4.sqlite3').exists()
+        assert not (tmp_path / 'data/test/state-v1/state-v4.sqlite3').exists()
     finally:
         if child.poll() is None:
             child.kill()

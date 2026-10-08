@@ -5,6 +5,8 @@ Stop does not migrate the store, open a transcript, or call a model.
 
 from __future__ import annotations
 
+from ..state_layout import state_root
+
 import json
 import sqlite3
 import subprocess
@@ -102,7 +104,7 @@ def prepare_schema(config_path):
 
 
 def _store_path(config):
-    return Path(config["root"]).resolve() / config["domain"] / "state-v4.sqlite3"
+    return state_root(config["root"], config["domain"]) / "state-v4.sqlite3"
 
 
 def _columns(db, table):

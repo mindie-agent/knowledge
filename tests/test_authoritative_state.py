@@ -114,7 +114,7 @@ def test_same_columns_without_authoritative_constraints_cannot_reopen(tmp_path, 
         path, reopen = tmp_path / LEDGER_NAME, lambda: Ledger(tmp_path)
     else:
         Store(tmp_path, 'demo').close()
-        path, reopen = tmp_path / 'demo/state-v4.sqlite3', lambda: Store(tmp_path, 'demo')
+        path, reopen = tmp_path / 'demo/state-v1/state-v4.sqlite3', lambda: Store(tmp_path, 'demo')
     _remove_constraints(path, table)
     before = path.read_bytes()
     with pytest.raises(ValueError, match=table):

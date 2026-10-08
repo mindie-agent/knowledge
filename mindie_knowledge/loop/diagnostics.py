@@ -5,6 +5,8 @@ may inspect a local identity, but this view grants no access and changes no stat
 """
 from __future__ import annotations
 
+from ..state_layout import state_root
+
 import hashlib
 import json
 import os
@@ -446,7 +448,7 @@ def _capture_diagnostic(row, domain):
 
 
 def _store(config, session, result):
-    path = Path(config["root"]) / config["domain"] / "state-v4.sqlite3"
+    path = state_root(config["root"], config["domain"]) / "state-v4.sqlite3"
     try:
         path.stat()
     except FileNotFoundError:

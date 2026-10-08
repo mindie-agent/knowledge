@@ -335,13 +335,12 @@ def test_blocked_consent_keeps_local_retrieval(tmp_path):
         _cleanup(world)
 
 
-def _pending_batch(store, generation):
+def _pending_batch(store, generation, settings_path):
     from mindie_knowledge.loop.export import build_batch
     from mindie_knowledge.loop import settings as settings_mod
     store.create_draft(kind='experience', title='K3 source observation', summary='Reported, unverified.',
                        content='Pending source material retains its uncertainty.', generation=generation)
-    path = store.root.parents[1] / 'community.json'
-    return build_batch(store, settings=settings_mod.load(path))[0]
+    return build_batch(store, settings=settings_mod.load(settings_path))[0]
 
 
 def _submit(tmp_path, consent):
@@ -357,7 +356,7 @@ def _submit(tmp_path, consent):
         "reconcile_batch": lambda *args, **kwargs: {"status": "unknown"},
     }
     generation = json.loads(world["settings"].read_text())["generation"]
-    batch_id = _pending_batch(world["store"], generation)
+    batch_id = _pending_batch(world["store"], generation, world["settings"])
     world["batch_id"] = batch_id
     world["engine"]._submit(world["store"].batch(batch_id))
     return world, called

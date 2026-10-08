@@ -141,7 +141,7 @@ def test_navigation_only_revision_keeps_block_and_observed_feedback_after_restar
     assert current["content"] == observed["content"]
     assert current["current_revision"] != observed["current_revision"]
     assert current["current_navigation"]["title"] == "Corrected investigation"
-    with closing(Store(store.root.parent, DOMAIN)) as reopened:
+    with closing(Store(store.root.parents[1], DOMAIN)) as reopened:
         reads = track_body_reads(monkeypatch)
         vote = reopened.record_vote(root_hash="root", ref=observed["feedback_ref"],
                                     rating="down", reason="Correction", publishable=False)
@@ -166,7 +166,7 @@ def test_lost_revision_authority_is_not_silently_recreated(corpus):
     with closing(sqlite3.connect(store.root / 'state-v4.sqlite3')) as damaged, damaged:
         damaged.execute("DROP TABLE known_revisions")
     with pytest.raises(ValueError, match='known_revisions'):
-        Store(store.root.parent, DOMAIN)
+        Store(store.root.parents[1], DOMAIN)
     assert {path: path.read_bytes() for path in store.materials.root.rglob('*.md')} == before
     with closing(sqlite3.connect(store.root / 'state-v4.sqlite3')) as damaged:
         assert not damaged.execute("SELECT 1 FROM sqlite_master WHERE name='known_revisions'").fetchone()

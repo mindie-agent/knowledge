@@ -17,6 +17,8 @@ path); legacy adapter-config indirection is removed, not aliased.
 
 from __future__ import annotations
 
+from ..state_layout import state_root
+
 import argparse
 import importlib.util
 import json
@@ -211,7 +213,7 @@ def contribution_recovery(config, operation, batch_id):
                 store.close()
         from mindie_knowledge.community.ledger import LEDGER_NAME
 
-        ledger_path = Path(config["root"]) / config["domain"] / "outbox" / LEDGER_NAME
+        ledger_path = state_root(config["root"], config["domain"]) / "outbox" / LEDGER_NAME
         if ledger_path.is_file():
             import sqlite3
 
@@ -232,7 +234,7 @@ def contribution_recovery(config, operation, batch_id):
     store = _open_existing_store(config)
     if store is None:
         raise ValueError("no knowledge store exists for this domain")
-    state_dir = Path(config["root"]) / config["domain"] / "outbox"
+    state_dir = state_root(config["root"], config["domain"]) / "outbox"
     settings = settings_mod.from_engine_config(config)
     try:
         row = store.batch(batch_id)
@@ -293,7 +295,7 @@ def _feeds(config, store):
 
 
 def _open_existing_store(config):
-    path = Path(config["root"]) / config["domain"] / "state-v4.sqlite3"
+    path = state_root(config["root"], config["domain"]) / "state-v4.sqlite3"
     if not path.is_file():
         return None
     return Store(config["root"], config["domain"])

@@ -71,5 +71,29 @@ before publication. Task status tracks indexing progress, not the underlying
 business outcome. Failed and uncertain evidence remains reference material;
 summaries and retrieval scores do not certify it. Explicitly selected historical
 imports and live capture share the same material pipeline. The v4 runtime does
-not automatically open or migrate prior state formats; pre-existing private
+not automatically open prior development state formats. Pre-existing private
 files stay inert until explicitly selected through the supported import path.
+
+## Development and released state
+
+Until the repositories meet the product release criteria and publish normal
+release versions, breaking state changes are allowed repeatedly. There is no
+one-reset limit. Internal package numbers and Git pins used for development
+installation do not declare that coordinated release.
+
+`mindie_knowledge.state_layout` declares the persistent `FORMAT` and the product
+`RELEASE_VERSION`. It remains `None` during development; the release commit sets
+a normal `major.minor.patch` version. State lives in `<root>/<domain>/state-v<FORMAT>`.
+A development format change selects a fresh directory and leaves earlier data
+inert. Configuration and old directories are retained; old receipts are not
+imported into the new development format.
+
+Once a release has successfully opened the state, compatible upgrades reuse
+the same material, cursors, model attempts and publication receipts. Returning
+to a development build does not remove that release boundary. A different
+format must ship an explicit migration before it can consume released state;
+the current implementation refuses it and preserves the old state. Missing or
+damaged layout metadata is an error, never permission to reset. The Harness
+updater uses the read-only compatibility check before retiring its old runtime.
+Future migration code and native release acceptance are still separate work;
+this boundary does not certify an unknown future representation.

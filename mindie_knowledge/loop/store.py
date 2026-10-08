@@ -393,8 +393,22 @@ class Store:
     def __init__(self, root, domain):
         if not isinstance(domain, str) or not documents.DOMAIN_RE.fullmatch(domain):
             raise ValueError("invalid domain")
+        from ..state_layout import prepare_layout
+        try:
+            with prepare_layout(root, domain) as directory:
+                self._open_state(directory, domain)
+        except BaseException as error:
+            for resource in (getattr(self, 'db', None), getattr(self, 'materials', None)):
+                if resource is not None:
+                    try:
+                        resource.close()
+                    except Exception as cleanup:
+                        error.add_note('State initialization cleanup also failed: ' + type(cleanup).__name__)
+            raise
+
+    def _open_state(self, directory, domain):
         self.domain = domain
-        self.root = Path(root).resolve() / domain
+        self.root = Path(directory)
         self.root.mkdir(parents=True, exist_ok=True)
         self.root.chmod(0o700)
         self.lock = threading.RLock()
