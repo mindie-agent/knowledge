@@ -1,6 +1,10 @@
 """Development resets are repeatable; release makes persisted state durable."""
 from contextlib import closing
 import json
+import os
+from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -150,3 +154,47 @@ def test_layout_write_error_survives_later_cleanup_error(tmp_path, monkeypatch):
     with pytest.raises(OSError, match='primary layout write failure') as caught:
         markdown._atomic_write_text(tmp_path / 'layout.json', '{}')
     assert any('cleanup' in note for note in caught.value.__notes__)
+
+
+def test_concurrent_first_open_waits_for_layout_publication(tmp_path):
+    first = '''import sys
+from mindie_knowledge.loop.store import Store
+open_state = Store._open_state
+def held(self, *args):
+    open_state(self, *args)
+    print('database-ready', flush=True)
+    sys.stdin.readline()
+Store._open_state = held
+Store(sys.argv[1], 'demo').close()
+'''
+    second = '''import sys
+from mindie_knowledge.loop.store import Store
+from mindie_knowledge.loop.locks import StartLock
+acquire = StartLock.acquire
+def observed(self, **kwargs):
+    if self.path.name == 'state-layout.lock':
+        print('lock-attempt', flush=True)
+    return acquire(self, **kwargs)
+StartLock.acquire = observed
+Store(sys.argv[1], 'demo').close()
+'''
+    env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]))
+    processes = []
+    try:
+        a = subprocess.Popen([sys.executable, '-c', first, str(tmp_path)], env=env,
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        processes.append(a)
+        assert a.stdout.readline().strip() == 'database-ready'
+        b = subprocess.Popen([sys.executable, '-c', second, str(tmp_path)], env=env,
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        processes.append(b)
+        assert b.stdout.readline().strip() == 'lock-attempt'
+        _, error = a.communicate('release\n', timeout=10)
+        assert a.returncode == 0, error
+        _, error = b.communicate(timeout=10)
+        assert b.returncode == 0, error
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=10)

@@ -69,8 +69,8 @@ def prepare_layout(root, domain):
     from .markdown import _atomic_write_text
     # Validate the configured path before mkdir/resolve can follow a dangling
     # link and turn a broken existing root into a new empty target.
-    state_root(root, domain)
     base = Path(root).absolute() / domain
+    _read(base)
     base.mkdir(parents=True, exist_ok=True)
     lock = StartLock(base / 'state-layout.lock')
     lock.acquire(wait=None)
