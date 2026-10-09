@@ -81,6 +81,8 @@ class Engine:
         self._activity_lock = threading.Lock()
         self._activity = 0
         self._frozen = False
+        self._reported_faults = set()
+        self._fault_lock = threading.Lock()
         # Publication belongs to this package. A broken installation is a
         # startup failure, not a service with silently missing capabilities.
         from mindie_knowledge.community import reconcile_batch, submit_batch
@@ -93,6 +95,21 @@ class Engine:
 
     def _error(self, detail):
         self.errors = (self.errors + [detail])[-20:]
+
+    def _fault(self, operation, stage, category, exception=None):
+        """Deliver known required-stage failures too, once while unchanged."""
+        key = (operation, stage, category)
+        with self._fault_lock:
+            if key not in self._reported_faults:
+                result = failure(operation, stage=stage, category=category, exception=exception,
+                                 reportable=False)
+                if not result.get('delivery_failed'):
+                    self._reported_faults.add(key)
+
+    def _clear_faults(self, operation, stages=None):
+        with self._fault_lock:
+            self._reported_faults.difference_update({key for key in self._reported_faults
+                if key[0] == operation and (stages is None or key[1] in stages)})
 
     def _unexpected(self, operation, stage, exc):
         """Report an unhandled internal error. Expected cancellation, budget,
@@ -123,14 +140,20 @@ class Engine:
         """
         settings = self._settings()
         if not settings.allows_capture():
+            if settings.capture_block_kind() == 'fault':
+                self._fault('knowledge.capture', 'authorization', 'authority_unavailable')
+                return dict(status='failed', reason=settings.contribution_block_reason(),
+                            failed_stage='authorization', error_code='authority_unavailable')
             return dict(status="skipped",
                         reason=settings.contribution_block_reason())
         if self.admission is None:
-            return dict(status="skipped",
+            self._fault('knowledge.capture', 'admission', 'admission_unconfigured')
+            return dict(status="failed",
                         reason="no adapter admission is configured; identity unknown")
         lease = self.admission.active_lease(session_id)
         if lease is None:
-            return dict(status="skipped", reason="session is not bound; invoke the entry once")
+            self._fault('knowledge.capture', 'admission', 'task_unbound')
+            return dict(status="failed", reason="native task association is missing")
         if not lease.get("capture_schema"):
             return dict(status="skipped",
                         reason="adapter lease store predates the capture schema")
@@ -144,7 +167,6 @@ class Engine:
         boundary = max(
             settings.enabled_at,
             activated_at if type(activated_at) in (int, float) else 0,
-            self.store.capture_floor,
         )
         if self._is_frozen():
             return dict(status="skipped",
@@ -254,6 +276,7 @@ class Engine:
         )
 
     def _defer_admission(self, ident):
+        self._fault('knowledge.capture', 'authorization', 'admission_unavailable')
         reason = self.store.continuation_reason(ident) or ""
         if reason == "admission-unreadable":
             self.store.dormant_capture(ident, reason="admission-unreadable")
@@ -269,6 +292,7 @@ class Engine:
         dropped: the capture stays pending with a persisted, capped backoff
         and resumes once the authority is restored and revalidation passes.
         """
+        self._fault('knowledge.capture', 'authorization', 'authority_unavailable')
         reason = self.store.continuation_reason(ident) or ""
         try:
             count = (
@@ -301,7 +325,8 @@ class Engine:
         Returns complete public text or None when there is no material."""
         parser = self.transcript
         if parser is None:
-            self.store.mark_capture(row["id"], "failed", "no transcript adapter is configured")
+            self.store.mark_capture(row["id"], "failed", "no transcript adapter is configured",
+                                    error_code='parser_unconfigured', failed_stage='configuration')
             return None
         boundary = row["boundary"] or settings.enabled_at
         key = str(Path(row["transcript"]).resolve(strict=False))
@@ -323,7 +348,8 @@ class Engine:
             )
 
         if cursor is None and boundary is None:
-            self.store.mark_capture(row["id"], "failed", "no reliable authorization boundary")
+            self.store.mark_capture(row["id"], "failed", "no reliable authorization boundary",
+                                    error_code='authorization_boundary_missing', failed_stage='authorization')
             return None
         start = cursor["finish"] if cursor else 0
         expected = None
@@ -337,6 +363,7 @@ class Engine:
                 self.store.mark_capture(
                     row["id"], "failed",
                     "persisted transcript identity is unusable; not rereading",
+                    error_code='persisted_identity_invalid', failed_stage='identity',
                 )
                 return None
         inc = parser.read_material(
@@ -350,7 +377,7 @@ class Engine:
             self.store.mark_capture(row["id"], "failed", canonical(dict(
                 error="incomplete transcript page; cursor unchanged",
                 records=inc["discarded_records"],
-            )))
+            )), error_code='incomplete_projection')
             return None
         if status == "ok" and inc["text"].strip():
             if not inc.get("timestamps_reliable", True):
@@ -363,6 +390,7 @@ class Engine:
                 )
                 self.store.mark_capture(
                     row["id"], "failed", "unreliable transcript timestamps",
+                    error_code='unreliable_timestamps',
                 )
                 return None
             return inc["text"]
@@ -434,6 +462,7 @@ class Engine:
             )
             self.store.mark_capture(
                 row["id"], "failed", "unknown transcript format",
+                error_code='unknown_transcript_format',
             )
             return None
         if status == "replaced":
@@ -445,22 +474,27 @@ class Engine:
             if region_id is None:
                 self.store.mark_capture(
                     row["id"], "failed", "transcript replaced; cursor not regressed",
+                    error_code='transcript_replaced', failed_stage='identity',
                 )
                 return None
             region["region_id"] = region_id
-            self.store.mark_capture(row["id"], "failed", "transcript replaced or truncated")
+            self.store.mark_capture(row["id"], "failed", "transcript replaced or truncated",
+                                    error_code='transcript_replaced', failed_stage='identity')
             return None
         if status == "wrong-task":
             self.store.mark_capture(row["id"], "failed",
-                                    "transcript identity mismatch; not read")
+                                    "transcript identity mismatch; not read",
+                                    error_code='transcript_identity_mismatch', failed_stage='identity')
             return None
         if status in {
             "invalid-record", "invalid-boundary", "oversize",
         }:
             self.store.mark_capture(row["id"], "failed",
-                                    "public transcript " + status + "; cursor unchanged")
+                                    "public transcript " + status + "; cursor unchanged",
+                                    error_code='transcript_' + status.replace('-', '_'))
             return None
-        self.store.mark_capture(row["id"], "failed", "transcript read failed: " + status)
+        self.store.mark_capture(row["id"], "failed", "transcript read failed: " + status,
+                                error_code='transcript_read_failed')
         return None
 
 
@@ -481,17 +515,25 @@ class Engine:
                 return
             from .transcript_capture import capture
             capture(self, row, text, region)
+            self._clear_faults('knowledge.capture')
         except CursorConflict:
             self._defer_reread(ident)
         except AdmissionUnreadable:
             self._defer_admission(ident)
         except MaintenanceCancelled:
-            self.store.mark_capture(ident, "cancelled", "capture authority revoked")
+            if self.stop.is_set():
+                self.store.defer_capture(ident, due=time.time(),
+                                         reason="service stopped; local work retained")
+            else:
+                self.store.mark_capture(ident, "cancelled", "capture authority revoked")
         except GateFault:
             self._defer_gate_fault(ident)
         except Exception as exc:
             detail = f"{type(exc).__name__}: {exc}"[:1000]
             self._error(detail)
+            self._fault('knowledge.capture', 'local-capture',
+                        'committed_cleanup_failed' if getattr(exc, 'metadata_committed', False)
+                        else 'capture_processing_failed', exc)
             if getattr(exc, "metadata_committed", False):
                 # The body/cursor committed; cleanup is a separate visible fault.
                 self.background_errors["material-cleanup"] = type(exc).__name__
@@ -561,6 +603,7 @@ class Engine:
                         GateFault):
                     continue
                 except Exception as exc:
+                    self._fault('knowledge.capture', 'worker', 'capture_worker_failed', exc)
                     self._unexpected("knowledge.worker", "run", exc)
                     # Stop this thread and leave rows durable. Do not count
                     # errors or start another worker inside the loop.
@@ -577,6 +620,7 @@ class Engine:
                     GateFault):
                 pass
             except Exception as exc:  # never let the worker die silently
+                self._fault('knowledge.capture', 'worker', 'capture_worker_failed', exc)
                 self._unexpected("knowledge.worker", "run", exc)
                 self._error(f"{type(exc).__name__}: {exc}"[:1000])
             finally:
@@ -597,6 +641,7 @@ class Engine:
             try:
                 summarize_due(self)
             except Exception as exc:
+                self._fault('knowledge.summary', 'worker', 'summary_worker_failed', exc)
                 self._unexpected("knowledge.summary", "run", exc)
                 self.background_errors["summary"] = type(exc).__name__
                 self._error(f"summary worker stopped: {type(exc).__name__}")
@@ -652,21 +697,33 @@ class Engine:
             return
         try:
             receipt = self.community["submit_batch"](
-                batch, settings.as_dict(), self.state_dir, cancel=self._cancel
+                batch, settings.as_dict(), self.state_dir, cancel=self._cancel,
+                authority_guard=self.store.db.assert_authority,
             )
         except Exception as exc:
+            self._fault('knowledge.publish', 'submit', 'publication_failed', exc)
             self._unexpected("knowledge.publish", "submit", exc)
-            self.store.mark_batch(
-                batch_row["batch_id"], "unknown", attempted=True,
-                detail=f"{type(exc).__name__}: {exc}"[:500],
-            )
+            try:
+                self.store.mark_batch(
+                    batch_row["batch_id"], "unknown", attempted=True,
+                    detail=f"{type(exc).__name__}: {exc}"[:500],
+                )
+            except Exception as receipt_error:
+                exc.add_note('publication runtime receipt also failed: ' + type(receipt_error).__name__)
+                raise exc from receipt_error
             return
-        self.store.mark_batch(
-            batch_row["batch_id"], receipt.get("status", "unknown"),
-            attempted=True, detail=receipt.get("detail", ""),
-            pr_url=receipt.get("pr_url"), head_sha=receipt.get("head_sha"),
-            actual_files=receipt.get("files"), retry_at=receipt.get("retry_at"),
-        )
+        try:
+            self.store.mark_batch(
+                batch_row["batch_id"], receipt.get("status", "unknown"),
+                attempted=True, detail=receipt.get("detail", ""),
+                pr_url=receipt.get("pr_url"), head_sha=receipt.get("head_sha"),
+                actual_files=receipt.get("files"), retry_at=receipt.get("retry_at"),
+            )
+        except Exception as exc:
+            exc.mindie_publication_result = receipt
+            exc.add_note('publication result was returned before runtime receipt failure: ' + receipt.get('status', 'unknown'))
+            self._fault('knowledge.publish', 'receipt', 'publication_recording_failed', exc)
+            raise
         if receipt.get("status") in Store_confirmed:
             # Confirmed upload retires staging. The candidate remains readable
             # until this revision is confirmed in the synchronized public feed.
@@ -735,7 +792,9 @@ class Engine:
                     # unchanged once the authority is restored; a generation
                     # that genuinely changed is still caught on the next
                     # non-fault tick by the edge below.
-                    pass
+                    if (self.settings_path is not None or self.store.outbox_pending(limit=1)
+                            or self.store.outbox_unresolved(limit=1) or self.store.outbox_unavailable(limit=1)):
+                        self._fault('knowledge.publish', 'authorization', 'authority_unavailable')
                 elif self._generation is not None and generation != self._generation:
                     if generation is None:
                         self._cancel_unsent("sharing disabled; unsent work cancelled")
@@ -746,6 +805,7 @@ class Engine:
                         self._cancel.clear()
                 if block != "fault":
                     self._generation = generation
+                    self._clear_faults('knowledge.publish', {'authorization'})
                 # ReMe refreshes on query or an explicit index operation. The
                 # retired FTS scheduler must not import/index a whole library
                 # under the state lock during capture or service startup.
@@ -795,7 +855,9 @@ class Engine:
                                 self._flush()
                             finally:
                                 self.end_work()
+                self._clear_faults('knowledge.publish', {'worker'})
             except Exception as exc:
+                self._fault('knowledge.publish', 'worker', 'publication_worker_failed', exc)
                 self._unexpected("knowledge.outbox", "tick", exc)
                 self._error(f"outbox: {type(exc).__name__}: {exc}"[:500])
             self.stop.wait(1.0)

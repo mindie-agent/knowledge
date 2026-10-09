@@ -1,8 +1,10 @@
 """Shared helpers for the community package: digests, bounds, subprocesses.
 
-Every external effect in this package is a bounded git or gh subprocess. Contribution text is never interpolated
-into a shell command: payloads travel via stdin temp files or ``--input`` body
-files, and every call carries a deadline plus an output cap.
+Every external effect in this package is an owned git or gh subprocess.
+Contribution text is never interpolated into a shell command: payloads travel
+via stdin temp files or ``--input`` body files. Pipe queues stay bounded;
+callers can explicitly request complete output. Time and operation limits
+apply only when explicitly supplied by the caller.
 """
 
 from __future__ import annotations
@@ -41,12 +43,6 @@ MAX_FILE_BYTES = 100 * 1024 * 1024
 MAX_BATCH_BYTES = 128 * 1024 * 1024
 MAX_TITLE = 240
 MAX_VOTE_REASON = 1000
-
-DEFAULT_TRANSACTION_SECONDS = 120
-DEFAULT_OPERATION_LIMIT = 60
-DEFAULT_GIT_OP_SECONDS = 60
-DEFAULT_API_OP_SECONDS = 30
-
 
 def finite_epoch(value: Any) -> float | None:
     """Unix seconds, or None. Bool, NaN and infinity are not a delay."""
@@ -155,48 +151,65 @@ def check_sha(value: Any, name: str = "commit") -> str:
     return value
 
 
-class Deadline:
-    """Total transaction deadline plus an operation count, shared by one run.
+def optional_timeout(value: Any, name: str = "timeout") -> float | None:
+    """None disables the limit; an explicit duration must be positive and finite."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise CommunityError(f"{name} must be a positive finite number or null")
+    try:
+        seconds = float(value)
+    except (OverflowError, ValueError):
+        raise CommunityError(f"{name} must be a positive finite number or null") from None
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise CommunityError(f"{name} must be a positive finite number or null")
+    return seconds
 
-    The deadline is wall-clock for the whole transaction, not per request;
-    ``step()`` enforces both limits and the cooperative cancel flag before
-    every single external effect.
+
+class Deadline:
+    """Optional caller limits plus cancellation, shared by one transaction.
+
+    There is no default deadline or operation-count limit. When supplied,
+    ``seconds`` is the total wall-clock budget, not a fresh per-request budget.
+    Every external effect still checks the cooperative owner cancel flag.
     """
 
     def __init__(
         self,
-        seconds: float = DEFAULT_TRANSACTION_SECONDS,
-        operations: int = DEFAULT_OPERATION_LIMIT,
+        seconds: float | None = None,
+        operations: int | None = None,
         *,
         cancel: Any = None,
     ):
-        if not (1 <= seconds <= 3600):
-            raise CommunityError("transaction deadline must be 1..3600 seconds")
-        if not (1 <= operations <= 500):
-            raise CommunityError("operation limit must be 1..500")
+        seconds = optional_timeout(seconds, "transaction deadline")
+        if operations is not None and (type(operations) is not int or operations <= 0):
+            raise CommunityError("operation limit must be a positive integer or null")
         self.started = time.monotonic()
-        self.limit = self.started + seconds
+        self.limit = None if seconds is None else self.started + seconds
         self.seconds = seconds
         self.remaining_ops = operations
         self.operations_used = 0
         self.cancel = cancel
 
-    def step(self, name: str = "operation") -> float:
+    def step(self, name: str = "operation") -> float | None:
         if self.cancel is not None:
             is_set = getattr(self.cancel, "is_set", None)
             if callable(is_set) and is_set():
                 raise CommunityError("cancelled by owner", status="failed")
-        self.remaining_ops -= 1
+        if self.remaining_ops is not None:
+            self.remaining_ops -= 1
+            if self.remaining_ops < 0:
+                raise CommunityError(f"operation limit exhausted at {name}", status="failed")
         self.operations_used += 1
-        if self.remaining_ops < 0:
-            raise CommunityError(f"operation limit exhausted at {name}", status="failed")
+        if self.limit is None:
+            return None
         remaining = self.limit - time.monotonic()
         if remaining <= 0:
             raise CommunityError(f"transaction deadline exceeded at {name}", status="unknown")
         return remaining
 
-    def remaining(self) -> float:
-        return max(0.0, self.limit - time.monotonic())
+    def remaining(self) -> float | None:
+        return None if self.limit is None else max(0.0, self.limit - time.monotonic())
 
 
 class ProcessResult:
@@ -239,11 +252,12 @@ def _reader(stream, tag: str, chunks: "queue.Queue", stop: threading.Event, erro
 def run_argv(
     argv: Sequence[str],
     *,
-    timeout: float,
-    max_output: int = 256 * 1024,
+    timeout: float | None = None,
+    max_output: int | None = 256 * 1024,
     input_bytes: bytes | None = None,
     cwd: Path | None = None,
     env: Mapping[str, str] | None = None,
+    inherit_env: bool = True,
     cancel: Any = None,
 ) -> ProcessResult:
     """Run ``argv`` with owned process-tree cleanup and bounded pipes.
@@ -254,7 +268,14 @@ def run_argv(
     child is in flight also kills the tree and raises ``UnknownOutcome``: a
     mid-flight outbound operation must be reconciled read-only afterwards,
     never reported as a clean refusal.
+    ``max_output=None`` retains complete reports with a bounded pipe queue;
+    ``inherit_env=False`` passes only the supplied environment.
     """
+    timeout = optional_timeout(timeout)
+    if max_output is not None and (type(max_output) is not int or max_output < 0):
+        raise CommunityError("max_output must be a nonnegative integer or null")
+    if cancel is not None and callable(getattr(cancel, "is_set", None)) and cancel.is_set():
+        raise CommunityError("cancelled by owner", status="failed")
     argv = [str(a) for a in argv]
     if not argv:
         raise CommunityError("empty argv")
@@ -267,7 +288,7 @@ def run_argv(
         input_file.write(input_bytes)
         input_file.seek(0)
         stdin_target = input_file
-    merged_env = dict(os.environ)
+    merged_env = dict(os.environ) if inherit_env else {}
     if env:
         merged_env.update({str(k): str(v) for k, v in env.items()})
     try:
@@ -303,8 +324,9 @@ def run_argv(
         # resumes it; this is neither content rejection nor uncertain write.
         raise TransientError(f"cannot start {argv[0]}: {exc.strerror or exc}")
 
-    # Bounded in-flight buffer: producers block instead of outgrowing max_output.
-    chunks: "queue.Queue" = queue.Queue(maxsize=max(8, max_output // 4096 + 8))
+    # Complete reports may exceed the usual capture cap, but the producer
+    # queue stays bounded while the consumer drains every byte.
+    chunks: "queue.Queue" = queue.Queue(maxsize=8 if max_output is None else max(8, max_output // 4096 + 8))
     stop = threading.Event()
     read_errors = []
     readers = [
@@ -316,10 +338,10 @@ def run_argv(
     out = bytearray()
     err = bytearray()
     open_streams = len(readers)
-    deadline = time.monotonic() + timeout
+    deadline = None if timeout is None else time.monotonic() + timeout
     timed_out = False
     try:
-        while open_streams:
+        while open_streams or process.poll() is None:
             if read_errors:
                 raise UnknownOutcome("subprocess output read failed; reconcile read-only") from read_errors[0]
             if cancel is not None:
@@ -328,19 +350,19 @@ def run_argv(
                     raise UnknownOutcome(
                         "cancelled while a subprocess was in flight; reconcile read-only"
                     )
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
                 timed_out = True
                 break
             try:
-                tag, chunk = chunks.get(timeout=min(0.1, remaining))
+                tag, chunk = chunks.get(timeout=0.1 if remaining is None else min(0.1, remaining))
             except queue.Empty:
                 continue
             if chunk is None:
                 open_streams -= 1
                 continue
             target = out if tag == "out" else err
-            if len(out) + len(err) + len(chunk) > max_output:
+            if max_output is not None and len(out) + len(err) + len(chunk) > max_output:
                 target.extend(chunk[: max(0, max_output - len(out) - len(err))])
                 timed_out = False
                 raise CommunityError("process output exceeds limit")
@@ -349,7 +371,9 @@ def run_argv(
             raise UnknownOutcome("subprocess output read failed; reconcile read-only") from read_errors[0]
         if timed_out:
             return ProcessResult(-1, bytes(out), bytes(err), True)
-        code = process.wait(timeout=max(0.01, deadline - time.monotonic()))
+        # poll() confirmed exit; keep cancellation live even if the child
+        # closed both pipes before finishing.
+        code = process.wait()
         return ProcessResult(code, bytes(out), bytes(err), False)
     finally:
         stop.set()

@@ -70,3 +70,61 @@ def test_iter_file_records_bounded_chunks(tmp_path):
     records = [b"a" * 100, b"b" * 100, b""]
     path.write_bytes(b"\0".join(records))
     assert list(iter_file_records(path, chunk_size=64)) == records[:-1]
+
+
+def test_default_file_wait_has_no_execution_timeout(tmp_path):
+    out = tmp_path / 'out'
+    run_stdout_to_file([sys.executable, '-c', "import time; time.sleep(.2); print('complete')"], out)
+    assert out.read_bytes().strip() == b'complete'
+
+
+def test_owner_cancel_stops_a_silent_file_process(tmp_path, monkeypatch):
+    import subprocess
+    import threading
+    import mindie_knowledge.gitread as gitread
+    cancel, spawned = threading.Event(), []
+    command = [sys.executable, '-c', 'import time; time.sleep(60)']
+    popen = subprocess.Popen
+    def observed(*args, **kwargs):
+        process = popen(*args, **kwargs)
+        spawned.append(process)
+        return process
+    monkeypatch.setattr(gitread.subprocess, 'Popen', observed)
+    timer = threading.Timer(.2, cancel.set)
+    timer.start()
+    try:
+        with pytest.raises(InterruptedError, match='cancelled by its owner'):
+            run_stdout_to_file(command, tmp_path / 'out', cancel=cancel)
+        # Windows cleanup also launches taskkill through the shared module.
+        # Only the requested operation must start once; every observed helper
+        # must still finish before cancellation returns.
+        assert len([process for process in spawned if process.args == command]) == 1
+        assert all(process.poll() is not None for process in spawned)
+    finally:
+        timer.cancel()
+        timer.join()
+
+
+def test_owner_cancel_interrupts_silent_cat_file_protocol(tmp_path, monkeypatch):
+    import subprocess
+    import threading
+    import mindie_knowledge.gitread as gitread
+    cancel = threading.Event()
+    popen = subprocess.Popen
+    def silent(argv, **kwargs):
+        if argv == ['git', '-C', str(tmp_path), 'cat-file', '--batch']:
+            argv = [sys.executable, '-c', 'import time; time.sleep(60)']
+        return popen(argv, **kwargs)
+    monkeypatch.setattr(gitread.subprocess, 'Popen', silent)
+    reader = CatFileBatch(tmp_path)
+    timer = threading.Timer(.2, cancel.set)
+    timer.start()
+    try:
+        with pytest.raises(InterruptedError, match='cancelled by its owner'):
+            reader.read('a' * 40, max_bytes=1024, cancel=cancel)
+    finally:
+        reader.close()
+        timer.cancel()
+        timer.join()
+    assert reader._process.poll() is not None
+    assert not reader._reader.is_alive()

@@ -5,6 +5,8 @@ may inspect a local identity, but this view grants no access and changes no stat
 """
 from __future__ import annotations
 
+from ..state_layout import state_root
+
 import hashlib
 import json
 import os
@@ -210,6 +212,8 @@ def record_delivery_failure(config, *, stage, cause, capture_id=None, event=None
         status="unresolved", component="knowledge.capture", stage=stage, cause=cause,
         config_fingerprint=_fingerprint(config),
     )
+    from .dfx import failure as report_failure
+    report_failure('knowledge.capture', stage=stage, category=cause.replace('-', '_'), reportable=False)
     if isinstance(capture_id, str) and _SAFE_ID.fullmatch(capture_id):
         payload["capture_id"] = capture_id
     if isinstance(event, str) and _SAFE_ID.fullmatch(event):
@@ -444,7 +448,7 @@ def _capture_diagnostic(row, domain):
 
 
 def _store(config, session, result):
-    path = Path(config["root"]) / config["domain"] / "state-v4.sqlite3"
+    path = state_root(config["root"], config["domain"]) / "state-v4.sqlite3"
     try:
         path.stat()
     except FileNotFoundError:

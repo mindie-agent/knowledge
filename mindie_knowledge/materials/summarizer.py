@@ -28,7 +28,6 @@ MAX_BLOCKS = 8
 MAX_NAVIGATION_BYTES = 4096
 MAX_TITLE_CHARS = 120
 MAX_SUMMARY_CHARS = 1000
-SUMMARY_TIMEOUT = 90
 ID = re.compile(r"[0-9a-f]{64}\Z")
 COUNTERS = ("input_tokens", "cached_input_tokens", "output_tokens")
 
@@ -234,7 +233,7 @@ def policy_identity(*, model, effort, implementation):
                  output_schema=digest(output_schema()),
                  limits=dict(block_bytes=MAX_BLOCK_BYTES, prompt_bytes=MAX_PROMPT_BYTES,
                              response_bytes=MAX_RESPONSE_BYTES, blocks=MAX_BLOCKS,
-                             navigation_bytes=MAX_NAVIGATION_BYTES, timeout=SUMMARY_TIMEOUT))
+                             navigation_bytes=MAX_NAVIGATION_BYTES))
     return {**value, "fingerprint": digest(value)}
 
 
@@ -453,8 +452,30 @@ class SummaryLedger:
     A returned output is necessary recovery state, cleared after application.
     """
 
-    def __init__(self, db: sqlite3.Connection):
-        self.db = db
+    def __init__(self, db: sqlite3.Connection, *, initialize=False):
+        self._db = db
+        from ..owned_state import require_schema
+        if initialize:
+            self._initialize(db)
+        require_schema(db, self._initialize)
+        self._schema_cookie = db.execute('PRAGMA schema_version').fetchone()[0]
+
+    @property
+    def db(self):
+        # Production owns a guarded runtime connection; standalone component
+        # users still cannot keep using a changed paid-attempt table.
+        if hasattr(self._db, 'assert_authority'):
+            self._db.assert_authority()
+        else:
+            cookie = self._db.execute('PRAGMA schema_version').fetchone()[0]
+            if cookie != self._schema_cookie:
+                from ..owned_state import require_schema
+                require_schema(self._db, self._initialize)
+                self._schema_cookie = cookie
+        return self._db
+
+    @staticmethod
+    def _initialize(db):
         db.execute("""CREATE TABLE IF NOT EXISTS material_summary_attempts (
             attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, batch_id TEXT NOT NULL,
             body_version TEXT NOT NULL, input_digest TEXT NOT NULL, policy_identity TEXT NOT NULL,
@@ -463,6 +484,10 @@ class SummaryLedger:
         )""")
         db.execute("CREATE INDEX IF NOT EXISTS material_summary_by_task_batch "
                    "ON material_summary_attempts(task_id,batch_id,created)")
+        db.execute("CREATE INDEX IF NOT EXISTS material_summary_window "
+                   "ON material_summary_attempts(created) WHERE status!='prepared'")
+        db.execute("CREATE INDEX IF NOT EXISTS material_summary_invoking "
+                   "ON material_summary_attempts(updated) WHERE status='invoking'")
 
     def _get(self, where, values):
         cursor = self.db.execute("SELECT * FROM material_summary_attempts WHERE " + where, values)

@@ -8,12 +8,14 @@ boundary. Dev-transport success is mechanism evidence, not GitHub acceptance.
 import json
 import sqlite3
 import threading
+from pathlib import Path
 
 import pytest
 
 from mindie_knowledge.community import reconcile_batch, submit_batch
 from mindie_knowledge.community.common import CommunityError, UnknownOutcome
 from mindie_knowledge.community.ledger import Ledger
+from authority_support import damage_database
 
 from .conftest import (
     entry_file,
@@ -46,9 +48,120 @@ def test_submit_happy_path_real_git(settings, state_dir, transport, remote_url):
     assert row["status"] == "submitted" and row["pr_number"] == 1
     steps = [s["step"] for s in ledger.steps_for("batch-a", batch["revision"])]
     # Intent and step receipts exist before effects, in order.
-    assert steps[:2] == ["gate:before-git", "git:clone-fetch"]
+    assert steps[:2] == ["publication-contract:validated", "gate:before-worktree"]
     assert "git:pushed" in steps and "github:pr-created" in steps
     ledger.close()
+
+
+@pytest.mark.parametrize('failure_point', ['push-step', 'gate-step', 'intent-step', 'pr-step', 'final'])
+def test_completed_external_write_survives_receipt_failure(
+        settings, state_dir, transport, remote_url, monkeypatch, failure_point):
+    original_step, original_finish = Ledger.record_step, Ledger.finish_publication
+    def broken_step(self, batch_id, revision, step, detail=''):
+        if (failure_point, step) in {('push-step', 'git:pushed'), ('gate-step', 'gate:before-api'),
+                                     ('intent-step', 'github:create-pr'), ('pr-step', 'github:pr-created')}:
+            raise sqlite3.OperationalError('synthetic local receipt failure')
+        return original_step(self, batch_id, revision, step, detail)
+    def broken_finish(self, batch_id, revision, **kwargs):
+        if failure_point == 'final' and kwargs['status'] == 'submitted':
+            raise sqlite3.OperationalError('synthetic local terminal receipt failure')
+        return original_finish(self, batch_id, revision, **kwargs)
+    monkeypatch.setattr(Ledger, 'record_step', broken_step)
+    monkeypatch.setattr(Ledger, 'finish_publication', broken_finish)
+    batch = make_batch('receipt-effect', [entry_file(make_entry())])
+    receipt = submit_batch(batch, settings, state_dir, transport=transport)
+    assert receipt['recording_failed'] and receipt['failed_stage'] == 'receipt'
+    tip = git(['ls-remote', remote_url, 'refs/heads/mindie-contrib/npu/receipt-effect'])
+    assert tip.split()[0] == receipt['head_sha']
+    prs = transport.list_open_pull_requests(settings['repository'], deadline=_deadline())
+    if failure_point in {'push-step', 'gate-step', 'intent-step'}:
+        assert receipt['status'] == 'failed' and receipt['completed_steps'] == ['git-push']
+        assert prs == []
+    else:
+        assert receipt['status'] == 'submitted' and receipt['pr_url']
+        assert len(prs) == 1 and receipt['completed_steps'] == ['git-push', 'pr-create']
+    monkeypatch.setattr(Ledger, 'record_step', original_step)
+    monkeypatch.setattr(Ledger, 'finish_publication', original_finish)
+    def forbid_write(*args, **kwargs):
+        raise AssertionError('receipt recovery must not repeat the external write')
+    monkeypatch.setattr(transport, 'create_pull_request', forbid_write)
+    again = submit_batch(batch, settings, state_dir, transport=transport)
+    assert again['status'] in ({'failed'} if failure_point in {'push-step', 'gate-step', 'intent-step'} else {'submitted', 'unchanged'})
+
+
+@pytest.mark.parametrize('authority', ['publication', 'runtime'])
+@pytest.mark.parametrize('before_step', ['git:push', 'github:create-pr'])
+@pytest.mark.parametrize('damage', ['missing_marker', 'replaced_db'])
+def test_live_authority_loss_blocks_next_real_external_write(
+        settings, state_dir, transport, remote_url, tmp_path, monkeypatch, authority, before_step, damage):
+    from contextlib import closing
+    from mindie_knowledge.loop.store import Store
+    owner = Store(tmp_path / 'source', 'demo')
+    original = Ledger.record_step
+    def damage_after_intent(self, batch_id, revision, step, detail=''):
+        result = original(self, batch_id, revision, step, detail)
+        if step == before_step:
+            db = self.db if authority == 'publication' else owner.db
+            path = state_dir / 'community-ledger.sqlite3' if authority == 'publication' else owner.root / 'state-v4.sqlite3'
+            if damage == 'missing_marker':
+                path.with_name(path.name + '.owner').unlink()
+            else:
+                replacement = path.with_name('replacement.sqlite3')
+                with closing(sqlite3.connect(replacement)) as copy:
+                    db.backup(copy)
+                read = (lambda: self.get_publication(batch_id, revision)) if authority == 'publication' else owner.status
+                damage_database(db, path, read=read, replacement=replacement)
+        return result
+    monkeypatch.setattr(Ledger, 'record_step', damage_after_intent)
+    batch = make_batch('lost-authority', [entry_file(make_entry())])
+    try:
+        result = submit_batch(batch, settings, state_dir, transport=transport,
+                              authority_guard=owner.db.assert_authority)
+        assert result['status'] == 'unavailable'
+        prs = transport.list_open_pull_requests(settings['repository'], deadline=_deadline())
+        assert prs == []
+        tip = git(['ls-remote', remote_url, 'refs/heads/mindie-contrib/npu/lost-authority'])
+        if before_step == 'git:push':
+            assert not tip and not result['external_write_completed']
+        else:
+            assert tip.split()[0] == result['head_sha']
+            assert result['completed_steps'] == ['git-push']
+    finally:
+        owner.close()
+
+
+@pytest.mark.parametrize('gate_number', [3, 4])
+@pytest.mark.parametrize('change', ['disabled', 'corrupt'])
+def test_profile_consent_change_stops_next_actual_external_write(
+        settings, state_dir, transport, remote_url, tmp_path, monkeypatch, gate_number, change):
+    from mindie_knowledge import consent_store
+    from mindie_knowledge.community import publish
+    consent = tmp_path / 'consent.json'
+    consent_store.record_choice(consent, 'contribute')
+    settings['consent_config'] = str(consent)
+    Path(settings['config_path']).write_text(json.dumps(settings))
+    original, calls = publish._settings_gate, []
+    def change_at_gate(admitted):
+        calls.append(1)
+        if len(calls) == gate_number:
+            if change == 'disabled':
+                consent_store.record_choice(consent, 'disabled')
+            else:
+                consent.write_text('{broken')
+        original(admitted)
+    monkeypatch.setattr(publish, '_settings_gate', change_at_gate)
+    batch = make_batch('revoke-native-write', [entry_file(make_entry())])
+    receipt = submit_batch(batch, settings, state_dir, transport=transport)
+    assert receipt['status'] == ('disabled' if change == 'disabled' else 'unavailable')
+    assert not transport.list_open_pull_requests(settings['repository'], deadline=_deadline())
+    tip = git(['ls-remote', remote_url, 'refs/heads/mindie-contrib/npu/revoke-native-write'])
+    if gate_number == 3:
+        assert tip == ''
+        assert receipt['external_write_completed'] is False
+    else:
+        assert tip.split()[0] == receipt['head_sha']
+        assert receipt['completed_steps'] == ['git-push']
+        assert 'Git push completed' in receipt['detail']
 
 
 def test_idempotent_resubmit_and_new_event_id(settings, state_dir, transport):
@@ -181,7 +294,7 @@ def test_unlaunchable_executable_is_recoverable_before_any_child_runs(tmp_path):
 def test_unknown_push_outcome_reconciles_readonly(settings, state_dir, transport, remote_url):
     class UnknownPushTransport(type(transport)):
         def create_pull_request(self, repo, **kwargs):
-            # The write actually landed on the remote; only the API reply is lost.
+            # The push landed; the API result cannot yet be established.
             raise UnknownOutcome("connection lost after push")
 
     flaky = UnknownPushTransport(transport.path, transport.remotes)
@@ -194,9 +307,13 @@ def test_unknown_push_outcome_reconciles_readonly(settings, state_dir, transport
     # Reconciliation is read-only: no PR exists yet, so it stays unknown.
     unresolved = reconcile_batch("batch-f", settings, state_dir, transport=transport)
     assert unresolved["status"] == "unknown"
-    # Once the PR truly exists (created by an explicit retry), reconcile resolves it.
+    # An explicit retry flag still cannot prove the unknown write was absent.
     retried = submit_batch({**batch, "explicit_retry": True}, settings, state_dir, transport=transport)
-    assert retried["status"] == "submitted"
+    assert retried['status'] == 'unknown'
+    assert transport.list_open_pull_requests(settings['repository'], deadline=_deadline()) == []
+    # Simulate the delayed remote result becoming visible; only a read follows.
+    transport.create_pull_request(settings['repository'], title='Delayed response fixture', body='',
+                                  head='mindie-contrib/npu/batch-f', base='main', deadline=_deadline())
     resolved = reconcile_batch("batch-f", settings, state_dir, transport=transport)
     assert resolved["status"] == "submitted" and resolved["pr_url"]
 
@@ -345,3 +462,39 @@ def test_deleted_entry_is_not_restored_by_a_pending_correction(settings, state_d
     result = submit_batch(batch, settings, state_dir, transport=transport)
     assert result['status'] == 'needs_review' and 'deleted' in result['detail']
     assert git(['ls-remote', remote_url, 'refs/heads/mindie-contrib/npu/batch-delete']).split()[0] == before
+
+
+def test_contract_mismatch_before_intent_or_remote_write_and_same_payload_recovers(
+    settings, state_dir, transport, remote_url, tmp_path,
+):
+    from mindie_knowledge.publication_contract import make_contract, render_contract
+    from mindie_knowledge.community.common import sha256_text
+    wanted = render_contract(make_contract('npu', 'b' * 40))
+    settings['publication_contract_sha256'] = sha256_text(wanted)
+    config = tmp_path / 'community.json'
+    data = json.loads(config.read_text())
+    data['publication_contract_sha256'] = settings['publication_contract_sha256']
+    config.write_text(json.dumps(data))
+    batch = make_batch('contract-recovery', [entry_file(make_entry())])
+    before = git(['ls-remote', remote_url])
+    receipt = submit_batch(batch, settings, state_dir, transport=transport)
+    assert receipt['status'] == 'unavailable' and receipt['error_code'] == 'contract_mismatch'
+    assert receipt['failed_stage'] == 'publication-contract'
+    assert receipt['external_write_attempted'] is False
+    ledger = Ledger(state_dir)
+    try:
+        assert ledger.get_publication(batch['batch_id'], batch['revision']) is None
+    finally:
+        ledger.close()
+    assert git(['ls-remote', remote_url]) == before
+    assert transport.list_open_pull_requests(settings['repository'], deadline=_deadline()) == []
+    work = tmp_path / 'repair-contract'
+    git(['clone', remote_url, str(work)])
+    (work / 'publication-contract.json').write_bytes(wanted.encode('utf-8'))
+    git(['add', '.'], cwd=work)
+    git(['-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid',
+         'commit', '-m', 'reviewed deployment combination'], cwd=work)
+    git(['push', 'origin', 'main'], cwd=work)
+    # Identical frozen payload, no explicit retry or new batch identity needed.
+    receipt = submit_batch(batch, settings, state_dir, transport=transport)
+    assert receipt['status'] == 'submitted', receipt

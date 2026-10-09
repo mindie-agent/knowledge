@@ -20,6 +20,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from mindie_knowledge.markdown import _atomic_write_text
+from mindie_knowledge.materials.references import MaterialReadError, ReadReferenceError
+from mindie_knowledge.materials.provenance import QueryContinuationError
 
 from .dfx import attach_reference, failure
 from .store import canonical, session_key
@@ -30,8 +32,13 @@ MAX_BODY = 2 * 1024 * 1024
 class RequestRejected(ValueError):
     """A structured request rejection, distinct from wire/runtime failure."""
 
+    def __init__(self, message, *, error_code="read_rejected", read_ref=None):
+        super().__init__(message)
+        self.error_code = error_code
+        self.read_ref = read_ref
 
-def rpc(connection, method, arguments=None, *, timeout=10):
+
+def rpc(connection, method, arguments=None, *, timeout=None):
     url = connection["url"]
     if not url.startswith("http://127.0.0.1:"):
         raise ValueError("the knowledge service is loopback-only")
@@ -63,8 +70,10 @@ def rpc(connection, method, arguments=None, *, timeout=10):
     if not ok:
         error = result.get("error", "knowledge request failed")
         if result.get("error_kind") == "invalid_request":
-            raise RequestRejected(error)
-        exception = RuntimeError(error)
+            raise RequestRejected(error, error_code=result.get("error_code", "read_rejected"),
+                                  read_ref=result.get("read_ref"))
+        exception = (MaterialReadError(error, read_ref=result.get("read_ref"))
+                     if result.get("error_code") == "material_corrupt" else RuntimeError(error))
         attach_reference(exception, result.get("diagnostic"))
         raise exception
     try:
@@ -114,7 +123,8 @@ class _BoundedHTTPServer(ThreadingHTTPServer):
 
 class Service:
     def __init__(self, engine, *, connection_path=None, admission=None, feeds=(),
-                 max_workers=8, request_timeout=10.0, config_path=None):
+                 max_workers=8, request_timeout=None, config_path=None,
+                 config_fingerprint=None):
         self.engine, self.store = engine, engine.store
         self.admission = admission
         self.feeds = list(feeds)
@@ -159,6 +169,21 @@ class Service:
                         ok=True,
                         result=service.call(payload["method"], payload["arguments"]),
                     )
+                except QueryContinuationError as exc:
+                    result = dict(ok=False, error_kind="invalid_request", error=str(exc), error_code=exc.code)
+                except ReadReferenceError as exc:
+                    result = dict(ok=False, error_kind="invalid_request", error=str(exc), error_code=exc.code)
+                    if exc.read_ref is not None:
+                        result["read_ref"] = exc.read_ref
+                except MaterialReadError as exc:
+                    failure("knowledge.rpc", stage="query" if payload["method"] == "query" else "read",
+                            category="material_corrupt", exception=exc)
+                    result = dict(ok=False, error_kind="operation_failed", error=str(exc), error_code=exc.code)
+                    if exc.read_ref is not None:
+                        result["read_ref"] = exc.read_ref
+                    diagnostic = getattr(exc, "mindie_diagnostic", None)
+                    if diagnostic is not None:
+                        result["diagnostic"] = diagnostic
                 except (ValueError, TypeError) as exc:
                     result = dict(ok=False, error_kind="invalid_request", error=str(exc)[:500])
                 except (TimeoutError, OSError):
@@ -190,7 +215,7 @@ class Service:
             ("127.0.0.1", 0),
             Handler,
             max_workers=max_workers,
-            slot_wait=min(5.0, request_timeout),
+            slot_wait=0,  # Reject exhausted server capacity before admitting work.
         )
         self.http.service_actions = self._check_config_lifetime
         self.connection = dict(
@@ -198,16 +223,19 @@ class Service:
             token=self.token,
             domain=self.store.domain,
         )
+        if config_fingerprint is not None:
+            self.connection['config_fingerprint'] = config_fingerprint
 
     # -------------------------------------------------------------- routing
 
-    def _identify(self, args, *, capture=False):
+    def _identify(self, args, *, capture=False, read_only=False):
         """Pop and validate the internal identity fields.
 
         ``_activation`` proves the call with the adapter-issued token (Hook /
         CLI path). ``_session_verified`` means the MCP layer already bound the
-        call to verified host metadata; the lease is still re-checked here.
-        Capture always requires the token and the current lease schema.
+        call to verified host metadata. Public reads need no capture lease;
+        feedback uses a lease only to decide publication eligibility. Capture
+        always requires the token and the current lease schema.
         """
         args = dict(args)
         session = args.pop("_session_id", None)
@@ -222,9 +250,7 @@ class Service:
             else:
                 lease = self.admission.check(session, token)
         elif not capture and args.pop("_session_verified", False):
-            lease = self.admission.active_lease(session)
-            if lease is None:
-                raise ValueError("session is not manually activated")
+            lease = None if read_only else self.admission.active_lease(session)
         else:
             raise ValueError("call identity cannot be verified")
         return args, session, lease
@@ -263,19 +289,27 @@ class Service:
     def _dispatch(self, method, args):
         lease = None
         session = None
-        if method in {"query", "explain", "feedback", "capture"}:
+        if method in {"feedback", "capture"}:
             args, session, lease = self._identify(args, capture=method == "capture")
+        elif method in {'query', 'explain'}:
+            # Host identity is verified without creating or consulting a
+            # capture lease for ordinary public knowledge reads.
+            args, session, lease = self._identify(args, read_only=True)
         if method == "query":
             return self.store.query(
-                args["query"], limit=args.get("limit", 5),
+                args.get("query"), limit=args.get("limit", 5),
                 conditions=args.get("conditions"),
+                continuation=args.get("continuation"),
             )
         if method == "explain":
-            return self.store.explain(
-                args["ref"], offset=args.get("offset", 0), limit=args.get("limit")
-            )
+            if set(args) != {"ref"}:
+                raise ValueError("explain accepts only ref; whole-document offset/limit reading is unavailable")
+            return self.store.explain(args["ref"])
         if method == "feedback":
             settings = self.engine._settings()
+            if settings.capture_block_kind() == 'fault':
+                self.engine._fault('knowledge.feedback', 'authorization', 'authority_unavailable')
+                raise RuntimeError(settings.contribution_block_reason())
             root_session = (lease or {}).get("root_session") or session
             scope = self.admission.scope_root(session) if self.admission else None
             publishable = bool(

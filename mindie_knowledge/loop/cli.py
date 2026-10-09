@@ -17,6 +17,8 @@ path); legacy adapter-config indirection is removed, not aliased.
 
 from __future__ import annotations
 
+from ..state_layout import state_root
+
 import argparse
 import importlib.util
 import json
@@ -107,125 +109,65 @@ def connection_path(config):
     return Path(config["root"]) / config["domain"] / "connection.json"
 
 
-def connect(config):
-    connection = json.loads(connection_path(config).read_text())
+def connect(config, *, config_path=None):
+    from .diagnostics import _bytes
+    connection = json.loads(_bytes(connection_path(config)))
     if connection.get("domain") != config["domain"]:
         raise ValueError("connection is for another domain")
+    if config_path is not None:
+        from .lifecycle import config_fingerprint
+        if connection.get('config_fingerprint') != config_fingerprint(config_path, config):
+            raise ValueError('connection is for another service configuration')
     return connection
 
 
-STARTUP_TIMEOUT = 5.0
-MAX_STARTUP_PROBES = 3
-
-
-def _existing_service(config_path, config, timeout):
-    """Return a live connection, None when the process is absent, or raise.
-
-    Timeout and any other ambiguous probe must not lead to a second service.
-    A missing connection file or a refused connection is absent.
-    """
+def ensure_service(config_path, *, _from_detached_starter=False):
+    """Own one startup until ready or a real failure; elapsed time is no fault."""
     from .handoff import _probe
+    from .locks import StartLock
+    from .process import spawn_service, terminate_tree
+    from .diagnostics import clear_startup_failure
+    from .lifecycle import require_active
 
-    state = _probe(config, timeout)
-    if state == "unknown":
-        raise RuntimeError(
-            "knowledge service probe was ambiguous; not starting a second service"
-        )
-    if state == "absent":
-        return None
-    if state == "ready":
-        from .diagnostics import clear_startup_failure
-
-        clear_startup_failure(config_path, config)
-    return connect(config)
-
-
-def ensure_service(config_path):
-    """One start attempt, at most three readiness probes, absolute startup budget."""
     config = config_at(config_path)
-    deadline = time.monotonic() + STARTUP_TIMEOUT
-
-    def probe():
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise RuntimeError("knowledge startup deadline exceeded")
-        found = _existing_service(config_path, config, min(0.5, remaining))
-        if found is None:
-            raise FileNotFoundError("knowledge service is absent")
-        return found
-
-    try:
-        return probe()
-    except FileNotFoundError:
-        pass
-    from .handoff import prepare_schema
-
-    prepare_schema(config_path)
-    from .locks import StartInProgress, StartLock
-
+    require_active(config_path, config)
+    state = _probe(config, None, config_path=config_path)
+    if state == "ready":
+        clear_startup_failure(config_path, config)
+        return connect(config, config_path=config_path)
+    if state in {"unknown", "worker-dead"}:
+        raise RuntimeError("knowledge service is " + state + "; not starting a second service")
     lock = StartLock(connection_path(config).with_name("start.lock"))
-    acquired = False
     process = None
     ready = False
+    # Other starters retain this OS lock for their complete readiness handshake.
+    # A slow initializer remains the sole owner for any duration.
+    lock.acquire(wait=None)
     try:
-        try:
-            lock.acquire()
-            acquired = True
-        except StartInProgress:
-            pass
-        if acquired:
-            try:
-                return probe()
-            except FileNotFoundError:
-                pass
-            from .process import spawn_service
-            process = spawn_service(
-                [
-                    sys.executable,
-                    "-m",
-                    "mindie_knowledge.loop.cli",
-                    "serve",
-                    "--config",
-                    str(Path(config_path).resolve()),
-                ],
-            )
-        interval = max(0, STARTUP_TIMEOUT - .3) / MAX_STARTUP_PROBES
-        for _attempt in range(MAX_STARTUP_PROBES):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            time.sleep(min(interval, remaining))
+        require_active(config_path, config)
+        while True:
             if process is not None and process.poll() is not None:
                 raise RuntimeError("knowledge service exited during startup; no retry")
-            try:
-                connection = probe()
-            except FileNotFoundError:
-                continue
-            except RuntimeError as exc:
-                # The process we just started may not answer yet. That timeout
-                # is not a second service, and it is not a reason to spawn again.
-                if "ambiguous" not in str(exc) and "deadline" not in str(exc):
-                    raise
-                continue
-            except (OSError, ValueError):
-                continue
-            ready = True
-            return connection
-        raise RuntimeError(
-            "knowledge service unavailable after bounded readiness probes; no restart"
-        )
+            state = _probe(config, None, config_path=config_path)
+            if state == "ready":
+                ready = True
+                clear_startup_failure(config_path, config)
+                return connect(config, config_path=config_path)
+            if state in {"unknown", "worker-dead"}:
+                raise RuntimeError("knowledge service is " + state + "; startup failed")
+            if state == "absent" and process is None:
+                process = spawn_service(
+                    [sys.executable, "-m", "mindie_knowledge.loop.cli", "serve",
+                     "--config", str(Path(config_path).resolve())],
+                    from_detached_starter=_from_detached_starter,
+                )
+            # This is scheduling cadence, never an operation deadline.
+            time.sleep(.1)
     finally:
-        if process is not None and not ready:
-            from .process import terminate_tree
-
+        if process is not None and not ready and process.poll() is None:
+            # Only cancellation/known failure reaches cleanup of our own child.
             terminate_tree(process)
-            try:
-                process.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=1)
-        if acquired:
-            lock.release()
+        lock.release()
 
 
 def capture_hook(config_path, event):
@@ -271,7 +213,7 @@ def contribution_recovery(config, operation, batch_id):
                 store.close()
         from mindie_knowledge.community.ledger import LEDGER_NAME
 
-        ledger_path = Path(config["root"]) / config["domain"] / "outbox" / LEDGER_NAME
+        ledger_path = state_root(config["root"], config["domain"]) / "outbox" / LEDGER_NAME
         if ledger_path.is_file():
             import sqlite3
 
@@ -292,7 +234,7 @@ def contribution_recovery(config, operation, batch_id):
     store = _open_existing_store(config)
     if store is None:
         raise ValueError("no knowledge store exists for this domain")
-    state_dir = Path(config["root"]) / config["domain"] / "outbox"
+    state_dir = state_root(config["root"], config["domain"]) / "outbox"
     settings = settings_mod.from_engine_config(config)
     try:
         row = store.batch(batch_id)
@@ -353,7 +295,7 @@ def _feeds(config, store):
 
 
 def _open_existing_store(config):
-    path = Path(config["root"]) / config["domain"] / "state-v4.sqlite3"
+    path = state_root(config["root"], config["domain"]) / "state-v4.sqlite3"
     if not path.is_file():
         return None
     return Store(config["root"], config["domain"])
@@ -367,16 +309,9 @@ def _serve(config_path, config):
     """
     from .activation import Admission
     from .diagnostics import record_startup_failure
-    from .locks import StartInProgress, StartLock
+    from .lifecycle import acquire_consumer, config_fingerprint
 
-    consumer = StartLock(connection_path(config).with_name("consumer.lock"))
-    try:
-        # lock_held briefly acquires a free lock to observe it. An observer
-        # racing this startup is not proof of an existing service. Use the
-        # existing startup budget to wait for ownership, never spawn again.
-        consumer.acquire(wait=STARTUP_TIMEOUT)
-    except StartInProgress:
-        return 0
+    consumer = acquire_consumer(config_path, config)
     stage = "store"
     store = service = engine = None
     try:
@@ -394,7 +329,8 @@ def _serve(config_path, config):
         stage = "service"
         service = Service(engine, connection_path=connection_path(config),
                           admission=admission, feeds=_feeds(config, store),
-                          config_path=config_path)
+                          config_path=config_path,
+                          config_fingerprint=config_fingerprint(config_path, config))
         service.serve()
         return 0
     except Exception as exc:
@@ -524,7 +460,7 @@ def main(argv=None):
         return 0
     if args.operation == "status":
         try:
-            result = rpc(connect(config), "status", timeout=10)
+            result = rpc(connect(config), "status")
         except (OSError, ValueError):
             result = dict(status="not-running")
             store = _open_existing_store(config)
@@ -536,7 +472,7 @@ def main(argv=None):
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     # stop
-    result = rpc(connect(config), "stop", timeout=10)
+    result = rpc(connect(config), "stop")
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 

@@ -45,12 +45,12 @@ def split_material(text, maximum=BLOCK_BYTES):
 
 
 def prepare_increment(*, task_id, text, start, end, source_digest, scanner_state,
-                      executable, key, private_paths):
+                      executable, key, private_paths, cancel=None):
     if not isinstance(text, str) or not (0 <= start < end):
         raise ValueError('invalid public source increment')
     masked, rules, state = redact_increment(text, state=scanner_state,
                                            executable=executable, key=key,
-                                           private_paths=private_paths)
+                                           private_paths=private_paths, cancel=cancel)
     if masked:
         masked += '\n\n'
     blocks = []

@@ -14,12 +14,15 @@ from mindie_knowledge.loop.feed import Feed
 from mindie_knowledge.loop.store import Store
 from mindie_knowledge.gitread import with_windows_longpaths
 
+from mindie_knowledge.publication_contract import make_contract, render_contract
+
 PRODUCER = "a" * 64
 
 
 def init_repo(path):
     path.mkdir(parents=True)
     (path / ".gitattributes").write_bytes(b"* -text\n")
+    (path / "publication-contract.json").write_bytes(render_contract(make_contract("vllm-ascend", "a" * 40)).encode("utf-8"))
 
     def git(*args):
         return subprocess.check_output(["git", "-C", str(path), *args], text=True).strip()
@@ -72,19 +75,57 @@ def test_sync_keeps_only_current_published_body(env):
     assert receipt["status"] == "synced" and receipt["commit"] == first
     hits = store.query("Device gate")["results"]
     assert hits and hits[0]["origin"] == "feed"
-    v1 = store.get(hits[0]["ref"])["revision"]
+    v1 = store.explain(hits[0]["ref"])["current_revision"]
     assert feed.sync()["status"] == "unchanged"
     revised = entry_doc("1" * 64, "Device gate revised")
     second = commit_docs(git, repo, [revised])
     assert feed.sync()["commit"] == second
     # A stale pin expires instead of silently resolving to another revision.
-    with pytest.raises(ValueError, match='unknown pinned revision'):
-        store.get(hits[0]["ref"])
-    current = store.get(store.query("Device gate")["results"][0]["ref"])
-    assert current["revision"] == revised["revision"]
+    with pytest.raises(ValueError, match='no longer a member'):
+        store.explain(hits[0]["ref"])
+    current = store.explain(store.query("Device gate")["results"][0]["ref"])
+    assert current["current_revision"] == revised["revision"]
     with pytest.raises(ValueError, match='unknown pinned revision'):
         store.get(store.ref("1" * 64, v1))
     assert store.db.execute('SELECT count(*) FROM revisions').fetchone()[0] == 1
+
+
+def test_streamed_candidate_failure_keeps_entire_prior_snapshot(env):
+    git, repo, store, feed = env
+    first = commit_docs(git, repo, [entry_doc('1' * 64, 'Existing evidence')])
+    assert feed.sync()['commit'] == first
+    before = (store.materials.root / 'current.json').read_bytes()
+    def candidates():
+        yield package_for(entry_doc('2' * 64, 'Candidate two'))
+        yield package_for(entry_doc('3' * 64, 'Candidate three'))
+        raise OSError('last package read failed')
+    with pytest.raises(OSError, match='last package'):
+        store.install_feed(candidates(), feed_ident=feed.ident, source_revision='f' * 40)
+    assert (store.materials.root / 'current.json').read_bytes() == before
+    assert store.feed_get('published-commit')['commit'] == first
+    assert [row[0] for row in store.db.execute('SELECT entry_id FROM entries WHERE feed_active=1')] == ['1' * 64]
+    assert store.query('Existing evidence')['results']
+
+
+def test_feed_does_not_keep_prior_package_bodies_in_memory(env, monkeypatch):
+    import weakref
+    _, _, store, feed = env
+    class ObservedText(str):
+        pass
+    refs = []
+    def candidates():
+        for number in range(1, 6):
+            # At most the current/previous task may still be on iterator frames.
+            # Holding all earlier bodies would make a large corpus require its
+            # complete byte size in RAM before any install can finish.
+            assert sum(ref() is not None for ref in refs) <= 2
+            package = package_for(entry_doc(str(number) * 64, 'Streaming evidence ' + str(number)))
+            path = next(path for path in package['files'] if path.startswith('blocks/'))
+            value = ObservedText(package['files'][path])
+            refs.append(weakref.ref(value))
+            package['files'][path] = value
+            yield package
+    assert store.install_feed(candidates(), feed_ident=feed.ident)['entries'] == 5
 
 
 def test_upstream_deletion_removes_body_and_expires_pinned_reads(env):
@@ -98,11 +139,12 @@ def test_upstream_deletion_removes_body_and_expires_pinned_reads(env):
     hits = store.query("Old driver")["results"]
     assert hits and hits[0]["summary"].startswith("Summary of")  # published body wins
     pinned = hits[0]["ref"]
+    observed_feedback = hits[0]["feedback_ref"]
     commit_docs(git, repo, [])  # deleted from the upstream main tree
     assert feed.sync()["entries"] == 0
     assert store.query("Old driver")["results"] == []  # gone from retrieval
-    with pytest.raises(ValueError, match='unknown pinned revision'):
-        store.get(pinned)
+    with pytest.raises(ValueError, match='withdrawn'):
+        store.explain(pinned)
     doc = store.get(store.ref("2" * 64))
     assert doc["withdrawn"] is True and "withdrawn" in doc["note"]
     assert doc['content'] == ''
@@ -111,10 +153,10 @@ def test_upstream_deletion_removes_body_and_expires_pinned_reads(env):
     # The stale local draft neither resurrects the entry in search nor
     # becomes a new publication candidate.
     assert store.drafts_changed(generation="gen-1") == []
-    # Feedback cannot pretend an expired body is still present.
-    with pytest.raises(ValueError, match='unknown pinned revision'):
-        store.record_vote(root_hash="9" * 64, ref=pinned, rating="down",
-                          reason="superseded", publishable=True, generation="gen-1")
+    # An observed revision stays a valid feedback target, but withdrawn entries
+    # cannot be sent again. No old body is retained for the vote.
+    store.record_vote(root_hash="9" * 64, ref=observed_feedback, rating="down",
+                      reason="superseded", publishable=True, generation="gen-1")
     assert store.unbatched_votes(generation="gen-1") == []
 
 
@@ -286,7 +328,7 @@ def test_same_commit_refresh_drops_stale_unavailable_recovery_fields(env):
     assert "detail" not in receipt
     assert "retained_commit" not in receipt
     hits = store.query("Recovered same commit")["results"]
-    assert hits and "Recovered same commit" in store.get(hits[0]["ref"])["title"]
+    assert hits and "Recovered same commit" in store.explain(hits[0]["ref"])["title"]
 
 
 def test_interrupted_candidate_resumes_from_staged_progress(env, monkeypatch):
@@ -301,7 +343,11 @@ def test_interrupted_candidate_resumes_from_staged_progress(env, monkeypatch):
     real_read = gitread.CatFileBatch.read
     fail = {"armed": True}
 
+    contract_blob = git("rev-parse", commit + ":publication-contract.json")
+
     def counting_read(self, rev, **kwargs):
+        if rev == contract_blob:
+            return real_read(self, rev, **kwargs)
         if fail["armed"] and len(reads) == 3:
             fail["armed"] = False
             reads.append(rev)
@@ -360,3 +406,27 @@ def test_sync_discards_old_git_objects_and_old_database_bodies(env):
     assert missing.returncode != 0
     assert store.get(store.ref('c' * 64))['title'] == current['title']
     assert not (feed.dir / 'staging').exists()
+
+
+def test_normal_sync_has_no_internal_execution_deadline(env, monkeypatch):
+    import mindie_knowledge.loop.feed as feed_module
+    import mindie_knowledge.gitread as gitread
+    git, repo, store, feed = env
+    commit_docs(git, repo, [entry_doc('7' * 64, 'Complete public evidence')])
+    calls = []
+    run, listing, read = feed_module.run_argv, gitread.run_stdout_to_file, gitread.CatFileBatch.read
+    def checked_run(*args, **kwargs):
+        calls.append(('process', kwargs.get('timeout')))
+        return run(*args, **kwargs)
+    def checked_listing(*args, **kwargs):
+        calls.append(('listing', kwargs.get('timeout')))
+        return listing(*args, **kwargs)
+    def checked_read(self, *args, **kwargs):
+        calls.append(('blob', kwargs.get('deadline')))
+        return read(self, *args, **kwargs)
+    monkeypatch.setattr(feed_module, 'run_argv', checked_run)
+    monkeypatch.setattr(gitread, 'run_stdout_to_file', checked_listing)
+    monkeypatch.setattr(gitread.CatFileBatch, 'read', checked_read)
+    assert feed.sync()['status'] == 'synced'
+    assert {kind for kind, _ in calls} == {'process', 'listing', 'blob'}
+    assert all(deadline is None for _, deadline in calls)

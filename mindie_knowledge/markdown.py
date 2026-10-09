@@ -34,9 +34,14 @@ def _atomic_write_bytes(path: Path, raw: bytes) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+    except BaseException as error:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError as cleanup:
+            error.add_note('Atomic write cleanup also failed: ' + type(cleanup).__name__)
+        raise
+    else:
+        temporary.unlink(missing_ok=True)
 
 
 def _atomic_write_text(path: Path, text: str) -> None:

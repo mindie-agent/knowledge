@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from mindie_knowledge.loop.store import Store
+from mindie_knowledge.materials.references import MaterialReadError
 
 PRODUCER = 'a' * 64
 
@@ -55,7 +56,7 @@ def test_feed_overlay_returns_published_revision_header_and_body(tmp_path):
         hit = store.query('calibration')['results'][0]
         assert hit['title'] == 'Published observation'
         assert hit['revision'] == doc['revision'] and hit['supplemental']
-        assert store.get(hit['ref'])['content'] == 'calibration original'
+        assert store.explain(hit['ref'])['content'] == 'calibration original'
         assert store.query('unverifiedclaim')['results'] == []
 
 
@@ -67,8 +68,8 @@ def test_withdrawal_removes_searchable_body_and_old_pinned_read(tmp_path):
         store.install_feed([], feed_ident='f' * 64)
         assert store.query('withdrawable')['results'] == []
         assert store.get(store.ref(p['task_id']))['withdrawn']
-        with pytest.raises(ValueError, match='unknown pinned revision'):
-            store.get(pinned)
+        with pytest.raises(ValueError, match='withdrawn'):
+            store.explain(pinned)
 
 
 def test_warm_queries_do_not_rechunk_unchanged_material(store, monkeypatch):
@@ -111,8 +112,10 @@ def test_corrupt_derived_snapshot_is_visible_and_rebuild_only_discards_cache(tmp
         stamp = store.materials.root / '.reme-index' / 'snapshot.json'
     stamp.write_text('{broken')
     with closing(Store(root, 'test')) as store:
-        with pytest.raises(ValueError):
+        with pytest.raises(MaterialReadError) as caught:
             store.query('rms_norm')
+        assert caught.value.code == 'material_corrupt'
+        assert isinstance(caught.value.__cause__, ValueError)
         assert store.search_index_status()['phase'] == 'failed'
         assert stamp.read_text() == '{broken'
         store.materials.rebuild_index()
@@ -136,5 +139,8 @@ def test_current_pointer_mismatch_cannot_be_reported_as_empty_success(store):
     doc = draft(store)
     path = store.materials.root / 'current.json'
     path.write_text('{}')
-    with pytest.raises(ValueError, match='current material'):
+    with pytest.raises(MaterialReadError) as caught:
         store.query('rms_norm')
+    assert caught.value.code == 'material_corrupt'
+    assert isinstance(caught.value.__cause__, ValueError)
+    assert 'current material' in str(caught.value.__cause__)

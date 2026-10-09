@@ -26,7 +26,6 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .common import (
-    DEFAULT_API_OP_SECONDS,
     CommunityError,
     Deadline,
     TransientError,
@@ -81,12 +80,11 @@ class Transport:
 
 
 class GhTransport(Transport):
-    """Bounded ``gh api`` argv calls. The token stays in gh's own env var."""
+    """Owned ``gh api`` calls. The token stays in gh's own env var."""
 
     def __init__(self, settings: Mapping[str, Any]):
         self.settings = settings
         self.token_env = settings.get("token_env", "GH_TOKEN")
-        self.op_seconds = min(DEFAULT_API_OP_SECONDS, settings.get("transaction_seconds", 120))
 
     def _api(
         self, method: str, path: str, deadline: Deadline, body: Mapping[str, Any] | None = None
@@ -109,9 +107,10 @@ class GhTransport(Transport):
                 env = {"GH_TOKEN": token}
             result = run_argv(
                 argv,
-                timeout=min(self.op_seconds, remaining),
+                timeout=remaining,
                 max_output=MAX_API_OUTPUT,
                 env=env,
+                cancel=deadline.cancel,
             )
         finally:
             if tmp is not None:
@@ -412,8 +411,9 @@ class FileTransport(Transport):
         remaining = deadline.step("git ls-remote")
         result = run_argv(
             ["git", "ls-remote", url, f"refs/heads/{branch}"],
-            timeout=min(30, remaining),
+            timeout=remaining,
             max_output=64 * 1024,
+            cancel=deadline.cancel,
         )
         if result.code != 0 or not result.out_text.strip():
             return None
@@ -511,8 +511,9 @@ class FileTransport(Transport):
                 remaining = deadline.step("record PR head ref")
                 result = run_argv(
                     ["git", "--git-dir", url, "update-ref", f"refs/pull/{number}/head", sha],
-                    timeout=min(30, remaining),
+                    timeout=remaining,
                     max_output=64 * 1024,
+                    cancel=deadline.cancel,
                 )
                 if result.timed_out:
                     raise TransientError("recording the PR head ref timed out")
@@ -547,7 +548,7 @@ class FileTransport(Transport):
         else:
             mirror.parent.mkdir(parents=True, exist_ok=True)
             argv = ["git", "clone", "--mirror", url, str(mirror)]
-        result = run_argv(argv, timeout=min(60, remaining), max_output=128 * 1024)
+        result = run_argv(argv, timeout=remaining, max_output=128 * 1024, cancel=deadline.cancel)
         if result.code != 0:
             raise CommunityError(f"cannot sync dev remote mirror: {result.err_text[:200]}")
         return mirror
@@ -590,8 +591,9 @@ class FileTransport(Transport):
             result = run_argv(
                 ["git", "-c", "core.longpaths=true", "-c", "core.autocrlf=false",
                  "-c", "core.eol=lf", *args],
-                timeout=min(60, deadline.step(f"dev merge {operation}")),
+                timeout=deadline.step(f"dev merge {operation}"),
                 max_output=128 * 1024,
+                cancel=deadline.cancel,
             )
             if result.timed_out:
                 error = UnknownOutcome if operation == "push" else TransientError

@@ -45,14 +45,14 @@ def test_pending_send_owns_old_payload_after_draft_advances(tmp_path):
         descriptor = json.loads(pending["batch"])
         assert all("content" not in item for item in descriptor["files"])
         frozen = load_batch_payload(store, pending)
-        sent_files = frozen["files"]
+        sent_files = [dict(item) for item in frozen["files"]]
         new, _ = store.append_observation(old["entry_id"], "Later unsent observation",
                                           marker="a" * 32, generation=settings.generation)
         assert store._revision_doc(old["entry_id"], old["revision"]) is None
         sent = []
         engine = Engine(store, settings_path=path)
         engine.community = {"submit_batch": lambda batch, *a, **kw: (
-            sent.append(batch) or {"status": "submitted", "head_sha": "a" * 40,
+            sent.append(dict(batch, files=[dict(item) for item in batch['files']])) or {"status": "submitted", "head_sha": "a" * 40,
                                    "pr_url": "https://example.invalid/pull/1"})}
         engine._submit(pending)
         assert len(sent) == 1 and sent[0]["files"] == sent_files

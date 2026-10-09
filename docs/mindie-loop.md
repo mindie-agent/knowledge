@@ -60,8 +60,9 @@ action and is never re-onboarding.
 
 Stop forwards native identity and the transcript path. A duplicate final-answer
 copy in the hook is ignored and has no size veto. The hook commits the local
-notification before returning, then a worker reads the owning transcript. Hook
-and process deadlines bound a stalled caller; they are not text-size limits.
+notification before returning, then a worker reads the owning transcript. There
+is no default elapsed-time deadline for the accepted hook or indexing operation;
+owner cancellation and actual process or protocol failures remain visible.
 
 Each harness owns its public-message projection. User input, visible assistant
 progress and final answers remain; tool calls/results, hidden reasoning,
@@ -71,9 +72,11 @@ limits work between records without discarding data. Malformed complete records
 and unverifiable ownership/timestamps do not advance the cursor.
 
 Gitleaks and deterministic privacy rules redact locally before storage. Body,
-cursor and continuation commit together. A scanner launch failure or timeout
-leaves the same notification pending and automatically retries after recovery;
-no new Stop is required and no unredacted body is published. No model creates,
+cursor and continuation commit together. Scanning has no default execution
+deadline and retains its complete report. Shutdown cancellation or scanner failure
+leaves the same notification pending for recovery;
+explicit authority revocation remains cancelled. No new Stop is required for
+recovery and no unredacted body is published. No model creates,
 shortens or rewrites the body. The GitHub ordinary-Git per-file 100 MiB limit
 remains a visible publication constraint, not a silent truncation rule.
 
@@ -118,12 +121,46 @@ Current draft and feed revisions remain available, while obsolete manifests and
 unreferenced blocks are retired. Pending publication owns an immutable staging
 package and a small descriptor, not a second database body.
 
+After main publishes a correction, continuation adopts the confirmed current
+package and only provably unsent local blocks. The local candidate must preserve
+all last-sent block identities; a whole-body rewrite cannot be split into safe
+additions mechanically and remains a visible conflict. Remote navigation replaces
+claims about removed material, while new blocks keep their own indexes. This
+operation reads manifests and file identities, not unrelated block bodies. A
+small preparation receipt binds the observed feed revision to the frozen send;
+confirmation after a newer feed sync cannot rewrite that base. Pending or unknown
+sends remain frozen, and unfinished index results settle before reorganization.
+Existing open-PR edits still require their actual current head: conflicting edits
+remain `needs_review` with no write, rather than using main as a replacement base.
+
 Search follows the visible current revision and folds draft/feed lineage.
 Withdrawal comes from a successful public-feed refresh: the entry leaves search
-and a local draft cannot resurrect it. Query references pin short entry/revision
-prefixes; an exact current reference reads that package, and superseded revisions
-expire instead of returning a different body. Conditions describe observed
-versions or commits; they do not make an experience universally applicable.
+and a local draft cannot resurrect it. Query returns a directly readable block
+reference and a separate `feedback_ref` for the observed task revision.
+Conditions describe observed versions or commits; they do not make an experience
+universally applicable.
+
+### Reading material
+
+`knowledge_explain(ref)` accepts two full canonical reference forms:
+
+- `mindie://DOMAIN/TASK`: current fallible navigation, `current_revision`,
+  `block_count` and `first_block_ref`; it returns no assembled body.
+- `mindie://DOMAIN/TASK/blocks/<block-id>@<file-sha256>`: one current member block,
+  its `content`, `previous_block_ref` and `next_block_ref`. `current_navigation`
+  and `current_revision` describe the current task separately from the fixed
+  block bytes. Appending blocks or revising navigation preserves unchanged
+  block references.
+
+Task IDs, block IDs and hashes are full 64-character identities. Membership is
+checked in the current manifest before opening exactly the selected block.
+`removed_or_superseded` means that the selected block no longer belongs to the
+current package; `withdrawn` means the task was removed upstream. Missing required
+files, unsafe paths and mismatching bytes fail as `material_corrupt`, never as
+empty or expired material. Old files awaiting cleanup do not grant read access.
+A returned `read_ref` suggests current navigation when available; it does not
+substitute another body. Historical task-revision references are accepted only
+for feedback, and short references and the old `offset`/`limit` reader are removed.
 
 ### Local retrieval index
 
@@ -132,15 +169,80 @@ from current material files. They search every current block, not only the short
 navigation. Technical identifiers and Chinese token boundaries retain the
 repository's established tokenization. The index is replaceable and explicitly
 reports load/build failures; a failed refresh does not become an empty result.
+The current directory persists validated task headers and the latest change
+generation per task. Source pointers update one task at a time; `current.json`
+contains only the directory generation. A pending-marker receipt covers a crash
+between the committed directory and marker replacement. An unrelated missing or
+malformed marker remains an error. This replaces the unpublished `current/1`
+whole-directory JSON format; there is no alternate compatibility path.
+
+Warm queries reuse that generation without enumerating every manifest or statting
+every block. Returned blocks and resolved source links check current file state;
+changed files are read and verified before use. An explicit body read always
+verifies its exact current member hash. This is not a continuous audit of files
+that no operation has selected. Each changed block checkpoints its ReMe graph,
+chunks and exact term counts in one compressed SQLite row. Restart restores those
+counts without rechunking old bodies. ReMe's scoring and token semantics remain
+unchanged, and retired lexical slots are compacted automatically.
 There is no ReMe agent, provider, watcher, service, separate transcript store or
 model invocation in consumer retrieval. The SQLite runtime must still satisfy
 the package's supported runtime prerequisite checks.
+
+### Query matches and citation groups
+
+`knowledge_query(query, limit?, conditions?)` returns groups of current block
+matches; `limit` counts groups, from 1 to 20. Each match has its own readable
+block `ref`, current task `task_ref`, and separate observed `feedback_ref`.
+`match_basis` distinguishes an actual body match from fallible index metadata
+or an exact identity lookup. Excerpts come from material, not generated summaries.
+
+Only literal, full canonical MindIE references in block bodies produce `cites`.
+Titles, summaries and task navigation cannot create citation relationships. A
+resolvable single-source chain groups matching blocks only when the source body
+independently matches and covers every query term matched in the citing body.
+A newly observed term absent from the source therefore keeps its own result.
+The group presents the source anchor and related matches with their own excerpts,
+readable references and feedback references. Failed reuse and corrections remain
+readable; a citation group and its `related_count` express navigation, not factual
+confidence or independent corroboration. Citation counts never increase scores.
+
+Historical `mindie://DOMAIN/<task-id>@<observed-revision>` literals stay unchanged in `cites`.
+When that revision is unavailable, `citation_status=version_unavailable` and a
+separate `current_source_ref` may identify the current task for navigation and
+query-specific grouping. It does not make the historical bytes readable. Multiple
+source tasks, cycles, unavailable blocks, missing sources and cross-domain
+citations remain ordinary matches with citation information. Failure to read or
+validate a present source is an operational failure, never a missing citation.
+Exact task/block references and complete task IDs preserve the requested object
+instead of redirecting to its cited source.
+
+Each initial group includes up to two compact related-match previews: their own
+read and feedback references, original excerpts, observed conditions, match
+basis and citation information. Repeated task navigation and generated titles
+or summaries are omitted from these previews. An excerpt can omit a later
+correction or applicability limit; the complete block remains available through
+its own `ref`. Neither the preview nor its score certifies the claim.
+
+`related_count` counts all other matches in the group. When more matches exist,
+`related_next` continues after the previews, returning the remaining matches
+with their full retrieval metadata. Continue with
+`knowledge_query(continuation=related_next, limit=20)`, sending only that token and
+an optional `limit`; `query` and `conditions` must be omitted. The token binds the
+original query, filters, anchor and current corpus. `continuation_invalid` rejects
+malformed or conflicting requests; `continuation_expired` means the corpus changed
+and a new query is required. Continuation recomputes from the replaceable index
+without storing durable query results or rereading unchanged block bodies.
 
 ## Optional feedback
 
 `knowledge_feedback(ref, rating, reason?)` records one current `up`/`down`
 vote per opaque root and entry (a new vote replaces the old, including its
-revision); the reason is optional, at most 1000 characters. Raw native
+revision). Supply the exact `feedback_ref` returned with the observation:
+`mindie://DOMAIN/<task-id>@<observed-revision>`. Task and block read references are rejected,
+so a delayed vote cannot silently attach to a newer task revision. A minimal
+identity receipt retains only task/revision hashes after old packages are
+pruned; voting does not read or retain historical bodies. The reason is optional,
+at most 1000 characters. Raw native
 session IDs never leave the store — public exports carry only the random
 opaque root ID. Votes recorded while sharing is off stay local
 (`publishable=0`) and are never backfilled; a vote while off also never wakes
@@ -184,15 +286,16 @@ commit messages or PR text.
 
 ## Knowledge sync
 
-`sync --config` is standalone and model-free (30 s per attempt): it follows
+`sync --config` is standalone and model-free, with no default execution deadline: it follows
 the configured content repository branch as an immutable Git commit,
 validates the candidate tree (canonical complete task packages under `tasks/`,
 per-file platform envelope, UTF-8/LF, schema, revisions, domain) and switches
 atomically. There is no whole-feed entry-count or total-byte cap: blobs are
 read one at a time through a bounded persistent `git cat-file --batch`
 process, and each verified blob is checkpointed against the exact candidate
-commit, so an attempt that hits the deadline resumes after the last staged
-blob — never restarting at item zero — and the visible feed switches in one
+commit, so recovery resumes after the last staged blob rather than restarting
+at item zero. Healthy long work continues until completion or owner cancellation;
+the visible feed switches in one
 short local transaction only after the candidate completes. Transient
 failures persist a backoff `next_check` and are retried automatically once
 due; a structurally incompatible candidate stays quarantined against its
@@ -202,17 +305,29 @@ unsupported old layout (e.g. `corpus/`) fails loudly instead of looking like
 an empty feed. Sync works with community contribution off and never starts
 the maintenance service.
 
+The service starter likewise waits for its one owned initializer for any duration.
+Real process exit, failed readiness protocol and cancellation remain failures;
+elapsed time and a slow store recovery do not cause termination or another spawn.
+
+Developer resource checks use actual SQL instructions, file reads and changed
+checkpoint rows in `tests/test_incremental_resources.py`. The standalone
+`benchmarks/resource_paths.py` reports measured CPU, elapsed time, memory,
+descriptors and storage for synthetic workloads (requires developer-only
+`psutil`). Its workload counts and measurement windows are never runtime limits.
+Observed costs and limitations are recorded in
+[local resource validation](resource-validation-2026-10-05.md).
+
 ## MCP surface
 
 Native MCP dispatch belongs to the harness adapters; the former core MCP host
 shim (bound to Codex-only turn metadata) is retired. Core keeps the
 authenticated loopback RPC the adapters forward to (`query`, `explain`,
 `feedback`, `capture`), each still bound to a verified per-call identity and
-re-checked against the admission store. Bodies are no longer size-capped by a
-business limit, so `explain` paginates long content by default (8 Ki
-characters per page, explicit `limit` up to 32 Ki characters) using the
-existing `offset`/`limit` shape with `content_offset`, `content_length` and
-`next_offset` continuations — a per-call wire budget, not a document cap.
+re-checked against the admission store. `explain` takes only `ref` and reads
+one existing material block per request. Adjacent block references allow explicit
+traversal without assembling a whole task or discarding long-task content.
+Read rejection codes and material corruption remain visible through the RPC
+boundary; they do not become successful empty responses.
 
 ## Commands
 
@@ -281,10 +396,22 @@ Candidate repository Python is never imported or executed.
 
 The current material format uses fresh `state-v4.sqlite3` metadata and Markdown
 packages. Old private databases and organizer checkpoints are not imported or
-used for recovery. The persisted capture floor combines sharing and activation
-timestamps, so normal Stop capture does not backfill earlier material. Explicit
+used for recovery. Capture boundaries combine the saved sharing timestamp and
+the verified native task/fork boundary. Creating an internal database adds no
+new boundary and cannot discard a legitimate first turn. Explicit
 selected-history import is a separately authorized source operation. Existing
 failed/unknown current-format publication receipts remain non-replayable.
+
+Authoritative runtime, paid-attempt and publication databases are initialized
+only on demonstrable first use. A missing database with an ownership marker or
+material residue, an empty database, or a missing required table is an error;
+opening the runtime must not recreate receipts or prune Markdown from an empty
+replacement snapshot. Derived search checkpoints remain rebuildable.
+The declared types, defaults, nullability, primary keys and indexes are part of
+that contract, not merely the column names. Cached connections recheck the live
+database/marker identity and schema cookie; missing or replaced authority cannot
+authorize another model or remote write. Changed schema triggers structural
+validation, while unchanged operations avoid repeating that full inspection.
 
 ## Confirmed payload cleanup and idle updates
 
@@ -302,8 +429,27 @@ all earlier blocks. There is no organizer-triggered remote restoration path.
 Successful upstream withdrawal blocks resurrection, and exact-base publication
 checks surface remote edits instead of silently merging them.
 
+Publication selection reads headers. Complete task packages, frozen candidates,
+batch validation, outbound scanning and worktree application use hash-bound file
+views, loading one file at a time. Public descriptors contain metadata only;
+every later access verifies the exact frozen file digest. An expired or modified
+candidate fails visibly rather than reading a newer current task. Feed intake
+likewise stages one package/file at a time and promotes only after the complete
+snapshot validates. Metadata still grows with the number of blocks and tasks.
+
+A successful push or PR write stays a known completed step if recording its
+receipt fails. The result includes the known head/PR and `recording_failed`;
+Agent diagnostics report the failed receipt separately. Unknown writes remain
+read-only reconciliation work even when an `explicit_retry` flag is supplied.
+
 The authenticated local `stop_if_idle` RPC freezes admission and initiates
 shutdown only when no actual call, worker or admitted capture work remains.
 Idle authorization grants and pending/unknown durable PR receipts alone do
 not block a version switch. Adapters protect each complete call with their
-operation lock and use this RPC instead of status-then-stop inference.
+operation lock and call core `lifecycle.retire_service` for a version switch.
+That operation owns the startup/admission locks and records retirement of the
+exact configuration path and fingerprint before deciding whether the service
+is absent or idle. Already spawned late helpers and direct `serve` processes
+consult the same record. A busy result rolls back only that retirement;
+restoration accepts only its exact completed receipt. A lost stop response
+remains uncertain, and a later receipt/cleanup failure cannot erase a known stop.

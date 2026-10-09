@@ -131,8 +131,11 @@ def test_notification_without_token_and_locked_admission(tmp_path, monkeypatch):
     assert accepted["stage"] in {"accepted-local", "accepted-runtime"}
     assert "token" not in accepted
     held = sqlite3.connect(admission)
-    held.execute("BEGIN EXCLUSIVE")
     try:
+        # WAL readers can use the committed snapshot during an exclusive writer.
+        # DELETE mode makes this fixture exercise an actually blocked read.
+        assert held.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
+        held.execute("BEGIN EXCLUSIVE")
         blocked = capture_hook(config, dict(
             event, event_id="22222222-2222-4222-8222-222222222222",
         ))
@@ -172,12 +175,24 @@ def test_live_pid_in_wake_json_does_not_coalesce(tmp_path, monkeypatch):
     wake = tmp_path / "root" / "test" / "wake.json"
     wake.write_text(json.dumps({"wake_pid": live.pid, "service_pid": live.pid}))
     try:
-        result = request_wake(config, session_id="manual-A", budget_seconds=0.8)
+        result = request_wake(config, session_id="manual-A")
     finally:
         live.kill()
         live.wait(timeout=2)
     assert result["wake"] == "requested"
     assert spawned
+
+
+def test_wake_authority_damage_is_visible_and_never_claims_disabled(tmp_path, monkeypatch):
+    from mindie_knowledge.loop import agent_diagnostics
+    monkeypatch.setenv('MINDIE_DIAGNOSTICS_ROOT', str(tmp_path / 'diagnostics'))
+    config, _admission, _project, settings = _ready(tmp_path)
+    settings.write_text('{broken')
+    result = request_wake(config, session_id='manual-A')
+    assert result['wake'] == 'failed' and result['reason'] == 'authority-unavailable'
+    items = agent_diagnostics.pending()['items']
+    assert any(item['operation'] == 'knowledge.capture' and item['code'] == 'authority_unavailable'
+               for item in items)
 
 
 def _force_cas_races(store, count):

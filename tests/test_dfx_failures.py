@@ -127,7 +127,7 @@ def test_live_http_internal_reference_not_duplicated(reports, store, monkeypatch
 
 
 @pytest.mark.parametrize('enabled', [False, True])
-def test_capture_hook_records_only_authorized_rpc_internal(reports, tmp_path, monkeypatch, enabled):
+def test_capture_hook_reports_authorized_unavailable_but_not_disabled(reports, tmp_path, monkeypatch, enabled):
     import json
     from conftest import write_settings, make_admission, admission_token
     from mindie_knowledge.loop import cli
@@ -146,9 +146,12 @@ def test_capture_hook_records_only_authorized_rpc_internal(reports, tmp_path, mo
     if enabled:
         assert result['stage'] == 'unavailable'
         assert result['reason'] == 'store-not-ready'
+        assert [(row['operation'], row['stage'], row['category']) for row in reports] == [
+            ('knowledge.capture', 'accept', 'store_not_ready'),
+        ]
     else:
         assert result['stage'] == 'inert'
-    assert reports == []
+        assert reports == []
 
 
 def test_actual_invalid_utf8_is_recorded_at_decode_owner(reports):

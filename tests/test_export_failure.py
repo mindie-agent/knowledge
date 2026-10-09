@@ -8,6 +8,21 @@ from mindie_knowledge.loop import settings
 from mindie_knowledge.loop.export import build_batch
 
 
+def test_export_selection_reads_headers_without_reassembling_all_task_bodies(tmp_path, monkeypatch):
+    shared = settings.write(tmp_path / 'sharing.json', enabled=True,
+                            repository='owner/repo', project_roots=[tmp_path])
+    store = Store(tmp_path / 'data', 'test')
+    try:
+        store.create_draft(kind='experience', title='Public example', summary='Correction retained',
+                           content='A claim was corrected after a failed trial.', generation=shared.generation)
+        def no_whole_body(*args, **kwargs):
+            raise AssertionError('publication selection must not concatenate the full task body')
+        monkeypatch.setattr(store.materials, 'get_document', no_whole_body)
+        assert build_batch(store, settings=shared) is not None
+    finally:
+        store.close()
+
+
 def test_unsafe_material_is_quarantined_without_blocking_valid_material(tmp_path):
     shared = settings.write(tmp_path / 'sharing.json', enabled=True,
                             repository='owner/repo', project_roots=[tmp_path])

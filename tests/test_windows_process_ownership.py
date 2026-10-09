@@ -43,7 +43,7 @@ def test_python_venv_helper_does_not_create_a_console(tmp_path, kind):
 
 @pytest.mark.skipif(os.name != "nt", reason="Win32 Job ownership; POSIX groups have separate tests")
 @pytest.mark.parametrize("caller", ["organizer", "community"])
-@pytest.mark.parametrize("inherited_pipes", [False, True], ids=["normal-exit", "pipe-timeout"])
+@pytest.mark.parametrize("inherited_pipes", [False, True], ids=["normal-exit", "inherited-pipes"])
 def test_exited_leader_keeps_descendants_owned(tmp_path, caller, inherited_pipes):
     from ctypes import wintypes
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -94,7 +94,11 @@ def test_exited_leader_keeps_descendants_owned(tmp_path, caller, inherited_pipes
         handle = kernel.OpenProcess(0x100001, False, pid)  # SYNCHRONIZE | TERMINATE
         stdout, stderr = process.communicate(timeout=4)
         assert process.returncode == 0, stderr.decode("utf-8", "replace")
-        assert json.loads(stdout)["timed_out"] is inherited_pipes
+        # The organizer completes on the native leader's real exit and then
+        # reaps its owned descendants. Community subprocesses drain complete
+        # output, so inherited pipes instead reach this explicit test deadline.
+        expected_timeout = inherited_pipes and caller == "community"
+        assert json.loads(stdout)["timed_out"] is expected_timeout
         if handle:
             assert kernel.WaitForSingleObject(handle, 1000) == 0, "owned descendant survived"
         assert time.monotonic() - started < 3

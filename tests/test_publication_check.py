@@ -1,4 +1,5 @@
 """Exact-commit package validation from orthogonal long-task publication cases."""
+from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import json
@@ -7,6 +8,7 @@ import subprocess
 import pytest
 
 from mindie_knowledge.publication_check import validate
+from mindie_knowledge.publication_contract import make_contract, render_contract
 from mindie_knowledge.loop.documents import make_entry
 from mindie_knowledge.materials import MaterialStore
 
@@ -15,7 +17,8 @@ def git(repo, *args, timeout=10):
     return subprocess.check_output(['git', '-C', str(repo), *args], text=True, timeout=timeout).strip()
 
 
-def publish(tmp_path, files, *, write_timeout=10):
+def publish(tmp_path, files, *, write_timeout=10, domain="vllm-ascend"):
+    files = {"publication-contract.json": render_contract(make_contract(domain, "a" * 40)), **files}
     repo = tmp_path / 'repo'
     repo.mkdir()
     git(repo, 'init', '-q', '-b', 'main')
@@ -37,8 +40,7 @@ def task_files(number=1, *, domain='vllm-ascend', body='Complete public evidence
     doc = make_entry(entry_id=entry_id, domain=domain, kind=kind,
                      title=f'Inference task {number}', summary=f'Case {number}; evidence remains reference material.',
                      content=body)
-    with TemporaryDirectory() as root:
-        store = MaterialStore(root, domain)
+    with TemporaryDirectory() as root, closing(MaterialStore(root, domain)) as store:
         saved = store.put_document(doc)
         store.retain_current(entry_id, {'draft': saved['revision']})
         package = store.export_task(entry_id)
@@ -101,8 +103,7 @@ def test_whole_same_commit_package_is_required(tmp_path, damage):
 
 
 def test_pending_block_index_cannot_be_published(tmp_path):
-    with TemporaryDirectory() as root:
-        store = MaterialStore(root, 'vllm-ascend')
+    with TemporaryDirectory() as root, closing(MaterialStore(root, 'vllm-ascend')) as store:
         task = store.append_batch('a' * 64, [dict(block_id='b' * 64, text='Unindexed observation.',
                                                  source_range={}, title='', summary='')],
                                   'Pending indexing.', title='Unfinished task')
@@ -132,6 +133,8 @@ def test_checkpoint_resume_skips_reverified_blobs(tmp_path, monkeypatch):
     real_read, reads, armed = gitread.CatFileBatch.read, [], [True]
 
     def counting_read(self, rev, **kwargs):
+        if rev == git(repo, "rev-parse", sha + ":publication-contract.json"):
+            return real_read(self, rev, **kwargs)
         if armed[0] and len(reads) == 40:
             armed[0] = False
             reads.append(rev)
@@ -174,7 +177,7 @@ def test_same_blob_under_another_path_is_not_cache_skipped(tmp_path):
 
 def test_checkpoint_bound_to_domain_and_validator_context(tmp_path, monkeypatch):
     from mindie_knowledge import gitread
-    repo, sha = publish(tmp_path, task_files(domain='npu'))
+    repo, sha = publish(tmp_path, task_files(domain='npu'), domain='npu')
     state = tmp_path / 'state.json'
     assert validate(repo, sha, 'npu', state=state)['entries'] == 1
     with pytest.raises(ValueError, match='domain'):
@@ -182,6 +185,8 @@ def test_checkpoint_bound_to_domain_and_validator_context(tmp_path, monkeypatch)
     real_read, reads = gitread.CatFileBatch.read, []
 
     def counting(self, rev, **kwargs):
+        if rev == git(repo, "rev-parse", sha + ":publication-contract.json"):
+            return real_read(self, rev, **kwargs)
         reads.append(rev)
         return real_read(self, rev, **kwargs)
 
@@ -206,7 +211,7 @@ def test_checkpoint_binds_installed_sources_and_privacy_scan(tmp_path, monkeypat
         target = copied / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(package_root / relative, target)
-    repo, sha = publish(tmp_path, task_files(domain='npu', body='Body contains policy-canary-1.'))
+    repo, sha = publish(tmp_path, task_files(domain='npu', body='Body contains policy-canary-1.'), domain='npu')
     state = tmp_path / 'state.json'
     assert validate(repo, sha, 'npu', state=state)['entries'] == 1
     original = pc._validator_context('npu')
@@ -238,7 +243,7 @@ def test_validate_does_not_leak_descriptors(tmp_path):
     assert len(os.listdir('/dev/fd')) <= before
 
 
-def test_validate_advances_bounded_slices_in_one_call(tmp_path, monkeypatch):
+def test_validation_interruption_is_visible_and_resume_reuses_verified_work(tmp_path, monkeypatch):
     import mindie_knowledge.publication_check as pc
     from mindie_knowledge import gitread
     files = {}
@@ -246,33 +251,27 @@ def test_validate_advances_bounded_slices_in_one_call(tmp_path, monkeypatch):
         files.update(task_files(i, body=f'Complete task {i}.'))
     repo, sha = publish(tmp_path, files)
     state = tmp_path / 'validator-state.json'
-    boundary = 5
-    monkeypatch.setattr(pc, '_CHECKPOINT_EVERY', boundary)
-    real_read, real_ctor = gitread.CatFileBatch.read, pc.CatFileBatch
-    reads, slices, counts = [], [], {}
+    monkeypatch.setattr(pc, '_CHECKPOINT_EVERY', 5)
+    real_read = gitread.CatFileBatch.read
+    contract = git(repo, "rev-parse", sha + ":publication-contract.json")
+    reads = []
+    interrupted = False
 
-    def bounded_read(self, rev, **kwargs):
-        done = counts.get(id(self), 0)
-        if done >= boundary:
-            raise TimeoutError('controlled boundary before this read')
+    def read(self, rev, **kwargs):
+        nonlocal interrupted
+        if rev != contract and len(reads) == 5 and not interrupted:
+            interrupted = True
+            raise TimeoutError('external interruption')
         blob = real_read(self, rev, **kwargs)
-        counts[id(self)] = done + 1
-        reads.append(rev)
+        if rev != contract:
+            reads.append(rev)
         return blob
 
-    class CountingCtor:
-        def __new__(cls, *args, **kwargs):
-            batch = real_ctor(*args, **kwargs)
-            slices.append(batch)
-            return batch
-
-    monkeypatch.setattr(gitread.CatFileBatch, 'read', bounded_read)
-    monkeypatch.setattr(pc, 'CatFileBatch', CountingCtor)
+    monkeypatch.setattr(gitread.CatFileBatch, 'read', read)
+    with pytest.raises(TimeoutError, match='external interruption'):
+        pc.validate(repo, sha, 'vllm-ascend', state=state)
+    assert len(reads) == 5
+    assert len(json.loads(state.read_text())['verified']) == 5
     assert pc.validate(repo, sha, 'vllm-ascend', state=state)['entries'] == 30
-    assert len(slices) > 1
     assert len(reads) == 60 and len(set(reads)) == 60
-    saved = json.loads(state.read_text())
-    assert saved['commit'] == sha and len(saved['verified']) == 60
-    monkeypatch.setattr(gitread.CatFileBatch, 'read', real_read)
-    monkeypatch.setattr(pc, 'CatFileBatch', real_ctor)
-    assert pc.validate(repo, sha, 'vllm-ascend', state=state)['entries'] == 30
+    assert len(json.loads(state.read_text())['verified']) == 60

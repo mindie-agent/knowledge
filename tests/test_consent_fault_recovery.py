@@ -31,8 +31,7 @@ def _world(tmp_path):
     engine = Engine(store, settings_path=settings, admission=admission,
                     transcript_adapter=load_parser('codex'), redactor_executable=install_scanner(),
                     summary_command=summary_command(calls=marker))
-    when = max(parsed.enabled_at, admission.active_lease('ses-fault')['activated_at'],
-               store.capture_floor) + 1
+    when = max(parsed.enabled_at, admission.active_lease('ses-fault')['activated_at']) + 1
     write_transcript('codex', source, 'ses-fault', [TOKEN], when)
     return dict(store=store, engine=engine, settings=settings, consent=consent,
                 marker=marker, project=project, source=source, saved=consent.read_bytes(),

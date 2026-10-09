@@ -10,7 +10,7 @@ import hashlib
 
 from mindie_knowledge.community.batch import batch_revision, validate_batch
 from mindie_knowledge.community.common import MAX_BATCH_BYTES, MAX_FILE_BYTES
-from mindie_knowledge.materials.publication import CleanupReceiptError, freeze_batch
+from mindie_knowledge.materials.publication import CleanupReceiptError, freeze_batch, load_batch_payload
 from mindie_knowledge.redact import scan_text
 
 from .store import REPLACEABLE_BATCH, canonical, digest
@@ -41,19 +41,35 @@ def _vote_payload(votes):
     }
 
 
-def _task_files(store, doc):
+def _task_files(store, doc, *, source_revisions=None):
+    # Bind the files and the observed feed identity together. A concurrent
+    # feed/capture change is visible and retried through existing export state.
+    with store._write_txn():
+        store.rebase_draft_on_published(doc["entry_id"])
+        row = store._row(doc["entry_id"])
+        if row is None or row["draft_revision"] != doc["revision"]:
+            raise BlockingIOError("current task changed before publication preparation")
+        files = _task_files_for_revision(store, doc)
+        if source_revisions is not None:
+            source_revisions[doc["entry_id"]] = row["published_revision"] if row["feed_active"] else None
+        return files
+
+
+def _task_files_for_revision(store, doc):
     package = store.materials.export_task(
-        doc["entry_id"], source="draft", revision=doc["revision"],
+        doc["entry_id"], source="draft", revision=doc["revision"], streaming=True,
     )
     if package["task_id"] != doc["entry_id"] or package["revision"] != doc["revision"]:
         raise ValueError("current task package changed while preparing its contribution")
     if not package["ready"]:
         raise ValueError("current task package still has unfinished material indexes")
     prefix = f"tasks/{package['task_id']}/"
-    previous = {file["path"]: file["sha256"] for file in store.sent_package_files(doc["entry_id"])
+    previous = {file["path"]: file["sha256"] for file in store.contribution_base_files(doc["entry_id"])
                 if file.get("sha256") is not None}
     files = []
-    for relative, content in sorted(package["files"].items()):
+    for relative in sorted(package['files']):
+        source = package['files'].file(relative)
+        content = source['content']
         path = prefix + relative
         if len(content.encode("utf-8")) > MAX_FILE_BYTES:
             raise ExportContentError("task package file exceeds the GitHub file envelope")
@@ -61,8 +77,7 @@ def _task_files(store, doc):
         if findings:
             rules = ", ".join(sorted({finding.rule for finding in findings}))
             raise ExportContentError(f"final outbound redaction scan: {rules}")
-        files.append(dict(path=path, content=content, sha256=_sha(content),
-                          base_sha256=previous.get(path)))
+        files.append(source.with_metadata(path=path, base_sha256=previous.get(path)))
     current = {file["path"] for file in files}
     for path, sha in sorted(previous.items()):
         if not path.startswith(prefix):
@@ -79,21 +94,29 @@ def build_batch(store, *, settings, revision_fn=None):
     previous = store.batch(lineage)
     if previous is not None and previous["status"] not in REPLACEABLE_BATCH:
         return None
-    drafts = store.drafts_changed(generation=settings.generation, ready_only=True)
+    with store.lock:
+        continued = [row[0] for row in store.db.execute(
+            "SELECT entry_id FROM entries WHERE feed_active=1 AND draft_revision IS NOT NULL")]
+    for entry_id in continued:
+        store.rebase_draft_on_published(entry_id)
+    drafts = store.drafts_changed(generation=settings.generation, ready_only=True, include_content=False)
     drafts = [doc for doc in drafts if store.summary_ready(doc)]
     votes = sorted(store.unbatched_votes(generation=settings.generation),
                    key=lambda vote: (vote["root_opaque"], vote["entry_id"], vote["revision"]))[:MAX_BATCH_VOTES]
     if not drafts and not votes:
         return None
-    files, kept = [], []
+    files, kept, source_revisions = [], [], {}
     total = 0
     for doc in sorted(drafts, key=lambda item: item["entry_id"]):
         try:
-            task_files = _task_files(store, doc)
+            task_files = _task_files(store, doc, source_revisions=source_revisions)
         except ExportContentError as exc:
             store.quarantine_entry(doc["entry_id"], kind="content-scan", detail=str(exc))
             continue
-        size = len(canonical(task_files).encode("utf-8"))
+        # Preserve the grouping envelope while encoding only one file at a
+        # time. A long task never becomes one giant JSON allocation.
+        size = 2 + max(0, len(task_files) - 1) + sum(
+            len(canonical(dict(file)).encode('utf-8')) for file in task_files)
         if kept and total + size > MAX_BATCH_BYTES:
             continue  # whole task remains pending; never publish half a package
         files.extend(task_files)
@@ -126,10 +149,13 @@ def build_batch(store, *, settings, revision_fn=None):
                      summary=f"{store.domain}: {len(kept)} task packages, {len(votes)} votes"[:240])
         validate_batch(batch)
         descriptor = freeze_batch(store.root, batch)
+        batch = load_batch_payload(store.root, descriptor)
         entry_ids = [doc["entry_id"] for doc in kept]
         vote_keys = [(vote["root_opaque"], vote["entry_id"], vote["revision"]) for vote in votes]
         store.create_batch(batch_id=lineage, revision=revision, batch=descriptor,
-                           entry_ids=entry_ids, vote_keys=vote_keys, generation=settings.generation)
+                           entry_ids=entry_ids, vote_keys=vote_keys, generation=settings.generation,
+                           source_revisions={ident: source_revisions[ident] for ident in entry_ids},
+                           entry_revisions={doc["entry_id"]: doc["revision"] for doc in kept})
     except CleanupReceiptError:
         # The replacement is already durable and pending. Its local cleanup
         # error cannot turn it into a failed export or authorize another build.

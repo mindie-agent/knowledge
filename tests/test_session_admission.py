@@ -1,12 +1,13 @@
 """Neutral admission store: canonical SessionGate semantics."""
 
+from contextlib import closing
 import os
 import sqlite3
 import time
 
 import pytest
 
-from mindie_knowledge.loop.activation import Admission
+from mindie_knowledge.loop.activation import Admission, AdmissionUnavailable
 from mindie_knowledge.loop.store import session_key
 
 from conftest import admission_token, make_admission
@@ -88,7 +89,7 @@ def test_scope_change_rotates_token_and_boundary(tmp_path):
 
 def test_authorization_has_no_wallclock_expiry(tmp_path):
     path = make_admission(tmp_path, project_root=tmp_path)
-    with sqlite3.connect(path) as db:
+    with closing(sqlite3.connect(path)) as db, db:
         db.execute("UPDATE leases SET activated_at=?", (time.time() - 10 * 86400,))
     assert Admission(path).active_lease("manual-A")
 
@@ -125,20 +126,24 @@ def test_claim_consumes_exactly_once_and_finish_is_diagnostic_only(tmp_path):
         gate.finish("manual-A", token, True)  # rotated-out token is dead
 
 
-def test_old_lease_schema_reads_for_status_but_capture_fails_closed(tmp_path):
+def test_incomplete_lease_schema_cannot_authorize_status_or_capture(tmp_path):
     path = tmp_path / "admission.sqlite3"
-    with sqlite3.connect(path) as db:
+    with closing(sqlite3.connect(path)) as db, db:
         db.execute(
             "CREATE TABLE leases(session TEXT, token TEXT, enabled INTEGER, "
             "failures INTEGER)"
         )
         db.execute("INSERT INTO leases VALUES('manual-A', 'cap-A', 1, 0)")
     gate = Admission(path)
-    lease = gate.check("manual-A", "cap-A")  # identity still readable
-    assert lease["session"] == "manual-A"
-    assert lease["capture_schema"] is False
-    with pytest.raises(ValueError, match="predates this schema"):
+    before = path.read_bytes()
+    with pytest.raises(AdmissionUnavailable, match="state"):
+        gate.check("manual-A", "cap-A")
+    with pytest.raises(AdmissionUnavailable, match="state"):
         gate.capture_lease("manual-A", "cap-A")
+    assert path.read_bytes() == before
+    with closing(sqlite3.connect(path)) as db:
+        assert db.execute("SELECT * FROM leases").fetchall() == [("manual-A", "cap-A", 1, 0)]
+        assert not db.execute("SELECT name FROM sqlite_master WHERE name='attempts'").fetchone()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")

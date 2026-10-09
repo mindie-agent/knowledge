@@ -19,6 +19,7 @@ Ordering guarantees, all backed by the durable ledger in ``state_dir``:
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -46,6 +47,7 @@ from .common import (
 from .ledger import Ledger
 from .settings import live_gate, sharing_enabled
 from .transport import Transport, transport_from_settings
+from mindie_knowledge.publication_contract import ContractMismatch, read_git_contract
 
 RECEIPT_STATUSES = (
     "submitted",
@@ -98,6 +100,47 @@ def _settings_gate(settings: Mapping[str, Any]) -> None:
     live_gate(settings)
 
 
+class _CompletedEffectReceiptFailure(Exception):
+    """A remote effect returned successfully; its following receipt failed."""
+    def __init__(self, result, cause):
+        self.result, self.cause = result, cause
+        super().__init__('completed external effect receipt failed')
+
+
+def _record_completed(ledger, batch_id, revision, step, detail, result):
+    try:
+        ledger.record_step(batch_id, revision, step, detail)
+    except Exception as exc:
+        raise _CompletedEffectReceiptFailure(result, exc) from exc
+
+
+def _finish_result(checked, ledger, result, *, recording_error=None):
+    """Keep a known business result even if its independent receipt fails."""
+    result = dict(result)
+    try:
+        ledger.finish_publication(
+            checked['batch_id'], checked['revision'], status=result['status'],
+            detail=result.get('detail', ''), pr_number=result.get('pr_number'),
+            pr_url=result.get('pr_url'), head_sha=result.get('head_sha'),
+        )
+    except Exception as exc:
+        if recording_error is None:
+            recording_error = exc
+        else:
+            recording_error.add_note('final publication receipt also failed: ' + type(exc).__name__)
+    if recording_error is not None:
+        from mindie_knowledge.loop.dfx import failure
+        failure('knowledge.publish', stage='receipt', category='publication_recording_failed',
+                exception=recording_error, reportable=False)
+        result['detail'] = result.get('detail', '') + '; local publication receipt failed (' + type(recording_error).__name__ + ')'
+        result.update(recording_failed=True, failed_stage='receipt', error_code='publication_recording_failed')
+    return _receipt(checked, status=result['status'], detail=result.get('detail', ''),
+                    pr_url=result.get('pr_url'), head_sha=result.get('head_sha'),
+                    retry_at=result.get('retry_at'),
+                    extras={key: value for key, value in result.items()
+                            if key not in {'status', 'detail', 'pr_url', 'head_sha', 'retry_at'}})
+
+
 def submit_batch(
     batch: dict,
     settings: dict,
@@ -105,14 +148,31 @@ def submit_batch(
     *,
     cancel: Any = None,
     transport: Transport | None = None,
+    authority_guard=None,
 ) -> dict:
     """Publish one contribution batch through Git + GitHub, idempotently."""
     state_dir = Path(state_dir)
-    ledger = Ledger(state_dir)
+    ledger = Ledger(state_dir, authority_guard=authority_guard)
+    result = None
     try:
-        return _submit(batch, settings, state_dir, ledger, cancel=cancel, transport=transport)
+        result = _submit(batch, settings, state_dir, ledger, cancel=cancel, transport=transport)
+        return result
     finally:
-        ledger.close()
+        import sys
+        primary_error = sys.exc_info()[1]
+        try:
+            ledger.close()
+        except Exception as exc:
+            if primary_error is not None:
+                primary_error.add_note('publication ledger cleanup also failed: ' + type(exc).__name__)
+            elif result is not None:
+                from mindie_knowledge.loop.dfx import failure
+                failure('knowledge.publish', stage='cleanup', category='publication_cleanup_failed',
+                        exception=exc, reportable=False)
+                result.update(cleanup_failed=True)
+                result['detail'] += '; publication ledger cleanup failed (' + type(exc).__name__ + ')'
+            else:
+                raise
 
 
 def _submit(batch, settings, state_dir, ledger, *, cancel, transport) -> dict[str, Any]:
@@ -121,8 +181,8 @@ def _submit(batch, settings, state_dir, ledger, *, cancel, transport) -> dict[st
                         detail="community sharing is disabled or unconfigured")
     checked = validate_batch(batch)
     deadline = Deadline(
-        settings.get("transaction_seconds", 120),
-        settings.get("operation_limit", 60),
+        settings.get("transaction_seconds"),
+        settings.get("operation_limit"),
         cancel=cancel,
     )
     transport = transport or transport_from_settings(settings, state_dir)
@@ -164,11 +224,10 @@ def _submit(batch, settings, state_dir, ledger, *, cancel, transport) -> dict[st
                                 detail="resolved by read-only reconciliation",
                                 pr_url=resolved.get("pr_url"), head_sha=resolved.get("head_sha"),
                                 extras={"files": resolved.get("files")})
-            if not checked["explicit_retry"]:
+            if resolved['status'] == 'unknown' or not checked["explicit_retry"]:
                 return resolved
-            # Explicit retry of a still-unknown/failed revision: step receipts of
-            # completed earlier stages are preserved; git push of an identical
-            # commit is a no-op, and a moved remote branch parks needs_review.
+            # Only a proven failed result may proceed through explicit retry.
+            # An explicit flag never turns an uncertain effect into no effect.
         # "unavailable" deliberately falls through: the earlier attempt failed
         # in the environment before any uncertain write, so the same stored
         # operation is retried (bounded by the caller's persisted backoff).
@@ -223,46 +282,59 @@ def _submit(batch, settings, state_dir, ledger, *, cancel, transport) -> dict[st
     elif prior:
         branch = f"{branch}-{revision[:8]}"
 
+    # The repository/data contract is a read-only prerequisite, not an
+    # attempted publication. A deployment mismatch cannot create an unknown
+    # write or consume a frozen payload before any remote mutation happens.
+    try:
+        prepared = _publication_base(checked, settings, state_dir, deadline,
+                                     repository=repository, write_repo=write_repo,
+                                     remote_url=remote_url)
+    except ContractMismatch as exc:
+        return _receipt(checked, status="unavailable", detail=str(exc), extras={
+            "error_code": exc.code, "failed_stage": "publication-contract",
+            "external_write_attempted": False,
+        })
+    except (OSError, TimeoutError) as exc:
+        return _receipt(checked, status="unavailable", detail=str(exc), extras={
+            "failed_stage": "publication-contract", "external_write_attempted": False,
+        })
+    except CommunityError as exc:
+        return _receipt(checked, status=exc.status, detail=str(exc), retry_at=exc.retry_at,
+                        extras={"failed_stage": "publication-contract", "external_write_attempted": False})
+
     ledger.record_intent(
         batch_id=batch_id, revision=revision, domain=checked["domain"],
         repository=repository, branch=branch,
     )
+    progress = {}
     try:
         result = _publish(
             checked, settings, state_dir, ledger, deadline, transport,
             repository=repository, write_repo=write_repo, remote_url=remote_url,
             branch=branch, pr_title=pr_title, pr_body=pr_body, commit_message=commit_message,
-            prior=prior,
+            prior=prior, prepared=prepared, progress=progress,
         )
+    except _CompletedEffectReceiptFailure as exc:
+        return _finish_result(checked, ledger, exc.result, recording_error=exc.cause)
     except UnknownOutcome as exc:
-        ledger.finish_publication(batch_id, revision, status="unknown", detail=str(exc))
-        return _receipt(checked, status="unknown", detail=str(exc), retry_at=exc.retry_at)
+        return _finish_result(checked, ledger, dict(progress, status='unknown', detail=str(exc), retry_at=exc.retry_at))
     except CommunityError as exc:
-        ledger.finish_publication(
-            batch_id, revision,
-            status=exc.status if exc.status in RECEIPT_STATUSES else "failed",
-            detail=str(exc),
-        )
-        return _receipt(checked, status=exc.status, detail=str(exc), retry_at=exc.retry_at)
-    ledger.finish_publication(
-        batch_id, revision, status=result["status"], detail=result.get("detail", ""),
-        pr_number=result.get("pr_number"), pr_url=result.get("pr_url"),
-        head_sha=result.get("head_sha"),
-    )
-    return _receipt(checked, status=result["status"], detail=result.get("detail", ""),
-                    pr_url=result.get("pr_url"), head_sha=result.get("head_sha"),
-                    extras={"files": result.get("files")})
+        # A later gate/read failure cannot erase a push which already
+        # completed. Preserve that fact even when creating the PR is blocked.
+        pushed = progress.get('head_sha')
+        detail = str(exc)
+        if pushed:
+            detail = 'Git push completed; subsequent publication step did not complete: ' + detail
+        return _finish_result(checked, ledger, dict(status=exc.status, detail=detail,
+                              retry_at=exc.retry_at, head_sha=pushed,
+                              completed_steps=['git-push'] if pushed else [], external_write_completed=bool(pushed)))
+    return _finish_result(checked, ledger, {**progress, **result})
 
 
-def _publish(checked, settings, state_dir, ledger, deadline, transport, *,
-             repository, write_repo, remote_url, branch, pr_title, pr_body, commit_message,
-             prior):
-    batch_id, revision = checked["batch_id"], checked["revision"]
+def _publication_base(checked, settings, state_dir, deadline, *, repository, write_repo, remote_url):
+    """Select and validate the exact upstream base before publication intent."""
     base_branch = settings.get("branch", "main")
-
-    ledger.record_step(batch_id, revision, "gate:before-git")
     _settings_gate(settings)
-    ledger.record_step(batch_id, revision, "git:clone-fetch")
     genv = gitops.git_env(settings)
     work_dir = gitops.ensure_clone(
         remote_url, state_dir / "git" / write_repo.replace("/", "_"), deadline, env=genv
@@ -277,6 +349,23 @@ def _publish(checked, settings, state_dir, ledger, deadline, transport, *,
         base_tip = gitops.fetch_ref(
             work_dir, read_url, f"refs/heads/{base_branch}", deadline, env=genv
         )
+    contract = read_git_contract(
+        work_dir, base_tip, checked["domain"],
+        expected_sha256=settings.get("publication_contract_sha256"),
+        deadline=deadline.limit, env=genv, cancel=deadline.cancel,
+    )
+    return dict(work_dir=work_dir, genv=genv, base_tip=base_tip,
+                read_url=read_url, base_branch=base_branch, contract=contract)
+
+
+def _publish(checked, settings, state_dir, ledger, deadline, transport, *,
+             repository, write_repo, remote_url, branch, pr_title, pr_body, commit_message,
+             prior, prepared, progress):
+    batch_id, revision = checked["batch_id"], checked["revision"]
+    work_dir, genv = prepared["work_dir"], prepared["genv"]
+    base_tip, read_url = prepared["base_tip"], prepared["read_url"]
+    base_branch = prepared["base_branch"]
+    ledger.record_step(batch_id, revision, "publication-contract:validated", prepared["contract"]["sha256"])
     if checked["base_commit"] and checked["base_commit"] != base_tip:
         ledger.record_step(batch_id, revision, "git:base-diverged",
                            f"batch base {checked['base_commit'][:12]} != remote {base_tip[:12]}")
@@ -317,6 +406,19 @@ def _publish(checked, settings, state_dir, ledger, deadline, transport, *,
         else:
             checkout_ref = base_tip
 
+    # Updating an open contribution must not carry an independently changed
+    # workflow/data policy from its head. Inspect before checkout or a write.
+    selected_commit = gitops._git(["rev-parse", checkout_ref], deadline, cwd=work_dir, env=genv).strip()
+    try:
+        read_git_contract(work_dir, selected_commit, checked["domain"],
+                          expected_sha256=prepared["contract"]["sha256"],
+                          deadline=deadline.limit, env=genv, cancel=deadline.cancel)
+    except ContractMismatch as exc:
+        raise CommunityError(f"contribution head contract differs from its upstream base: {exc}",
+                             status="needs_review") from exc
+    except (OSError, TimeoutError) as exc:
+        raise TransientError(f"cannot verify the contribution head contract: {exc}") from exc
+
     # Inspect Git objects before asking the host to materialize them. A path
     # or mode conflict must stay needs_review even when checkout cannot create
     # that path (for example a newline filename or symlink on Windows).
@@ -356,14 +458,15 @@ def _publish(checked, settings, state_dir, ledger, deadline, transport, *,
         if updating:
             ledger.record_step(batch_id, revision, "gate:before-metadata")
             _settings_gate(settings)
+            ledger.assert_authority()
             transport.update_pull_request(repository, prior["number"], title=pr_title, body=pr_body, deadline=deadline)
             return {"status": "unchanged", "detail": "no content change; PR metadata refreshed",
                     "pr_number": prior["number"], "pr_url": prior.get("html_url"), "head_sha": head_sha,
-                    "files": actual_files}
+                    "files": actual_files, 'completed_steps': ['pr-update'], 'external_write_completed': True}
         if resumed or own_resume:
             # The exact commits are already on the remote branch; only the PR
             # step is outstanding. Skip the push entirely and create the PR.
-            pass
+            progress.update(head_sha=head_sha, completed_steps=['git-push'], external_write_completed=True)
         else:
             return {"status": "unchanged",
                     "detail": "content already present on the target branch",
@@ -378,30 +481,44 @@ def _publish(checked, settings, state_dir, ledger, deadline, transport, *,
         # this revision's expected commit).
         ledger.record_step(batch_id, revision, "git:intended-head", head_sha)
         ledger.record_step(batch_id, revision, "git:push")
+        ledger.assert_authority()
         gitops.push_branch(work_dir, branch, deadline, env=genv, cancel=deadline.cancel)
-        ledger.record_step(batch_id, revision, "git:pushed", head_sha)
+        progress.update(head_sha=head_sha, completed_steps=['git-push'], external_write_completed=True)
+        _record_completed(ledger, batch_id, revision, 'git:pushed', head_sha,
+                          dict(status='failed', detail='Git push completed; PR publication did not start',
+                               head_sha=head_sha, files=actual_files, completed_steps=['git-push'],
+                               external_write_completed=True))
 
-    ledger.record_step(batch_id, revision, "gate:before-api")
+    # Any local receipt between the completed push and the next request must
+    # preserve the same known result, including intent/gate records.
+    pushed_result = dict(status='failed', detail='Git push completed; subsequent PR request did not start',
+                         head_sha=head_sha, files=actual_files, completed_steps=['git-push'],
+                         external_write_completed=True)
+    _record_completed(ledger, batch_id, revision, 'gate:before-api', '', pushed_result)
     _settings_gate(settings)
     if updating:
-        ledger.record_step(batch_id, revision, "github:update-pr", f"#{prior['number']}")
+        _record_completed(ledger, batch_id, revision, 'github:update-pr', f"#{prior['number']}", pushed_result)
+        ledger.assert_authority()
         transport.update_pull_request(repository, prior["number"], title=pr_title, body=pr_body, deadline=deadline)
+        progress.update(completed_steps=[*progress.get('completed_steps', []), 'pr-update'], external_write_completed=True)
         return {"status": "updated", "detail": f"updated open PR #{prior['number']}",
                 "pr_number": prior["number"], "pr_url": prior.get("html_url"), "head_sha": head_sha,
                 "files": actual_files}
 
     if merged_prior:
         pr_body = pr_body + f"\nFollow-up to merged PR #{merged_prior['number']}.\n"
-    ledger.record_step(batch_id, revision, "github:create-pr")
+    _record_completed(ledger, batch_id, revision, 'github:create-pr', '', pushed_result)
     head_ref = branch if write_repo == repository else f"{write_repo.split('/')[0]}:{branch}"
+    ledger.assert_authority()
     pr = transport.create_pull_request(
         write_repo if write_repo == repository else repository,
         title=pr_title, body=pr_body, head=head_ref, base=base_branch, deadline=deadline,
     )
-    ledger.record_step(batch_id, revision, "github:pr-created", f"#{pr.get('number')}")
-    return {"status": "submitted", "detail": f"opened PR #{pr.get('number')}",
+    result = {"status": "submitted", "detail": f"opened PR #{pr.get('number')}",
             "pr_number": pr.get("number"), "pr_url": pr.get("html_url"), "head_sha": head_sha,
-            "files": actual_files}
+            "files": actual_files, 'completed_steps': ['git-push', 'pr-create'], 'external_write_completed': True}
+    _record_completed(ledger, batch_id, revision, 'github:pr-created', f"#{pr.get('number')}", result)
+    return result
 
 
 def _actual_entry_files(checked, work_dir):
@@ -916,8 +1033,8 @@ def inspect_batch(batch_id: str, settings: dict, state_dir: Path, *, transport: 
                     "pr_url": None, "head_sha": None,
                     "detail": "community sharing is disabled or unconfigured"}
         transport = transport or transport_from_settings(settings, state_dir)
-        deadline = Deadline(settings.get("transaction_seconds", 120),
-                            settings.get("operation_limit", 60))
+        deadline = Deadline(settings.get("transaction_seconds"),
+                            settings.get("operation_limit"))
         rows = [
             row for row in ledger.all_for_batch(batch_id)
             if row["status"] in ("intent", "unknown", "failed", "rejected")
@@ -947,8 +1064,8 @@ def reconcile_batch(batch_id: str, settings: dict, state_dir: Path, *, transport
                     "pr_url": None, "head_sha": None,
                     "detail": "community sharing is disabled or unconfigured"}
         transport = transport or transport_from_settings(settings, state_dir)
-        deadline = Deadline(settings.get("transaction_seconds", 120),
-                            settings.get("operation_limit", 60))
+        deadline = Deadline(settings.get("transaction_seconds"),
+                            settings.get("operation_limit"))
         unresolved = ledger.unresolved_for_batch(batch_id)
         if not unresolved:
             latest = ledger.latest_for_batch(batch_id)

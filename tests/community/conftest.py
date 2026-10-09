@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 
+from mindie_knowledge.publication_contract import make_contract, render_contract
 from mindie_knowledge.loop import documents  # integrated package is required
 
 from mindie_knowledge.community import entrydoc  # noqa: F401  (delegates to core documents)
@@ -81,7 +82,8 @@ def make_remote(tmp_path: Path, name: str) -> str:
     work = tmp_path / f"{name}-seed"
     git(["clone", str(bare), str(work)])
     (work / "README.md").write_text(f"# {name}\n", encoding="utf-8")
-    git(["add", "README.md"], cwd=work)
+    (work / "publication-contract.json").write_bytes(render_contract(make_contract("npu", "a" * 40)).encode("utf-8"))
+    git(["add", "README.md", "publication-contract.json"], cwd=work)
     git(["-c", "user.name=seed", "-c", "user.email=seed@example.invalid",
          "commit", "-m", "init"], cwd=work)
     git(["push", "origin", "main"], cwd=work)
@@ -99,6 +101,7 @@ def make_entry(entry_id="entry-1", domain="npu", title="Container device numberi
                content="Map the physical device, then number logically from zero.",
                revision=None, kind="experience", conditions=None,
                summary="How device numbering works"):
+    from contextlib import closing
     import hashlib
     import re
     import tempfile
@@ -109,8 +112,8 @@ def make_entry(entry_id="entry-1", domain="npu", title="Container device numberi
     doc = documents.make_entry(entry_id=entry_id, domain=domain, kind=kind,
                               title=title, summary=summary, content=content,
                               conditions=conditions or {"driver": "cann 8.0"})
-    with tempfile.TemporaryDirectory(prefix="mindie-package-fixture-") as directory:
-        materials = MaterialStore(Path(directory), domain)
+    with tempfile.TemporaryDirectory(prefix="mindie-package-fixture-") as directory, \
+            closing(MaterialStore(Path(directory), domain)) as materials:
         doc = materials.put_document(doc)
         package = materials.export_task(entry_id, revision=doc["revision"])
     _PACKAGES[doc["revision"]] = package

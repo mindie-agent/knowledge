@@ -1,8 +1,8 @@
 """Bounded blob reads through one persistent ``git cat-file --batch``.
 
-Spawning a fresh Git process per blob makes whole-tree validation hit the
-per-attempt deadline as a knowledge base grows; one long-lived batch process
-per validation attempt keeps each read a bounded single-record operation
+Spawning a fresh Git process per blob repeats initialization as a knowledge
+base grows; one owned batch process per validation operation keeps each read
+a bounded single-record operation
 (at most one blob body in memory) without per-item spawn overhead. The batch
 protocol is parsed strictly: a malformed header, a short read or a protocol
 desync aborts the attempt as a transient local failure (the caller's
@@ -68,15 +68,22 @@ def _git_command(argv) -> bool:
     return os.path.basename(str(argv[0])).lower() in {"git", "git.exe"}
 
 
-def run_stdout_to_file(argv, target, *, timeout, env=None):
+def _check_cancel(cancel):
+    if cancel is not None and cancel.is_set():
+        raise InterruptedError("Git read cancelled by its owner")
+
+
+def run_stdout_to_file(argv, target, *, timeout=None, env=None, cancel=None):
     """Run ``argv`` with stdout redirected to ``target`` (no memory cap).
 
     Metadata output can grow with the catalogue; disk absorbs it. stderr goes
     to a managed scratch file so a chatty child can never block the pipe and
     fake a timeout; only a bounded tail is read afterwards for diagnostics.
-    Raises OSError on a nonzero exit and TimeoutError when the bounded wait
-    expires; the process tree is always cleaned up.
+    Elapsed time is unbounded unless the caller explicitly supplies a timeout.
+    Process exit and owner cancellation remain observable during long work.
     """
+    _check_cancel(cancel)
+    deadline = None if timeout is None else time.monotonic() + timeout
     merged_env = dict(os.environ)
     if env:
         merged_env.update({str(k): str(v) for k, v in env.items()})
@@ -101,11 +108,15 @@ def run_stdout_to_file(argv, target, *, timeout, env=None):
             except (FileNotFoundError, OSError) as exc:
                 raise OSError(f"cannot start {argv[0]}: {exc}") from exc
             try:
-                try:
-                    process.wait(timeout=timeout)
-                except subprocess.TimeoutExpired:
-                    terminate_tree(process)
-                    raise TimeoutError(f"{argv[0]} exceeded the bounded wait") from None
+                while process.poll() is None:
+                    _check_cancel(cancel)
+                    remaining = None if deadline is None else deadline - time.monotonic()
+                    if remaining is not None and remaining <= 0:
+                        raise TimeoutError(f"{argv[0]} exceeded the caller's explicit timeout")
+                    try:
+                        process.wait(timeout=.1 if remaining is None else min(.1, remaining))
+                    except subprocess.TimeoutExpired:
+                        pass  # Polling only; the accepted operation remains alive.
                 if process.returncode != 0:
                     raise OSError(f"{argv[0]} failed: {_bounded_tail(err_name)}")
             finally:
@@ -200,23 +211,26 @@ class CatFileBatch:
                 self._eof = True
                 self._cond.notify_all()
 
-    def _await(self, deadline):
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
+    def _await(self, deadline, cancel):
+        _check_cancel(cancel)
+        if self._process.poll() is not None:
+            raise OSError("git cat-file --batch exited before its complete response")
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
             raise TimeoutError("git blob read exceeded the validation deadline")
-        self._cond.wait(timeout=min(remaining, 1.0))
+        self._cond.wait(timeout=.1 if remaining is None else min(remaining, .1))
 
-    def _take(self, count, deadline):
+    def _take(self, count, deadline, cancel):
         with self._cond:
             while len(self._buffer) < count:
                 if self._eof:
                     raise OSError("git cat-file --batch closed its stream")
-                self._await(deadline)
+                self._await(deadline, cancel)
             out = bytes(self._buffer[:count])
             del self._buffer[:count]
             return out
 
-    def _readline(self, deadline):
+    def _readline(self, deadline, cancel):
         with self._cond:
             while True:
                 index = self._buffer.find(b"\n")
@@ -228,16 +242,17 @@ class CatFileBatch:
                     raise OSError("git cat-file --batch returned a malformed header")
                 if self._eof:
                     raise OSError("git cat-file --batch closed its stream")
-                self._await(deadline)
+                self._await(deadline, cancel)
 
-    def read(self, rev, *, deadline, max_bytes):
+    def read(self, rev, *, deadline=None, max_bytes, cancel=None):
         """The exact bytes of one blob revision (``commit:path`` or SHA)."""
+        _check_cancel(cancel)
         try:
             self._process.stdin.write(rev.encode("utf-8") + b"\n")
             self._process.stdin.flush()
         except OSError as exc:
             raise OSError(f"git cat-file --batch write failed: {exc}") from exc
-        line = self._readline(deadline)
+        line = self._readline(deadline, cancel)
         if line == rev.encode("utf-8") + b" missing":
             return None
         header = _HEADER_RE.fullmatch(line)
@@ -252,8 +267,8 @@ class CatFileBatch:
             # without reading the oversized body into memory. The caller
             # aborts the attempt, so the desynced process is simply closed.
             raise ValueError(f"{rev} exceeds the per-file byte limit")
-        data = self._take(size, deadline)
-        trailer = self._take(1, deadline)
+        data = self._take(size, deadline, cancel)
+        trailer = self._take(1, deadline, cancel)
         if trailer != b"\n":
             raise OSError("git cat-file --batch protocol desync")
         return data

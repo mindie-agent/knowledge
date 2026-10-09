@@ -109,7 +109,7 @@ def test_locked_store_is_not_accepted(tmp_path):
     project = tmp_path / "proj"
     project.mkdir()
     config, admission = _ready(tmp_path, project)
-    path = tmp_path / "root" / "test" / "state-v4.sqlite3"
+    path = tmp_path / "root" / "test" / "state-v1" / "state-v4.sqlite3"
     held = sqlite3.connect(path)
     held.execute("BEGIN IMMEDIATE")
     started = time.monotonic()

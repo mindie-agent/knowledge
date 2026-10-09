@@ -132,7 +132,7 @@ def test_scoped_records_and_failure_counts_are_diagnostic_only(tmp_path):
         store.close()
     for _ in range(3):
         admission.finish("task-A", lease["token"], False)
-    dbpath = tmp_path / "state/test/state-v4.sqlite3"
+    dbpath = tmp_path / "state/test/state-v1/state-v4.sqlite3"
     before = dbpath.read_bytes()
     result = diagnostics.snapshot(path, session="task-A")
     assert before == dbpath.read_bytes()
@@ -153,7 +153,7 @@ def test_scoped_records_and_failure_counts_are_diagnostic_only(tmp_path):
 def test_actual_database_lock_is_bounded(tmp_path):
     path, data = config(tmp_path)
     store = Store(data["root"], "test"); store.close()
-    db = sqlite3.connect(tmp_path / "state/test/state-v4.sqlite3", isolation_level=None)
+    db = sqlite3.connect(tmp_path / "state/test/state-v1/state-v4.sqlite3", isolation_level=None)
     try:
         db.execute("PRAGMA journal_mode=DELETE")
         db.execute("BEGIN EXCLUSIVE")
@@ -297,7 +297,7 @@ def test_capture_material_receipt_reaches_read_only_adapter_snapshot(tmp_path, m
                        if receipt_state == 'bad-reference' else 'private-receipt-canary' * diagnostics.MAX_JSON)
                 store.db.execute('UPDATE state SET value=? WHERE key=?',
                                  (raw, 'capture-material:' + own['id']))
-    dbpath = tmp_path / 'state/test/state-v4.sqlite3'
+    dbpath = tmp_path / 'state/test/state-v1/state-v4.sqlite3'
     before = dbpath.read_bytes()
     def no_store_initialization(*args, **kwargs):
         raise AssertionError('diagnostics must not initialize a writable Store')

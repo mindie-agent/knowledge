@@ -89,7 +89,7 @@ def test_complete_package_repeat_stop_and_resume(settings, state_dir, transport,
         merge(transport, settings, first)
         assert feed.sync()["status"] == "synced"
         hit = reader.query("cache replay failed")["results"][0]
-        assert "MIDDLE_PREFIX_FAILURE_SENTINEL" in reader.get(hit["ref"])["content"]
+        assert "MIDDLE_PREFIX_FAILURE_SENTINEL" in reader.explain(hit["ref"])["content"]
         old_ref = hit["ref"]
         revised = append_parts(producer, "Later correction: the earlier success claim was invalid.\n",
                                navigation="Correction: initial smoke did not establish full precision acceptance.")
@@ -103,8 +103,10 @@ def test_complete_package_repeat_stop_and_resume(settings, state_dir, transport,
         assert len(changed) == 2 and f"tasks/{TASK}/index.md" in changed
         merge(transport, settings, second)
         assert feed.sync()["status"] == "synced"
-        with pytest.raises((ValueError, KeyError), match="unknown|expired"):
-            reader.get(old_ref)
+        stable = reader.explain(old_ref)
+        assert "MIDDLE_PREFIX_FAILURE_SENTINEL" in stable["content"]
+        assert stable["current_revision"] == revised["revision"]
+        assert "Correction" in stable["current_navigation"]["summary"]
         latest = reader.get(reader.ref(TASK))
         assert latest["revision"] == revised["revision"]
         assert "Correction" in latest["summary"] and "cache replay failed" in latest["content"]
@@ -273,15 +275,15 @@ def test_invalid_package_keeps_current_then_valid_withdrawal_removes_it(settings
         git(["push", "-q", "origin", "main"], cwd=edit)
         invalid = feed.sync()
         assert invalid["status"] == "invalid"
-        assert "Middle task failure" in reader.get(pinned)["content"]
+        assert "Middle task failure" in reader.explain(pinned)["content"]
         (edit / "tasks" / TASK / "index.md").unlink()
         git(["add", "-A"], cwd=edit)
         git(["-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-qm", "withdraw task"], cwd=edit)
         git(["push", "-q", "origin", "main"], cwd=edit)
         assert feed.sync()["entries"] == 0
         assert reader.query("Middle task failure")["results"] == []
-        with pytest.raises((ValueError, KeyError), match="unknown|expired"):
-            reader.get(pinned)
+        with pytest.raises(ValueError, match="withdrawn"):
+            reader.explain(pinned)
     finally:
         producer.close()
         reader.close()
@@ -440,7 +442,7 @@ def test_feed_rejects_unusual_task_path_and_preserves_primary_error(settings, st
         reader.close()
 
 
-@pytest.mark.parametrize("remote_change", ["unreferenced-block", "symlink-index", "crlf-index"])
+@pytest.mark.parametrize("remote_change", ["unreferenced-block", "symlink-index", "crlf-index", "replaced-block"])
 def test_remote_package_changes_are_never_overwritten(settings, state_dir, transport,
                                                       remote_url, tmp_path, remote_change, monkeypatch):
     from mindie_knowledge.community import gitops
@@ -463,9 +465,23 @@ def test_remote_package_changes_are_never_overwritten(settings, state_dir, trans
         elif remote_change == "symlink-index":
             commit = commit_tree_file(work, "HEAD", f"tasks/{TASK}/index.md",
                                       b"../../README.md", mode="120000")
-        else:
+        elif remote_change == "crlf-index":
             commit = commit_tree_file(work, "HEAD", f"tasks/{TASK}/index.md",
                                       index.read_bytes().replace(b"\n", b"\r\n"))
+        else:
+            # A canonical maintainer redaction is still a changed PR head.
+            import shutil
+            from mindie_knowledge.materials import MaterialStore
+            from package_fixture import write_package
+            with closing(MaterialStore(tmp_path / "corrected-pr", "npu")) as corrected:
+                corrected.append_batch(TASK, [dict(block_id="c" * 64, text="Maintainer-corrected public body.\n",
+                    title="Correction", summary="A limited public correction.", source_range={})],
+                    "Remote correction is authoritative.", title="Corrected task", status="complete", promote=True)
+                shutil.rmtree(work / "tasks" / TASK)
+                write_package(work, corrected.export_task(TASK))
+            git(["add", "-A"], cwd=work)
+            git(["-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-qm", "redact open PR"], cwd=work)
+            commit = git(["rev-parse", "HEAD"], cwd=work)
         git(["update-ref", "HEAD", commit], cwd=work)
         git(["push", "origin", "HEAD"], cwd=work)
         git(["push", "origin", "HEAD:refs/pull/1/head"], cwd=work)

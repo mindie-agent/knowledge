@@ -1,4 +1,5 @@
 """Small real material-package helpers for mechanism tests, without models."""
+from contextlib import closing
 from pathlib import Path
 import tempfile
 
@@ -8,8 +9,8 @@ from mindie_knowledge.loop.documents import FIELDS
 
 def package_for(doc):
     """Bind a manual test document to its actual Markdown package identity."""
-    with tempfile.TemporaryDirectory(prefix="mindie-test-package-") as directory:
-        store = MaterialStore(Path(directory), doc["domain"])
+    with tempfile.TemporaryDirectory(prefix="mindie-test-package-") as directory, \
+            closing(MaterialStore(Path(directory), doc["domain"])) as store:
         bound = store.put_document({key: doc[key] for key in FIELDS})
         package = store.export_task(doc["entry_id"], revision=bound["revision"])
     doc.update(bound)

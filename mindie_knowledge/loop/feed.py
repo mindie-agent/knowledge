@@ -20,7 +20,8 @@ from mindie_knowledge.materials.store import MaterialCleanupError
 from .locks import StartInProgress, StartLock
 from .store import _backoff_seconds, digest
 from mindie_knowledge.community.common import CommunityError, run_argv
-from mindie_knowledge.gitread import with_windows_longpaths
+from mindie_knowledge.gitread import with_windows_longpaths, _check_cancel
+from mindie_knowledge.publication_contract import read_git_contract
 
 
 def _feed_git_env():
@@ -32,7 +33,6 @@ def _feed_git_env():
         "GIT_CONFIG_VALUE_0": os.devnull,
     })
 
-ATTEMPT_SECONDS = 30
 # Repeated discovery failure defers ordinary calls for one hour, the
 # updater's established post-failure cadence; it is not a new quota.
 DISCOVERY_BACKOFF_SECONDS = 3600
@@ -66,27 +66,35 @@ class Feed:
         ):
             raise ValueError("feed requires a GitHub owner/repository and ref")
         self.repository, self.ref = repository, ref
+        self.contract_sha256 = config.get("contract_sha256")
+        if self.contract_sha256 is not None and (
+            not isinstance(self.contract_sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", self.contract_sha256)
+        ):
+            raise ValueError("feed contract_sha256 must be a complete SHA256 digest")
         self.prefix = (config.get("prefix") or "").strip("/")
         self.url = config.get("url") or f"https://github.com/{repository}.git"
         self.ident = feed_ident(repository, ref, self.prefix)
         self.dir = store.root / "feed" / self.ident
         self.dir.mkdir(parents=True, exist_ok=True)
         self.repo = self.dir / "repo.git"
+        self._cancel = None
 
     # -------------------------------------------------------------- git I/O
 
-    def _git(self, *args, deadline):
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError("knowledge sync attempt exceeded 30 seconds")
+    def _git(self, *args, deadline=None):
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            raise TimeoutError("knowledge sync exceeded the caller's explicit timeout")
         maximum = 1024 * 1024
         try:
             completed = run_argv(
             ["git", "-C", str(self.repo), *args],
-                timeout=min(remaining, 25), max_output=maximum, input_bytes=b"",
-                env=_feed_git_env(),
+                timeout=remaining, max_output=maximum, input_bytes=b"",
+                env=_feed_git_env(), cancel=self._cancel,
             )
         except CommunityError as exc:
+            _check_cancel(self._cancel)
             raise OSError(f"bounded git {args[0]} failed: {exc}") from exc
         if completed.timed_out:
             raise TimeoutError(f"git {args[0]} exceeded the sync deadline")
@@ -96,10 +104,10 @@ class Feed:
             )
         return completed.out
 
-    def _clone(self, deadline):
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError("knowledge sync attempt exceeded 30 seconds")
+    def _clone(self, deadline=None):
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            raise TimeoutError("knowledge sync exceeded the caller's explicit timeout")
         url = self.url
         if "://" not in url and not url.startswith("git@"):
             # A local path with --depth goes through git's local-copy path,
@@ -110,10 +118,11 @@ class Feed:
             completed = run_argv(
                 ["git", "clone", "--bare", "--quiet", "--depth=1", "--single-branch", "--no-tags",
                  "--branch", self.ref, url, str(self.repo)],
-                timeout=min(remaining, 25), max_output=65536, input_bytes=b"",
-                env=_feed_git_env(),
+                timeout=remaining, max_output=65536, input_bytes=b"",
+                env=_feed_git_env(), cancel=self._cancel,
             )
         except CommunityError as exc:
+            _check_cancel(self._cancel)
             raise OSError(f"bounded git clone failed: {exc}") from exc
         if completed.timed_out:
             raise TimeoutError("git clone exceeded the sync deadline")
@@ -167,13 +176,15 @@ class Feed:
             ["git", "-C", str(self.repo), "ls-tree", "-r", "-z", "--long", commit,
              "--", self.prefix or "."],
             listing_path,
-            timeout=max(1.0, deadline - time.monotonic()),
-            env=_feed_git_env(),
+            timeout=None if deadline is None else max(0, deadline - time.monotonic()),
+            env=_feed_git_env(), cancel=self._cancel,
         )
+        records = None
         try:
             records = iter_file_records(listing_path)
             entries = []
             for raw_record in records:
+                _check_cancel(self._cancel)
                 line = raw_record.decode("utf-8", "strict")
                 if not line:
                     continue
@@ -214,6 +225,8 @@ class Feed:
                         f"unsupported content layout at {path!r}; not a canonical feed"
                     )
         except (ValueError, OSError, TimeoutError) as exc:
+            if records is not None:
+                records.close()
             try:
                 listing_path.unlink(missing_ok=True)
             except OSError as cleanup:
@@ -223,6 +236,7 @@ class Feed:
                 raise error(f"{exc}; listing cleanup also failed: {type(cleanup).__name__}: {cleanup}") from exc
             raise
         else:
+            records.close()
             listing_path.unlink(missing_ok=True)
         return sorted(entries)
 
@@ -247,7 +261,8 @@ class Feed:
         staged = 0
         try:
             for path, size, object_id in entries:
-                if time.monotonic() >= deadline:
+                _check_cancel(self._cancel)
+                if deadline is not None and time.monotonic() >= deadline:
                     raise TimeoutError("task package staging exceeded the sync deadline")
                 target = staging / path
                 if target.is_symlink():
@@ -257,7 +272,8 @@ class Feed:
                     continue
                 if reader is None:
                     reader = CatFileBatch(self.repo, env=_feed_git_env())
-                raw = reader.read(object_id, deadline=deadline, max_bytes=documents.MAX_FILE_BYTES)
+                raw = reader.read(object_id, deadline=deadline, max_bytes=documents.MAX_FILE_BYTES,
+                                  cancel=self._cancel)
                 if raw is None:
                     raise OSError(f"listed blob is unreadable in the local clone: {path}")
                 if not self._matches_blob(raw, size, object_id):
@@ -277,6 +293,7 @@ class Feed:
 
     def _packages(self, commit, entries):
         from mindie_knowledge.materials import validate_package_files
+        from mindie_knowledge.materials.file_source import FileContents
 
         grouped = {}
         for path, _size, _object_id in entries:
@@ -284,8 +301,7 @@ class Feed:
             grouped.setdefault(task_id, []).append(relative)
         staging = self._staging_dir(commit)
         for task_id, names in sorted(grouped.items()):
-            files = {relative: (staging / "tasks" / task_id / relative).read_text(encoding="utf-8")
-                     for relative in names}
+            files = FileContents.from_paths(staging / 'tasks' / task_id, names)
             checked = validate_package_files(files, self.store.domain)
             package = checked
             if not package["ready"]:
@@ -336,7 +352,10 @@ class Feed:
             CANDIDATE_BACKOFF_BASE, CANDIDATE_BACKOFF_CAP, attempts
         )
 
-    def sync(self, *, force=False):
+    def sync(self, *, force=False, cancel=None, timeout=None):
+        if timeout is not None and (type(timeout) not in (int, float) or timeout <= 0):
+            raise ValueError("explicit sync timeout must be positive")
+        _check_cancel(cancel)
         receipt_key = "feed:" + self.ident
         receipt = self.store.feed_get(receipt_key) or {}
         lock = StartLock(self.dir / "sync.lock")
@@ -346,7 +365,8 @@ class Feed:
             return dict(status="busy", repository=self.repository,
                         retained_commit=receipt.get("commit"))
         try:
-            deadline = time.monotonic() + ATTEMPT_SECONDS
+            self._cancel = cancel
+            deadline = None if timeout is None else time.monotonic() + timeout
             discovery_key = f"feed-discovery:{self.ident}"
             discovery = self.store.feed_get(discovery_key) or {}
             failures = discovery.get("failures", 0)
@@ -378,6 +398,8 @@ class Feed:
                 if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit):
                     raise OSError("remote ref did not resolve to a commit")
                 self._retain_tip(commit, deadline)
+            except InterruptedError:
+                raise
             except (OSError, TimeoutError) as exc:
                 self.store.feed_set(receipt_key, dict(
                     receipt, status="unavailable", repository=self.repository,
@@ -386,7 +408,8 @@ class Feed:
                 ))
                 return self.store.feed_get(receipt_key)
             self.store.feed_set(discovery_key, {"failures": 0, "commit": commit})
-            if receipt.get("commit") == commit and not force:
+            if (receipt.get("commit") == commit and receipt.get("contract_sha256")
+                    and receipt.get("contract_requirement") == self.contract_sha256 and not force):
                 cleaned = dict(receipt)
                 cleaned.pop("detail", None)
                 cleaned.pop("retained_commit", None)
@@ -396,12 +419,17 @@ class Feed:
                 self.store.feed_set(receipt_key, cleaned)
                 return cleaned
             candidate = self._candidate()
-            if candidate.get("commit") != commit:
-                candidate = {"commit": commit, "attempts": 0, "status": "new"}
+            if (candidate.get("commit") != commit
+                    or candidate.get("contract_requirement", "") != self.contract_sha256):
+                candidate = {"commit": commit, "attempts": 0, "status": "new",
+                             "contract_requirement": self.contract_sha256}
             if candidate.get("status") == "invalid":
-                return dict(status="invalid", repository=self.repository,
-                            commit=commit, detail=candidate.get("detail", ""),
-                            retained_commit=receipt.get("commit"))
+                result = dict(status="invalid", repository=self.repository,
+                              commit=commit, detail=candidate.get("detail", ""),
+                              retained_commit=receipt.get("commit"))
+                if candidate.get("error_code"):
+                    result.update(error_code=candidate["error_code"], failed_stage="publication-contract")
+                return result
             # A transient validation failure never exhausts permanently: it
             # persists a backoff next_check and ordinary sync retries the same
             # candidate once due. An explicit resume skips the wait.
@@ -417,31 +445,42 @@ class Feed:
             candidate["attempts"] = candidate.get("attempts", 0) + 1
             self._save_candidate(candidate)  # persisted before any work
             try:
+                contract = read_git_contract(
+                    self.repo, commit, self.store.domain, prefix=self.prefix,
+                    expected_sha256=self.contract_sha256, deadline=deadline, env=_feed_git_env(), cancel=cancel,
+                )
                 listing = self._validate_listing(commit, deadline)
                 staged = self._stage_tree_docs(commit, listing, deadline)
                 # The candidate switched atomically only when every blob of
                 # the exact commit was verified and staged; the switch itself
                 # is a short local transaction with no Git IO inside.
-                packages = list(self._packages(commit, listing))
+                packages = self._packages(commit, listing)
                 installed = self.store.install_feed(packages, feed_ident=self.ident, source_revision=commit)
             except MaterialCleanupError as exc:
                 # The new pointers and metadata are already committed. Preserve
                 # this outcome separately from retiring superseded local files.
-                installed = dict(entries=len(packages), cleanup_error=str(exc)[:300])
+                installed = dict(entries=len({path.split('/')[1] for path, _, _ in listing}),
+                                 cleanup_error=str(exc)[:300])
             except ValueError as exc:
                 if getattr(exc, "metadata_committed", False):
                     return self._partial_promotion(commit, self.repository, exc)
                 candidate.update(status="invalid", detail=str(exc)[:300])
+                if getattr(exc, "code", None):
+                    candidate["error_code"] = exc.code
                 candidate.pop("next_check", None)
                 self._save_candidate(candidate)
                 result = dict(status="invalid", repository=self.repository,
                               commit=commit, detail=str(exc)[:300],
                               retained_commit=receipt.get("commit"))
+                if getattr(exc, "code", None):
+                    result.update(error_code=exc.code, failed_stage="publication-contract")
                 try:
                     self._clear_staging()
                 except OSError as cleanup:
                     result.update(cleanup_status="failed", cleanup_error=str(cleanup)[:300])
                 return result
+            except InterruptedError:
+                raise
             except (OSError, TimeoutError) as exc:
                 if getattr(exc, "metadata_committed", False):
                     return self._partial_promotion(commit, self.repository, exc)
@@ -467,17 +506,20 @@ class Feed:
                 status="synced", repository=self.repository, ref=self.ref,
                 prefix=self.prefix, commit=commit, entries=installed["entries"],
                 attempts=candidate["attempts"], checked=time.time(),
+                contract_sha256=contract["sha256"], contract_requirement=self.contract_sha256,
             )
             if installed.get("cleanup_error"):
                 receipt["material_cleanup_error"] = installed["cleanup_error"]
             self._cleanup_receipt(receipt)
             try:
                 self.store.feed_set(receipt_key, receipt)
-                self._save_candidate({"commit": commit, "attempts": 0, "status": "ok"})
+                self._save_candidate({"commit": commit, "attempts": 0, "status": "ok",
+                                      "contract_requirement": self.contract_sha256})
             except Exception as exc:
                 # The file snapshot is already installed. Report its known
                 # outcome even when saving the secondary sync receipt fails.
                 receipt.update(receipt_status="failed", receipt_error=f"{type(exc).__name__}: {exc}"[:300])
             return receipt
         finally:
+            self._cancel = None
             lock.release()
