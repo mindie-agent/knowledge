@@ -49,7 +49,7 @@ def pending_header(_text):
     return 'Task experience awaiting indexing', 'Reference material; indexing is pending.'
 
 
-def capture(engine, row, text, region):
+def capture(engine, row, text, region, *, cancel):
     from .engine import CursorConflict
     store, inc = engine.store, region.get('inc') or {}
     if not inc or inc.get('coverage') or inc.get('discarded_records'):
@@ -62,7 +62,7 @@ def capture(engine, row, text, region):
                                  source_digest=inc['digest'],
                                  scanner_state=json.loads(prior['redaction_state']) if prior else {},
                                  executable=engine.redactor_executable, key=store.redaction_key(),
-                                 private_paths=(row['scope'], str(Path.home())), cancel=engine._cancel)
+                                 private_paths=(row['scope'], str(Path.home())), cancel=cancel)
     engine._revalidate(row)
     with store._write_txn():
         engine._revalidate(row)
@@ -82,28 +82,6 @@ def capture(engine, row, text, region):
     engine.last_activity = time.monotonic()
 
 
-def _settle_task(store, entry_id):
-    """Derive queue status from current block indexes, never from process liveness."""
-    row = store._row(entry_id)
-    task = store.materials.read_task(entry_id, revision=row['draft_revision'], source='draft')
-    indexed = {b['block_id'] for b in task['blocks'] if b['indexed']}
-    for batch in store.db.execute("SELECT batch_id,block_ids FROM material_batches WHERE entry_id=? AND status!='complete'",
-                                  (entry_id,)).fetchall():
-        if set(json.loads(batch['block_ids'])) <= indexed:
-            store.db.execute("UPDATE material_batches SET status='complete',detail='' WHERE batch_id=?", (batch['batch_id'],))
-    batches = store.db.execute('SELECT status,detail FROM material_batches WHERE entry_id=?', (entry_id,)).fetchall()
-    statuses = {r['status'] for r in batches}
-    status = 'complete' if statuses == {'complete'} else ('outcome_unknown' if 'outcome_unknown' in statuses else
-             'failed' if 'failed' in statuses else 'cancelled' if 'cancelled' in statuses else 'pending')
-    details = sorted({r['detail'] for r in batches if r['status'] == status and r['detail']})
-    detail = '' if status in {'complete', 'pending'} else ('index-summary ' + status + ': ' +
-              ('; '.join(details) if details else 'explicit recovery required'))[:500]
-    if status not in {'complete', 'pending'} and details and details[0].startswith('{'):
-        detail = details[0]
-    store.db.execute('UPDATE transcript_tasks SET summary_status=?,summary_detail=?,body_digest=?,summary_due=? WHERE entry_id=?',
-                     (status, detail, task['entry']['material_digest'], time.time(), entry_id))
-
-
 def summarize_due(engine):
     """Process one complete new batch; a saved response resumes locally only."""
     from .engine import AdmissionUnreadable, GateFault
@@ -112,16 +90,16 @@ def summarize_due(engine):
     if time.monotonic() - engine.last_activity < SUMMARY_SETTLE_SECONDS:
         return
     store = engine.store
-    with store.lock:
-        found = store.db.execute("SELECT b.* FROM material_batches b JOIN transcript_tasks t ON t.entry_id=b.entry_id "
-                                 "WHERE b.status IN ('pending','retry-requested') AND t.summary_due<=? ORDER BY b.created,b.batch_id LIMIT 1",
-                                 (time.time(),)).fetchone()
-    if found is None or not engine.begin_work():
+    batch = engine.index_queue.due()
+    if batch is None:
         return
-    batch, attempt, ledger = dict(found), None, None
+    attempt, ledger, operation = None, None, None
     try:
         authorization = json.loads(batch['authorization'])
-        cancel = engine._begin_summary(authorization['generation'])
+        operation = engine.operations.begin('index', batch['batch_id'], authorization['generation'])
+        if operation is None:
+            return
+        cancel = operation.cancel
         engine._gate_live()
         engine._revalidate(authorization)
         row = store._row(batch['entry_id'])
@@ -130,15 +108,13 @@ def summarize_due(engine):
         blocks = [store.materials.read_block(batch['entry_id'], b['block_id'], revision=row['draft_revision'])
                   for b in task['blocks'] if b['block_id'] in wanted and not b['indexed']]
         if not blocks:
-            with store._write_txn():
-                _settle_task(store, batch['entry_id'])
+            engine.index_queue.settle(batch['entry_id'])
             return
         prior_navigation = (dict(title=task['entry']['title'], summary=task['navigation'])
                             if any(b['indexed'] for b in task['blocks']) else None)
         selected = partition_blocks(blocks, prior_navigation)[0]
-        with store._write_txn():
-            ledger = SummaryLedger(store.db)
-            attempt = ledger.latest(batch['entry_id'], batch_identity(selected))
+        ledger = SummaryLedger(store.db)
+        attempt = engine.index_queue.latest(batch['entry_id'], batch_identity(selected))
         invoke = False
         if attempt is None or attempt['status'] == 'prepared' or batch['status'] == 'retry-requested':
             if not engine.summary_command:
@@ -147,18 +123,8 @@ def summarize_due(engine):
                                                                 timeout=None, max_output=8192, cancel=cancel)))
             request = make_request(task_id=batch['entry_id'], body_version=batch_identity(selected), blocks=selected,
                                    prior_navigation=prior_navigation, identity=identity)
-            with store._write_txn():
-                _admit_summary(engine)
-                if batch['status'] == 'retry-requested' and attempt and attempt['status'] in {'failed', 'outcome_unknown'}:
-                    attempt = ledger.retry(attempt['attempt_id'], request)
-                else:
-                    attempt = ledger.prepare(request)
-                store.db.execute('UPDATE material_summary_attempts SET created=? WHERE attempt_id=? AND status=\'prepared\'',
-                                 (time.time(), attempt['attempt_id']))
-                ledger.claim(attempt['attempt_id'])
-                attempt = ledger.get(attempt['attempt_id'])
-                store.db.execute("UPDATE material_batches SET status='pending' WHERE batch_id=?", (batch['batch_id'],))
-                invoke = True
+            attempt = engine.index_queue.claim(batch, request, admit=lambda: _admit_summary(engine))
+            invoke = True
         if invoke:
             try:
                 cleanup_receipt = {}
@@ -208,10 +174,7 @@ def summarize_due(engine):
             receipt = json.loads(attempt['response']) if attempt['response'] else {}
             failure = failure_detail(receipt) if receipt else None
             reason = canonical(failure) if failure else attempt['error'] or 'unknown'
-            with store._write_txn():
-                store.db.execute('UPDATE material_batches SET status=?,detail=? WHERE batch_id=?',
-                                 (attempt['status'], reason, batch['batch_id']))
-                _settle_task(store, batch['entry_id'])
+            engine.index_queue.finish(batch, attempt['status'], reason)
             diagnostic_failure('index.summary',
                 stage=failure['stage'] if failure else 'native-execution',
                 category=failure['reason'] if failure else 'outcome_unknown')
@@ -229,41 +192,19 @@ def summarize_due(engine):
         validate_result(result, [b['block_id'] for b in selected])
         engine._gate_live()
         engine._revalidate(authorization)
-        with store._write_txn():
-            engine._revalidate(authorization)
-            store.apply_material_indexes(entry_id=batch['entry_id'], indexes=result['blocks'],
-                                          navigation=result['navigation'], generation=authorization['generation'])
-            ledger.complete(attempt['attempt_id'])
-            _settle_task(store, batch['entry_id'])
+        engine.index_queue.apply(batch, attempt, result, authorization['generation'],
+                                 revalidate=lambda: engine._revalidate(authorization))
     except BudgetExceeded as exc:
-        with store._write_txn():
-            store.db.execute('UPDATE transcript_tasks SET summary_detail=?,summary_due=? WHERE entry_id=?',
-                             ('summary budget deferred; no call made', exc.retry_at, batch['entry_id']))
+        engine.index_queue.postpone(batch['entry_id'], 'summary budget deferred; no call made', exc.retry_at)
     except (ScannerUnavailable, AdmissionUnreadable, GateFault) as exc:
         diagnostic_failure('index.summary', stage='local-apply', category='dependency_unavailable', exception=exc)
         with store._write_txn():
             if ledger and attempt and ledger.get(attempt['attempt_id'])['status'] == 'returned':
                 ledger.local_failure(attempt['attempt_id'], 'scanner_unavailable' if isinstance(exc, ScannerUnavailable)
                                      else 'authority_unavailable')
-            store.db.execute("UPDATE transcript_tasks SET summary_detail=?,summary_due=? WHERE entry_id=?",
-                             (type(exc).__name__ + '; no model replay', time.time() + 30, batch['entry_id']))
+            engine.index_queue.postpone(batch['entry_id'], type(exc).__name__ + '; no model replay', time.time() + 30)
     except MaintenanceCancelled:
-        with store._write_txn():
-            attempted = ledger.get(attempt['attempt_id']) if ledger and attempt else None
-            if attempted and attempted['status'] == 'outcome_unknown':
-                # Process cancellation does not prove an attempted external
-                # model call failed or was never billed. Keep its uncertainty.
-                store.db.execute("UPDATE material_batches SET status='outcome_unknown',detail=? WHERE batch_id=?",
-                                 ('summary call interrupted; external outcome unknown', batch['batch_id']))
-            elif engine.stop.is_set():
-                # Shutdown is not revocation. A prepared call or saved return
-                # remains pending; restart revalidates authority before work.
-                store.db.execute("UPDATE material_batches SET status='pending',detail='service stopped; local work retained' "
-                                 "WHERE batch_id=?", (batch['batch_id'],))
-            else:
-                store.db.execute("UPDATE material_batches SET status='cancelled',detail='contribution authority revoked' "
-                                 "WHERE entry_id=? AND status IN ('pending','retry-requested')", (batch['entry_id'],))
-            _settle_task(store, batch['entry_id'])
+        engine.index_queue.interrupted(batch, attempt, stopping=engine.stop.is_set())
     except Exception as exc:
         diagnostic_failure('index.summary', stage='process', category='summary_failed', exception=exc)
         if getattr(exc, 'metadata_committed', False):
@@ -274,16 +215,15 @@ def summarize_due(engine):
                 state = ledger.get(attempt['attempt_id'])['status'] if ledger and attempt else 'failed'
                 if state == 'returned':
                     ledger.local_failure(attempt['attempt_id'], 'apply_failed')
-                    store.db.execute('UPDATE transcript_tasks SET summary_detail=?,summary_due=? WHERE entry_id=?',
-                                     ('local index apply failed: ' + type(exc).__name__, time.time() + 30, batch['entry_id']))
+                    engine.index_queue.postpone(batch['entry_id'],
+                        'local index apply failed: ' + type(exc).__name__, time.time() + 30)
                 else:
                     state = 'outcome_unknown' if state in {'invoking', 'outcome_unknown'} else 'failed'
                     detail = 'configuration: summary worker is not configured' if not engine.summary_command else type(exc).__name__
-                    store.db.execute('UPDATE material_batches SET status=?,detail=? WHERE batch_id=?',
-                                     (state, detail, batch['batch_id']))
-                    _settle_task(store, batch['entry_id'])
+                    engine.index_queue.finish(batch, state, detail)
         except Exception as receipt_error:
             exc.add_note('summary state could not record this failure: ' + type(receipt_error).__name__)
             raise exc from receipt_error
     finally:
-        engine.end_work()
+        if operation is not None:
+            engine.operations.end(operation)

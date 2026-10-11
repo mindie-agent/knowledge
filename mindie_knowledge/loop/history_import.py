@@ -128,12 +128,7 @@ def import_transcript(engine, *, session_id, token, source, source_session,
     row = store._row(entry_id)
     if retry_summary and row:
         gate()
-        with store._write_txn():
-            import time
-            store.db.execute("UPDATE material_batches SET status='retry-requested',detail='' "
-                             "WHERE entry_id=? AND status IN ('failed','outcome_unknown')", (entry_id,))
-            store.db.execute("UPDATE transcript_tasks SET summary_status='pending',summary_detail='',summary_due=? "
-                             "WHERE entry_id=?", (time.time(), entry_id))
+        engine.index_queue.retry(entry_id)
     task = store.transcript_task(key)
     return dict(status=(('extended' if was_existing else 'imported') if added else 'unchanged') if row else 'empty',
                 ref=task_ref(store.domain, entry_id) if row else None,

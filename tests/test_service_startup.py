@@ -245,7 +245,7 @@ def test_stop_if_idle_refuses_in_flight_and_queued_work(tmp_path):
         )
     idle = engine.stop_if_idle()
     assert idle["idle"] is True
-    engine._frozen = False
+    engine.operations.resume()
     engine.stop.clear()
 
     assert engine.begin_work() is True

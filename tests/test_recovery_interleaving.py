@@ -53,7 +53,7 @@ def test_interrupted_index_worker_keeps_material_and_does_not_repeat_call(tmp_pa
         work = threading.Thread(target=_due, args=(engine,))
         work.start()
         _wait(started, work)
-        engine._summary_cancel.set()  # real bounded_run terminates its owned worker process
+        engine.operations.cancel('index')  # real bounded_run terminates its owned worker process
         work.join(timeout=10)
         assert not work.is_alive()
         with store.lock:
@@ -72,7 +72,7 @@ def test_interrupted_index_worker_keeps_material_and_does_not_repeat_call(tmp_pa
         assert store.db.execute('SELECT summary_status FROM transcript_tasks').fetchone()[0] == 'outcome_unknown'
     finally:
         release.touch()
-        engine._summary_cancel.set()
+        engine.operations.cancel('index')
         if work:
             work.join(timeout=5)
         store.close()
@@ -112,7 +112,7 @@ def test_late_summary_claim_loser_cannot_overwrite_completed_winner(tmp_path):
         assert store.db.execute('SELECT summary_status FROM transcript_tasks').fetchone()[0] == 'complete'
     finally:
         identity_go.touch()
-        loser._summary_cancel.set()
+        loser.operations.cancel('index')
         if work:
             work.join(timeout=5)
         store.close()

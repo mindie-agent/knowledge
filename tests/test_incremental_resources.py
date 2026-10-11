@@ -48,7 +48,8 @@ def test_real_summary_idle_and_admission_paths_exclude_completed_history(store, 
         store.db.executemany('INSERT INTO material_summary_attempts VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
             ((ident(i), ident(i), ident(i), 'body', 'digest', '{}', '["b"]',
               'complete', None, None, 0, 0) for i in range(completed)))
-    engine = SimpleNamespace(store=store, last_activity=-100,
+    from mindie_knowledge.loop.index_queue import IndexQueue
+    engine = SimpleNamespace(store=store, index_queue=IndexQueue(store), last_activity=-100,
         begin_work=lambda: pytest.fail('idle scheduler admitted a completed batch'),
         _settings=lambda: SimpleNamespace(as_dict=lambda: {}))
     steps = []

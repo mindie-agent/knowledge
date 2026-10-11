@@ -40,8 +40,25 @@ def publisher(engine):
                     pr_url="https://example.invalid/pull/1")
 
     engine.community = dict(submit_batch=submit,
-                            reconcile_batch=lambda *a: dict(status="unknown"))
+                            reconcile_batch=lambda *a, **kw: dict(status="unknown"))
     return sent
+
+
+@pytest.mark.parametrize('change', ['disabled', 'corrupt'])
+def test_paused_reconciliation_never_rewrites_original_unknown_write(tmp_path, change):
+    settings = write_settings(tmp_path / 'sharing.json', roots=[tmp_path])
+    with closing(Store(tmp_path / 'store', 'test')) as store:
+        _, batch_id = prepare(store, settings, 'Synthetic unresolved publication.')
+        store.mark_batch(batch_id, 'unknown', attempted=True, detail='original write outcome unknown')
+        original = store.batch(batch_id)
+        engine = Engine(store, settings_path=settings.path)
+        engine.community = {'reconcile_batch': lambda *a, **kw: pytest.fail('paused read must not run')}
+        if change == 'disabled':
+            write_settings(settings.path, roots=[tmp_path], enabled=False)
+        else:
+            settings.path.write_text('{corrupt')
+        engine._reconcile(original)
+        assert store.batch(batch_id) == original
 
 
 @pytest.mark.parametrize("disabled_start", [True, False])
@@ -60,7 +77,6 @@ def test_reenable_sends_only_newly_authorized_material(tmp_path, monkeypatch, di
             old_doc, old_batch = prepare(store, first, "Prior authorization material.")
             write_settings(path, enabled=False, roots=[tmp_path])
             tick(engine, monkeypatch)
-        revoked_token = engine._cancel
         current = write_settings(path, roots=[tmp_path, tmp_path / "additional-project"])
         new_doc, new_batch = prepare(store, current, "Subsequent authorization material.")
         sent = publisher(engine)
@@ -70,7 +86,6 @@ def test_reenable_sends_only_newly_authorized_material(tmp_path, monkeypatch, di
         assert store.batch(new_batch)["status"] == "submitted"
         assert store.batch(old_batch)["status"] == "disabled"
         assert "Prior authorization material." in store.get(store.ref(old_doc["entry_id"]))["content"]
-        assert revoked_token.is_set()  # A new generation must not revive its old token.
 
 
 def test_changed_generation_keeps_material_admitted_before_poll(tmp_path, monkeypatch):
@@ -80,12 +95,12 @@ def test_changed_generation_keeps_material_admitted_before_poll(tmp_path, monkey
         engine = Engine(store, settings_path=path)
         tick(engine, monkeypatch)
         old_doc, old_batch = prepare(store, first, "Old generation material.")
-        retired_token = engine._cancel
+        retired = engine.operations.begin("capture", generation=first.generation)
         # Stop intake can admit the new generation before the outbox notices it.
         current = write_settings(path, roots=[tmp_path, tmp_path / "additional-project"])
         new_doc, new_batch = prepare(store, current, "Already admitted under the new generation.")
         # The summary worker also reads current authority independently of this poll.
-        current_summary = engine._begin_summary(current.generation)
+        current_summary = engine.operations.begin("index", generation=current.generation)
         for doc, generation in [(old_doc, first.generation), (new_doc, current.generation)]:
             store.record_vote(root_hash="b" * 64, ref=store.ref(doc['entry_id'], doc['revision']),
                               rating="up", reason="", publishable=True, generation=generation)
@@ -95,10 +110,12 @@ def test_changed_generation_keeps_material_admitted_before_poll(tmp_path, monkey
         assert sent[0]["entry_refs"] == [store.ref(new_doc["entry_id"], new_doc["revision"])]
         assert store.batch(new_batch)["status"] == "submitted"
         assert store.batch(old_batch)["status"] == "disabled"
-        assert retired_token.is_set()
-        assert not current_summary.is_set()
+        assert retired.cancel.is_set()
+        assert not current_summary.cancel.is_set()
         assert store.unbatched_votes(generation=first.generation) == []
         assert len(store.unbatched_votes(generation=current.generation)) == 1
+        engine.operations.end(retired)
+        engine.operations.end(current_summary)
 
 
 def test_authority_fault_parks_batch_and_restored_generation_reuses_it(tmp_path, monkeypatch):
@@ -108,7 +125,7 @@ def test_authority_fault_parks_batch_and_restored_generation_reuses_it(tmp_path,
     with closing(Store(tmp_path / "store", "test")) as store:
         engine = Engine(store, settings_path=path)
         tick(engine, monkeypatch)
-        token = engine._cancel
+        operation = engine.operations.begin("capture", generation=settings.generation)
         _, batch_id = prepare(store, settings, "Material parked while authority is unreadable.")
         sent = publisher(engine)
         path.write_bytes(b"{broken authority")
@@ -117,7 +134,8 @@ def test_authority_fault_parks_batch_and_restored_generation_reuses_it(tmp_path,
         path.write_bytes(original)
         tick(engine, monkeypatch)
         assert len(sent) == 1 and store.batch(batch_id)["status"] == "submitted"
-        assert engine._cancel is token and not token.is_set()
+        assert not operation.cancel.is_set()
+        engine.operations.end(operation)
 
 
 def test_generation_change_preserves_unknown_write_for_read_only_reconciliation(tmp_path, monkeypatch):
@@ -132,7 +150,7 @@ def test_generation_change_preserves_unknown_write_for_read_only_reconciliation(
         _, new_batch = prepare(store, current, "Independent current generation material.")
         sent = publisher(engine)
         reconciled = []
-        engine.community["reconcile_batch"] = lambda batch_id, *a: (
+        engine.community["reconcile_batch"] = lambda batch_id, *a, **kw: (
             reconciled.append(batch_id) or dict(status="unknown", detail="no remote proof"))
         tick(engine, monkeypatch)
         assert reconciled == [uncertain]
@@ -143,14 +161,16 @@ def test_generation_change_preserves_unknown_write_for_read_only_reconciliation(
 def test_summary_cancellation_belongs_to_its_generation(tmp_path):
     with closing(Store(tmp_path / "store", "test")) as store:
         engine = Engine(store)
-        prior = engine._begin_summary("prior")
+        prior = engine.operations.begin("index", generation="prior")
         engine._cancel_unsent("authority changed", keep_generation="current")
-        current = engine._begin_summary("current")
-        assert prior.is_set() and not current.is_set()
+        current = engine.operations.begin("index", generation="current")
+        assert prior.cancel.is_set() and not current.cancel.is_set()
         engine._cancel_unsent("delayed authority observation", keep_generation="current")
-        assert prior.is_set() and not current.is_set()
+        assert prior.cancel.is_set() and not current.cancel.is_set()
         engine._cancel_unsent("sharing disabled")
-        assert current.is_set()
+        assert current.cancel.is_set()
+        engine.operations.end(prior)
+        engine.operations.end(current)
 
 
 @pytest.mark.parametrize("disabled_start", [False, True])
@@ -164,9 +184,10 @@ def test_revocation_cancels_work_even_before_outbox_observes_enable(tmp_path, mo
         # outbox's first enabled tick (or its next poll after disabled startup).
         current = write_settings(path, roots=[tmp_path])
         _, batch_id = prepare(store, current, "Material admitted before the first enabled outbox poll.")
-        active = engine._begin_summary(current.generation)
-        assert engine._generation is None
+        active = engine.operations.begin("index", generation=current.generation)
+        assert engine._observed_authority is None
         write_settings(path, enabled=False, roots=[tmp_path])
         tick(engine, monkeypatch)
-        assert active.is_set()
+        assert active.cancel.is_set()
         assert store.batch(batch_id)["status"] == "disabled"
+        engine.operations.end(active)

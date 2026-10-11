@@ -302,7 +302,7 @@ def test_reconciliation_read_failure_is_delivered_without_overwriting_original_i
         agent_diagnostics.acknowledge(agent_diagnostics.pending())
         original = store.batch(batch_id)
         engine = Engine(store, settings_path=settings.path)
-        def unavailable(*args):
+        def unavailable(*args, **kwargs):
             raise OSError('synthetic read failure')
         engine.community['reconcile_batch'] = unavailable
         for _ in range(2):
@@ -311,7 +311,7 @@ def test_reconciliation_read_failure_is_delivered_without_overwriting_original_i
         faults = agent_diagnostics.pending()['items']
         assert [(item['stage'], item['code'], item['count']) for item in faults] == [
             ('reconcile', 'publication_reconciliation_failed', 1)]
-        engine.community['reconcile_batch'] = lambda *a: dict(status='unknown', detail='read succeeded; no proof')
+        engine.community['reconcile_batch'] = lambda *a, **kw: dict(status='unknown', detail='read succeeded; no proof')
         engine._reconcile(original)
         engine.community['reconcile_batch'] = unavailable
         engine._reconcile(store.batch(batch_id))
@@ -329,7 +329,7 @@ def test_reconciled_remote_result_survives_local_receipt_failure(tmp_path, monke
         original = store.batch(batch_id)
         engine = Engine(store, settings_path=settings.path)
         receipt = dict(status='submitted', head_sha='a' * 40, pr_url='https://example.invalid/pull/1')
-        engine.community['reconcile_batch'] = lambda *a: receipt
+        engine.community['reconcile_batch'] = lambda *a, **kw: receipt
         error = OSError('synthetic local receipt failure')
         def fail_record(*a, **kw):
             raise error

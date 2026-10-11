@@ -33,9 +33,10 @@ def test_returned_response_recovers_without_current_worker(pipeline, tmp_path, m
         elif fault == 'scanner-cancel':
             from mindie_knowledge.loop.process import MaintenanceCancelled
             def cancel_scanner(_text, **options):
-                assert options['cancel'] is engine._summary_cancel
+                assert options['cancel'] is not None and engine.operations.snapshot()['activity'] > 0
                 engine.stop.set()
-                engine._summary_cancel.set()
+                engine.operations.cancel('index')
+                assert options['cancel'].is_set()
                 raise MaintenanceCancelled('scanner cancelled by owner')
             faults.setattr('mindie_knowledge.loop.transcript_capture.redact', cancel_scanner)
         elif fault == 'authority':
@@ -73,7 +74,7 @@ def test_returned_response_recovers_without_current_worker(pipeline, tmp_path, m
     if fault in {'stopping', 'scanner-cancel'}:
         assert store.db.execute('SELECT summary_status FROM transcript_tasks').fetchone()[0] == 'pending'
         engine.stop.clear()
-        engine._summary_cancel.clear()
+        engine.operations.resume()
     # A removed/upgraded executable cannot obstruct recovery of returned output.
     engine.summary_command = [str(tmp_path / 'worker-no-longer-installed')]
     with store._write_txn():
@@ -130,11 +131,12 @@ def test_identity_stage_obeys_owner_cancellation_without_execution_deadline(pipe
     observed, errors = [], []
     original = transcript_capture.bounded_run
     def run(command, payload, **options):
-        observed.append(options.get('cancel') is engine._summary_cancel)
+        observed.append(options.get('cancel') is not None and engine.operations.snapshot()['activity'] > 0)
         assert options.get('timeout') is None
         if when == 'before-spawn':
             engine.stop.set()
-            engine._summary_cancel.set()
+            engine.operations.cancel('index')
+            assert options['cancel'].is_set()
         return original(command, payload, **options)
     monkeypatch.setattr(transcript_capture, 'bounded_run', run)
     def cancel_waiting():
@@ -144,7 +146,7 @@ def test_identity_stage_obeys_owner_cancellation_without_execution_deadline(pipe
         if not started.exists():
             errors.append('identity helper did not start')
         engine.stop.set()
-        engine._summary_cancel.set()
+        engine.operations.cancel('index')
     watcher = threading.Thread(target=cancel_waiting, daemon=True) if when == 'while-waiting' else None
     if watcher:
         watcher.start()

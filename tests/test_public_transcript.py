@@ -260,6 +260,17 @@ def test_summary_cannot_rewrite_body_and_failure_does_not_block(pipeline):
     assert store.transcript_task(task['task_key'])['summary_status'] == 'failed'
     # New evidence cannot silently retry the failed older batch.
     assert store.db.execute("SELECT count(*) FROM material_batches WHERE status='failed'").fetchone()[0] == 1
+    assert build_batch(store, settings=engine._settings()) is None
+    from mindie_knowledge.materials.summarizer import SummaryLedger
+    assert SummaryLedger(store.db).usage_totals()['model_calls'] == 2
+    # Explicit retry applies only to the failed older increment. Later indexed
+    # material and its paid result are reused; whole-package readiness follows.
+    engine.index_queue.retry(doc['entry_id'])
+    transcript_capture.summarize_due(engine)
+    assert SummaryLedger(store.db).usage_totals()['model_calls'] == 3
+    assert store.drafts_changed()[0]['content'] == body
+    assert store.transcript_task(task['task_key'])['summary_status'] == 'complete'
+    assert build_batch(store, settings=engine._settings()) is not None
 
 
 def test_real_scanner_secrets_unicode_overlap_and_technical_negative_controls(scanner):
@@ -395,9 +406,10 @@ def test_scanner_shutdown_keeps_same_capture_pending_without_advancing_cursor(pi
     append(path, 'Complete public material must survive scanner cancellation.')
     event = engine.capture(session_id='manual-A', turn_id='scanner-shutdown', transcript_path=str(path))
     def cancelled(**options):
-        assert options['cancel'] is engine._cancel
+        assert options['cancel'] is not None and engine.operations.snapshot()['activity'] > 0
         engine.stop.set()
-        engine._cancel.set()
+        engine.operations.cancel('capture')
+        assert options['cancel'].is_set()
         raise MaintenanceCancelled('scanner cancelled by owner')
     with monkeypatch.context() as patcher:
         patcher.setattr(transcript_capture, 'prepare_increment', cancelled)
@@ -407,7 +419,7 @@ def test_scanner_shutdown_keeps_same_capture_pending_without_advancing_cursor(pi
     assert store.capture_row(event['id'])['status'] in {'pending', 'deferred'}
     assert store.continuation_reason(event['id']) == 'service stopped; local work retained'
     engine.stop.clear()
-    engine._cancel.clear()
+    engine.operations.resume()
     engine._process(event['id'])
     assert store.capture_row(event['id'])['status'] == 'organized'
     assert 'Complete public material must survive scanner cancellation.' in store.drafts_changed()[0]['content']

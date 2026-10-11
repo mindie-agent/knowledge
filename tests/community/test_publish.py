@@ -8,6 +8,7 @@ boundary. Dev-transport success is mechanism evidence, not GitHub acceptance.
 import json
 import sqlite3
 import threading
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -25,6 +26,77 @@ from .conftest import (
     make_entry,
     vote,
 )
+
+
+def _uncertain_intent(state_dir, settings):
+    with closing(Ledger(state_dir)) as ledger:
+        ledger.record_intent(batch_id='original-intent', revision='a' * 64,
+                             domain='npu', repository=settings['repository'],
+                             branch='mindie-contrib/npu/original-intent')
+        return ledger.latest_for_batch('original-intent')
+
+
+def test_reconcile_owner_cancel_retains_original_intent(settings, state_dir, transport):
+    original = _uncertain_intent(state_dir, settings)
+    cancel = threading.Event()
+    cancel.set()
+    result = reconcile_batch('original-intent', settings, state_dir,
+                             transport=transport, cancel=cancel)
+    assert result['status'] == 'unknown' and 'cancelled by owner' in result['detail']
+    with closing(Ledger(state_dir)) as ledger:
+        row = ledger.latest_for_batch('original-intent')
+        assert {key: row[key] for key in ('batch_id', 'revision', 'repository', 'branch')} == {
+            key: original[key] for key in ('batch_id', 'revision', 'repository', 'branch')}
+        assert [step['step'] for step in ledger.steps_for(row['batch_id'], row['revision'])] == ['reconcile:attempt']
+
+
+def test_reconcile_read_error_survives_ledger_cleanup_error(settings, state_dir, transport, monkeypatch):
+    _uncertain_intent(state_dir, settings)
+    error = OSError('synthetic primary read failure')
+    def broken_read(*args, **kwargs):
+        raise error
+    original_close = Ledger.close
+    def broken_close(ledger):
+        original_close(ledger)
+        raise ValueError('synthetic secondary close failure')
+    monkeypatch.setattr(transport, 'find_pull_requests', broken_read)
+    monkeypatch.setattr(Ledger, 'close', broken_close)
+    with pytest.raises(OSError) as caught:
+        reconcile_batch('original-intent', settings, state_dir, transport=transport)
+    assert caught.value is error and 'ValueError' in ' '.join(error.__notes__)
+
+
+def test_reconcile_known_result_survives_ledger_cleanup_error(settings, state_dir, transport, monkeypatch):
+    row = _uncertain_intent(state_dir, settings)
+    with closing(Ledger(state_dir)) as ledger:
+        ledger.finish_publication(row['batch_id'], row['revision'], status='submitted',
+                                  detail='exact remote proof', head_sha='b' * 40,
+                                  pr_url='https://example.invalid/pull/1')
+    original_close = Ledger.close
+    def broken_close(ledger):
+        original_close(ledger)
+        raise OSError('synthetic close failure')
+    monkeypatch.setattr(Ledger, 'close', broken_close)
+    result = reconcile_batch('original-intent', settings, state_dir, transport=transport)
+    assert result['status'] == 'submitted' and result['head_sha'] == 'b' * 40
+    assert result['cleanup_failed'] and 'ledger cleanup failed' in result['detail']
+
+
+def test_reconcile_remote_proof_survives_local_receipt_error(settings, state_dir, transport, monkeypatch):
+    batch = make_batch('reconcile-receipt-failure', [entry_file(make_entry())])
+    sent = submit_batch(batch, settings, state_dir, transport=transport)
+    with closing(Ledger(state_dir)) as ledger:
+        ledger.finish_publication(batch['batch_id'], batch['revision'], status='unknown',
+                                  pr_number=sent['pr_number'], pr_url=sent['pr_url'], head_sha=sent['head_sha'])
+    def broken_finish(*args, **kwargs):
+        raise OSError('synthetic reconciliation receipt failure')
+    monkeypatch.setattr(Ledger, 'finish_publication', broken_finish)
+    result = reconcile_batch(batch['batch_id'], settings, state_dir, transport=transport)
+    assert result['status'] == 'submitted' and result['head_sha'] == sent['head_sha']
+    assert result['recording_failed'] and result['failed_stage'] == 'receipt'
+    assert result['pr_url'] == sent['pr_url']
+    with closing(Ledger(state_dir)) as ledger:
+        assert ledger.latest_for_batch(batch['batch_id'])['status'] == 'unknown'
 
 
 def test_submit_happy_path_real_git(settings, state_dir, transport, remote_url):
