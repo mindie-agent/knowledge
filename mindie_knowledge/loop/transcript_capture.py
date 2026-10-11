@@ -121,7 +121,7 @@ def summarize_due(engine):
     batch, attempt, ledger = dict(found), None, None
     try:
         authorization = json.loads(batch['authorization'])
-        engine._summary_cancel.clear()
+        cancel = engine._begin_summary(authorization['generation'])
         engine._gate_live()
         engine._revalidate(authorization)
         row = store._row(batch['entry_id'])
@@ -144,7 +144,7 @@ def summarize_due(engine):
             if not engine.summary_command:
                 raise ValueError('configuration: summary worker is not configured')
             identity = validate_identity(json.loads(bounded_run([*engine.summary_command, '--identity'], '{}',
-                                                                timeout=None, max_output=8192, cancel=engine._summary_cancel)))
+                                                                timeout=None, max_output=8192, cancel=cancel)))
             request = make_request(task_id=batch['entry_id'], body_version=batch_identity(selected), blocks=selected,
                                    prior_navigation=prior_navigation, identity=identity)
             with store._write_txn():
@@ -175,7 +175,7 @@ def summarize_due(engine):
                         raise
                 store.db.assert_authority()
                 raw = bounded_run(engine.summary_command, canonical(request), timeout=None,
-                                  max_output=MAX_RESPONSE_BYTES * 3, cancel=engine._summary_cancel,
+                                  max_output=MAX_RESPONSE_BYTES * 3, cancel=cancel,
                                   cleanup_receipt=cleanup_receipt, on_result=save_result)
                 response = json.loads(raw)
                 if ledger.get(attempt['attempt_id'])['status'] == 'invoking':
@@ -225,7 +225,7 @@ def summarize_due(engine):
                 header[field], _ = redact(header[field], executable=engine.redactor_executable,
                                           key=store.redaction_key(),
                                           private_paths=(authorization['scope'], str(Path.home())),
-                                          cancel=engine._summary_cancel)
+                                          cancel=cancel)
         validate_result(result, [b['block_id'] for b in selected])
         engine._gate_live()
         engine._revalidate(authorization)

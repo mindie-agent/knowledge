@@ -1657,12 +1657,14 @@ class Store:
         with self.lock:
             return self._outbox_rows("status='pending' AND attempted IS NULL", limit=limit)
 
-    def cancel_pending(self, detail):
-        """Cancel unsent operations without deserializing their payloads."""
+    def cancel_pending(self, detail, *, keep_generation=None):
+        """Cancel unsent operations without touching current or uncertain work."""
         with self._write_txn():
             return self.db.execute(
                 "UPDATE outbox SET status='disabled', detail=?, updated=? "
-                "WHERE status='pending' AND attempted IS NULL", (detail, time.time())
+                "WHERE status='pending' AND attempted IS NULL "
+                "AND (? IS NULL OR generation IS NOT ?)",
+                (detail, time.time(), keep_generation, keep_generation),
             ).rowcount
 
     def _operation_due(self, batch_id):
