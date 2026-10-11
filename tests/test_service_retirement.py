@@ -5,6 +5,7 @@ import sys
 import threading
 import time
 from contextlib import closing
+from pathlib import Path
 
 import pytest
 import transcript_double
@@ -13,6 +14,7 @@ from mindie_knowledge.loop import cli, lifecycle, transport
 from mindie_knowledge.loop.engine import Engine
 from mindie_knowledge.loop.locks import StartLock, lock_held
 from mindie_knowledge.loop.store import Store
+from mindie_knowledge.loop.handoff import _probe
 
 
 def configuration(tmp_path):
@@ -22,6 +24,58 @@ def configuration(tmp_path):
     path = tmp_path / 'engine.json'
     path.write_text(json.dumps(config))
     return path, config
+
+
+def test_retirement_discards_previous_generation_discovery_before_new_owner(tmp_path):
+    path, config = configuration(tmp_path)
+    connection = cli.connection_path(config)
+    connection.parent.mkdir(parents=True)
+    connection.write_text(json.dumps(dict(domain=config['domain'], token='test',
+        url='http://127.0.0.1:1', config_fingerprint=lifecycle.config_fingerprint(path, config))))
+    next_path = tmp_path / 'next-engine.json'
+    next_path.write_text(json.dumps(config))
+    lifecycle.retire_service(path)
+    # A real new owner can hold its lifetime lock while initializing. Its old
+    # endpoint must not become an unknown configuration or RPC to the old owner.
+    with StartLock(connection.with_name('consumer.lock')):
+        assert _probe(config, None, config_path=next_path) == 'starting'
+    assert not connection.exists()
+    try:
+        actual = cli.ensure_service(next_path)
+        assert actual['config_fingerprint'] == lifecycle.config_fingerprint(next_path, config)
+        assert transport.rpc(actual, 'status')['worker_alive']
+    finally:
+        lifecycle.retire_service(next_path)
+
+
+@pytest.mark.parametrize('previous_receipt', [False, True])
+def test_discovery_cleanup_failure_preserves_completed_retirement(tmp_path, monkeypatch, previous_receipt):
+    path, config = configuration(tmp_path)
+    if previous_receipt:
+        lifecycle.retire_service(path)
+    connection = cli.connection_path(config)
+    connection.parent.mkdir(parents=True, exist_ok=True)
+    with StartLock(connection.with_name('consumer.lock')):
+        pass
+    connection.write_text('previous stopped listener')
+    unlink = Path.unlink
+    def denied(target, *args, **kwargs):
+        if target == connection:
+            raise PermissionError(13, 'private path must not appear in result')
+        return unlink(target, *args, **kwargs)
+    monkeypatch.setattr(Path, 'unlink', denied)
+    result = lifecycle.retire_service(path)
+    assert result['idle'] and result['service'] == 'absent'
+    assert result['retirement']['status'] == 'retired' and result['cleanup_failed']
+    assert result['cleanup_error'] == dict(stage='connection_discovery', error_type='PermissionError',
+                                          errno=13, operation_completed=True)
+    assert lifecycle.inspect_retirement(path)['status'] == 'retired'
+    assert connection.read_text() == 'previous stopped listener'
+    assert 'private path' not in json.dumps(result)
+    monkeypatch.setattr(Path, 'unlink', unlink)
+    recovered = lifecycle.retire_service(path)
+    assert recovered['retirement'] == result['retirement']
+    assert not recovered.get('cleanup_failed') and not connection.exists()
 
 
 def test_retirement_bars_already_spawned_late_helper_and_direct_serve(tmp_path):
@@ -65,6 +119,7 @@ def test_real_idle_service_stops_and_exact_rollback_can_restart(tmp_path):
     try:
         result = lifecycle.retire_service(path)
         assert result['idle'] and result['service'] == 'stopped'
+        assert not cli.connection_path(config).exists()
         assert lock_held(cli.connection_path(config).with_name('consumer.lock')) is False
         with pytest.raises(lifecycle.ServiceRetired):
             cli.ensure_service(path)
