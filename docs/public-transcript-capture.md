@@ -56,8 +56,10 @@ never zero. `model_calls` counts native invocation attempts, not independently
 observed provider-internal requests. Token counters are reported; no monetary
 price or dollar cost is inferred from them.
 
-The 90-second invocation deadline, bounded process output and strict schema guard
-one invocation. Rolling call/input-token admission limits constrain new work;
+Bounded process output and the strict schema guard one invocation. A healthy
+operation has no default total deadline; owner cancellation and an explicitly
+requested limit remain separate from the persisted invocation outcome.
+Rolling call/input-token admission limits constrain new work;
 local recovery of returned output needs no fresh budget. Missing worker
 configuration, incomplete indexing and failed/unknown batches block publication.
 They do not turn a saved body or an excerpt into an indexed contribution.
@@ -75,3 +77,29 @@ continuation appends to the retained current feed package. Upstream withdrawal
 prevents continuation from resurrecting removed content. Navigation and retrieved
 experience remain fallible reference material, including incomplete work and
 later corrections; neither publication nor retrieval certifies an outcome.
+
+## Lifecycle ownership
+
+`Engine` schedules work and revalidates native authorization. `OperationOwner`
+owns each live capture, index, package preparation and publication separately,
+with its own identity, generation and cancellation token. Revocation cancels old
+contribution operations while retaining already admitted current-generation
+work. A cancelled token is never reused. Reads and reconciliation have independent
+lifetimes; service shutdown cancels all live work. Admission and update freezing
+use the same owner lock, and a failed required idle check releases the freeze
+while reporting the original error.
+
+`IndexQueue` owns queue transitions on the existing Store transaction;
+`SummaryLedger` retains prepared, invoking, returned, failed/unknown and applied
+attempt facts. Applying returned indexes, completing their attempt and settling
+queue readiness commit together. A later increment can be indexed after an
+earlier failure, but the entire package remains unready until every required
+block is indexed. Explicit retry retains earlier usage and reuses successful
+later increments. Neither live operation tokens nor process liveness decide
+durable completion.
+
+`PublicationWorker` owns frozen-package loading, sending, read-only reconciliation
+and result recording. Store revokes unsent batches and unbatched feedback in one
+transaction. Original unknown writes and confirmed remote outcomes survive
+receipt/cleanup faults. Body/cursor commits and public-feed membership continue
+to use the existing Store/MaterialStore transactions and current Markdown files.

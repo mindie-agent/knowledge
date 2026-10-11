@@ -20,9 +20,10 @@ from .activation import activation_epoch, AdmissionUnavailable as AdmissionUnrea
 from .budget import BudgetExceeded
 from .dfx import failure
 from .process import MaintenanceCancelled
-from .store import Store, canonical, session_key
-
-Store_confirmed = Store.CONFIRMED_BATCH
+from .store import canonical, session_key
+from .operations import OperationOwner
+from .index_queue import IndexQueue
+from .publication_worker import PublicationWorker
 
 _EOF_SETTLE_LIMIT = 3
 _PARTIAL_LIMIT = 4
@@ -62,10 +63,10 @@ class Engine:
         self.state_dir = Path(state_dir) if state_dir else store.root / "outbox"
         self.queue = queue.Queue(maxsize=8)
         self.stop = threading.Event()
-        self._cancel = threading.Event()
-        self._summary_cancel = threading.Event()
-        self._summary_generation = None
-        self._summary_lock = threading.Lock()
+        self.operations = OperationOwner(self.stop)
+        self.index_queue = IndexQueue(store)
+        self.publisher = PublicationWorker(self)
+        self._work_local = threading.local()
         self.thread = threading.Thread(
             target=self.run, name="mindie-capture", daemon=True
         )
@@ -78,11 +79,8 @@ class Engine:
         self.errors = []
         self.background_errors = {}
         self.last_activity = time.monotonic()
-        self._generation = None
+        self._observed_authority = None
         self._worker_failed = False
-        self._activity_lock = threading.Lock()
-        self._activity = 0
-        self._frozen = False
         self._reported_faults = set()
         self._fault_lock = threading.Lock()
         # Publication belongs to this package. A broken installation is a
@@ -504,6 +502,12 @@ class Engine:
         row = self.store.capture_row(ident)
         if row is None or row["status"] not in {"queued", "pending", "deferred"}:
             return
+        with self.operations.scope("capture", ident, row["generation"]) as operation:
+            if operation is not None:
+                self._process_capture(row, operation.cancel)
+
+    def _process_capture(self, row, cancel):
+        ident = row["id"]
         region = {}
         try:
             settings = self._revalidate(row)
@@ -516,7 +520,7 @@ class Engine:
             if text is None:
                 return
             from .transcript_capture import capture
-            capture(self, row, text, region)
+            capture(self, row, text, region, cancel=cancel)
             self._clear_faults('knowledge.capture')
         except CursorConflict:
             self._defer_reread(ident)
@@ -580,7 +584,8 @@ class Engine:
         settings = self._settings()
         block = settings.capture_block_kind()
         if block is None:
-            self.store.disable_foreign_pending(settings.generation)
+            self._cancel_unsent("settings generation changed; unsent work cancelled",
+                                keep_generation=settings.generation)
         elif block == "revoked":
             self._cancel_unsent("sharing disabled; unsent work cancelled")
 
@@ -596,11 +601,8 @@ class Engine:
                     continue
                 try:
                     ident = self.store.due_capture()
-                    if ident and self.begin_work():
-                        try:
-                            self._process(ident)
-                        finally:
-                            self.end_work()
+                    if ident:
+                        self._process(ident)
                 except (MaintenanceCancelled, AdmissionUnreadable, CursorConflict,
                         GateFault):
                     continue
@@ -613,11 +615,8 @@ class Engine:
                     return
                 continue
             try:
-                if ident and self.begin_work():
-                    try:
-                        self._process(ident)
-                    finally:
-                        self.end_work()
+                if ident:
+                    self._process(ident)
             except (MaintenanceCancelled, AdmissionUnreadable, CursorConflict,
                     GateFault):
                 pass
@@ -651,156 +650,19 @@ class Engine:
 
     # ---------------------------------------------------------------- outbox
 
-    def _begin_summary(self, generation):
-        """One operation owns its token; a later operation cannot un-cancel it."""
-        with self._summary_lock:
-            self._summary_generation = generation
-            self._summary_cancel = threading.Event()
-            if self.stop.is_set():
-                self._summary_cancel.set()
-            return self._summary_cancel
-
     def _cancel_unsent(self, reason, *, keep_generation=None):
         """Revoke unsent work, retaining any already admitted current generation."""
-        self._cancel.set()
-        with self._summary_lock:
-            if keep_generation is None or self._summary_generation != keep_generation:
-                self._summary_cancel.set()
-        self.store.cancel_pending(reason, keep_generation=keep_generation)
-        with self.store._write_txn():
-            self.store.db.execute(
-                "UPDATE votes SET publishable=0 WHERE batch_id IS NULL "
-                "AND (? IS NULL OR NOT EXISTS (SELECT 1 FROM grants "
-                "WHERE grants.kind='vote' AND grants.identity=votes.root_opaque||':'||votes.entry_id "
-                "AND grants.revision=votes.revision AND grants.generation=?))",
-                (keep_generation, keep_generation),
-            )
+        self.operations.revoke(keep_generation=keep_generation)
+        self.store.revoke_unsent(reason, keep_generation=keep_generation)
 
     def _submit(self, batch_row):
-        settings = self._settings()
-        if not settings.allows_capture():
-            return
-        if batch_row["generation"] != settings.generation:
-            self.store.mark_batch(
-                batch_row["batch_id"], "disabled",
-                detail="settings generation changed before send",
-            )
-            return
-        if self.community is None:
-            self.store.mark_batch(
-                batch_row["batch_id"], "unavailable", attempted=True,
-                detail="mindie_knowledge.community is not installed; "
-                       "the contribution cannot be sent (dependency failure)",
-            )
-            return
-        from ..materials.publication import load_batch_payload
-        try:
-            batch = load_batch_payload(self.store, batch_row)
-        except Exception as exc:
-            self._fault('knowledge.publish', 'payload', 'publication_payload_unavailable', exc)
-            try:
-                self.store.mark_batch(batch_row['batch_id'], 'unavailable',
-                                      detail='local frozen contribution could not be loaded: ' + type(exc).__name__)
-            except Exception as receipt_error:
-                exc.add_note('payload failure receipt also failed: ' + type(receipt_error).__name__)
-                raise exc from receipt_error
-            self._error('Publication did not start: frozen contribution load failed (' + type(exc).__name__ + ').')
-            return
-        self._clear_faults('knowledge.publish', {'payload'})
-        try:
-            withdrawn = any(self.store.is_withdrawn(ref)
-                            for ref in batch["entry_refs"])
-        except ValueError:
-            self.store.mark_batch(batch_row["batch_id"], "needs_review",
-                                  detail="pending contribution reference no longer resolves")
-            return
-        if withdrawn:
-            self.store.mark_batch(batch_row["batch_id"], "disabled",
-                                  detail="upstream withdrew pending contribution material")
-            return
-        try:
-            receipt = self.community["submit_batch"](
-                batch, settings.as_dict(), self.state_dir, cancel=self._cancel,
-                authority_guard=self.store.db.assert_authority,
-            )
-        except Exception as exc:
-            self._fault('knowledge.publish', 'submit', 'publication_failed', exc)
-            self._unexpected("knowledge.publish", "submit", exc)
-            try:
-                self.store.mark_batch(
-                    batch_row["batch_id"], "unknown", attempted=True,
-                    detail=f"{type(exc).__name__}: {exc}"[:500],
-                )
-            except Exception as receipt_error:
-                exc.add_note('publication runtime receipt also failed: ' + type(receipt_error).__name__)
-                raise exc from receipt_error
-            return
-        self._record_publication_receipt(batch_row, receipt, attempted=True)
-        if receipt.get("status") in Store_confirmed:
-            # Confirmed upload retires staging. The candidate remains readable
-            # until this revision is confirmed in the synchronized public feed.
-            cleanup = self.store.compact_confirmed(batch_row["batch_id"])
-            if cleanup.get('cleanup_status') == 'failed':
-                self._error('Publication confirmed; local cleanup failed: ' + cleanup.get('cleanup_error', 'unknown'))
+        return self.publisher.submit(batch_row)
 
     def _reconcile(self, batch_row):
-        if self.community is None:
-            return  # stay unresolved; the dependency failure is reported on submit
-        try:
-            receipt = self.community["reconcile_batch"](
-                batch_row["batch_id"], self._settings().as_dict(), self.state_dir
-            )
-        except Exception as exc:
-            self._fault('knowledge.publish', 'reconcile', 'publication_reconciliation_failed', exc)
-            self._unexpected("knowledge.publish", "reconcile", exc)
-            # A failed read establishes no new remote fact. Keep the original
-            # intent/result and report this separate reconciliation failure.
-            self._error(f"publication reconciliation failed: {type(exc).__name__}")
-            return
-        self._record_publication_receipt(batch_row, receipt)
-        self._clear_faults('knowledge.publish', {'reconcile'})
-        if receipt.get("status") in Store_confirmed:
-            cleanup = self.store.compact_confirmed(batch_row["batch_id"])
-            if cleanup.get('cleanup_status') == 'failed':
-                self._error('Publication confirmed; local cleanup failed: ' + cleanup.get('cleanup_error', 'unknown'))
-
-    def _record_publication_receipt(self, batch_row, receipt, *, attempted=False):
-        """A returned write or read result survives a local recording failure."""
-        try:
-            self.store.mark_batch(
-                batch_row["batch_id"], receipt.get("status", "unknown"),
-                attempted=attempted, detail=receipt.get("detail", ""),
-                pr_url=receipt.get("pr_url"), head_sha=receipt.get("head_sha"),
-                actual_files=receipt.get("files"), retry_at=receipt.get("retry_at"),
-            )
-        except Exception as exc:
-            exc.mindie_publication_result = receipt
-            exc.add_note('publication result was returned before runtime receipt failure: ' + receipt.get('status', 'unknown'))
-            self._fault('knowledge.publish', 'receipt', 'publication_recording_failed', exc)
-            raise
-        self._clear_faults('knowledge.publish', {'receipt'})
+        return self.publisher.reconcile(batch_row)
 
     def _flush(self):
-        """Coalesce all pending material into one batch and send it."""
-        from .export import build_batch
-        from ..materials.publication import CleanupReceiptError
-
-        settings = self._settings()
-        if not settings.allows_capture():
-            return
-        try:
-            built = build_batch(self.store, settings=settings)
-        except CleanupReceiptError as exc:
-            batch_id = exc.batch_id
-            self._error("New contribution staged; prior staging cleanup receipt failed: " + str(exc))
-        else:
-            if built is None:
-                return
-            batch_id, _revision, _batch, _ids, _votes = built
-            cleanup = self.store.feed_get("publication-cleanup:" + batch_id)
-            if cleanup and cleanup.get("status") == "failed":
-                self._error("New contribution staged; prior staging cleanup failed: " + cleanup.get("detail", "unknown"))
-        self._submit(self.store.batch(batch_id))
+        return self.publisher.flush()
 
     def _outbox_loop(self):
         """Model-free idle worker: lives for the service lifetime so the
@@ -820,27 +682,15 @@ class Engine:
                     if (self.settings_path is not None or self.store.outbox_pending(limit=1)
                             or self.store.outbox_unresolved(limit=1) or self.store.outbox_unavailable(limit=1)):
                         self._fault('knowledge.publish', 'authorization', 'authority_unavailable')
-                elif block == "revoked":
-                    # Intake/summary can observe enable before this worker's
-                    # first enabled poll. Explicit revocation still owns the
-                    # cancellation edge, even when the cached generation is None.
-                    if (self._generation is not None or not self._cancel.is_set()
-                            or not self._summary_cancel.is_set()):
-                        self._cancel_unsent("sharing disabled; unsent work cancelled")
-                elif generation != self._generation:
-                    if self._generation is not None:
-                        self._cancel_unsent(
-                            "settings generation changed; unsent work cancelled",
-                            keep_generation=generation,
-                        )
-                    # Disabled startup and OFF/ON both leave the previous
-                    # token cancelled. New work owns a fresh token; never
-                    # revive a token held by an earlier operation.
-                    self._cancel = threading.Event()
-                    if self.stop.is_set():
-                        self._cancel.set()
+                elif ((block, generation) != self._observed_authority
+                      or self.operations.has_foreign_contribution(generation)):
+                    self._cancel_unsent(
+                        "sharing disabled; unsent work cancelled" if block == "revoked" else
+                        "settings generation changed; unsent work cancelled",
+                        keep_generation=generation,
+                    )
                 if block != "fault":
-                    self._generation = generation
+                    self._observed_authority = (block, generation)
                     self._clear_faults('knowledge.publish', {'authorization'})
                 # ReMe refreshes on query or an explicit index operation. The
                 # retired FTS scheduler must not import/index a whole library
@@ -849,30 +699,20 @@ class Engine:
                     for row in self.store.outbox_unresolved(limit=2, due_only=True):
                         if self._is_frozen():
                             break
-                        if self.store.reconcile_due(row["batch_id"]) and self.begin_work():
-                            try:
-                                self._reconcile(row)
-                            finally:
-                                self.end_work()
+                        if self.store.reconcile_due(row["batch_id"]):
+                            self._reconcile(row)
                     # Transient send failures resume automatically with
                     # persisted backoff: the stored batch payload is retried,
                     # never rebuilt from scratch and never silently dropped.
                     for row in self.store.outbox_unavailable(limit=2, due_only=True):
                         if self._is_frozen():
                             break
-                        if self.store.retry_due(row["batch_id"]) and self.begin_work():
-                            try:
-                                self._submit(row)
-                            finally:
-                                self.end_work()
+                        if self.store.retry_due(row["batch_id"]):
+                            self._submit(row)
                     for row in self.store.outbox_pending(limit=2):
                         if self._is_frozen():
                             break
-                        if self.begin_work():
-                            try:
-                                self._submit(row)
-                            finally:
-                                self.end_work()
+                        self._submit(row)
                     material = self.store.has_changed_drafts(
                         generation=generation, ready_only=True
                     ) or self.store.unbatched_votes(generation=generation)
@@ -885,12 +725,8 @@ class Engine:
                         if (
                             (idle_for >= settings.idle_seconds or deactivated)
                             and not self._is_frozen()
-                            and self.begin_work()
                         ):
-                            try:
-                                self._flush()
-                            finally:
-                                self.end_work()
+                            self._flush()
                 self._clear_faults('knowledge.publish', {'worker'})
             except Exception as exc:
                 self._fault('knowledge.publish', 'worker', 'publication_worker_failed', exc)
@@ -899,10 +735,7 @@ class Engine:
             self.stop.wait(1.0)
 
     def shutdown(self):
-        self.stop.set()
-        self._cancel.set()
-        with self._summary_lock:
-            self._summary_cancel.set()
+        self.operations.shutdown()
         try:
             self.queue.put_nowait(None)
         except queue.Full:
@@ -916,47 +749,39 @@ class Engine:
 
     def begin_work(self):
         """Admit one actual service/worker operation. False when frozen or stopping."""
-        with self._activity_lock:
-            if self._frozen or self.stop.is_set():
-                return False
-            self._activity += 1
-            return True
+        operation = self.operations.begin("capability")
+        if operation is None:
+            return False
+        if not hasattr(self._work_local, "stack"):
+            self._work_local.stack = []
+        self._work_local.stack.append(operation)
+        return True
 
     def end_work(self):
-        with self._activity_lock:
-            if self._activity > 0:
-                self._activity -= 1
+        self.operations.end(self._work_local.stack.pop())
 
     def _is_frozen(self):
-        with self._activity_lock:
-            return self._frozen or self.stop.is_set()
+        return self.operations.frozen()
 
     def stop_if_idle(self):
         """Atomically freeze new admission and report whether anything is
         actually running or queued. Unknown/pending receipts and idle task
         grants are not activity. Never cancels in-flight work: a busy result
         unfreezes so the service continues."""
-        with self._activity_lock:
-            if self.stop.is_set():
-                return dict(
-                    idle=True, status="stopping", activity=self._activity,
-                    queued_captures=self.queue.unfinished_tasks,
-                    due_capture=False,
-                )
-            self._frozen = True
-            activity = self._activity
-            queued = self.queue.unfinished_tasks
-        due = self.store.due_capture() is not None
-        with self.store.lock:
-            due_summary = self.store.db.execute(
-                "SELECT 1 FROM material_batches b JOIN transcript_tasks t ON t.entry_id=b.entry_id "
-                "WHERE b.status IN ('pending','retry-requested') AND t.summary_due<=? LIMIT 1",
-                (time.time(),)).fetchone() is not None
+        activity = self.operations.freeze()
+        queued = self.queue.unfinished_tasks
+        if self.stop.is_set():
+            return dict(idle=True, status="stopping", activity=activity,
+                        queued_captures=queued, due_capture=False)
+        try:
+            due = self.store.due_capture() is not None
+            due_summary = self.index_queue.has_due()
+        except BaseException:
+            self.operations.resume()
+            raise
         busy = activity > 0 or queued > 0 or due or due_summary
         if busy:
-            with self._activity_lock:
-                if not self.stop.is_set():
-                    self._frozen = False
+            self.operations.resume()
             return dict(
                 idle=False, status="busy", activity=activity,
                 queued_captures=queued, due_capture=due, due_summary=due_summary,
@@ -974,9 +799,7 @@ class Engine:
         transport = settings.as_dict().get("transport", "gh")
         required = ["git", "gh"] if transport == "gh" else ["git"]
         missing = [name for name in required if shutil.which(name) is None]
-        with self._activity_lock:
-            activity = self._activity
-            frozen = self._frozen
+        activity = self.operations.snapshot()
         from ..materials.summarizer import SummaryLedger
         with self.store._write_txn():
             ledger = SummaryLedger(self.store.db)
@@ -999,8 +822,8 @@ class Engine:
             ),
             errors=self.errors,
             background_errors=dict(self.background_errors),
-            activity=activity,
-            admission_frozen=frozen,
+            activity=activity['activity'],
+            admission_frozen=activity['frozen'],
             worker_alive=self.thread.is_alive() and not self._worker_failed,
             worker_failed=bool(self._worker_failed),
             outbox_alive=self.outbox_thread.is_alive(),

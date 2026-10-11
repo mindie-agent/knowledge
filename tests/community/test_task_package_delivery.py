@@ -205,7 +205,9 @@ def test_uncertain_revision_never_replaced_or_cleaned(tmp_path, status):
 
 @pytest.mark.parametrize("receipt_failure", [False, True])
 def test_replacement_cleanup_failure_does_not_block_or_repeat_new_send(tmp_path, monkeypatch, receipt_failure):
-    from mindie_knowledge.loop.engine import Engine
+    import threading
+    from mindie_knowledge.loop.operations import OperationOwner
+    from mindie_knowledge.loop.publication_worker import PublicationWorker
     from mindie_knowledge.materials import publication
 
     store = Store(tmp_path / "producer", "npu")
@@ -228,8 +230,10 @@ def test_replacement_cleanup_failure_does_not_block_or_repeat_new_send(tmp_path,
         monkeypatch.setattr(store, "feed_set", fail_final_receipt)
         errors, sent = [], []
         engine = SimpleNamespace(store=store, _settings=lambda: SimpleNamespace(generation="g1", allows_capture=lambda: True),
-                                 _error=errors.append, _submit=lambda row: sent.append(row["revision"]))
-        Engine._flush(engine)
+                                 _error=errors.append, operations=OperationOwner(threading.Event()))
+        worker = PublicationWorker(engine)
+        monkeypatch.setattr(worker, 'submit', lambda row: sent.append(row["revision"]))
+        worker.flush()
         assert len(sent) == 1 and sent[0] != first
         assert store.batch(batch_id)["status"] == "pending"
         assert load_batch_payload(store, store.batch(batch_id))["revision"] == sent[0]
@@ -237,7 +241,7 @@ def test_replacement_cleanup_failure_does_not_block_or_repeat_new_send(tmp_path,
         if receipt_failure:
             assert "cleanup receipt write refused" in errors[0]
         assert not any(attempt["status"] == "failed" for attempt in store.status()["export_attempts"])
-        Engine._flush(engine)
+        worker.flush()
         assert len(sent) == 1  # no new build or duplicate send after cleanup failure
         assert staging_path(store.root, batch_id, first).exists()
         # A later confirmed send retries the old exact revision as well; its

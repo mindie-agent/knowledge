@@ -271,13 +271,14 @@ class Service:
         work = method in {
             "query", "explain", "feedback", "capture", "sync",
         }
-        if work and not self.engine.begin_work():
+        operation = self.engine.operations.begin("capability", method) if work else None
+        if work and operation is None:
             raise ValueError("service is not admitting new work")
         try:
-            return self._dispatch(method, args)
+            return self._dispatch(method, args, cancel=operation.cancel if operation else None)
         finally:
-            if work:
-                self.engine.end_work()
+            if operation is not None:
+                self.engine.operations.end(operation)
 
     def _stop_if_idle(self):
         result = self.engine.stop_if_idle()
@@ -286,7 +287,7 @@ class Service:
             return dict(result, status="stopping")
         return result
 
-    def _dispatch(self, method, args):
+    def _dispatch(self, method, args, *, cancel=None):
         lease = None
         session = None
         if method in {"feedback", "capture"}:
@@ -327,7 +328,7 @@ class Service:
         if method == "capture":
             return self.engine.capture(**args)
         if method == "sync":
-            return [feed.sync(force=True) for feed in self.feeds]
+            return [feed.sync(force=True, cancel=cancel) for feed in self.feeds]
         raise ValueError("unsupported operation")
 
     # -------------------------------------------------------------- serving
@@ -383,6 +384,5 @@ class Service:
             raise
 
     def close(self):
-        self.engine.stop.set()
-        self.engine._cancel.set()
+        self.engine.operations.shutdown()
         self.http.shutdown()

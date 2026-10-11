@@ -158,21 +158,25 @@ def submit_batch(
         result = _submit(batch, settings, state_dir, ledger, cancel=cancel, transport=transport)
         return result
     finally:
-        import sys
-        primary_error = sys.exc_info()[1]
-        try:
-            ledger.close()
-        except Exception as exc:
-            if primary_error is not None:
-                primary_error.add_note('publication ledger cleanup also failed: ' + type(exc).__name__)
-            elif result is not None:
-                from mindie_knowledge.loop.dfx import failure
-                failure('knowledge.publish', stage='cleanup', category='publication_cleanup_failed',
-                        exception=exc, reportable=False)
-                result.update(cleanup_failed=True)
-                result['detail'] += '; publication ledger cleanup failed (' + type(exc).__name__ + ')'
-            else:
-                raise
+        _close_ledger(ledger, result)
+
+
+def _close_ledger(ledger, result):
+    import sys
+    primary_error = sys.exc_info()[1]
+    try:
+        ledger.close()
+    except Exception as exc:
+        if primary_error is not None:
+            primary_error.add_note('publication ledger cleanup also failed: ' + type(exc).__name__)
+        elif result is not None:
+            from mindie_knowledge.loop.dfx import failure
+            failure('knowledge.publish', stage='cleanup', category='publication_cleanup_failed',
+                    exception=exc, reportable=False)
+            result.update(cleanup_failed=True)
+            result['detail'] += '; publication ledger cleanup failed (' + type(exc).__name__ + ')'
+        else:
+            raise
 
 
 def _submit(batch, settings, state_dir, ledger, *, cancel, transport) -> dict[str, Any]:
@@ -893,14 +897,9 @@ def _resolve_unknown(ledger, row, settings, state_dir, transport, deadline) -> d
         retry_at = exc.retry_at
     except CommunityError as exc:
         detail = f"reconciliation lookup failed: {exc}"
-    ledger.finish_publication(
-        row["batch_id"], row["revision"], status=status, detail=detail,
-        pr_url=pr_url, head_sha=expected,
-    )
-    return _attach_retry(
-        ledger.receipt(ledger.get_publication(row["batch_id"], row["revision"])),
-        retry_at,
-    )
+    result = dict(ledger.receipt(row), status=status, detail=detail,
+                  pr_url=pr_url, head_sha=expected, pr_number=row.get('pr_number'))
+    return _attach_retry(_finish_result(row, ledger, result), retry_at)
 
 
 def _inspect_row(ledger, row, settings, state_dir, transport, deadline) -> dict[str, Any]:
@@ -1054,25 +1053,30 @@ def inspect_batch(batch_id: str, settings: dict, state_dir: Path, *, transport: 
         ledger.close()
 
 
-def reconcile_batch(batch_id: str, settings: dict, state_dir: Path, *, transport: Transport | None = None) -> dict:
+def reconcile_batch(batch_id: str, settings: dict, state_dir: Path, *, transport: Transport | None = None,
+                    cancel: Any = None, authority_guard=None) -> dict:
     """Read-only reconciliation of every unresolved intent of one batch id."""
     state_dir = Path(state_dir)
-    ledger = Ledger(state_dir)
+    ledger = Ledger(state_dir, authority_guard=authority_guard)
+    result = None
     try:
         if not sharing_enabled(settings):
-            return {"status": "disabled", "batch_id": batch_id, "revision": None,
+            result = {"status": "disabled", "batch_id": batch_id, "revision": None,
                     "pr_url": None, "head_sha": None,
                     "detail": "community sharing is disabled or unconfigured"}
+            return result
         transport = transport or transport_from_settings(settings, state_dir)
         deadline = Deadline(settings.get("transaction_seconds"),
-                            settings.get("operation_limit"))
+                            settings.get("operation_limit"), cancel=cancel)
         unresolved = ledger.unresolved_for_batch(batch_id)
         if not unresolved:
             latest = ledger.latest_for_batch(batch_id)
             if latest is None:
-                return {"status": "unknown", "batch_id": batch_id, "revision": None,
+                result = {"status": "unknown", "batch_id": batch_id, "revision": None,
                         "pr_url": None, "head_sha": None, "detail": "no publication record for this batch"}
-            return ledger.receipt(latest)
+            else:
+                result = ledger.receipt(latest)
+            return result
         result = None
         for row in unresolved:
             result = _resolve_unknown(ledger, row, settings, state_dir, transport, deadline)
@@ -1080,7 +1084,7 @@ def reconcile_batch(batch_id: str, settings: dict, state_dir: Path, *, transport
                 break
         return result
     finally:
-        ledger.close()
+        _close_ledger(ledger, result)
 
 
 def _remote_url(settings: Mapping[str, Any], write_repo: str) -> str:

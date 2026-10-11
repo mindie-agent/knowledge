@@ -182,7 +182,9 @@ def test_connection_write_failure_cancels_real_child_and_workers(tmp_path, monke
 
         def run(self):
             try:
-                bounded_run([sys.executable, str(child), str(pidfile)], "", timeout=10, max_output=1024, cancel=self._cancel)
+                with self.operations.scope("capture", "synthetic-workload") as operation:
+                    bounded_run([sys.executable, str(child), str(pidfile)], "", timeout=10, max_output=1024,
+                                cancel=operation.cancel)
             except MaintenanceCancelled:
                 pass
 

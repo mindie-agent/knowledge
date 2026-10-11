@@ -276,7 +276,7 @@ def test_production_increment_starts_from_changed_confirmed_main(
 
 def test_pending_index_result_settles_before_rebase_preserves_remote_navigation(
         settings, state_dir, transport, remote_url, tmp_path):
-    from mindie_knowledge.loop.transcript_capture import _settle_task
+    from mindie_knowledge.loop.index_queue import IndexQueue
     with closing(Store(tmp_path / "producer", "npu")) as store:
         feed = Feed(store, dict(repository=settings["repository"], domain="npu", ref="main", url=remote_url))
         append_parts(store, "REMOVED_SOURCE_CANARY: the old claim.\n")
@@ -299,7 +299,7 @@ def test_pending_index_result_settles_before_rebase_preserves_remote_navigation(
             store.apply_material_indexes(entry_id=TASK, generation="g1", indexes=[dict(
                 block_id=local["block_id"], title="Local observation", summary="Unsent local evidence.")],
                 navigation=dict(title="Stale model title", summary="The removed claim was successful."))
-            _settle_task(store, TASK)
+            IndexQueue(store).settle(TASK)
         candidate = package_from_batch(build(store)[2])
         assert "REMOVED_SOURCE_CANARY" not in package_body(candidate)
         assert "Unsent local observation" in package_body(candidate)

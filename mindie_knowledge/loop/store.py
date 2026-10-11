@@ -1667,6 +1667,18 @@ class Store:
                 (detail, time.time(), keep_generation, keep_generation),
             ).rowcount
 
+    def revoke_unsent(self, detail, *, keep_generation=None):
+        """Batch and feedback revocation share one authority transaction."""
+        with self._write_txn():
+            self.cancel_pending(detail, keep_generation=keep_generation)
+            self.db.execute(
+                "UPDATE votes SET publishable=0 WHERE batch_id IS NULL "
+                "AND (? IS NULL OR NOT EXISTS (SELECT 1 FROM grants "
+                "WHERE grants.kind='vote' AND grants.identity=votes.root_opaque||':'||votes.entry_id "
+                "AND grants.revision=votes.revision AND grants.generation=?))",
+                (keep_generation, keep_generation),
+            )
+
     def _operation_due(self, batch_id):
         """Persisted exponential backoff gate for one bounded outbox operation.
 

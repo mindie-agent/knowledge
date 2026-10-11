@@ -23,15 +23,15 @@ def test_removed_config_retires_only_after_grace_and_idle(tmp_path, monkeypatch)
             config.unlink()
             now[0] = 130.0
             service.http.service_actions()
-            assert not engine._frozen
+            assert not engine.operations.frozen()
             assert engine.begin_work()
             now[0] = 160.0
             service.http.service_actions()
-            assert not engine._frozen  # Never cancel a capture/publication.
+            assert not engine.operations.frozen()  # Never cancel a capture/publication.
             engine.end_work()
             now[0] = 190.0
             service.http.service_actions()
-            assert engine._frozen and service._config_retired
+            assert engine.operations.frozen() and service._config_retired
         finally:
             service.http.server_close()
 
@@ -71,5 +71,25 @@ def test_embedded_service_needs_no_config_file(tmp_path, monkeypatch):
         monkeypatch.setattr(service, '_stop_if_idle', lambda: (_ for _ in ()).throw(AssertionError('must stay alive')))
         try:
             service.http.service_actions()
+        finally:
+            service.http.server_close()
+
+
+def test_sync_read_owns_shutdown_cancellation(tmp_path):
+    import pytest
+    class Feed:
+        def sync(self, *, force, cancel):
+            assert force and cancel is not None
+            assert engine.operations.snapshot()['activity'] == 1
+            engine.operations.shutdown()
+            assert cancel.is_set()
+            raise InterruptedError('owner stopped the feed read')
+    with closing(Store(tmp_path / 'data', 'test')) as store:
+        engine = Engine(store)
+        service = Service(engine, feeds=[Feed()])
+        try:
+            with pytest.raises(InterruptedError, match='owner stopped'):
+                service.call('sync', {})
+            assert engine.operations.snapshot()['activity'] == 0
         finally:
             service.http.server_close()
