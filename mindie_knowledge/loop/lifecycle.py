@@ -95,6 +95,18 @@ def acquire_consumer(config_path, config):
         time.sleep(.01)
 
 
+def _completed_retirement(config, outcome, receipt):
+    """Discard obsolete discovery only after owner exit, under both locks."""
+    from .cli import connection_path
+    try:
+        connection_path(config).unlink(missing_ok=True)
+    except OSError as exc:
+        return dict(outcome, retirement=receipt, cleanup_failed=True,
+                    cleanup_error=dict(stage='connection_discovery', error_type=type(exc).__name__,
+                                       errno=exc.errno, operation_completed=True))
+    return dict(outcome, retirement=receipt)
+
+
 def retire_service(config_path):
     from .cli import config_at, connect
     from .handoff import _probe
@@ -111,7 +123,7 @@ def retire_service(config_path):
                     raise RuntimeError('previous service retirement has an uncertain outcome; inspect it before recovery')
                 if _consumer_state(config):
                     raise RuntimeError('retired service still owns its consumer lock')
-                return dict(idle=True, service='absent', retirement=previous)
+                return _completed_retirement(config, dict(idle=True, service='absent'), previous)
             receipt = dict(schema=SCHEMA, config_fingerprint=config_fingerprint(config_path, config),
                            operation_id=uuid.uuid4().hex, status='retiring')
             _atomic_write_text(_marker(config_path), json.dumps(receipt, sort_keys=True) + '\n')
@@ -153,7 +165,7 @@ def retire_service(config_path):
                 return dict(outcome, retirement=receipt, cleanup_failed=True,
                             cleanup_error=dict(stage='consumer_ownership', error_type=type(exc).__name__,
                                                errno=exc.errno, operation_completed=True))
-            return dict(outcome, retirement=receipt)
+            return _completed_retirement(config, outcome, receipt)
         finally:
             admission.release()
     finally:
