@@ -287,3 +287,101 @@ def test_store_close_preserves_committed_effect_error_over_cleanup(tmp_path, mon
             store.db.execute('SELECT 1')
     finally:
         close_materials()  # The intentionally failed cleanup must not leak handles.
+
+
+def test_reconciliation_read_failure_is_delivered_without_overwriting_original_intent(tmp_path, monkeypatch):
+    from mindie_knowledge.loop import agent_diagnostics
+    from mindie_knowledge.loop.engine import Engine
+    from conftest import write_settings
+    from test_publication_authority import prepare
+    monkeypatch.setenv('MINDIE_DIAGNOSTICS_ROOT', str(tmp_path / 'diagnostics'))
+    settings = write_settings(tmp_path / 'sharing.json', roots=[tmp_path])
+    with closing(Store(tmp_path / 'store', 'test')) as store:
+        _, batch_id = prepare(store, settings, 'Synthetic uncertain publication.')
+        store.mark_batch(batch_id, 'unknown', attempted=True, detail='original push outcome unknown')
+        agent_diagnostics.acknowledge(agent_diagnostics.pending())
+        original = store.batch(batch_id)
+        engine = Engine(store, settings_path=settings.path)
+        def unavailable(*args):
+            raise OSError('synthetic read failure')
+        engine.community['reconcile_batch'] = unavailable
+        for _ in range(2):
+            engine._reconcile(original)
+        assert store.batch(batch_id) == original
+        faults = agent_diagnostics.pending()['items']
+        assert [(item['stage'], item['code'], item['count']) for item in faults] == [
+            ('reconcile', 'publication_reconciliation_failed', 1)]
+        engine.community['reconcile_batch'] = lambda *a: dict(status='unknown', detail='read succeeded; no proof')
+        engine._reconcile(original)
+        engine.community['reconcile_batch'] = unavailable
+        engine._reconcile(store.batch(batch_id))
+        assert agent_diagnostics.pending()['items'][0]['count'] == 2
+
+
+def test_reconciled_remote_result_survives_local_receipt_failure(tmp_path, monkeypatch):
+    from mindie_knowledge.loop.engine import Engine
+    from conftest import write_settings
+    from test_publication_authority import prepare
+    settings = write_settings(tmp_path / 'sharing.json', roots=[tmp_path])
+    with closing(Store(tmp_path / 'store', 'test')) as store:
+        _, batch_id = prepare(store, settings, 'Synthetic publication with remote proof.')
+        store.mark_batch(batch_id, 'unknown', attempted=True, detail='original push outcome unknown')
+        original = store.batch(batch_id)
+        engine = Engine(store, settings_path=settings.path)
+        receipt = dict(status='submitted', head_sha='a' * 40, pr_url='https://example.invalid/pull/1')
+        engine.community['reconcile_batch'] = lambda *a: receipt
+        error = OSError('synthetic local receipt failure')
+        def fail_record(*a, **kw):
+            raise error
+        monkeypatch.setattr(store, 'mark_batch', fail_record)
+        with pytest.raises(OSError) as caught:
+            engine._reconcile(original)
+        assert caught.value is error and caught.value.mindie_publication_result == receipt
+        assert 'submitted' in ' '.join(caught.value.__notes__)
+        assert store.batch(batch_id) == original
+
+
+def test_frozen_payload_failure_delivers_its_stage_before_any_write(tmp_path, monkeypatch):
+    from mindie_knowledge.loop import agent_diagnostics
+    from mindie_knowledge.loop.engine import Engine
+    from mindie_knowledge.materials.publication import staging_path
+    from conftest import write_settings
+    from test_publication_authority import prepare
+    monkeypatch.setenv('MINDIE_DIAGNOSTICS_ROOT', str(tmp_path / 'diagnostics'))
+    settings = write_settings(tmp_path / 'sharing.json', roots=[tmp_path])
+    with closing(Store(tmp_path / 'store', 'test')) as store:
+        _, batch_id = prepare(store, settings, 'Synthetic frozen contribution.')
+        row = store.batch(batch_id)
+        staging_path(store.root, batch_id, row['revision']).joinpath('manifest.json').unlink()
+        engine = Engine(store, settings_path=settings.path)
+        writes = []
+        engine.community['submit_batch'] = lambda *a, **kw: writes.append(a)
+        engine._submit(row)
+        assert not writes and store.batch(batch_id)['status'] == 'unavailable'
+        assert store.batch(batch_id)['attempted'] is None
+        assert any(item['stage'] == 'payload' and item['code'] == 'publication_payload_unavailable'
+                   for item in agent_diagnostics.pending()['items'])
+
+
+def test_payload_error_remains_primary_when_failure_recording_also_fails(tmp_path, monkeypatch):
+    from mindie_knowledge.loop.engine import Engine
+    from mindie_knowledge.materials import publication
+    from conftest import write_settings
+    from test_publication_authority import prepare
+    settings = write_settings(tmp_path / 'sharing.json', roots=[tmp_path])
+    with closing(Store(tmp_path / 'store', 'test')) as store:
+        _, batch_id = prepare(store, settings, 'Synthetic local failure before writing.')
+        original = store.batch(batch_id)
+        engine = Engine(store, settings_path=settings.path)
+        primary, secondary = FileNotFoundError('frozen payload missing'), OSError('receipt unavailable')
+        def fail_payload(*a):
+            raise primary
+        def fail_record(*a, **kw):
+            raise secondary
+        monkeypatch.setattr(publication, 'load_batch_payload', fail_payload)
+        monkeypatch.setattr(store, 'mark_batch', fail_record)
+        with pytest.raises(FileNotFoundError) as caught:
+            engine._submit(original)
+        assert caught.value is primary and caught.value.__cause__ is secondary
+        assert 'payload failure receipt also failed: OSError' in caught.value.__notes__
+        assert store.batch(batch_id) == original

@@ -64,6 +64,8 @@ class Engine:
         self.stop = threading.Event()
         self._cancel = threading.Event()
         self._summary_cancel = threading.Event()
+        self._summary_generation = None
+        self._summary_lock = threading.Lock()
         self.thread = threading.Thread(
             target=self.run, name="mindie-capture", daemon=True
         )
@@ -649,14 +651,29 @@ class Engine:
 
     # ---------------------------------------------------------------- outbox
 
-    def _cancel_unsent(self, reason):
-        """Sharing revocation cancels pending timers and unsent contributions."""
+    def _begin_summary(self, generation):
+        """One operation owns its token; a later operation cannot un-cancel it."""
+        with self._summary_lock:
+            self._summary_generation = generation
+            self._summary_cancel = threading.Event()
+            if self.stop.is_set():
+                self._summary_cancel.set()
+            return self._summary_cancel
+
+    def _cancel_unsent(self, reason, *, keep_generation=None):
+        """Revoke unsent work, retaining any already admitted current generation."""
         self._cancel.set()
-        self._summary_cancel.set()
-        self.store.cancel_pending(reason)
+        with self._summary_lock:
+            if keep_generation is None or self._summary_generation != keep_generation:
+                self._summary_cancel.set()
+        self.store.cancel_pending(reason, keep_generation=keep_generation)
         with self.store._write_txn():
             self.store.db.execute(
-                "UPDATE votes SET publishable=0 WHERE batch_id IS NULL"
+                "UPDATE votes SET publishable=0 WHERE batch_id IS NULL "
+                "AND (? IS NULL OR NOT EXISTS (SELECT 1 FROM grants "
+                "WHERE grants.kind='vote' AND grants.identity=votes.root_opaque||':'||votes.entry_id "
+                "AND grants.revision=votes.revision AND grants.generation=?))",
+                (keep_generation, keep_generation),
             )
 
     def _submit(self, batch_row):
@@ -680,10 +697,16 @@ class Engine:
         try:
             batch = load_batch_payload(self.store, batch_row)
         except Exception as exc:
-            self.store.mark_batch(batch_row['batch_id'], 'unavailable',
-                                  detail='local frozen contribution could not be loaded: ' + type(exc).__name__)
+            self._fault('knowledge.publish', 'payload', 'publication_payload_unavailable', exc)
+            try:
+                self.store.mark_batch(batch_row['batch_id'], 'unavailable',
+                                      detail='local frozen contribution could not be loaded: ' + type(exc).__name__)
+            except Exception as receipt_error:
+                exc.add_note('payload failure receipt also failed: ' + type(receipt_error).__name__)
+                raise exc from receipt_error
             self._error('Publication did not start: frozen contribution load failed (' + type(exc).__name__ + ').')
             return
+        self._clear_faults('knowledge.publish', {'payload'})
         try:
             withdrawn = any(self.store.is_withdrawn(ref)
                             for ref in batch["entry_refs"])
@@ -712,18 +735,7 @@ class Engine:
                 exc.add_note('publication runtime receipt also failed: ' + type(receipt_error).__name__)
                 raise exc from receipt_error
             return
-        try:
-            self.store.mark_batch(
-                batch_row["batch_id"], receipt.get("status", "unknown"),
-                attempted=True, detail=receipt.get("detail", ""),
-                pr_url=receipt.get("pr_url"), head_sha=receipt.get("head_sha"),
-                actual_files=receipt.get("files"), retry_at=receipt.get("retry_at"),
-            )
-        except Exception as exc:
-            exc.mindie_publication_result = receipt
-            exc.add_note('publication result was returned before runtime receipt failure: ' + receipt.get('status', 'unknown'))
-            self._fault('knowledge.publish', 'receipt', 'publication_recording_failed', exc)
-            raise
+        self._record_publication_receipt(batch_row, receipt, attempted=True)
         if receipt.get("status") in Store_confirmed:
             # Confirmed upload retires staging. The candidate remains readable
             # until this revision is confirmed in the synchronized public feed.
@@ -739,21 +751,34 @@ class Engine:
                 batch_row["batch_id"], self._settings().as_dict(), self.state_dir
             )
         except Exception as exc:
+            self._fault('knowledge.publish', 'reconcile', 'publication_reconciliation_failed', exc)
             self._unexpected("knowledge.publish", "reconcile", exc)
-            self.store.mark_batch(batch_row["batch_id"], "unknown",
-                                  detail=f"reconciliation failed: {type(exc).__name__}")
+            # A failed read establishes no new remote fact. Keep the original
+            # intent/result and report this separate reconciliation failure.
             self._error(f"publication reconciliation failed: {type(exc).__name__}")
             return
-        self.store.mark_batch(
-            batch_row["batch_id"], receipt.get("status", "unknown"),
-            detail=receipt.get("detail", ""), pr_url=receipt.get("pr_url"),
-            head_sha=receipt.get("head_sha"),
-            actual_files=receipt.get("files"), retry_at=receipt.get("retry_at"),
-        )
+        self._record_publication_receipt(batch_row, receipt)
+        self._clear_faults('knowledge.publish', {'reconcile'})
         if receipt.get("status") in Store_confirmed:
             cleanup = self.store.compact_confirmed(batch_row["batch_id"])
             if cleanup.get('cleanup_status') == 'failed':
                 self._error('Publication confirmed; local cleanup failed: ' + cleanup.get('cleanup_error', 'unknown'))
+
+    def _record_publication_receipt(self, batch_row, receipt, *, attempted=False):
+        """A returned write or read result survives a local recording failure."""
+        try:
+            self.store.mark_batch(
+                batch_row["batch_id"], receipt.get("status", "unknown"),
+                attempted=attempted, detail=receipt.get("detail", ""),
+                pr_url=receipt.get("pr_url"), head_sha=receipt.get("head_sha"),
+                actual_files=receipt.get("files"), retry_at=receipt.get("retry_at"),
+            )
+        except Exception as exc:
+            exc.mindie_publication_result = receipt
+            exc.add_note('publication result was returned before runtime receipt failure: ' + receipt.get('status', 'unknown'))
+            self._fault('knowledge.publish', 'receipt', 'publication_recording_failed', exc)
+            raise
+        self._clear_faults('knowledge.publish', {'receipt'})
 
     def _flush(self):
         """Coalesce all pending material into one batch and send it."""
@@ -795,14 +820,25 @@ class Engine:
                     if (self.settings_path is not None or self.store.outbox_pending(limit=1)
                             or self.store.outbox_unresolved(limit=1) or self.store.outbox_unavailable(limit=1)):
                         self._fault('knowledge.publish', 'authorization', 'authority_unavailable')
-                elif self._generation is not None and generation != self._generation:
-                    if generation is None:
+                elif block == "revoked":
+                    # Intake/summary can observe enable before this worker's
+                    # first enabled poll. Explicit revocation still owns the
+                    # cancellation edge, even when the cached generation is None.
+                    if (self._generation is not None or not self._cancel.is_set()
+                            or not self._summary_cancel.is_set()):
                         self._cancel_unsent("sharing disabled; unsent work cancelled")
-                    else:
+                elif generation != self._generation:
+                    if self._generation is not None:
                         self._cancel_unsent(
-                            "settings generation changed; unsent work cancelled"
+                            "settings generation changed; unsent work cancelled",
+                            keep_generation=generation,
                         )
-                        self._cancel.clear()
+                    # Disabled startup and OFF/ON both leave the previous
+                    # token cancelled. New work owns a fresh token; never
+                    # revive a token held by an earlier operation.
+                    self._cancel = threading.Event()
+                    if self.stop.is_set():
+                        self._cancel.set()
                 if block != "fault":
                     self._generation = generation
                     self._clear_faults('knowledge.publish', {'authorization'})
@@ -865,7 +901,8 @@ class Engine:
     def shutdown(self):
         self.stop.set()
         self._cancel.set()
-        self._summary_cancel.set()
+        with self._summary_lock:
+            self._summary_cancel.set()
         try:
             self.queue.put_nowait(None)
         except queue.Full:
