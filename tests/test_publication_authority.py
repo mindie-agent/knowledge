@@ -151,3 +151,22 @@ def test_summary_cancellation_belongs_to_its_generation(tmp_path):
         assert prior.is_set() and not current.is_set()
         engine._cancel_unsent("sharing disabled")
         assert current.is_set()
+
+
+@pytest.mark.parametrize("disabled_start", [False, True])
+def test_revocation_cancels_work_even_before_outbox_observes_enable(tmp_path, monkeypatch, disabled_start):
+    path = tmp_path / "sharing.json"
+    write_settings(path, enabled=not disabled_start, roots=[tmp_path])
+    with closing(Store(tmp_path / "store", "test")) as store:
+        engine = Engine(store, settings_path=path)
+        engine.revoke_stale()
+        # The summary worker can observe enable independently, before the
+        # outbox's first enabled tick (or its next poll after disabled startup).
+        current = write_settings(path, roots=[tmp_path])
+        _, batch_id = prepare(store, current, "Material admitted before the first enabled outbox poll.")
+        active = engine._begin_summary(current.generation)
+        assert engine._generation is None
+        write_settings(path, enabled=False, roots=[tmp_path])
+        tick(engine, monkeypatch)
+        assert active.is_set()
+        assert store.batch(batch_id)["status"] == "disabled"

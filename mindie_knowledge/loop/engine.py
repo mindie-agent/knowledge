@@ -820,21 +820,25 @@ class Engine:
                     if (self.settings_path is not None or self.store.outbox_pending(limit=1)
                             or self.store.outbox_unresolved(limit=1) or self.store.outbox_unavailable(limit=1)):
                         self._fault('knowledge.publish', 'authorization', 'authority_unavailable')
-                elif generation != self._generation:
-                    if generation is None:
+                elif block == "revoked":
+                    # Intake/summary can observe enable before this worker's
+                    # first enabled poll. Explicit revocation still owns the
+                    # cancellation edge, even when the cached generation is None.
+                    if (self._generation is not None or not self._cancel.is_set()
+                            or not self._summary_cancel.is_set()):
                         self._cancel_unsent("sharing disabled; unsent work cancelled")
-                    else:
-                        if self._generation is not None:
-                            self._cancel_unsent(
-                                "settings generation changed; unsent work cancelled",
-                                keep_generation=generation,
-                            )
-                        # Disabled startup and OFF/ON both leave the previous
-                        # token cancelled. New work owns a fresh token; never
-                        # revive a token held by an earlier operation.
-                        self._cancel = threading.Event()
-                        if self.stop.is_set():
-                            self._cancel.set()
+                elif generation != self._generation:
+                    if self._generation is not None:
+                        self._cancel_unsent(
+                            "settings generation changed; unsent work cancelled",
+                            keep_generation=generation,
+                        )
+                    # Disabled startup and OFF/ON both leave the previous
+                    # token cancelled. New work owns a fresh token; never
+                    # revive a token held by an earlier operation.
+                    self._cancel = threading.Event()
+                    if self.stop.is_set():
+                        self._cancel.set()
                 if block != "fault":
                     self._generation = generation
                     self._clear_faults('knowledge.publish', {'authorization'})
