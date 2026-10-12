@@ -12,10 +12,10 @@ from mindie_knowledge.materials import summarizer as s
 
 
 def command(*, title='Public case', summary='Reported observations remain reference material.',
-            calls=None, started=None, release=None, fail=False, required=None):
+            calls=None, started=None, release=None, fail=False, required=None, error_reason=None):
     options = dict(title=title, summary=summary, calls=str(calls) if calls else None,
                    started=str(started) if started else None, release=str(release) if release else None,
-                   fail=fail, required=required)
+                   fail=fail, required=required, error_reason=error_reason)
     return [sys.executable, str(Path(__file__).resolve()), json.dumps(options)]
 
 
@@ -54,6 +54,7 @@ if __name__ == '__main__':
     while options['release'] and not Path(options['release']).exists():
         time.sleep(.05)
     response = (s.outcome(request, status='failed', error='invalid_result', model_calls=1,
-                          usage_known=True, usage={'input_tokens':120,'cached_input_tokens':0,'output_tokens':30})
+                          usage_known=True, usage={'input_tokens':120,'cached_input_tokens':0,'output_tokens':30},
+                          error_reason=options['error_reason'])
                 if options['fail'] else answer(request, options['title'], options['summary']))
     print(json.dumps(response))

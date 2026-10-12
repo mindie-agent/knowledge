@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from mindie_knowledge.loop.store import Store
-from mindie_knowledge.loop.transcript_capture import summarize_due, _admit_summary
+from mindie_knowledge.loop.transcript_capture import summarize_due
 from mindie_knowledge.materials.catalog import SourcePointers
 from mindie_knowledge.materials.reme_checkpoint import ReMeCheckpoint
 from mindie_knowledge.materials.store import MaterialCleanupError
@@ -38,7 +38,7 @@ def increment(store, task, part):
 
 
 @pytest.mark.parametrize('completed', [1000, 20000])
-def test_real_summary_idle_and_admission_paths_exclude_completed_history(store, completed):
+def test_real_summary_idle_path_excludes_completed_history(store, completed):
     SummaryLedger(store.db)
     with store.db:
         store.db.executemany('INSERT INTO material_batches VALUES(?,?,?,?,?,?,?,?)',
@@ -56,7 +56,6 @@ def test_real_summary_idle_and_admission_paths_exclude_completed_history(store, 
     store.db.set_progress_handler(lambda: steps.append(1) or 0, 1)
     try:
         summarize_due(engine)
-        _admit_summary(engine)
     finally:
         store.db.set_progress_handler(None, 0)
     assert len(steps) < 200, 'the real idle path scanned completed history'
@@ -265,8 +264,7 @@ def test_failed_chunk_read_restores_deletions_from_committed_checkpoint(store):
     assert {row[0] for row in store.materials._index.checkpoint.db.execute('SELECT path FROM files')} == {relative}
 
 
-def test_summary_budget_counts_known_calls_and_keeps_unknown_calls_conservative(store):
-    from mindie_knowledge.loop.budget import BudgetExceeded
+def test_summary_metering_counts_not_called_and_unknown_outcomes_honestly(store):
     SummaryLedger(store.db)
     now = time.time()
     rows = [(ident(i), ident('task'), ident(i), 'body', 'digest', '{}', '["b"]', 'failed',
@@ -274,15 +272,13 @@ def test_summary_budget_counts_known_calls_and_keeps_unknown_calls_conservative(
             for i in range(40)]
     with store.db:
         store.db.executemany('INSERT INTO material_summary_attempts VALUES(?,?,?,?,?,?,?,?,?,?,?,?)', rows)
-    engine = SimpleNamespace(store=store, _settings=lambda: SimpleNamespace(as_dict=lambda: dict(
-        summary_budget=dict(calls_per_hour=1, input_tokens_per_hour=32768))))
-    _admit_summary(engine)
+    assert SummaryLedger(store.db).usage_totals()['model_calls'] == 0
     with store.db:
         store.db.execute('INSERT INTO material_summary_attempts VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
             (ident('unknown'), ident('task'), ident('unknown'), 'body', 'digest', '{}', '["b"]',
              'outcome_unknown', None, 'interrupted', now, now))
-    with pytest.raises(BudgetExceeded, match='rolling budget'):
-        _admit_summary(engine)
+    assert SummaryLedger(store.db).usage_totals()['model_calls'] == 1
+    assert SummaryLedger(store.db).usage_totals()['unknown_calls'] == 1
     assert store.db.execute("SELECT status FROM material_summary_attempts WHERE attempt_id=?", (ident('unknown'),)).fetchone()[0] == 'outcome_unknown'
 
 

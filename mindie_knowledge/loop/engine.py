@@ -17,7 +17,6 @@ from pathlib import Path
 
 from . import settings as settings_mod
 from .activation import activation_epoch, AdmissionUnavailable as AdmissionUnreadable
-from .budget import BudgetExceeded
 from .dfx import failure
 from .process import MaintenanceCancelled
 from .store import canonical, session_key
@@ -112,11 +111,11 @@ class Engine:
                 if key[0] == operation and (stages is None or key[1] in stages)})
 
     def _unexpected(self, operation, stage, exc):
-        """Report an unhandled internal error. Expected cancellation, budget,
+        """Report an unhandled internal error. Expected cancellation,
         config/caller, authority-fault, and community business errors are not
         incidents."""
         if isinstance(exc, (MaintenanceCancelled, AdmissionUnreadable, CursorConflict,
-                            GateFault, BudgetExceeded, OSError, ValueError, TypeError)):
+                            GateFault, OSError, ValueError, TypeError)):
             return
         try:
             from mindie_knowledge.community.common import CommunityError
@@ -811,7 +810,6 @@ class Engine:
             capture_pipeline=self.capture_mode,
             summary_mode="required-model" if self.summary_command else "configuration-error",
             maintenance_pending=self.queue.unfinished_tasks,
-            summary_budget=settings.as_dict().get('summary_budget', dict(calls_per_hour=32, input_tokens_per_hour=512000)),
             summary_usage=summary_usage,
             summary_attempts=summary_attempts,
             sharing=settings.public_status(),

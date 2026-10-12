@@ -6,7 +6,6 @@ import time
 
 import pytest
 
-from mindie_knowledge.loop.budget import BudgetExceeded
 from mindie_knowledge.loop.engine import Engine
 from mindie_knowledge.loop.process import bounded_run
 from mindie_knowledge.loop.store import Store

@@ -29,7 +29,7 @@ _SAFE_CLASSES = frozenset({
     "PermissionError", "FileNotFoundError", "TimeoutError", "TimeoutExpired",
     "ConnectionRefusedError", "ConnectionResetError", "URLError", "HTTPError",
     "DatabaseError", "OperationalError", "IntegrityError", "JSONDecodeError",
-    "ImportError", "ModuleNotFoundError", "SyntaxError", "BudgetExceeded",
+    "ImportError", "ModuleNotFoundError", "SyntaxError", "SummaryWorkerPaused",
     "MaintenanceCancelled", "CommandTimedOut", "OutputLimitExceeded", "AdmissionUnavailable",
 })
 _NATIVE_FAILURE = re.compile(

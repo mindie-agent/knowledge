@@ -500,6 +500,33 @@ class SummaryLedger:
     def latest(self, task_id, batch_id):
         return self._get("task_id=? AND batch_id=? ORDER BY created DESC,rowid DESC LIMIT 1", (task_id, batch_id))
 
+    def worker_fault(self, identity):
+        """Derive a shared failure from durable receipts, never a retry counter.
+
+        A different worker policy or a subsequent known native result releases
+        new work. Uncertain calls cannot prove recovery. The existing attempt
+        index is used only when a new batch is actually ready, never at idle.
+        """
+        shared = {'worker_policy_changed', 'native_model_rejected', 'native_start_failed',
+                  'native_output_unreadable', 'dependency_unavailable', 'configuration_invalid'}
+        rows = self.db.execute("SELECT attempt_id,status,response FROM material_summary_attempts "
+                               "WHERE status!='prepared' AND policy_identity=? "
+                               "ORDER BY created DESC,rowid DESC", (canonical(validate_identity(identity)),))
+        for attempt_id, status, raw in rows:
+            if status in {'returned', 'complete'}:
+                return None
+            if status != 'failed' or raw is None:
+                continue
+            receipt = json.loads(raw)
+            detail = failure_detail(receipt)
+            if detail and detail['reason'] in shared:
+                return dict(attempt_id=attempt_id, reason=detail['reason'], detail=detail)
+            # A source-specific validation failure after native completion
+            # proves the transport is working; it still fails that batch.
+            if detail and detail['stage'] == 'index-validation' and receipt.get('usage_known') is True:
+                return None
+        return None
+
     def prepare(self, request):
         validate_request(request)
         previous = self.latest(request["task_id"], request["batch_id"])
