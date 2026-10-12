@@ -188,7 +188,10 @@ def redact(text, *, executable, key, private_paths=(), cancel=None):
                 found = text.find(match, found + len(match), hi)
     except (ValueError, KeyError, TypeError, IndexError):
         raise ScannerUnavailable("transcript secret scanner returned invalid spans") from None
-    spans.extend((f.start, f.end, f.rule) for f in scan_text(text))
+    # Reporting suppresses duplicate overlapping findings. Replacement must
+    # instead union every detector's complete claim: masking an inner identity
+    # must not leave a formerly overlapping path/credential tail exposed.
+    spans.extend((f.start, f.end, f.rule) for f in scan_text(text, include_overlaps=True))
     for path in private_paths:
         if not isinstance(path, str) or len(path) < 3:
             continue

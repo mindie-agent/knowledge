@@ -22,6 +22,17 @@ class ExportContentError(ValueError):
     """Unsafe or structurally invalid outbound material; never a transport error."""
 
 
+class ExportQuarantinedError(ExportContentError):
+    """A partial local build survives, but rejected packages remain visible."""
+
+    def __init__(self, rejections, built=None):
+        self.rejections = rejections
+        self.built = built
+        self.publication = None
+        super().__init__("task publication incomplete: " + "; ".join(
+            item["entry_id"] + ": " + item["detail"] for item in rejections))
+
+
 def lineage_of(domain, generation=None):
     return "batch-" + digest(["lineage", domain, generation or ""])[:24]
 
@@ -105,13 +116,14 @@ def build_batch(store, *, settings, revision_fn=None):
                    key=lambda vote: (vote["root_opaque"], vote["entry_id"], vote["revision"]))[:MAX_BATCH_VOTES]
     if not drafts and not votes:
         return None
-    files, kept, source_revisions = [], [], {}
+    files, kept, source_revisions, rejections = [], [], {}, []
     total = 0
     for doc in sorted(drafts, key=lambda item: item["entry_id"]):
         try:
             task_files = _task_files(store, doc, source_revisions=source_revisions)
         except ExportContentError as exc:
             store.quarantine_entry(doc["entry_id"], kind="content-scan", detail=str(exc))
+            rejections.append(dict(entry_id=doc["entry_id"], stage="content-scan", detail=str(exc)))
             continue
         # Preserve the grouping envelope while encoding only one file at a
         # time. A long task never becomes one giant JSON allocation.
@@ -131,11 +143,15 @@ def build_batch(store, *, settings, revision_fn=None):
         else:
             votes = []
     if not files:
+        if rejections:
+            raise ExportQuarantinedError(rejections)
         return None
     refs = sorted({store.ref(doc["entry_id"], doc["revision"]) for doc in kept}
                   | {store.ref(vote["entry_id"], vote["revision"]) for vote in votes})
     fingerprint = digest([settings.generation, [(file["path"], file["sha256"]) for file in files], refs])
     if not store.reserve_export(fingerprint):
+        if rejections:
+            raise ExportQuarantinedError(rejections)
         return None
     try:
         base_commit = store.feed_get("published-commit")
@@ -162,8 +178,13 @@ def build_batch(store, *, settings, revision_fn=None):
         store.finish_export(fingerprint, "staged")
         raise
     except Exception as exc:
+        if rejections:
+            exc.add_note(str(ExportQuarantinedError(rejections)))
         store.finish_export(fingerprint, "failed", str(exc),
                             classification="content" if isinstance(exc, ExportContentError) else "transient")
         raise
     store.finish_export(fingerprint, "staged")
-    return lineage, revision, batch, entry_ids, vote_keys
+    built = lineage, revision, batch, entry_ids, vote_keys
+    if rejections:
+        raise ExportQuarantinedError(rejections, built)
+    return built

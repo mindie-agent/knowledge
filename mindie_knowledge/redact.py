@@ -98,6 +98,10 @@ from mindie_knowledge._common import (  # noqa: E402
 #: with a plausible distribution name. CIDR, range, and port forms, endpoint
 #: words as the name, and bare version-looking tokens stay reported. A
 #: relaxation; keep profile r2.
+#: r3 (correction): complete generated ``<redacted:rule:12-lowercase-hex>``
+#: placeholders cannot contain private identifiers. Ignore only findings wholly
+#: contained in those closed tokens; malformed tokens and findings extending
+#: beyond a token still go through the same privacy rules. A relaxation; keep r3.
 #: r3: mask complete private-key blocks. Missing or mismatched END markers
 #: cover the supplied remainder, including blank lines and long fragments.
 REDACTION_PROFILE = "r3"
@@ -698,23 +702,34 @@ class Finding:
         return f"{where}: [{self.rule}] {shown} — {self.hint}"
 
 
-def scan_text(text: str, allow: Allowlist | None = None, path: str = "<text>") -> list[Finding]:
-    """Scan one string. Earlier rules claim their spans; later rules skip overlaps."""
+def scan_text(text: str, allow: Allowlist | None = None, path: str = "<text>",
+              *, include_overlaps: bool = False) -> list[Finding]:
+    """Report disjoint findings, or every claim for source-side union redaction."""
     allow = allow or Allowlist()
     findings: list[Finding] = []
     claimed: list[tuple[int, int]] = []
+    placeholders = [m.span() for m in re.finditer(
+        r"<redacted:[a-z0-9-]+:[0-9a-f]{12}>", text)]
     for rule in RULES:
         # Each built-in finder yields disjoint spans in source order. Merge
         # its claims once, instead of comparing every match to every earlier
         # match (quadratic for a long public conversation with many hosts).
         added = []
         cursor = 0
+        placeholder_cursor = 0
         for start, end in rule.spans(text):
             if start == end:
                 continue
+            while (placeholder_cursor < len(placeholders)
+                   and placeholders[placeholder_cursor][1] <= start):
+                placeholder_cursor += 1
+            if (placeholder_cursor < len(placeholders)
+                    and placeholders[placeholder_cursor][0] <= start
+                    and end <= placeholders[placeholder_cursor][1]):
+                continue
             while cursor < len(claimed) and claimed[cursor][1] <= start:
                 cursor += 1
-            if cursor < len(claimed) and claimed[cursor][0] < end:
+            if not include_overlaps and cursor < len(claimed) and claimed[cursor][0] < end:
                 continue
             value = text[start:end]
             if allow.is_allowed(value):

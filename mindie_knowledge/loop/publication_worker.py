@@ -139,14 +139,22 @@ class PublicationWorker:
 
     def _flush(self):
         """Coalesce all pending material into one batch and send it."""
-        from .export import build_batch
+        from .export import build_batch, ExportQuarantinedError
         from ..materials.publication import CleanupReceiptError
 
         settings = self.engine._settings()
         if not settings.allows_capture():
             return
+        rejection = None
         try:
             built = build_batch(self.store, settings=settings)
+        except ExportQuarantinedError as exc:
+            rejection = exc
+            self.engine._fault('knowledge.publish', 'content-scan', 'publication_content_rejected', exc)
+            self.engine._error(str(exc))
+            if exc.built is None:
+                raise
+            batch_id = exc.built[0]
         except CleanupReceiptError as exc:
             batch_id = exc.batch_id
             self.engine._error("New contribution staged; prior staging cleanup receipt failed: " + str(exc))
@@ -157,4 +165,14 @@ class PublicationWorker:
             cleanup = self.store.feed_get("publication-cleanup:" + batch_id)
             if cleanup and cleanup.get("status") == "failed":
                 self.engine._error("New contribution staged; prior staging cleanup failed: " + cleanup.get("detail", "unknown"))
-        self.submit(self.store.batch(batch_id))
+        try:
+            self.submit(self.store.batch(batch_id))
+        except Exception as exc:
+            if rejection is not None:
+                rejection.add_note('Unrelated package submission also failed: ' + type(exc).__name__)
+                raise rejection from exc
+            raise
+        if rejection is not None:
+            row = self.store.batch(batch_id)
+            rejection.publication = {key: row[key] for key in ('batch_id', 'status', 'pr_url', 'head_sha')}
+            raise rejection
