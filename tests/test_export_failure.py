@@ -5,7 +5,7 @@ import time
 import pytest
 from mindie_knowledge.loop.store import Store
 from mindie_knowledge.loop import settings
-from mindie_knowledge.loop.export import build_batch
+from mindie_knowledge.loop.export import build_batch, ExportQuarantinedError
 
 
 def test_export_selection_reads_headers_without_reassembling_all_task_bodies(tmp_path, monkeypatch):
@@ -35,9 +35,12 @@ def test_unsafe_material_is_quarantined_without_blocking_valid_material(tmp_path
                                summary='New material remains eligible',
                                content='Public observation.',
                                generation=shared.generation)
-    # The unsafe entry never fails a build for unrelated valid material: the
-    # batch carries only the clean entry and is staged normally.
-    built = build_batch(store, settings=shared)
+    # Stage the clean entry, while reporting exactly which package was rejected.
+    with pytest.raises(ExportQuarantinedError) as rejected:
+        build_batch(store, settings=shared)
+    built = rejected.value.built
+    assert rejected.value.rejections[0]['entry_id'] == unsafe['entry_id']
+    assert rejected.value.publication is None  # staging did not write remotely
     assert built is not None
     _batch_id, _revision, batch, entry_ids, _votes = built
     assert entry_ids == [valid['entry_id']]
@@ -68,7 +71,10 @@ def test_all_unsafe_material_quarantines_without_a_batch(tmp_path):
                              summary='Endpoint observation',
                              content='Private endpoint: ' + '10.3.' + '5.7',
                              generation=shared.generation)
-    assert build_batch(store, settings=shared) is None
+    with pytest.raises(ExportQuarantinedError) as rejected:
+        build_batch(store, settings=shared)
+    assert rejected.value.built is None
+    assert rejected.value.rejections[0]['entry_id'] == doc['entry_id']
     # The rejection is quarantined to the entry and visible — the fingerprint
     # itself never needs a failing record to suppress retries.
     assert store.quarantined_entries() == {doc['entry_id']: 'content-scan'}

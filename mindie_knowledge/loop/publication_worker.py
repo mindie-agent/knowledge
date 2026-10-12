@@ -14,7 +14,7 @@ class PublicationWorker:
     def submit(self, batch):
         with self.engine.operations.scope("publish", batch["batch_id"], batch["generation"]) as operation:
             if operation is not None:
-                self._submit(batch, operation.cancel)
+                return self._submit(batch, operation.cancel)
 
     def reconcile(self, batch):
         with self.engine.operations.scope("reconcile", batch["batch_id"]) as operation:
@@ -90,9 +90,15 @@ class PublicationWorker:
         if receipt.get("status") in Store.CONFIRMED_BATCH:
             # Confirmed upload retires staging. The candidate remains readable
             # until this revision is confirmed in the synchronized public feed.
-            cleanup = self.store.compact_confirmed(batch_row["batch_id"])
+            try:
+                cleanup = self.store.compact_confirmed(batch_row["batch_id"])
+            except Exception as exc:
+                exc.mindie_publication_result = receipt
+                exc.add_note('Publication confirmed before local cleanup failure')
+                raise
             if cleanup.get('cleanup_status') == 'failed':
                 self.engine._error('Publication confirmed; local cleanup failed: ' + cleanup.get('cleanup_error', 'unknown'))
+        return receipt
 
     def _reconcile(self, batch_row, cancel):
         if self.engine.community is None:
@@ -139,14 +145,22 @@ class PublicationWorker:
 
     def _flush(self):
         """Coalesce all pending material into one batch and send it."""
-        from .export import build_batch
+        from .export import build_batch, ExportQuarantinedError
         from ..materials.publication import CleanupReceiptError
 
         settings = self.engine._settings()
         if not settings.allows_capture():
             return
+        rejection = None
         try:
             built = build_batch(self.store, settings=settings)
+        except ExportQuarantinedError as exc:
+            rejection = exc
+            self.engine._fault('knowledge.publish', 'content-scan', 'publication_content_rejected', exc)
+            self.engine._error(str(exc))
+            if exc.built is None:
+                raise
+            batch_id = exc.built[0]
         except CleanupReceiptError as exc:
             batch_id = exc.batch_id
             self.engine._error("New contribution staged; prior staging cleanup receipt failed: " + str(exc))
@@ -157,4 +171,23 @@ class PublicationWorker:
             cleanup = self.store.feed_get("publication-cleanup:" + batch_id)
             if cleanup and cleanup.get("status") == "failed":
                 self.engine._error("New contribution staged; prior staging cleanup failed: " + cleanup.get("detail", "unknown"))
-        self.submit(self.store.batch(batch_id))
+        try:
+            receipt = self.submit(self.store.batch(batch_id))
+        except Exception as exc:
+            if rejection is not None:
+                receipt = getattr(exc, 'mindie_publication_result', None)
+                if receipt is not None:
+                    rejection.publication = {key: receipt.get(key) for key in ('status', 'pr_url', 'head_sha')}
+                    rejection.publication['batch_id'] = batch_id
+                rejection.add_note('Unrelated package submission also failed: ' + type(exc).__name__)
+                raise rejection from exc
+            raise
+        if rejection is not None:
+            try:
+                row = receipt if receipt is not None else self.store.batch(batch_id)
+            except Exception as exc:
+                rejection.add_note('Unrelated publication receipt read failed: ' + type(exc).__name__)
+                raise rejection from exc
+            rejection.publication = {key: row.get(key) for key in ('status', 'pr_url', 'head_sha')}
+            rejection.publication['batch_id'] = batch_id
+            raise rejection
