@@ -59,8 +59,15 @@ price or dollar cost is inferred from them.
 Bounded process output and the strict schema guard one invocation. A healthy
 operation has no default total deadline; owner cancellation and an explicitly
 requested limit remain separate from the persisted invocation outcome.
-Rolling call/input-token admission limits constrain new work;
-local recovery of returned output needs no fresh budget. Missing worker
+Automatic capture and selected-history import have no hourly call or token
+quota. The retired `summary_budget` extension is no longer consulted. Serial
+execution, a single durable claim per batch and explicit retry of failed or
+unknown invocations prevent replay. A known shared worker fault (configuration,
+dependency, model rejection, launch or missing completed output) pauses new
+calls under that exact worker policy. Changing the worker policy, or explicitly
+retrying a failed batch and obtaining a known native result, permits new work;
+an uncertain retry cannot prove recovery. Returned-result local recovery always
+continues without another invocation. Missing worker
 configuration, incomplete indexing and failed/unknown batches block publication.
 They do not turn a saved body or an excerpt into an indexed contribution.
 

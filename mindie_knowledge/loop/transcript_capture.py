@@ -8,6 +8,7 @@ from pathlib import Path
 from .process import bounded_run
 from .dfx import failure as diagnostic_failure
 from .store import canonical, digest
+from .index_queue import SummaryWorkerPaused
 from .transcript_redaction import ScannerUnavailable, redact
 from ..materials.ingest import prepare_increment
 from ..materials.summarizer import (
@@ -17,32 +18,6 @@ from ..materials.summarizer import (
 
 MODE = 'public-transcript'
 SUMMARY_SETTLE_SECONDS = 3
-
-
-def _admit_summary(engine):
-    """A rolling envelope for new calls; returned-result recovery is free."""
-    from .budget import BudgetExceeded
-    limits = engine._settings().as_dict().get('summary_budget', {})
-    calls = limits.get('calls_per_hour', 32)
-    tokens = limits.get('input_tokens_per_hour', 512000)
-    if type(calls) is not int or calls < 1 or type(tokens) is not int or tokens < 32768:
-        raise ValueError('invalid summary budget configuration')
-    rows = engine.store.db.execute("SELECT created,response FROM material_summary_attempts "
-                                    "WHERE status!='prepared' AND created>?", (time.time() - 3600,)).fetchall()
-    used, invoked = 0, []
-    for row in rows:
-        response = json.loads(row['response']) if row['response'] else {}
-        model_calls = response.get('model_calls', 1)
-        if type(model_calls) is not int or model_calls not in (0, 1):
-            raise ValueError('invalid persisted summary model-call receipt')
-        if model_calls == 0:
-            continue  # Proven refusal/spawn failure consumed no model call.
-        invoked.append(row['created'])
-        usage = response.get('usage')
-        used += usage['input_tokens'] if isinstance(usage, dict) and type(usage.get('input_tokens')) is int else 32768
-    if len(invoked) >= calls or used + 32768 > tokens:
-        retry_at = min(invoked) + 3601 if invoked else time.time() + 3600
-        raise BudgetExceeded('summary rolling budget reached; material retained', retry_at=retry_at)
 
 
 def pending_header(_text):
@@ -86,7 +61,6 @@ def summarize_due(engine):
     """Process one complete new batch; a saved response resumes locally only."""
     from .engine import AdmissionUnreadable, GateFault
     from .process import MaintenanceCancelled
-    from .budget import BudgetExceeded
     if time.monotonic() - engine.last_activity < SUMMARY_SETTLE_SECONDS:
         return
     store = engine.store
@@ -123,7 +97,8 @@ def summarize_due(engine):
                                                                 timeout=None, max_output=8192, cancel=cancel)))
             request = make_request(task_id=batch['entry_id'], body_version=batch_identity(selected), blocks=selected,
                                    prior_navigation=prior_navigation, identity=identity)
-            attempt = engine.index_queue.claim(batch, request, admit=lambda: _admit_summary(engine))
+            attempt = engine.index_queue.claim(batch, request)
+            engine._clear_faults('index.summary', {'worker-paused'})
             invoke = True
         if invoke:
             try:
@@ -194,8 +169,10 @@ def summarize_due(engine):
         engine._revalidate(authorization)
         engine.index_queue.apply(batch, attempt, result, authorization['generation'],
                                  revalidate=lambda: engine._revalidate(authorization))
-    except BudgetExceeded as exc:
-        engine.index_queue.postpone(batch['entry_id'], 'summary budget deferred; no call made', exc.retry_at)
+    except SummaryWorkerPaused as exc:
+        engine._fault('index.summary', stage='worker-paused', category=exc.fault['reason'])
+        engine.index_queue.postpone(batch['entry_id'], canonical(dict(
+            status='worker-paused', attempt_id=exc.fault['attempt_id'], **exc.fault['detail'])), time.time() + 30)
     except (ScannerUnavailable, AdmissionUnreadable, GateFault) as exc:
         diagnostic_failure('index.summary', stage='local-apply', category='dependency_unavailable', exception=exc)
         with store._write_txn():

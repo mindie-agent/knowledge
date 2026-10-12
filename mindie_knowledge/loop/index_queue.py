@@ -13,6 +13,12 @@ import time
 from ..materials.summarizer import SummaryLedger
 
 
+class SummaryWorkerPaused(RuntimeError):
+    def __init__(self, fault):
+        self.fault = fault
+        super().__init__('summary worker paused after ' + fault['reason'] + '; no call made')
+
+
 class IndexQueue:
     def __init__(self, store):
         self.store = store
@@ -36,12 +42,16 @@ class IndexQueue:
         with self.store.lock:
             return SummaryLedger(self.store.db).latest(task_id, batch_id)
 
-    def claim(self, batch, request, *, admit):
+    def claim(self, batch, request):
         with self.store._write_txn():
             ledger = SummaryLedger(self.store.db)
-            admit()
             previous = ledger.latest(request['task_id'], request['batch_id'])
-            if batch['status'] == 'retry-requested' and previous and previous['status'] in {'failed', 'outcome_unknown'}:
+            explicit_retry = (batch['status'] == 'retry-requested' and previous
+                              and previous['status'] in {'failed', 'outcome_unknown'})
+            fault = ledger.worker_fault(request['policy_identity'])
+            if fault and not explicit_retry:
+                raise SummaryWorkerPaused(fault)
+            if explicit_retry:
                 attempt = ledger.retry(previous['attempt_id'], request)
             else:
                 attempt = ledger.prepare(request)
