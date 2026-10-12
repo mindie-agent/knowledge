@@ -14,7 +14,7 @@ class PublicationWorker:
     def submit(self, batch):
         with self.engine.operations.scope("publish", batch["batch_id"], batch["generation"]) as operation:
             if operation is not None:
-                self._submit(batch, operation.cancel)
+                return self._submit(batch, operation.cancel)
 
     def reconcile(self, batch):
         with self.engine.operations.scope("reconcile", batch["batch_id"]) as operation:
@@ -90,9 +90,15 @@ class PublicationWorker:
         if receipt.get("status") in Store.CONFIRMED_BATCH:
             # Confirmed upload retires staging. The candidate remains readable
             # until this revision is confirmed in the synchronized public feed.
-            cleanup = self.store.compact_confirmed(batch_row["batch_id"])
+            try:
+                cleanup = self.store.compact_confirmed(batch_row["batch_id"])
+            except Exception as exc:
+                exc.mindie_publication_result = receipt
+                exc.add_note('Publication confirmed before local cleanup failure')
+                raise
             if cleanup.get('cleanup_status') == 'failed':
                 self.engine._error('Publication confirmed; local cleanup failed: ' + cleanup.get('cleanup_error', 'unknown'))
+        return receipt
 
     def _reconcile(self, batch_row, cancel):
         if self.engine.community is None:
@@ -166,13 +172,22 @@ class PublicationWorker:
             if cleanup and cleanup.get("status") == "failed":
                 self.engine._error("New contribution staged; prior staging cleanup failed: " + cleanup.get("detail", "unknown"))
         try:
-            self.submit(self.store.batch(batch_id))
+            receipt = self.submit(self.store.batch(batch_id))
         except Exception as exc:
             if rejection is not None:
+                receipt = getattr(exc, 'mindie_publication_result', None)
+                if receipt is not None:
+                    rejection.publication = {key: receipt.get(key) for key in ('status', 'pr_url', 'head_sha')}
+                    rejection.publication['batch_id'] = batch_id
                 rejection.add_note('Unrelated package submission also failed: ' + type(exc).__name__)
                 raise rejection from exc
             raise
         if rejection is not None:
-            row = self.store.batch(batch_id)
-            rejection.publication = {key: row[key] for key in ('batch_id', 'status', 'pr_url', 'head_sha')}
+            try:
+                row = receipt if receipt is not None else self.store.batch(batch_id)
+            except Exception as exc:
+                rejection.add_note('Unrelated publication receipt read failed: ' + type(exc).__name__)
+                raise rejection from exc
+            rejection.publication = {key: row.get(key) for key in ('status', 'pr_url', 'head_sha')}
+            rejection.publication['batch_id'] = batch_id
             raise rejection

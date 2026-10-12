@@ -63,8 +63,8 @@ def test_source_redaction_unions_long_claim_over_an_inner_identity():
 
 
 @pytest.mark.parametrize('valid', [False, True])
-@pytest.mark.parametrize('remote_outcome', ['submitted', 'unknown'])
-def test_publisher_reports_rejection_and_retains_exact_partial_remote_result(tmp_path, valid, remote_outcome):
+@pytest.mark.parametrize('remote_outcome', ['submitted', 'unknown', 'receipt-failed', 'cleanup-failed'])
+def test_publisher_reports_rejection_and_retains_exact_partial_remote_result(tmp_path, monkeypatch, valid, remote_outcome):
     shared = write_settings(tmp_path / 'sharing.json', roots=[tmp_path])
     with closing(Store(tmp_path / 'data', 'test')) as store:
         unsafe = store.create_draft(kind='experience', title='Unsafe endpoint', summary='Synthetic.',
@@ -80,6 +80,17 @@ def test_publisher_reports_rejection_and_retains_exact_partial_remote_result(tmp
                 raise OSError('Synthetic uncertain remote write')
             return dict(status='submitted', head_sha='a' * 40, pr_url='https://example.invalid/pull/1')
         engine.community = dict(submit_batch=submit)
+        if remote_outcome == 'receipt-failed':
+            original = store.mark_batch
+            def record(batch_id, status, **kwargs):
+                if status == 'submitted':
+                    raise OSError('Synthetic local receipt recording failure')
+                return original(batch_id, status, **kwargs)
+            monkeypatch.setattr(store, 'mark_batch', record)
+        if remote_outcome == 'cleanup-failed':
+            def cleanup(*args, **kwargs):
+                raise OSError('Synthetic local cleanup failure')
+            monkeypatch.setattr(store, 'compact_confirmed', cleanup)
         with pytest.raises(ExportQuarantinedError) as rejected:
             engine.publisher.flush()
         assert rejected.value.rejections[0]['entry_id'] == unsafe['entry_id']
@@ -87,9 +98,16 @@ def test_publisher_reports_rejection_and_retains_exact_partial_remote_result(tmp
         assert 'npu' + '-rack7' not in str(rejected.value)
         if valid:
             assert len(sent) == 1
-            assert rejected.value.publication['status'] == remote_outcome
+            assert rejected.value.publication['status'] == ('unknown' if remote_outcome == 'unknown' else 'submitted')
             row = store.batch(rejected.value.publication['batch_id'])
-            assert row['head_sha'] == ('a' * 40 if remote_outcome == 'submitted' else None)
+            if remote_outcome == 'receipt-failed':
+                assert row['status'] == 'pending' and row['head_sha'] is None
+                assert rejected.value.publication['head_sha'] == 'a' * 40
+                assert isinstance(rejected.value.__cause__, OSError)
+            else:
+                assert row['head_sha'] == ('a' * 40 if remote_outcome in {'submitted', 'cleanup-failed'} else None)
+                if remote_outcome == 'cleanup-failed':
+                    assert isinstance(rejected.value.__cause__, OSError)
         else:
             assert sent == [] and rejected.value.publication is None
         engine.publisher.flush()
