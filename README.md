@@ -76,17 +76,18 @@ files stay inert until explicitly selected through the supported import path.
 
 ## Development and released state
 
-Until the repositories meet the product release criteria and publish normal
-release versions, breaking state changes are allowed repeatedly. There is no
-one-reset limit. Internal package numbers and Git pins used for development
-installation do not declare that coordinated release.
+The `0.0.1` product release preparation protects state even when installed from
+the candidate branch. Internal testing uses the same durability contract as a
+published release. Setting this boundary does not mean the product is published
+or that native acceptance is complete.
 
 `mindie_knowledge.state_layout` declares the persistent `FORMAT` and the product
-`RELEASE_VERSION`. It remains `None` during development; the release commit sets
-a normal `major.minor.patch` version. State lives in `<root>/<domain>/state-v<FORMAT>`.
-A development format change selects a fresh directory and leaves earlier data
-inert. Configuration and old directories are retained; old receipts are not
-imported into the new development format.
+`RELEASE_VERSION`, now `0.0.1`. This is a product state boundary, independent of
+the component package version. State lives in `<root>/<domain>/state-v<FORMAT>`.
+Only historical development state with a null release declaration permits a
+format change to select a fresh directory and leave earlier data inert.
+Configuration and old directories are retained; old receipts are not imported
+into a different format.
 
 Once a release has successfully opened the state, compatible upgrades reuse
 the same material, cursors, model attempts and publication receipts. Returning

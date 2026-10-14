@@ -18,6 +18,7 @@ def draft(store, title):
 
 
 def test_legacy_development_state_is_inert_and_format_changes_can_repeat(tmp_path, monkeypatch):
+    monkeypatch.setattr(state_layout, 'RELEASE_VERSION', None)
     legacy = tmp_path / 'demo'
     legacy.mkdir()
     old = legacy / 'state-v4.sqlite3'
@@ -33,6 +34,20 @@ def test_legacy_development_state_is_inert_and_format_changes_can_repeat(tmp_pat
     assert all((root / state_layout.DATABASE).is_file() for root in retained)
     assert all(list((root / 'materials').rglob('*.md')) for root in retained)
     assert json.loads((legacy / 'state-layout.json').read_text())['release_version'] is None
+
+
+def test_first_product_release_protects_state_without_an_override(tmp_path, monkeypatch):
+    with closing(Store(tmp_path, 'demo')) as store:
+        draft(store, 'first internal release')
+        root = store.root
+    layout = tmp_path / 'demo/state-layout.json'
+    assert json.loads(layout.read_text())['release_version'] == '0.0.1'
+    before = {str(p): p.read_bytes() for p in root.rglob('*') if p.is_file()}
+    monkeypatch.setattr(state_layout, 'FORMAT', 2)
+    with pytest.raises(ValueError, match='released.*migration'):
+        Store(tmp_path, 'demo')
+    assert {str(p): p.read_bytes() for p in root.rglob('*') if p.is_file()} == before
+    assert not (tmp_path / 'demo/state-v2').exists()
 
 
 def test_compatible_release_upgrade_reuses_data_and_never_unseals(tmp_path, monkeypatch):

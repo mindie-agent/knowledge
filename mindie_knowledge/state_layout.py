@@ -1,7 +1,7 @@
 """Development formats may restart; released state may never be reset.
 
-RELEASE_VERSION is set to the normal package version in the release commit.
-Internal package versions and Git pins alone do not declare a release.
+RELEASE_VERSION identifies the product release that protects this state.
+Component package versions and Git pins alone do not declare that boundary.
 FORMAT changes only when the persistent representation changes. Released
 format changes require an explicit migration before selecting a new runtime.
 """
@@ -12,7 +12,7 @@ import re
 import stat
 
 FORMAT = 1
-RELEASE_VERSION = None
+RELEASE_VERSION = '0.0.1'
 DATABASE = 'state-v4.sqlite3'
 
 
