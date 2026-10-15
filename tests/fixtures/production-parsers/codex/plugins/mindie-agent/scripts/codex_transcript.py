@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import re
+import stat as statmod
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -34,6 +35,17 @@ _TEXT_CONTENT = {"input_text", "output_text"}
 
 
 ANCHOR_BYTES = 512
+
+
+def _resolved_path(path, *, strict=False):
+    # Parser modules are loaded directly by core, outside the adapter sys.path.
+    from mindie_knowledge.filesystem import resolved_path
+    return resolved_path(path, strict=strict)
+
+
+def _path_identity(path):
+    from mindie_knowledge.filesystem import path_identity
+    return path_identity(path)
 
 
 @dataclass(frozen=True)
@@ -64,7 +76,7 @@ class FileIdentity:
     def anchor_for(self, count):
         """SHA256 of the first ``count`` bytes read on one fresh handle."""
         try:
-            fd = os.open(self.path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+            fd = os.open(_resolved_path(self.path), os.O_RDONLY | getattr(os, "O_BINARY", 0))
         except (OSError, ValueError):
             return None
         try:
@@ -106,7 +118,7 @@ class FileIdentity:
 def identify(path) -> FileIdentity | None:
     """Stat + anchor read bound to one opened handle; None if unreadable."""
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        fd = os.open(_resolved_path(path), os.O_RDONLY | getattr(os, "O_BINARY", 0))
     except (OSError, ValueError):
         return None
     try:
@@ -117,7 +129,7 @@ def identify(path) -> FileIdentity | None:
     finally:
         os.close(fd)
     return FileIdentity(
-        path=str(Path(path).resolve(strict=False)),
+        path=str(_resolved_path(path)),
         dev=stat.st_dev,
         ino=getattr(stat, "st_ino", 0),
         size=stat.st_size,
@@ -131,7 +143,7 @@ def same_file(identity: FileIdentity | None, current: FileIdentity | None) -> bo
     """Same persisted file? Requires the recorded prefix anchor to match."""
     if identity is None or current is None:
         return False
-    if identity.path != current.path:
+    if _path_identity(identity.path) != _path_identity(current.path):
         return False
     if identity.dev and current.dev and identity.dev != current.dev:
         return False
@@ -215,6 +227,84 @@ def _session_of(record):
     return ident if isinstance(ident, str) and ident else None
 
 
+def history_source(path):
+    """Describe exactly one explicitly selected historical source, never scan.
+
+    The caller must check current task admission and sharing before this read.
+    Native session metadata supplies the historical owner and project scope;
+    neither is inferred from a filename or the importing task's cwd.
+    """
+    path = _resolved_path(path)
+    fd = os.open(path, os.O_RDONLY | getattr(os, 'O_BINARY', 0) | getattr(os, 'O_NONBLOCK', 0))
+    with os.fdopen(fd, 'rb') as stream:
+        info = os.fstat(stream.fileno())
+        if not statmod.S_ISREG(info.st_mode):
+            raise ValueError('history source must be a regular transcript file')
+        anchor = stream.read(ANCHOR_BYTES)
+        stream.seek(0)
+        raw = stream.readline(info.st_size)
+    try:
+        meta = json.loads(raw)
+        if not isinstance(meta, dict):
+            raise ValueError('invalid metadata')
+        owner = _session_of(meta)
+        scope = meta['payload']['cwd']
+    except (ValueError, TypeError, KeyError):
+        raise ValueError('history source requires native session metadata and project scope') from None
+    if (not raw.endswith(b'\n') or not owner or not isinstance(scope, str)
+            or not Path(scope).is_absolute()):
+        raise ValueError('history source requires native session metadata and project scope')
+    return dict(session_id=owner, project_root=str(_resolved_path(scope)),
+                identity=FileIdentity(str(path), info.st_dev, info.st_ino,
+                                      info.st_size, info.st_mtime_ns, len(anchor),
+                                      hashlib.sha256(anchor).hexdigest()))
+
+
+def capture_source(path, session_id):
+    """Verify only the current event's native profile artifact and its header."""
+    from capture_errors import TranscriptSourceError
+    try:
+        profile = _resolved_path(os.environ.get('CODEX_HOME') or Path.home() / '.codex')
+        selected = _resolved_path(path, strict=True)
+    except (OSError, ValueError) as exc:
+        raise TranscriptSourceError('transcript_unavailable',
+                                    'native transcript path is unavailable') from exc
+    profile_key, selected_key = Path(_path_identity(profile)), Path(_path_identity(selected))
+    if not any(selected_key.is_relative_to(profile_key / name) for name in ('sessions', 'archived_sessions')):
+        raise TranscriptSourceError('transcript_outside_profile',
+                                    'capture transcript is outside the active native profile')
+    try:
+        fd = os.open(selected, os.O_RDONLY | getattr(os, 'O_BINARY', 0) | getattr(os, 'O_NONBLOCK', 0))
+        with os.fdopen(fd, 'rb') as stream:
+            info = os.fstat(stream.fileno())
+            if not statmod.S_ISREG(info.st_mode):
+                raise TranscriptSourceError('transcript_not_regular',
+                                            'capture source must be a regular transcript file')
+            header = stream.readline(1024 * 1024 + 1)
+    except OSError as exc:
+        raise TranscriptSourceError('transcript_unavailable',
+                                    'native transcript read is unavailable') from exc
+    if len(header) > 1024 * 1024 or not header.endswith(b'\n'):
+        raise TranscriptSourceError('transcript_header_invalid',
+                                    'native task header is missing or exceeds its byte bound')
+    try:
+        meta = json.loads(header)
+    except ValueError as exc:
+        raise TranscriptSourceError('transcript_header_invalid',
+                                    'native task header is invalid') from exc
+    if not isinstance(meta, dict) or _session_of(meta) != session_id:
+        raise TranscriptSourceError('transcript_identity_mismatch',
+                                    'capture transcript belongs to another task')
+    payload = meta['payload']
+    scope = payload.get('cwd')
+    created = _timestamp({'timestamp': payload.get('timestamp')}) or _timestamp(meta)
+    if not isinstance(scope, str) or not Path(scope).is_absolute() or created is None:
+        raise TranscriptSourceError('transcript_metadata_invalid',
+                                    'native task scope or creation boundary is unavailable')
+    return dict(session_id=session_id, project_root=str(_resolved_path(scope)),
+                created_at=created, transcript_path=str(selected))
+
+
 def read_material(path, start, *, session_id=None, not_before=None, expected=None,
                   max_scan_bytes=16777216, max_seconds=2.0, max_text_bytes=MAX_TEXT,
                   scan_until=None):
@@ -244,17 +334,17 @@ def read_material(path, start, *, session_id=None, not_before=None, expected=Non
     turn = None
     begun = time.monotonic()
     try:
-        with open(path, "rb") as stream:
+        with open(_resolved_path(path), "rb") as stream:
             stat = os.fstat(stream.fileno())
             anchor = stream.read(ANCHOR_BYTES)
-            current = FileIdentity(str(Path(path).resolve()), stat.st_dev, stat.st_ino,
+            current = FileIdentity(str(_resolved_path(path)), stat.st_dev, stat.st_ino,
                                    stat.st_size, stat.st_mtime_ns, len(anchor),
                                    hashlib.sha256(anchor).hexdigest())
             result["identity"] = current.serialize()
             result["snapshot_size"] = stat.st_size
             if expected is not None:
                 stream.seek(0)
-                if (expected.path != current.path or expected.dev != stat.st_dev
+                if (_path_identity(expected.path) != _path_identity(current.path) or expected.dev != stat.st_dev
                     or expected.ino != stat.st_ino or not expected.anchor_len
                     or hashlib.sha256(stream.read(expected.anchor_len)).hexdigest() != expected.anchor_digest):
                     result.update(status="replaced", coverage_note="transcript changed before read")
@@ -317,14 +407,13 @@ def read_material(path, start, *, session_id=None, not_before=None, expected=Non
                 except (ValueError, UnicodeDecodeError):
                     record = None
                 if not isinstance(record, dict):
-                    # A corrupt complete record is isolated, never exported.
-                    # Its byte position is retained without copying raw content.
+                    # A corrupt complete record makes this page incomplete.
+                    # Do not consume it or label later text as complete.
                     result.setdefault("discarded_records", []).append(
                         dict(start=offset, end=stream.tell(), reason="invalid record"))
-                    consumed.update(raw)
-                    result["end"] = stream.tell()
-                    result["skipped_records"] += 1
-                    continue
+                    result.update(status="invalid-record", end=start, text="",
+                                  coverage_note="invalid complete transcript record")
+                    return result
                 extracted = None
                 if isinstance(record, dict):
                     if record.get("type") in KNOWN:
@@ -344,14 +433,13 @@ def read_material(path, start, *, session_id=None, not_before=None, expected=Non
                 if extracted and extracted[1]:
                     stamp = _timestamp(record)
                     if not_before is not None and stamp is None:
-                        # Without a timestamp this record is not authorized.
-                        # Omit only this record; later dated messages can proceed.
+                        # An unknown authorization boundary is an error, not
+                        # permission to skip an unknown amount of experience.
                         result.setdefault("discarded_records", []).append(
                             dict(start=offset, end=stream.tell(), reason="missing public timestamp"))
-                        consumed.update(raw)
-                        result["end"] = stream.tell()
-                        result["skipped_records"] += 1
-                        continue
+                        result.update(status="invalid-record", end=start, text="",
+                                      coverage_note="missing public timestamp")
+                        return result
                     if not_before is not None and stamp < not_before:
                         extracted = None
                     else:
