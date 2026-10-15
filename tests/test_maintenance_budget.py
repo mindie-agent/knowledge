@@ -155,8 +155,8 @@ def test_bounded_run_cancellation_kills_the_whole_process_tree(tmp_path):
     spawned = []
     real_spawn = process_module._spawn
 
-    def recording_spawn(command, stdin):
-        proc = real_spawn(command, stdin)
+    def recording_spawn(command, stdin, scratch=None):
+        proc = real_spawn(command, stdin, scratch)
         spawned.append(proc)
         return proc
 
