@@ -23,6 +23,7 @@ from mindie_knowledge.community.common import CommunityError, run_argv
 from mindie_knowledge.gitread import with_windows_longpaths, _check_cancel
 from mindie_knowledge.publication_contract import read_git_contract
 from mindie_knowledge.filesystem import filesystem_path, git_path
+from mindie_knowledge.git_layout import feed_repository_path, validate_git_directory
 
 
 def _feed_git_env():
@@ -76,9 +77,10 @@ class Feed:
         self.prefix = (config.get("prefix") or "").strip("/")
         self.url = config.get("url") or f"https://github.com/{repository}.git"
         self.ident = feed_ident(repository, ref, self.prefix)
-        self.dir = store.root / "feed" / self.ident
+        self.repo = feed_repository_path(store.root, self.ident)
+        validate_git_directory(self.repo, bare=True, role="feed")
+        self.dir = self.repo.parent
         self.dir.mkdir(parents=True, exist_ok=True)
-        self.repo = self.dir / "repo.git"
         self._cancel = None
 
     # -------------------------------------------------------------- git I/O

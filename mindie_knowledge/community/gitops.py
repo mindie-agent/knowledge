@@ -23,6 +23,7 @@ from .common import (
 )
 from mindie_knowledge.gitread import with_windows_longpaths
 from mindie_knowledge.filesystem import filesystem_path, git_path
+from mindie_knowledge.git_layout import UnsupportedGitLayout, validate_git_directory
 
 MAX_GIT_OUTPUT = 256 * 1024
 _CANONICAL_CHECKOUT = ["-c", "core.autocrlf=false", "-c", "core.eol=lf"]
@@ -142,6 +143,11 @@ def remote_tip(remote_url: str, ref: str, deadline: Deadline, *, env=None) -> st
 def ensure_clone(remote_url: str, work_dir: Path, deadline: Deadline, *, env=None) -> Path:
     """Fetch objects into the private clone, without materializing unvalidated paths."""
     work_dir = filesystem_path(work_dir)
+    try:
+        validate_git_directory(work_dir, bare=False, role="publication")
+    except UnsupportedGitLayout as exc:
+        # Reconciliation must retain any earlier unknown publication outcome.
+        raise CommunityError(str(exc), status="unavailable") from exc
     if (work_dir / ".git").is_dir():
         _git(["fetch", "origin", "--prune"], deadline, cwd=Path(git_path(work_dir)), env=env)
     else:
