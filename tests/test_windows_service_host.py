@@ -411,3 +411,63 @@ def test_launch_record_preserves_existing_extended_config_fingerprint(tmp_path):
     record = host._record(path, config, filesystem_path(tmp_path / "host"), "S-1-5-21-123")
     host._validate_record(record, record["config"], config, "S-1-5-21-123")
     assert record["config"].startswith("\\\\?\\")
+
+
+def test_windowless_streams_supply_file_handles_only_for_missing_streams(monkeypatch):
+    import io
+    import sys
+    supplied = io.StringIO()
+    monkeypatch.setattr(sys, "stdin", None)
+    monkeypatch.setattr(sys, "stdout", supplied)
+    monkeypatch.setattr(sys, "stderr", None)
+    with host._windowless_streams():
+        assert sys.stdout is supplied
+        assert sys.stdin.read() == ""
+        os.fstat(sys.stdin.fileno())
+        os.fstat(sys.stderr.fileno())
+        sys.stderr.write("synthetic service output\n")
+        sys.stderr.flush()
+        owned = sys.stdin, sys.stderr
+    assert sys.stdin is None and sys.stderr is None
+    assert sys.stdout is supplied and not supplied.closed
+    assert all(stream.closed for stream in owned)
+
+
+def test_windowless_streams_never_suppress_business_failure(monkeypatch):
+    import sys
+    monkeypatch.setattr(sys, "stdout", None)
+    with pytest.raises(TypeError, match="synthetic business failure"):
+        with host._windowless_streams():
+            raise TypeError("synthetic business failure")
+    assert sys.stdout is None
+
+
+def test_original_startup_stage_and_class_survive_host_poll(scheduler, monkeypatch):
+    from mindie_knowledge.loop import cli, diagnostics
+    path, config, state = scheduler
+    request = host.request_start(path, config)
+    def failed_import(_config):
+        raise TypeError("private synthetic detail must not leave the process")
+    monkeypatch.setattr(cli, "load_transcript_adapter", failed_import)
+    monkeypatch.chdir(path.parent)
+    with pytest.raises(TypeError):
+        host.run(request.root / "launch.json", request.record["attempt"])
+    before = diagnostics._startup(path, config)
+    assert before["stage"] == "transcript_adapter" and before["error_class"] == "TypeError"
+    result = host._read(host._result_path(request.root, request.record))
+    assert result["status"] == "failed"
+    assert result["startup"]["stage"] == "transcript_adapter"
+    assert not (request.root / (request.record["attempt"] + ".context")).exists()
+    with pytest.raises(host.ServiceHostError, match="transcript_adapter:TypeError") as caught:
+        request.poll()
+    diagnostics.record_startup_failure(path, config, "service_host", caught.value)
+    assert diagnostics._startup(path, config) == before
+    assert "private synthetic detail" not in str(caught.value)
+    assert "private synthetic detail" not in diagnostics._startup_path(config).read_text()
+
+
+def test_host_rejects_nonstatic_startup_details():
+    error = host.ServiceHostError("service_start_failed", stage="service", startup=dict(
+        stage="private-source", error_class="TypeError", cause="import_failed"))
+    assert error._mindie_startup_failure is None
+    assert "private-source" not in str(error)

@@ -83,6 +83,22 @@ Safe caller receipts and startup diagnostics retain static host stage/code
 and uncertainty. They do not include raw provider messages, environment
 values, transcript content or private paths.
 
+## Windowless standard streams and startup errors
+
+Unlike a detached console process with redirected handles, `pythonw` may set
+`sys.stdin`, `sys.stdout` and `sys.stderr` to `None`. A real Windows retrieval
+startup failed when ReMe configured its logger with that absent output stream.
+The service host supplies a real UTF-8 null-device file only for each missing
+stream before loading components. Existing streams are preserved, and the host
+closes only the handles it created. This matches the existing detached
+`DEVNULL` contract without changing third-party logging or storing raw output.
+
+When a component fails during startup, its static stage, exception class and
+cause travel in the current attempt's result. The polling caller retains those
+details alongside the host code instead of replacing the original failure with
+a generic host exception. Both boundaries validate the static allowlist;
+exception messages and source content do not cross it.
+
 ## Verification boundaries
 
 `test_windows_service_host.py` covers context projection and absence,
@@ -99,6 +115,15 @@ authenticated readiness before native exit, worker and consumer ownership
 after exit, then exact retirement and task absence. The fixture uses no
 model, captures no private transcript and publishes nothing. Natural Stop
 capture and summary/index/publication acceptance remain separate evidence.
+
+The windowless-stream regression additionally runs the real CC helper,
+Scheduler host and ReMe retrieval twice against one synthetic material. Both
+queries return the same nonempty reference, reuse the service and index, and
+perform one checkpoint load and one material rebuild. Exact retirement
+releases the consumer and removes the task. No model is called. Unit fault
+injection verifies that a transcript-import error survives the actual host
+result and polling path. Unchanged POSIX launch behavior reuses prior native
+evidence; these checks do not certify natural Stop or publication.
 
 ## Design principles review
 
@@ -126,3 +151,12 @@ Reviewed against design-principles blob
    caller absence, receipt failure and cleanup failure remain distinct.
    Fault injection caught and fixed ambient credential inheritance, split
    startup locks and deletion of a transfer after an accepted Start.
+
+The windowless-stream follow-up was reviewed against the same nine principles.
+It removes a reproduced import failure and its generic-error misdiagnosis (1),
+implements only the missing-stream and safe startup-result contracts (2, 4),
+and requires no new user configuration or orchestration (3). It changes no
+skill, knowledge authority or activation behavior (5, 6, 7). It reuses the
+existing detached null-output semantics and unchanged POSIX evidence without
+model calls (8). Original startup errors remain visible and allowlisted across
+the Scheduler boundary, while business exceptions still propagate (9).

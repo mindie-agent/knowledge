@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -49,11 +50,16 @@ SAFE_CODES = {
 
 
 class ServiceHostError(RuntimeError):
-    def __init__(self, code, *, stage, uncertain=False, manager_hresult=None):
+    def __init__(self, code, *, stage, uncertain=False, manager_hresult=None, startup=None):
+        from .diagnostics import startup_failure_details
         self.code = code if isinstance(code, str) and code in SAFE_CODES else "service_start_failed"
         self.stage = stage if isinstance(stage, str) and stage in SAFE_STAGES else "service"
         self.uncertain = uncertain is True
-        super().__init__("knowledge service host: " + self.stage + ":" + self.code)
+        self._mindie_startup_failure = startup_failure_details(startup)
+        message = "knowledge service host: " + self.stage + ":" + self.code
+        if self._mindie_startup_failure is not None:
+            message += " (" + self._mindie_startup_failure["stage"] + ":" + self._mindie_startup_failure["error_class"] + ")"
+        super().__init__(message)
         self.manager_hresult = manager_hresult
 
 
@@ -301,7 +307,8 @@ class ScheduledService:
             raise ServiceHostError("launch_attempt_mismatch", stage="readiness", uncertain=True)
         if result is not None and result.get("status") == "failed":
             raise ServiceHostError(result.get("code", "service_start_failed"),
-                                   stage=result.get("stage", "readiness"))
+                                   stage=result.get("stage", "readiness"),
+                                   startup=result.get("startup"))
         if result is not None and result.get("status") == "finished":
             return result.get("exit_code", 1)
         task = _task(self.record["label"])
@@ -502,7 +509,30 @@ def remove_owned(config_path, config):
     manifest.unlink()
 
 
+@contextmanager
+def _windowless_streams():
+    """Match detached DEVNULL semantics only where pythonw has no stream."""
+    owned = []
+    try:
+        for name, mode in (("stdin", "r"), ("stdout", "w"), ("stderr", "w")):
+            if getattr(sys, name) is None:
+                stream = open(os.devnull, mode, encoding="utf-8")
+                owned.append((name, stream))
+                setattr(sys, name, stream)
+        yield
+    finally:
+        for name, stream in reversed(owned):
+            if getattr(sys, name) is stream:
+                setattr(sys, name, None)
+            stream.close()
+
+
 def run(manifest, attempt):
+    with _windowless_streams():
+        return _run(manifest, attempt)
+
+
+def _run(manifest, attempt):
     manifest = resolved_path(manifest)
     root = manifest.parent
     record = _read(manifest)
@@ -538,6 +568,10 @@ def run(manifest, attempt):
                       stage=safe.stage,
                       error_type=type(exc).__name__,
                       code=safe.code)
+        from .diagnostics import startup_failure_details
+        startup = startup_failure_details(getattr(exc, "_mindie_startup_failure", None))
+        if startup is not None:
+            result["startup"] = startup
         try:
             _write(result_path, result)
         except (OSError, ServiceHostError):

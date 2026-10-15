@@ -33,6 +33,21 @@ _SAFE_CLASSES = frozenset({
     "ImportError", "ModuleNotFoundError", "SyntaxError", "SummaryWorkerPaused",
     "MaintenanceCancelled", "CommandTimedOut", "OutputLimitExceeded", "AdmissionUnavailable",
 })
+_STARTUP_STAGES = {"store", "admission", "transcript_adapter", "engine", "service"}
+_STARTUP_CAUSES = {"startup_failed", "permission", "database", "missing_component", "import_failed"}
+
+
+def startup_failure_details(value):
+    """Allow only static details from the same failed startup attempt."""
+    if (not isinstance(value, dict)
+            or not isinstance(value.get("stage"), str) or value["stage"] not in _STARTUP_STAGES
+            or not isinstance(value.get("error_class"), str)
+            or value["error_class"] not in _SAFE_CLASSES | {"UnknownError"}
+            or not isinstance(value.get("cause"), str) or value["cause"] not in _STARTUP_CAUSES):
+        return None
+    return {key: value[key] for key in ("stage", "error_class", "cause")}
+
+
 _NATIVE_FAILURE = re.compile(
     r"RuntimeError: maintenance agent exited (-?\d{1,5}); "
     r"category=([a-z_]+); elapsed=(\d{1,7}(?:\.\d{1,6})?)s\Z"
@@ -198,6 +213,12 @@ def record_startup_failure(config_path, config, stage, exc):
         cause = "missing_component" if component and not Path(component).is_file() else "import_failed"
     payload = dict(status="failed", stage=stage, error_class=error_class(exc), cause=cause,
                    config_fingerprint=_fingerprint(config))
+    original = startup_failure_details(getattr(exc, "_mindie_startup_failure", None))
+    if stage == "service_host" and original is not None:
+        # The host transports this attempt's safe cause; it must not replace
+        # a component failure with its own generic polling exception.
+        payload.update(original)
+        component = config.get("transcript_adapter") if original["stage"] == "transcript_adapter" else None
     if stage == "service_host":
         from .windows_service import SAFE_CODES, SAFE_STAGES
         code = getattr(exc, "code", None)
@@ -212,6 +233,12 @@ def record_startup_failure(config_path, config, stage, exc):
             payload["host"]["manager_hresult"] = hresult
     if component:
         payload["component_path"] = str(component)
+    detail = startup_failure_details(payload)
+    if detail is not None:
+        try:
+            exc._mindie_startup_failure = detail
+        except Exception:
+            pass
     path = _startup_path(config)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     _atomic_write_text(path, json.dumps(payload) + "\n")
