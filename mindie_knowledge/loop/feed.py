@@ -157,6 +157,30 @@ class Feed:
     def _candidate(self):
         return self.store.feed_get(f"feed-candidate:{self.ident}") or {}
 
+    def read_availability(self):
+        """Project saved sync outcomes without fetching or retrying a source."""
+        receipt = self.store.feed_get("feed:" + self.ident) or {}
+        candidate = self._candidate()
+        commit = receipt.get("commit")
+        contract = receipt.get("contract_sha256")
+        installed = (isinstance(commit, str)
+                     and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit)
+                     and isinstance(contract, str) and re.fullmatch(r"[0-9a-f]{64}", contract))
+        sync_status = receipt.get("status", "not-synced")
+        if sync_status not in {"synced", "unchanged", "unavailable", "invalid", "deferred"}:
+            sync_status = "unknown"
+        candidate_status = candidate.get("status")
+        failed_candidate = candidate_status in {"invalid", "unavailable", "new"}
+        healthy = sync_status in {"synced", "unchanged"} and not failed_candidate
+        result = dict(repository=self.repository,
+                      status="ready" if installed and healthy else "stale" if installed else "unavailable",
+                      sync_status=sync_status)
+        if installed:
+            result["retained_commit"] = commit
+        if failed_candidate:
+            result["candidate_status"] = candidate_status
+        return result
+
     def _save_candidate(self, value):
         self.store.feed_set(f"feed-candidate:{self.ident}", value)
 
