@@ -242,11 +242,12 @@ def test_summary_worker_failure_is_visible_in_status(tmp_path, monkeypatch):
 
 
 def test_outbox_reports_a_new_failure_after_recovery_without_repeating_unchanged_fault(tmp_path, monkeypatch):
-    from mindie_knowledge.loop import agent_diagnostics, settings
+    from mindie_knowledge.loop import agent_diagnostics
+    from conftest import write_settings
     from mindie_knowledge.loop.engine import Engine
     monkeypatch.setenv('MINDIE_DIAGNOSTICS_ROOT', str(tmp_path / 'diagnostics'))
-    shared = settings.write(tmp_path / 'sharing.json', enabled=True,
-                            repository='owner/repo', project_roots=[tmp_path])
+    shared = write_settings(tmp_path / 'sharing.json', consent_choice='contribute', enabled=True,
+                            repository='owner/repo', roots=[tmp_path])
     with closing(Store(tmp_path / 'store', 'test')) as store:
         engine = Engine(store, settings_path=shared.path)
         ticks = []
@@ -295,7 +296,7 @@ def test_reconciliation_read_failure_is_delivered_without_overwriting_original_i
     from conftest import write_settings
     from test_publication_authority import prepare
     monkeypatch.setenv('MINDIE_DIAGNOSTICS_ROOT', str(tmp_path / 'diagnostics'))
-    settings = write_settings(tmp_path / 'sharing.json', roots=[tmp_path])
+    settings = write_settings(tmp_path / 'sharing.json', consent_choice="contribute", roots=[tmp_path])
     with closing(Store(tmp_path / 'store', 'test')) as store:
         _, batch_id = prepare(store, settings, 'Synthetic uncertain publication.')
         store.mark_batch(batch_id, 'unknown', attempted=True, detail='original push outcome unknown')
@@ -322,7 +323,7 @@ def test_reconciled_remote_result_survives_local_receipt_failure(tmp_path, monke
     from mindie_knowledge.loop.engine import Engine
     from conftest import write_settings
     from test_publication_authority import prepare
-    settings = write_settings(tmp_path / 'sharing.json', roots=[tmp_path])
+    settings = write_settings(tmp_path / 'sharing.json', consent_choice="contribute", roots=[tmp_path])
     with closing(Store(tmp_path / 'store', 'test')) as store:
         _, batch_id = prepare(store, settings, 'Synthetic publication with remote proof.')
         store.mark_batch(batch_id, 'unknown', attempted=True, detail='original push outcome unknown')
@@ -348,7 +349,7 @@ def test_frozen_payload_failure_delivers_its_stage_before_any_write(tmp_path, mo
     from conftest import write_settings
     from test_publication_authority import prepare
     monkeypatch.setenv('MINDIE_DIAGNOSTICS_ROOT', str(tmp_path / 'diagnostics'))
-    settings = write_settings(tmp_path / 'sharing.json', roots=[tmp_path])
+    settings = write_settings(tmp_path / 'sharing.json', consent_choice="contribute", roots=[tmp_path])
     with closing(Store(tmp_path / 'store', 'test')) as store:
         _, batch_id = prepare(store, settings, 'Synthetic frozen contribution.')
         row = store.batch(batch_id)
@@ -368,7 +369,7 @@ def test_payload_error_remains_primary_when_failure_recording_also_fails(tmp_pat
     from mindie_knowledge.materials import publication
     from conftest import write_settings
     from test_publication_authority import prepare
-    settings = write_settings(tmp_path / 'sharing.json', roots=[tmp_path])
+    settings = write_settings(tmp_path / 'sharing.json', consent_choice="contribute", roots=[tmp_path])
     with closing(Store(tmp_path / 'store', 'test')) as store:
         _, batch_id = prepare(store, settings, 'Synthetic local failure before writing.')
         original = store.batch(batch_id)

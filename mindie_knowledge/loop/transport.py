@@ -128,7 +128,7 @@ class _BoundedHTTPServer(ThreadingHTTPServer):
 class Service:
     def __init__(self, engine, *, connection_path=None, admission=None, feeds=(),
                  max_workers=8, request_timeout=None, config_path=None,
-                 config_fingerprint=None, client_fingerprint=None):
+                 config_fingerprint=None):
         self.engine, self.store = engine, engine.store
         self.admission = admission
         self.feeds = list(feeds)
@@ -234,8 +234,6 @@ class Service:
             self.connection['config_fingerprint'] = config_fingerprint
         if config_path is not None:
             self.connection['config_path'] = str(Path(config_path).resolve())
-        if client_fingerprint is not None:
-            self.connection['client_fingerprint'] = client_fingerprint
 
     # -------------------------------------------------------------- routing
 
@@ -270,13 +268,7 @@ class Service:
         if method == "stop_if_idle":
             return self._stop_if_idle()
         if method == "status":
-            status = self.engine.status()
-            if "client_fingerprint" in self.connection:
-                status["service_identity"] = {
-                    key: self.connection.get(key)
-                    for key in ("config_path", "config_fingerprint", "client_fingerprint")
-                }
-            return status
+            return self.engine.status()
         if method == "sharing_status":
             return dict(
                 self.engine._settings().public_status(),

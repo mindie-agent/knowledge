@@ -36,8 +36,12 @@ def _deadline():
 
 def _loop_settings(tmp_path, remote_url):
     """One real shared settings file valid for BOTH the loop and community."""
+    from mindie_knowledge import consent_store
+    consent = tmp_path / "consent.json"
+    consent_store.record_choice(consent, "contribute")
     return loop_settings.write(
         tmp_path / "community.json", enabled=True, repository=REPO,
+        consent_config=str(consent.resolve()),
         project_roots=[tmp_path], transport="file",
         dev_remotes={REPO: remote_url},
         transaction_seconds=120, operation_limit=60,

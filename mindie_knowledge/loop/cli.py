@@ -47,8 +47,8 @@ def validate_config(config):
         raise ValueError("configuration requires root and domain")
     from .service_context import validate as validate_launch_context
     validate_launch_context(config)
-    from .client_contract import fingerprint as client_fingerprint
-    client_fingerprint(config)
+    if "client_contract" in config:
+        raise ValueError("cross-runtime client compatibility is unsupported; reload the installed runtime")
     if "session_activation" in config:
         raise ValueError(
             "session_activation was removed; configure the neutral "
@@ -124,17 +124,6 @@ def connect(config, *, config_path=None):
         if connection.get('config_fingerprint') != config_fingerprint(config_path, config):
             raise ValueError('connection is for another service configuration')
     return connection
-
-
-def ensure_client_service(config_path):
-    """Use a compatible live owner or the exact completed service handoff."""
-    from .client_contract import ensure_service as ensure_client
-    return ensure_client(config_path)
-
-
-def prepare_client_service(config_path):
-    from .client_contract import prepare_service as prepare_client
-    return prepare_client(config_path)
 
 
 def ensure_service(config_path, *, _from_detached_starter=False):
@@ -401,12 +390,10 @@ def _serve(config_path, config):
                         redactor_executable=config.get("redactor_executable"),
                         summary_command=config.get("summary_command"))
         stage = "service"
-        from .client_contract import fingerprint as client_fingerprint
         service = Service(engine, connection_path=connection_path(config),
                           admission=admission, feeds=_feeds(config, store),
                           config_path=config_path,
-                          config_fingerprint=config_fingerprint(config_path, config),
-                          client_fingerprint=client_fingerprint(config))
+                          config_fingerprint=config_fingerprint(config_path, config))
         service.serve()
         return 0
     except Exception as exc:

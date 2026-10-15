@@ -292,7 +292,7 @@ def test_query_rpc_distinguishes_cursor_input_from_present_material_failure(stor
                        content="RMSNorm calibration matched the reference.", owner="a" * 64)
     hit = store.query("RMSNorm calibration")["results"][0]
     settings = tmp_path / "community.json"
-    write_settings(settings, enabled=False, roots=[tmp_path])
+    write_settings(settings, consent_choice="contribute", enabled=False, roots=[tmp_path])
     admission = Admission(make_admission(tmp_path, project_root=tmp_path))
     engine = Engine(store, settings_path=settings, admission=admission)
     service = Service(engine, admission=admission)

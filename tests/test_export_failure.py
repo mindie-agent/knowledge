@@ -4,13 +4,13 @@ import time
 
 import pytest
 from mindie_knowledge.loop.store import Store
-from mindie_knowledge.loop import settings
+from conftest import write_settings
 from mindie_knowledge.loop.export import build_batch, ExportQuarantinedError
 
 
 def test_export_selection_reads_headers_without_reassembling_all_task_bodies(tmp_path, monkeypatch):
-    shared = settings.write(tmp_path / 'sharing.json', enabled=True,
-                            repository='owner/repo', project_roots=[tmp_path])
+    shared = write_settings(tmp_path / 'sharing.json', consent_choice='contribute', enabled=True,
+                            repository='owner/repo', roots=[tmp_path])
     store = Store(tmp_path / 'data', 'test')
     try:
         store.create_draft(kind='experience', title='Public example', summary='Correction retained',
@@ -24,8 +24,8 @@ def test_export_selection_reads_headers_without_reassembling_all_task_bodies(tmp
 
 
 def test_unsafe_material_is_quarantined_without_blocking_valid_material(tmp_path):
-    shared = settings.write(tmp_path / 'sharing.json', enabled=True,
-                            repository='owner/repo', project_roots=[tmp_path])
+    shared = write_settings(tmp_path / 'sharing.json', consent_choice='contribute', enabled=True,
+                            repository='owner/repo', roots=[tmp_path])
     store = Store(tmp_path / 'data', 'test')
     unsafe = store.create_draft(kind='experience', title='Private endpoint',
                                 summary='Endpoint observation',
@@ -64,8 +64,8 @@ def test_unsafe_material_is_quarantined_without_blocking_valid_material(tmp_path
 
 
 def test_all_unsafe_material_quarantines_without_a_batch(tmp_path):
-    shared = settings.write(tmp_path / 'sharing.json', enabled=True,
-                            repository='owner/repo', project_roots=[tmp_path])
+    shared = write_settings(tmp_path / 'sharing.json', consent_choice='contribute', enabled=True,
+                            repository='owner/repo', roots=[tmp_path])
     store = Store(tmp_path / 'data', 'test')
     doc = store.create_draft(kind='experience', title='Private endpoint',
                              summary='Endpoint observation',
@@ -91,8 +91,8 @@ def test_all_unsafe_material_quarantines_without_a_batch(tmp_path):
 
 
 def test_transient_staging_failure_resumes_with_backoff(tmp_path, monkeypatch):
-    shared = settings.write(tmp_path / 'sharing.json', enabled=True,
-                            repository='owner/repo', project_roots=[tmp_path])
+    shared = write_settings(tmp_path / 'sharing.json', consent_choice='contribute', enabled=True,
+                            repository='owner/repo', roots=[tmp_path])
     store = Store(tmp_path / 'data', 'test')
     doc = store.create_draft(kind='experience', title='Unblocked case',
                              summary='survives a disk hiccup',
@@ -140,8 +140,8 @@ def test_transient_staging_failure_resumes_with_backoff(tmp_path, monkeypatch):
 def test_interrupted_export_reservation_is_not_a_permanent_lock(tmp_path):
     """A crash between reserve and finish leaves an ``attempted`` record with
     no outbox batch and no remote write; the build resumes after recovery."""
-    shared = settings.write(tmp_path / 'sharing.json', enabled=True,
-                            repository='owner/repo', project_roots=[tmp_path])
+    shared = write_settings(tmp_path / 'sharing.json', consent_choice='contribute', enabled=True,
+                            repository='owner/repo', roots=[tmp_path])
     store = Store(tmp_path / 'data', 'test')
     doc = store.create_draft(kind='experience', title='Crash window case',
                              summary='interrupted before staging',
@@ -169,8 +169,8 @@ def test_unavailable_retry_backoff_and_unknown_transition_resets(tmp_path):
     """Unavailable batches resubmit with persisted backoff and no exhaustion;
     a transition into unknown resets the counter so the first reconciliation
     is never skipped by an inherited count."""
-    shared = settings.write(tmp_path / 'sharing.json', enabled=True,
-                            repository='owner/repo', project_roots=[tmp_path])
+    shared = write_settings(tmp_path / 'sharing.json', consent_choice='contribute', enabled=True,
+                            repository='owner/repo', roots=[tmp_path])
     store = Store(tmp_path / 'data', 'test')
     store.create_draft(kind='experience', title='Retry case', summary='s',
                        content='Public observation.', generation=shared.generation)
@@ -215,8 +215,8 @@ def test_unavailable_retry_backoff_and_unknown_transition_resets(tmp_path):
 def test_retry_after_receipt_raises_but_never_shortens_backoff(tmp_path):
     """A valid retry_at receipt hint raises the persisted next-attempt floor;
     bools, NaN/inf and past or smaller values are ignored."""
-    shared = settings.write(tmp_path / 'sharing.json', enabled=True,
-                            repository='owner/repo', project_roots=[tmp_path])
+    shared = write_settings(tmp_path / 'sharing.json', consent_choice='contribute', enabled=True,
+                            repository='owner/repo', roots=[tmp_path])
     store = Store(tmp_path / 'data', 'test')
     store.create_draft(kind='experience', title='Rate limited', summary='s',
                        content='Public observation.', generation=shared.generation)
@@ -245,8 +245,8 @@ def test_submit_and_reconcile_receipts_apply_retry_after_floor(tmp_path):
     """Both receipt paths (submit and reconcile) persist the Retry-After
     floor into the existing outbox due field; a transition and a smaller hint
     never shorten an already reserved floor."""
-    shared = settings.write(tmp_path / 'sharing.json', enabled=True,
-                            repository='owner/repo', project_roots=[tmp_path])
+    shared = write_settings(tmp_path / 'sharing.json', consent_choice='contribute', enabled=True,
+                            repository='owner/repo', roots=[tmp_path])
     store = Store(tmp_path / 'data', 'test')
     store.create_draft(kind='experience', title='Retry case', summary='s',
                        content='Public observation.', generation=shared.generation)
@@ -284,8 +284,8 @@ def test_single_platform_legal_record_passes_a_smaller_grouping_budget(tmp_path,
     monkeypatch.setattr(common_mod, 'MAX_FILE_BYTES', 4096)
     monkeypatch.setattr(export_mod, 'MAX_BATCH_BYTES', 5242)
     monkeypatch.setattr(export_mod, 'MAX_FILE_BYTES', 4096)
-    shared = settings.write(tmp_path / 'sharing.json', enabled=True,
-                            repository='owner/repo', project_roots=[tmp_path])
+    shared = write_settings(tmp_path / 'sharing.json', consent_choice='contribute', enabled=True,
+                            repository='owner/repo', roots=[tmp_path])
     store = Store(tmp_path / 'data', 'test')
     heavy = store.create_draft(
         kind='experience', title='Quote heavy', summary='s',
@@ -313,8 +313,8 @@ def test_single_platform_legal_record_passes_a_smaller_grouping_budget(tmp_path,
 
 @pytest.mark.parametrize("waiting", ["pending", "unknown", "unavailable"])
 def test_waiting_for_old_write_does_not_consume_new_material(tmp_path, waiting):
-    shared = settings.write(tmp_path / 'sharing.json', enabled=True,
-                            repository='owner/repo', project_roots=[tmp_path])
+    shared = write_settings(tmp_path / 'sharing.json', consent_choice='contribute', enabled=True,
+                            repository='owner/repo', roots=[tmp_path])
     store = Store(tmp_path / 'data', 'test')
     store.create_draft(kind='experience', title='First', summary='First case',
                        content='First public observation.', generation=shared.generation)

@@ -152,7 +152,7 @@ def _accept_row(db, *, namespace, root_hash, session, turn, transcript, summary,
         raise
 
 
-def _probe(config, timeout, *, config_path=None, compatible=False):
+def _probe(config, timeout, *, config_path=None):
     from .cli import connect
     from .locks import lock_held
     from .transport import rpc
@@ -174,17 +174,13 @@ def _probe(config, timeout, *, config_path=None, compatible=False):
     if owner is False:
         return "absent"
     try:
-        client = compatible and config.get("client_contract") is not None
-        connection = connect(config, config_path=None if client else config_path)
+        connection = connect(config, config_path=config_path)
     except FileNotFoundError:
         return "starting" if owner is True else "absent"
     except (OSError, ValueError):
         return "unknown"
     try:
         status = rpc(connection, "status", timeout=timeout)
-        if client:
-            from .client_contract import verify_service_identity
-            verify_service_identity(config_path, config, connection, status)
     except FileNotFoundError:
         return "absent"
     except TimeoutError:
@@ -232,13 +228,9 @@ def request_wake(config_path, *, session_id, event=None):
         return out
     try:
         config = config_at(config_path)
-        from .client_contract import resolve_config
-        config_path, config = resolve_config(config_path)
+        require_active(config_path, config)
     except ServiceRetired:
         out.update(wake='not-applicable', runtime='retired', reason='service-retired')
-        return out
-    except RuntimeError:
-        out.update(wake="failed", runtime="unavailable", reason="service-handoff")
         return out
     except (OSError, ValueError):
         out.update(wake="failed", runtime="unavailable", reason="configuration")
@@ -268,7 +260,7 @@ def request_wake(config_path, *, session_id, event=None):
             return out
         out.update(wake="not-applicable", reason="not-activated")
         return out
-    state = _probe(config, WAKE_PROBE_SECONDS, config_path=config_path, compatible=True)
+    state = _probe(config, WAKE_PROBE_SECONDS, config_path=config_path)
     if state == "ready":
         out.update(wake="running", runtime="ready", reason="worker-ready")
         return out
@@ -307,7 +299,7 @@ def request_wake(config_path, *, session_id, event=None):
                 try:
                     # A query starter may have won while the wake lock was
                     # acquired; the scheduler never replaces a live consumer.
-                    current = _probe(config, WAKE_PROBE_SECONDS, config_path=config_path, compatible=True)
+                    current = _probe(config, WAKE_PROBE_SECONDS, config_path=config_path)
                     if current == "ready":
                         out.update(wake="running", runtime="ready", reason="worker-ready")
                         return out
@@ -556,7 +548,7 @@ def accept_stop(config_path, event):
             reason="stored", summary_dropped=dropped,
         )
     if status == "processing":
-        state = _probe(config, WAKE_PROBE_SECONDS, config_path=config_path, compatible=True)
+        state = _probe(config, WAKE_PROBE_SECONDS, config_path=config_path)
         return _result(
             stage="processing", capture_id=capture_id, duplicate=duplicate,
             wake="not-applicable",
@@ -569,7 +561,7 @@ def accept_stop(config_path, event):
         stage_name = "accepted-local"
     else:
         stage_name = "accepted-local"
-    state = _probe(config, WAKE_PROBE_SECONDS, config_path=config_path, compatible=True)
+    state = _probe(config, WAKE_PROBE_SECONDS, config_path=config_path)
     if state == "ready" and status in _UNPROCESSED_CAPTURE | {"pending", "deferred", "queued"}:
         clear_delivery_event(config, event_id)
         return _result(

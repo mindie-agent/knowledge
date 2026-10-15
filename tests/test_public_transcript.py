@@ -33,7 +33,7 @@ def scanner():
 @pytest.fixture
 def pipeline(tmp_path, scanner):
     settings = tmp_path / 'community.json'
-    write_settings(settings, roots=[tmp_path])
+    write_settings(settings, consent_choice="contribute", roots=[tmp_path])
     admission = Admission(make_admission(tmp_path, project_root=tmp_path))
     store = Store(tmp_path / 'store', 'test')
     engine = Engine(store, settings_path=settings, admission=admission,
@@ -59,7 +59,7 @@ def test_authorized_first_turn_survives_late_runtime_initialization(tmp_path, sc
     from mindie_knowledge.loop.activation import activation_epoch
     now = time.time()
     settings = tmp_path / 'community.json'
-    write_settings(settings, roots=[tmp_path])
+    write_settings(settings, consent_choice="contribute", roots=[tmp_path])
     data = json.loads(settings.read_text())
     data['enabled_at'] = now - 120
     settings.write_text(json.dumps(data))
@@ -519,7 +519,7 @@ def test_repeated_enable_keeps_pending_material_and_authorization(pipeline):
 def test_production_parsers_preserve_large_public_messages_through_export(tmp_path, scanner, harness, size):
     session = SESSIONS[harness]
     settings = tmp_path / 'community.json'
-    write_settings(settings, roots=[tmp_path])
+    write_settings(settings, consent_choice="contribute", roots=[tmp_path])
     admission = Admission(make_admission(tmp_path, project_root=tmp_path, session=session))
     path = transcript_path(harness, tmp_path, session)
     # Distinct head/middle/tail and total bytes catch clipping, skipped records,
@@ -553,7 +553,7 @@ def test_production_parsers_preserve_large_public_messages_through_export(tmp_pa
 def test_kimi_lineage_recovers_without_exporting_inherited_history(tmp_path, scanner):
     session = SESSIONS['kimi']
     settings = tmp_path / 'community.json'
-    write_settings(settings, roots=[tmp_path])
+    write_settings(settings, consent_choice="contribute", roots=[tmp_path])
     admission = Admission(make_admission(tmp_path, project_root=tmp_path, session=session))
     path = transcript_path('kimi', tmp_path, session)
     from lane_support import encode_record
@@ -589,7 +589,7 @@ def test_corrupt_record_blocks_incomplete_page_without_losing_source(tmp_path, s
     from lane_support import encode_record
     session = SESSIONS[harness]
     settings = tmp_path / 'community.json'
-    write_settings(settings, roots=[tmp_path])
+    write_settings(settings, consent_choice="contribute", roots=[tmp_path])
     admission = Admission(make_admission(tmp_path, project_root=tmp_path, session=session))
     path = transcript_path(harness, tmp_path, session)
     with closing(Store(tmp_path / 'store', 'test')) as store:
@@ -652,7 +652,7 @@ def paged_capture(tmp_path, scanner, monkeypatch):
     """Real Kimi parser, with a one-record page budget for deterministic yields."""
     session = SESSIONS['kimi']
     settings = tmp_path / 'community.json'
-    write_settings(settings, roots=[tmp_path])
+    write_settings(settings, consent_choice="contribute", roots=[tmp_path])
     admission = Admission(make_admission(tmp_path, project_root=tmp_path, session=session))
     path = transcript_path('kimi', tmp_path, session)
     parser = load_parser('kimi')

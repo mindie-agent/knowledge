@@ -120,7 +120,7 @@ def lifecycle_tests_use_explicit_process_backend(request, monkeypatch):
     This replacement is selected before a test, never after manager failure.
     """
     if request.node.path.name not in {
-        "test_service_startup.py", "test_service_retirement.py", "test_client_contract.py",
+        "test_service_startup.py", "test_service_retirement.py",
     }:
         return
     import sys
@@ -166,7 +166,15 @@ def store(tmp_path):
 
 
 def write_settings(path, *, enabled=True, repository="mindie-agent/knowledge-vllm-ascend",
-                   roots=None, idle_seconds=300, **extensions):
+                   roots=None, idle_seconds=300, consent_choice=None, **extensions):
+    """Write synthetic settings; only an explicit choice creates consent."""
+    if consent_choice is not None:
+        from mindie_knowledge import consent_store
+        if "consent_config" in extensions:
+            raise ValueError("fixture must choose a saved reference or an explicit choice")
+        consent = Path(path).with_name(Path(path).name + ".consent.json")
+        consent_store.record_choice(consent, consent_choice)
+        extensions["consent_config"] = str(consent.resolve())
     return settings_mod.write(
         path,
         enabled=enabled,

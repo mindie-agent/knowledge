@@ -132,7 +132,7 @@ def test_capture_hook_reports_authorized_unavailable_but_not_disabled(reports, t
     from conftest import write_settings, make_admission, admission_token
     from mindie_knowledge.loop import cli
     sharing = tmp_path / 'sharing.json'
-    write_settings(sharing, enabled=enabled, roots=[tmp_path])
+    write_settings(sharing, consent_choice="contribute", enabled=enabled, roots=[tmp_path])
     admission = make_admission(tmp_path, project_root=tmp_path)
     config = tmp_path / 'config.json'
     config.write_text(json.dumps({'root': str(tmp_path / 'knowledge'), 'domain': 'fixture', 'community_config': str(sharing), 'admission_path': str(admission), 'capture_mode': 'public-transcript', 'transcript_adapter': __import__('transcript_double').__file__, 'redactor_executable': str(tmp_path / 'gitleaks')}))

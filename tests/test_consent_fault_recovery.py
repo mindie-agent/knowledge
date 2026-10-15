@@ -69,6 +69,7 @@ def _patch_settings(world, **fields):
 
 _KEEP = {"queued", "pending", "deferred", "apply-pending"}
 _MALFORMED = (
+    "missing-config",
     "null-config",
     "empty-config",
     "number-config",
@@ -83,7 +84,11 @@ _MALFORMED = (
 
 def _introduce(world, kind):
     """One fault on top of a legal contribute configuration. Not a new choice."""
-    if kind == "null-config":
+    if kind == "missing-config":
+        raw = json.loads(world["settings"].read_text())
+        del raw["consent_config"]
+        world["settings"].write_text(json.dumps(raw) + "\n")
+    elif kind == "null-config":
         raw = _patch_settings(world, consent_config=None)
         assert "consent_config" in raw and raw["consent_config"] is None
     elif kind == "empty-config":
@@ -147,7 +152,7 @@ def test_k3_authority_fault_keeps_admitted_material_and_same_choice_resumes(tmp_
         store.close()
 
 
-@pytest.mark.parametrize('kind', ['corrupt', 'null-config', 'enabled-string-false', 'choice-absent'])
+@pytest.mark.parametrize('kind', ['corrupt', 'missing-config', 'null-config', 'enabled-string-false', 'choice-absent'])
 def test_k3_saved_model_result_survives_authority_fault_without_another_call(tmp_path, monkeypatch, kind):
     world = _world(tmp_path)
     store, engine = world['store'], world['engine']

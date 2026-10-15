@@ -249,7 +249,7 @@ def test_reference_types_do_not_guess_missing_identity_or_observation(corpus):
 def test_loopback_preserves_unavailable_and_corrupt_failure_meanings(corpus, tmp_path):
     store, _ = corpus
     settings = tmp_path / "community.json"
-    write_settings(settings, enabled=False, roots=[tmp_path])
+    write_settings(settings, consent_choice="contribute", enabled=False, roots=[tmp_path])
     admission = Admission(make_admission(tmp_path, project_root=tmp_path))
     engine = Engine(store, settings_path=settings, admission=admission)
     service = Service(engine, admission=admission)

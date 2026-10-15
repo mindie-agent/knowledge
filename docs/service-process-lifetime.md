@@ -85,21 +85,23 @@ and authenticated readiness. Status observations in the short Hook use a
 0.25-second control budget. A silent listener leaves the capture durable and
 reports unknown runtime state instead of blocking the Hook or claiming delivery.
 
-## Compatible clients and exact retirement
+## Exact configuration and retirement
 
-An adapter can declare a client protocol and semantic business identity.
-Runtime code locations are excluded only where the declaration supplies an
-explicit compatible protocol; provider, data, authorization and publication
-bindings remain part of that identity. An authenticated compatible live owner
-can serve an older client without making it another service owner.
+Every client uses the exact installed engine configuration. The service
+fingerprint includes its path and complete configuration; a mismatch is an
+error, not permission to attach to another owner or start a second service.
+Updates require the native session to reload. The unpublished 0.0.1 does not
+promise transparent operation by clients loaded from a different runtime.
 
-Completed retirement may name one verified successor config and fingerprint
-in the existing retirement receipt. When no compatible active service exists,
-an old client follows only that exact chain. Changed targets, incompatible
-business settings, cycles and uncertain retirement are errors. It never scans
-versions, selects a newest release, restores a retired owner, or introduces a
-global current pointer. Retirement without a successor does not authorize a
-client to attach to another compatible owner.
+The 0.0.1 adapters support first installation into an empty profile. A different
+existing binding is rejected explicitly; this release does not implement
+binding replacement or a transparent upgrade transaction. Exact retirement
+still supports idle shutdown and uninstall: a busy owner stays running and
+each immutable engine configuration retains its retirement receipt so a late
+helper cannot restart it. The core neither follows successor links nor selects
+plugin versions. Old compatibility declarations and successor receipts are
+rejected, not migrated. This does not delete business data, authorization,
+captures, paid receipts or uncertain external effects.
 
 ## Results and validation
 
@@ -111,8 +113,8 @@ termination does not claim crash-safe directory deletion.
 
 Model-free tests cover owner death before and after worker exit, launch
 failure, invalid result receipts, uncertain manager effects, exact ownership,
-context privacy and absence, silent status listeners, and old/new compatible
-clients. Platform evidence remains separate from native adapter acceptance.
+context privacy and absence, silent status listeners, and exact configuration
+rejection. Platform evidence remains separate from native adapter acceptance.
 The existing Windows Task Scheduler contract and descriptor layout are retained.
 The common `service_host` module only shares receipt IO, static errors and the
 one-use runner; platform manager transactions remain explicit.

@@ -82,7 +82,7 @@ def test_transcript_adapter_config_seam(tmp_path):
 def test_missing_adapter_fails_without_substituting_summary(tmp_path):
     project = tmp_path / "proj"
     project.mkdir()
-    settings = write_settings(tmp_path / "community.json", enabled=True,
+    settings = write_settings(tmp_path / "community.json", consent_choice="contribute", enabled=True,
                               roots=[project])
     adapter = make_admission(tmp_path, project_root=project)
     store = Store(tmp_path / "store", "test")
@@ -117,7 +117,7 @@ def test_missing_adapter_fails_without_substituting_summary(tmp_path):
 def test_compact_confirmed_removes_sent_payload_and_keeps_receipts(tmp_path):
     from mindie_knowledge.loop.store import canonical
 
-    settings = write_settings(tmp_path / "community.json", enabled=True,
+    settings = write_settings(tmp_path / "community.json", consent_choice="contribute", enabled=True,
                               roots=[tmp_path])
     store = Store(tmp_path / "store", "test")
     # Freeze the sent batch before creating independent unsent work.
@@ -179,7 +179,7 @@ def test_compact_confirmed_removes_sent_payload_and_keeps_receipts(tmp_path):
 
 
 def test_compact_keeps_newer_unsent_draft_and_drops_sent_history(tmp_path):
-    settings = write_settings(tmp_path / "community.json", enabled=True,
+    settings = write_settings(tmp_path / "community.json", consent_choice="contribute", enabled=True,
                               roots=[tmp_path])
     store = Store(tmp_path / "store", "test")
     doc, batch_id = _confirmed_batch(store, settings)
@@ -200,7 +200,7 @@ def test_compact_keeps_newer_unsent_draft_and_drops_sent_history(tmp_path):
 
 
 def test_per_entry_receipt_survives_later_lineage_batch(tmp_path):
-    settings = write_settings(tmp_path / "community.json", enabled=True,
+    settings = write_settings(tmp_path / "community.json", consent_choice="contribute", enabled=True,
                               roots=[tmp_path])
     store = Store(tmp_path / "store", "test")
     doc_a, batch_id = _confirmed_batch(store, settings)
@@ -223,7 +223,7 @@ def test_per_entry_receipt_survives_later_lineage_batch(tmp_path):
 
 
 def test_contribution_recovery_ops(tmp_path):
-    settings = write_settings(tmp_path / "community.json", enabled=True,
+    settings = write_settings(tmp_path / "community.json", consent_choice="contribute", enabled=True,
                               roots=[tmp_path])
     store = Store(tmp_path / "store", "test")
     doc, batch_id = _confirmed_batch(store, settings)
@@ -273,7 +273,7 @@ def test_compact_capture_coverage_requires_all_exact_sent_revisions(tmp_path):
     """Old A confirmation cannot discard newer or ambiguous A observations."""
     from mindie_knowledge.loop.store import canonical
 
-    settings = write_settings(tmp_path / "community.json", enabled=True,
+    settings = write_settings(tmp_path / "community.json", consent_choice="contribute", enabled=True,
                               roots=[tmp_path])
     store = Store(tmp_path / "store", "test")
     old, batch_id = _confirmed_batch(store, settings)

@@ -22,7 +22,7 @@ def _ready(tmp_path):
     project = tmp_path / "proj"
     project.mkdir()
     settings = tmp_path / "community.json"
-    write_settings(settings, enabled=True, roots=[project])
+    write_settings(settings, consent_choice="contribute", enabled=True, roots=[project])
     admission = make_admission(tmp_path, project_root=project)
     Store(tmp_path / "root", "test").close()
     config = tmp_path / "engine.json"

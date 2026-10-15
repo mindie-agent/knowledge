@@ -14,7 +14,7 @@ from mindie_knowledge.loop.transcript_redaction import redact as redact_body, in
 def test_generated_host_placeholder_is_scan_clean_and_exported_unchanged(tmp_path):
     text = 'SSH identity <redacted:username-at-host:a1b2c3d4e5f6> remains private.'
     assert redact.scan_text(text) == []
-    shared = write_settings(tmp_path / 'sharing.json', roots=[tmp_path])
+    shared = write_settings(tmp_path / 'sharing.json', consent_choice="contribute", roots=[tmp_path])
     with closing(Store(tmp_path / 'data', 'test')) as store:
         doc = store.create_draft(kind='experience', title='Public method', summary='Unverified trial.',
                                  content=text, generation=shared.generation)
@@ -65,7 +65,7 @@ def test_source_redaction_unions_long_claim_over_an_inner_identity():
 @pytest.mark.parametrize('valid', [False, True])
 @pytest.mark.parametrize('remote_outcome', ['submitted', 'unknown', 'receipt-failed', 'cleanup-failed'])
 def test_publisher_reports_rejection_and_retains_exact_partial_remote_result(tmp_path, monkeypatch, valid, remote_outcome):
-    shared = write_settings(tmp_path / 'sharing.json', roots=[tmp_path])
+    shared = write_settings(tmp_path / 'sharing.json', consent_choice="contribute", roots=[tmp_path])
     with closing(Store(tmp_path / 'data', 'test')) as store:
         unsafe = store.create_draft(kind='experience', title='Unsafe endpoint', summary='Synthetic.',
                                    content='host=' + 'npu' + '-rack7', generation=shared.generation)

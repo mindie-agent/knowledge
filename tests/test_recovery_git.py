@@ -42,7 +42,7 @@ class StubTransport:
 
 
 def _settings_dict(tmp_path, **extra):
-    settings = write_settings(tmp_path / "community.json", enabled=True,
+    settings = write_settings(tmp_path / "community.json", consent_choice="contribute", enabled=True,
                               roots=[tmp_path], repository=REPO, **extra)
     return settings, settings.as_dict()
 
@@ -202,7 +202,7 @@ def _import_pipeline(tmp_path):
     (repo / "publication-contract.json").write_bytes(render_contract(make_contract("test", "a" * 40)).encode("utf-8"))
     _git(["add", "."], repo)
     _git(["commit", "-qm", "initialize"], repo)
-    settings = write_settings(tmp_path / "community.json", enabled=True, roots=[tmp_path],
+    settings = write_settings(tmp_path / "community.json", consent_choice="contribute", enabled=True, roots=[tmp_path],
                               repository=REPO, transport="file", dev_remotes={REPO: str(repo)})
     store = Store(tmp_path / "store", "test")
     engine = Engine(store, settings_path=settings.path,

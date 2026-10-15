@@ -203,9 +203,13 @@ def remote_url(tmp_path):
 @pytest.fixture
 def settings(tmp_path, remote_url):
     # The live gate requires a real, validated shared config file on disk.
+    from mindie_knowledge import consent_store
+    consent = tmp_path / "consent.json"
+    consent_store.record_choice(consent, "contribute")
     data = {
         "schema": "mindie-community-config/1",
         "enabled": True,
+        "consent_config": str(consent.resolve()),
         "generation": "g1",
         "enabled_at": 1_700_000_000,
         "repository": REPO,

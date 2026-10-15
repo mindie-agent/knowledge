@@ -37,7 +37,7 @@ def test_many_appends_and_header_updates_keep_one_body_and_grant(store):
 
 def test_pending_send_owns_old_payload_after_draft_advances(tmp_path):
     path = tmp_path / "community.json"
-    settings = write_settings(path, roots=[tmp_path])
+    settings = write_settings(path, consent_choice="contribute", roots=[tmp_path])
     with closing(Store(tmp_path / "store", "test")) as store:
         old = draft(store, settings.generation)
         batch_id, *_ = build_batch(store, settings=settings)

@@ -1,4 +1,4 @@
-"""Retire one exact service configuration before replacing its owner.
+"""Explicitly retire one exact service configuration.
 
 The receipt lives beside the configuration. It bars already-spawned wake
 helpers as well as new starters; absence of a listener alone is never an
@@ -45,6 +45,7 @@ def inspect_retirement(config_path, config=None):
     except FileNotFoundError:
         return None
     if (not isinstance(value, dict) or value.get('schema') != SCHEMA
+            or set(value) != {'schema', 'status', 'operation_id', 'config_fingerprint'}
             or value.get('status') not in {'retiring', 'retired'}
             or not isinstance(value.get('operation_id'), str)
             or len(value['operation_id']) != 32
@@ -53,17 +54,6 @@ def inspect_retirement(config_path, config=None):
         raise ValueError('service retirement receipt is invalid')
     if value['config_fingerprint'] != fingerprint:
         raise ValueError('service retirement receipt belongs to a different configuration')
-    successor = value.get('successor')
-    if successor is not None and (
-            not isinstance(successor, dict)
-            or set(successor) != {'config_path', 'config_fingerprint'}
-            or not isinstance(successor.get('config_path'), str)
-            or not Path(successor['config_path']).is_absolute()
-            or not isinstance(successor.get('config_fingerprint'), str)
-            or len(successor['config_fingerprint']) != 64
-            or any(char not in '0123456789abcdef'
-                   for char in successor['config_fingerprint'])):
-        raise ValueError('service successor receipt is invalid')
     return value
 
 
@@ -129,7 +119,7 @@ def _completed_retirement(config_path, config, outcome, receipt):
     return dict(outcome, retirement=receipt)
 
 
-def retire_service(config_path, *, successor_config_path=None):
+def retire_service(config_path):
     from .cli import config_at, connect
     from .handoff import _probe
     from .transport import rpc
@@ -139,26 +129,15 @@ def retire_service(config_path, *, successor_config_path=None):
     try:
         admission.acquire(wait=None)
         try:
-            successor = None
-            if successor_config_path is not None:
-                from .client_contract import successor_binding, resolve_config
-                successor = successor_binding(config_path, config, successor_config_path)
-                target, _ = resolve_config(successor_config_path)
-                if target != Path(successor_config_path).resolve():
-                    raise ValueError('service successor is already retired')
             previous = inspect_retirement(config_path, config)
             if previous is not None:
                 if previous['status'] != 'retired':
                     raise RuntimeError('previous service retirement has an uncertain outcome; inspect it before recovery')
-                if successor is not None and previous.get('successor') != successor:
-                    raise ValueError('completed service handoff cannot be replaced')
                 if _consumer_state(config):
                     raise RuntimeError('retired service still owns its consumer lock')
                 return _completed_retirement(config_path, config, dict(idle=True, service='absent'), previous)
             receipt = dict(schema=SCHEMA, config_fingerprint=config_fingerprint(config_path, config),
                            operation_id=uuid.uuid4().hex, status='retiring')
-            if successor is not None:
-                receipt['successor'] = successor
             _atomic_write_text(_marker(config_path), json.dumps(receipt, sort_keys=True) + '\n')
             # A direct serve may already own the consumer but still be loading.
             # Wait for its actual readiness or lifetime-lock release.
@@ -206,7 +185,7 @@ def retire_service(config_path, *, successor_config_path=None):
 
 
 def restore_service(config_path, retirement=None):
-    """Restore an exact, known completed retirement after adapter rollback."""
+    """Explicitly restore one exact, known completed retirement."""
     from .cli import config_at
     config = config_at(config_path)
     start, admission = _locks(config)

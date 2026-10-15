@@ -31,7 +31,7 @@ def world(tmp_path, request, scanner):
     project = tmp_path / 'project'
     project.mkdir()
     settings = tmp_path / 'community.json'
-    write_settings(settings, roots=[project])
+    write_settings(settings, consent_choice="contribute", roots=[project])
     name = request.param
     session = SESSIONS[name]
     admission = Admission(make_admission(tmp_path, project_root=project, session=session))

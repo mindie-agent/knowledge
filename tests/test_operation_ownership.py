@@ -35,7 +35,7 @@ def test_revocation_cancels_only_foreign_contribution_and_never_revives_old_toke
 
 
 def test_feedback_revocation_failure_rolls_back_batch_revocation(tmp_path):
-    settings = write_settings(tmp_path / 'sharing.json', roots=[tmp_path])
+    settings = write_settings(tmp_path / 'sharing.json', consent_choice="contribute", roots=[tmp_path])
     with closing(Store(tmp_path / 'store', 'test')) as store:
         doc, batch = prepare(store, settings, 'Synthetic unsent material.')
         store.record_vote(root_hash='b' * 64, ref=store.ref(doc['entry_id'], doc['revision']),

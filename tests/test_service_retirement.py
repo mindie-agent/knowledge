@@ -210,3 +210,53 @@ def test_known_stop_retains_failed_consumer_observation_stage(tmp_path, monkeypa
                                            errno=13, operation_completed=True)
     assert lifecycle.inspect_retirement(path)['status'] == 'retired'
     assert 'private path' not in json.dumps(result)
+
+
+def test_live_owner_reuses_exact_config_but_rejects_another_binding(tmp_path, monkeypatch):
+    path, config = configuration(tmp_path)
+    first = cli.ensure_service(path)
+    other = tmp_path / 'other-engine.json'
+    other.write_text(json.dumps(config))
+    from mindie_knowledge.loop import service_host
+    backend = service_host.platform_backend()
+    if backend is not None:
+        monkeypatch.setattr(backend, 'request_start',
+                            lambda *args: pytest.fail('must not launch another owner'))
+    try:
+        assert cli.ensure_service(path) == first
+        assert _probe(config, .25, config_path=other) == 'unknown'
+        with pytest.raises(ValueError, match='another service configuration'):
+            cli.connect(config, config_path=other)
+        with pytest.raises(RuntimeError, match='unknown'):
+            cli.ensure_service(other)
+        assert transport.rpc(first, 'status')['worker_alive']
+        assert cli.connection_path(config).exists()
+    finally:
+        lifecycle.retire_service(path)
+
+
+def test_removed_client_declaration_is_not_silently_ignored(tmp_path):
+    path, config = configuration(tmp_path)
+    config['client_contract'] = {'schema': 'mindie-service-client/1'}
+    path.write_text(json.dumps(config))
+    with pytest.raises(ValueError, match='cross-runtime client compatibility'):
+        cli.config_at(path)
+    assert not cli.connection_path(config).exists()
+
+
+def test_successor_receipt_is_rejected_without_rewriting_or_starting(tmp_path):
+    path, config = configuration(tmp_path)
+    result = lifecycle.retire_service(path)
+    marker = lifecycle._marker(path)
+    receipt = dict(result['retirement'], successor={
+        'config_path': str(tmp_path / 'another-engine.json'),
+        'config_fingerprint': 'a' * 64,
+    })
+    marker.write_text(json.dumps(receipt))
+    before = marker.read_bytes()
+    with pytest.raises(ValueError, match='retirement receipt is invalid'):
+        lifecycle.inspect_retirement(path)
+    with pytest.raises(ValueError, match='retirement receipt is invalid'):
+        cli.ensure_service(path)
+    assert marker.read_bytes() == before
+    assert not cli.connection_path(config).exists()

@@ -46,7 +46,7 @@ def publisher(engine):
 
 @pytest.mark.parametrize('change', ['disabled', 'corrupt'])
 def test_paused_reconciliation_never_rewrites_original_unknown_write(tmp_path, change):
-    settings = write_settings(tmp_path / 'sharing.json', roots=[tmp_path])
+    settings = write_settings(tmp_path / 'sharing.json', consent_choice="contribute", roots=[tmp_path])
     with closing(Store(tmp_path / 'store', 'test')) as store:
         _, batch_id = prepare(store, settings, 'Synthetic unresolved publication.')
         store.mark_batch(batch_id, 'unknown', attempted=True, detail='original write outcome unknown')
@@ -54,7 +54,7 @@ def test_paused_reconciliation_never_rewrites_original_unknown_write(tmp_path, c
         engine = Engine(store, settings_path=settings.path)
         engine.community = {'reconcile_batch': lambda *a, **kw: pytest.fail('paused read must not run')}
         if change == 'disabled':
-            write_settings(settings.path, roots=[tmp_path], enabled=False)
+            write_settings(settings.path, consent_choice="contribute", roots=[tmp_path], enabled=False)
         else:
             settings.path.write_text('{corrupt')
         engine._reconcile(original)
@@ -64,20 +64,20 @@ def test_paused_reconciliation_never_rewrites_original_unknown_write(tmp_path, c
 @pytest.mark.parametrize("disabled_start", [True, False])
 def test_reenable_sends_only_newly_authorized_material(tmp_path, monkeypatch, disabled_start):
     path = tmp_path / "sharing.json"
-    first = write_settings(path, roots=[tmp_path])
+    first = write_settings(path, consent_choice="contribute", roots=[tmp_path])
     with closing(Store(tmp_path / "store", "test")) as store:
         if disabled_start:
             old_doc, old_batch = prepare(store, first, "Prior authorization material.")
-            write_settings(path, enabled=False, roots=[tmp_path])
+            write_settings(path, consent_choice="contribute", enabled=False, roots=[tmp_path])
         engine = Engine(store, settings_path=path)
         engine.revoke_stale()  # The startup gate, before workers begin.
         if not disabled_start:
             # Observe enabled A before an unsent batch exists, then disable.
             tick(engine, monkeypatch)
             old_doc, old_batch = prepare(store, first, "Prior authorization material.")
-            write_settings(path, enabled=False, roots=[tmp_path])
+            write_settings(path, consent_choice="contribute", enabled=False, roots=[tmp_path])
             tick(engine, monkeypatch)
-        current = write_settings(path, roots=[tmp_path, tmp_path / "additional-project"])
+        current = write_settings(path, consent_choice="contribute", roots=[tmp_path, tmp_path / "additional-project"])
         new_doc, new_batch = prepare(store, current, "Subsequent authorization material.")
         sent = publisher(engine)
         tick(engine, monkeypatch)
@@ -90,14 +90,14 @@ def test_reenable_sends_only_newly_authorized_material(tmp_path, monkeypatch, di
 
 def test_changed_generation_keeps_material_admitted_before_poll(tmp_path, monkeypatch):
     path = tmp_path / "sharing.json"
-    first = write_settings(path, roots=[tmp_path])
+    first = write_settings(path, consent_choice="contribute", roots=[tmp_path])
     with closing(Store(tmp_path / "store", "test")) as store:
         engine = Engine(store, settings_path=path)
         tick(engine, monkeypatch)
         old_doc, old_batch = prepare(store, first, "Old generation material.")
         retired = engine.operations.begin("capture", generation=first.generation)
         # Stop intake can admit the new generation before the outbox notices it.
-        current = write_settings(path, roots=[tmp_path, tmp_path / "additional-project"])
+        current = write_settings(path, consent_choice="contribute", roots=[tmp_path, tmp_path / "additional-project"])
         new_doc, new_batch = prepare(store, current, "Already admitted under the new generation.")
         # The summary worker also reads current authority independently of this poll.
         current_summary = engine.operations.begin("index", generation=current.generation)
@@ -120,7 +120,7 @@ def test_changed_generation_keeps_material_admitted_before_poll(tmp_path, monkey
 
 def test_authority_fault_parks_batch_and_restored_generation_reuses_it(tmp_path, monkeypatch):
     path = tmp_path / "sharing.json"
-    settings = write_settings(path, roots=[tmp_path])
+    settings = write_settings(path, consent_choice="contribute", roots=[tmp_path])
     original = path.read_bytes()
     with closing(Store(tmp_path / "store", "test")) as store:
         engine = Engine(store, settings_path=path)
@@ -140,13 +140,13 @@ def test_authority_fault_parks_batch_and_restored_generation_reuses_it(tmp_path,
 
 def test_generation_change_preserves_unknown_write_for_read_only_reconciliation(tmp_path, monkeypatch):
     path = tmp_path / "sharing.json"
-    first = write_settings(path, roots=[tmp_path])
+    first = write_settings(path, consent_choice="contribute", roots=[tmp_path])
     with closing(Store(tmp_path / "store", "test")) as store:
         engine = Engine(store, settings_path=path)
         tick(engine, monkeypatch)
         _, uncertain = prepare(store, first, "Original uncertain remote intent.")
         store.mark_batch(uncertain, "unknown", attempted=True, detail="push outcome unknown")
-        current = write_settings(path, roots=[tmp_path, tmp_path / "additional-project"])
+        current = write_settings(path, consent_choice="contribute", roots=[tmp_path, tmp_path / "additional-project"])
         _, new_batch = prepare(store, current, "Independent current generation material.")
         sent = publisher(engine)
         reconciled = []
@@ -176,17 +176,17 @@ def test_summary_cancellation_belongs_to_its_generation(tmp_path):
 @pytest.mark.parametrize("disabled_start", [False, True])
 def test_revocation_cancels_work_even_before_outbox_observes_enable(tmp_path, monkeypatch, disabled_start):
     path = tmp_path / "sharing.json"
-    write_settings(path, enabled=not disabled_start, roots=[tmp_path])
+    write_settings(path, consent_choice="contribute", enabled=not disabled_start, roots=[tmp_path])
     with closing(Store(tmp_path / "store", "test")) as store:
         engine = Engine(store, settings_path=path)
         engine.revoke_stale()
         # The summary worker can observe enable independently, before the
         # outbox's first enabled tick (or its next poll after disabled startup).
-        current = write_settings(path, roots=[tmp_path])
+        current = write_settings(path, consent_choice="contribute", roots=[tmp_path])
         _, batch_id = prepare(store, current, "Material admitted before the first enabled outbox poll.")
         active = engine.operations.begin("index", generation=current.generation)
         assert engine._observed_authority is None
-        write_settings(path, enabled=False, roots=[tmp_path])
+        write_settings(path, consent_choice="contribute", enabled=False, roots=[tmp_path])
         tick(engine, monkeypatch)
         assert active.cancel.is_set()
         assert store.batch(batch_id)["status"] == "disabled"
