@@ -7,7 +7,7 @@ import pytest
 from mindie_knowledge.loop.engine import Engine
 from mindie_knowledge.loop.feed import Feed
 from mindie_knowledge.loop.store import Store
-from mindie_knowledge.loop.transport import Service, rpc
+from mindie_knowledge.loop.transport import FeedUnavailableError, Service, rpc
 
 
 @pytest.fixture
@@ -54,13 +54,16 @@ def test_retained_snapshot_is_explicitly_stale(configured_service, monkeypatch):
 def test_rpc_delivers_source_failure_without_reporting_a_product_defect(configured_service, monkeypatch):
     store, feed, service = configured_service
     store.feed_set("feed:" + feed.ident, dict(status="unavailable"))
+    monkeypatch.setattr(store, "query", lambda *_a, **_kw: pytest.fail("unavailable feed must block query"))
+    monkeypatch.setattr(feed, "sync", lambda *_a, **_kw: pytest.fail("query must not retry sync"))
     monkeypatch.setattr("mindie_knowledge.loop.transport.failure",
                         lambda *_a, **_kw: pytest.fail("known source failure is not a product defect"))
     worker = threading.Thread(target=service.http.serve_forever)
     worker.start()
     try:
-        with pytest.raises(RuntimeError, match="configured feed has no verified installed snapshot"):
+        with pytest.raises(FeedUnavailableError, match="configured feed has no verified installed snapshot"):
             rpc(service.connection, "query", {"query": "synthetic"}, timeout=5)
+        assert service.engine.operations.snapshot()["activity"] == 0
     finally:
         service.http.shutdown()
         worker.join(timeout=5)

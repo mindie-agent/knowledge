@@ -76,8 +76,12 @@ def rpc(connection, method, arguments=None, *, timeout=None):
         if result.get("error_kind") == "invalid_request":
             raise RequestRejected(error, error_code=result.get("error_code", "read_rejected"),
                                   read_ref=result.get("read_ref"))
-        exception = (MaterialReadError(error, read_ref=result.get("read_ref"))
-                     if result.get("error_code") == "material_corrupt" else RuntimeError(error))
+        if result.get("error_code") == "material_corrupt":
+            exception = MaterialReadError(error, read_ref=result.get("read_ref"))
+        elif result.get("error_code") == "feed_unavailable":
+            exception = FeedUnavailableError(error)
+        else:
+            exception = RuntimeError(error)
         attach_reference(exception, result.get("diagnostic"))
         raise exception
     try:
