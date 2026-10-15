@@ -304,6 +304,7 @@ def contribution_recovery(config, operation, batch_id):
         raise ValueError("no knowledge store exists for this domain")
     state_dir = state_root(config["root"], config["domain"]) / "outbox"
     settings = settings_mod.from_engine_config(config)
+    receipt = None
     try:
         row = store.batch(batch_id)
         if row is None:
@@ -329,19 +330,40 @@ def contribution_recovery(config, operation, batch_id):
                     "uncertain (unknown/unresolved) write is inspected with "
                     "contribution-reconcile, never replayed"
                 )
-            batch = json.loads(row["batch"])
+            from ..materials.publication import load_batch_payload
+
+            batch = load_batch_payload(store, row)
             batch["explicit_retry"] = True
-            receipt = submit_batch(batch, settings.as_dict(), state_dir)
-        store.mark_batch(
-            batch_id, receipt.get("status", "unknown"),
-            detail=receipt.get("detail", ""), pr_url=receipt.get("pr_url"),
-            head_sha=receipt.get("head_sha"),
-        )
+            receipt = submit_batch(
+                batch, settings.as_dict(), state_dir,
+                authority_guard=store.db.assert_authority)
+        from .publication_worker import record_publication_receipt
+
+        record_publication_receipt(
+            store, row, receipt, attempted=operation == "contribution-retry")
         if receipt.get("status") in Store.CONFIRMED_BATCH:
-            store.compact_confirmed(batch_id)
+            try:
+                cleanup = store.compact_confirmed(batch_id)
+            except Exception as exc:
+                exc.mindie_publication_result = receipt
+                exc.add_note("Publication confirmed before local cleanup failure")
+                raise
+            if cleanup.get("cleanup_status") == "failed":
+                receipt = dict(receipt, cleanup_failed=True,
+                               cleanup_error=cleanup.get("cleanup_error", "unknown"))
         return receipt
     finally:
-        store.close()
+        primary_error = sys.exc_info()[1]
+        try:
+            store.close()
+        except Exception as exc:
+            if primary_error is not None:
+                primary_error.add_note("recovery store close also failed: " + type(exc).__name__)
+            else:
+                if receipt is not None:
+                    exc.mindie_publication_result = receipt
+                    exc.add_note("Publication result returned before recovery store close failure")
+                raise
 
 
 def _feeds(config, store):
@@ -498,9 +520,23 @@ def main(argv=None):
     if args.operation.startswith("contribution-"):
         if not args.batch:
             parser.error(f"{args.operation} requires --batch")
-        result = contribution_recovery(config, args.operation, args.batch)
+        try:
+            result = contribution_recovery(config, args.operation, args.batch)
+        except Exception as exc:
+            result = getattr(exc, "mindie_publication_result", None)
+            if not isinstance(result, dict):
+                raise
+            result = dict(result, recovery_error=dict(
+                category=type(exc).__name__, stage="local-receipt-or-cleanup"),
+                automatic_retry=False)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 2
         print(json.dumps(result, ensure_ascii=False, indent=2))
-        return 0
+        incomplete = (
+            result.get("cleanup_failed") or result.get("recording_failed")
+            or ("status" in result and result["status"] not in Store.CONFIRMED_BATCH)
+        )
+        return 2 if incomplete else 0
     if args.operation == "sync":
         # Standalone model-free knowledge update; never starts the service.
         store = Store(config["root"], config["domain"])
