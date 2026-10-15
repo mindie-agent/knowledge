@@ -6,6 +6,9 @@ import pytest
 
 from mindie_knowledge.loop import windows_manager as manager
 
+_XML = ('<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
+        '<Principals><Principal><UserId>S-1-5-21-123</UserId></Principal></Principals></Task>')
+
 
 class ComError(Exception):
     def __init__(self, code, *, inner=None):
@@ -61,6 +64,7 @@ def api(monkeypatch):
                             CoUninitialize=lambda: state["calls"].append(("uninitialize",))),
         dispatch=dispatch,
         security=SimpleNamespace(ConvertSidToStringSid=str,
+                                 ConvertStringSidToSid=lambda value: value,
                                  LookupAccountName=lambda unused, name: ("S-1-5-21-123",)),
         zone=SimpleNamespace(TimeZoneInfo=SimpleNamespace(
             local=lambda: timezone(timedelta(hours=8)))),
@@ -145,12 +149,55 @@ def test_scheduler_local_date_preserves_legacy_seven_digit_utc_format(api):
     _, state = api
     principal = SimpleNamespace(UserId="local-user", RunLevel=0)
     state["selected"] = SimpleNamespace(
-        Definition=SimpleNamespace(Principal=principal), Xml="<Task/>", State=3,
+        Definition=SimpleNamespace(Principal=principal), Xml=_XML, State=3,
         LastTaskResult=-2147024891,
         LastRunTime=datetime(1899, 12, 30, tzinfo=timezone.utc))
     result = manager.task("owned")
-    assert result == dict(xml="<Task/>", sid="S-1-5-21-123", state="Ready", run_level=0,
+    assert result == dict(xml=_XML, sid="S-1-5-21-123", state="Ready", run_level=0,
                           last_result=0x80070005, last_run="1899-12-29T16:00:00.0000000Z")
+
+
+def test_exact_xml_sid_avoids_machine_and_user_name_collision(api):
+    value, state = api
+    lookups = []
+    value.security.LookupAccountName = lambda *args: lookups.append(args) or ("S-1-5-21",)
+    conversions = []
+    value.security.ConvertStringSidToSid = lambda sid: conversions.append(sid) or sid
+    state["selected"] = SimpleNamespace(
+        Definition=SimpleNamespace(Principal=SimpleNamespace(UserId="MACHINE", RunLevel=0)),
+        Xml=_XML, State=3, LastTaskResult=267011,
+        LastRunTime=datetime(1899, 12, 30))
+    assert manager.task("owned")["sid"] == "S-1-5-21-123"
+    assert conversions == ["S-1-5-21-123"]
+    assert lookups == []
+
+
+@pytest.mark.parametrize("xml", [
+    "<Task/>", "<Task", _XML.replace("<UserId>S-1-5-21-123</UserId>", ""),
+    _XML.replace("S-1-5-21-123", "MACHINE"),
+    _XML.replace("<UserId>S-1-5-21-123</UserId>", "<UserId/>"),
+    _XML.replace("</UserId>", "</UserId><UserId>S-1-5-21-123</UserId>"),
+    _XML.replace("</Principal>", "</Principal><Principal/>"),
+    _XML.replace("</Principals>", "</Principals><Principals/>"),
+    _XML.replace("</UserId>", "<Unexpected/></UserId>"),
+])
+def test_missing_ambiguous_or_malformed_xml_principal_is_visible_failure(api, xml):
+    value, _ = api
+    with pytest.raises(manager.ServiceHostError) as caught:
+        manager._principal_sid(xml, value.security)
+    assert caught.value.code == "manager_status_invalid"
+    assert caught.value.stage == "query"
+    assert not caught.value.uncertain
+
+
+def test_invalid_sid_rejected_by_windows_conversion_is_visible_failure(api):
+    value, _ = api
+    def reject(sid):
+        raise ValueError("private invalid SID")
+    value.security.ConvertStringSidToSid = reject
+    with pytest.raises(manager.ServiceHostError, match="manager_status_invalid") as caught:
+        manager._principal_sid(_XML.replace("S-1-5-21-123", "S-1-invalid"), value.security)
+    assert "private" not in str(caught.value)
 
 
 @pytest.mark.parametrize("owner,aces,accepted", [

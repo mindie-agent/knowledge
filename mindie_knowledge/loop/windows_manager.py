@@ -5,6 +5,7 @@ windows_service. This module does not retain COM objects across calls/threads.
 """
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from xml.etree import ElementTree as ET
 
 from .service_host import ServiceHostError
 
@@ -12,6 +13,7 @@ _CHANGED_MODE = 0x80010106
 _DISPATCH_EXCEPTION = 0x80020009
 _NOT_FOUND = 0x80070002
 _STATES = {1: "Disabled", 2: "Queued", 3: "Ready", 4: "Running"}
+_XML_NS = "{http://schemas.microsoft.com/windows/2004/02/mit/task}"
 
 
 def _api():
@@ -87,6 +89,26 @@ def _utc_text(value, local_zone):
     return utc.strftime("%Y-%m-%dT%H:%M:%S.") + f"{utc.microsecond:06d}0Z"
 
 
+def _principal_sid(xml, security):
+    try:
+        root = ET.fromstring(xml)
+        principals = root.findall(_XML_NS + "Principals")
+        if (root.tag != _XML_NS + "Task" or len(principals) != 1
+                or len(principals[0]) != 1
+                or principals[0][0].tag != _XML_NS + "Principal"):
+            raise ValueError()
+        users = principals[0][0].findall(_XML_NS + "UserId")
+        if (len(users) != 1 or list(users[0])
+                or not (users[0].text or "").startswith("S-1-")):
+            raise ValueError()
+        # COM UserId can be an ambiguous bare account name. The task we
+        # registered declares an exact SID in XML; never resolve that name.
+        return security.ConvertSidToStringSid(
+            security.ConvertStringSidToSid(users[0].text))
+    except Exception:
+        raise ServiceHostError("manager_status_invalid", stage="query") from None
+
+
 def task(label):
     def read(folder, api):
         selected = principal = None
@@ -98,11 +120,9 @@ def task(label):
                     return None
                 raise
             principal = selected.Definition.Principal
-            sid = principal.UserId
-            if not sid.startswith("S-1-"):
-                sid = api.security.ConvertSidToStringSid(
-                    api.security.LookupAccountName(None, sid)[0])
-            return dict(xml=selected.Xml, sid=sid, state=_STATES.get(selected.State),
+            xml = selected.Xml
+            sid = _principal_sid(xml, api.security)
+            return dict(xml=xml, sid=sid, state=_STATES.get(selected.State),
                         run_level=principal.RunLevel,
                         last_result=int(selected.LastTaskResult) & 0xFFFFFFFF,
                         last_run=_utc_text(selected.LastRunTime, api.zone.TimeZoneInfo.local()))
