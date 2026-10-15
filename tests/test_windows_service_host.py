@@ -7,6 +7,7 @@ import pytest
 
 from mindie_knowledge.loop import service_context as context
 from mindie_knowledge.loop import windows_service as host
+from mindie_knowledge.loop import windows_manager as manager
 
 
 @pytest.fixture(autouse=True)
@@ -136,7 +137,7 @@ def scheduler(tmp_path, monkeypatch):
                           "--manifest", str(root / "launch.json"), "--attempt", attempt])
     monkeypatch.setattr(host, "_record", record)
     monkeypatch.setattr(host, "_task", lambda label: state["task"])
-    def execute(script, *, stage):
+    def execute(stage):
         state["calls"].append(stage)
         if stage == "register":
             root = host._paths(config)
@@ -149,7 +150,9 @@ def scheduler(tmp_path, monkeypatch):
         if stage == "remove":
             state["task"] = None
         return ""
-    monkeypatch.setattr(host, "_ps", execute)
+    monkeypatch.setattr(manager, "register", lambda *a, **kw: execute("register"))
+    monkeypatch.setattr(manager, "start", lambda *a, **kw: execute("start"))
+    monkeypatch.setattr(manager, "remove", lambda *a, **kw: execute("remove"))
     return config_path, config, state
 
 
@@ -221,17 +224,15 @@ def test_unrecognized_operation_never_authorizes_transfer_cleanup(scheduler):
 
 def test_confirmed_start_error_allows_later_new_attempt(scheduler, monkeypatch):
     path, config, state = scheduler
-    execute = host._ps
-    def denied(script, *, stage):
-        if stage == "start":
-            state["calls"].append(stage)
-            raise host.ServiceHostError("manager_not_spawned", stage=stage)
-        return execute(script, stage=stage)
-    monkeypatch.setattr(host, "_ps", denied)
+    execute = manager.start
+    def denied(label):
+        state["calls"].append("start")
+        raise host.ServiceHostError("manager_operation_failed", stage="start")
+    monkeypatch.setattr(manager, "start", denied)
     with pytest.raises(host.ServiceHostError):
         host.request_start(path, config)
     first = host._read(host._paths(config) / "launch.json")
-    monkeypatch.setattr(host, "_ps", execute)
+    monkeypatch.setattr(manager, "start", execute)
     second = host.request_start(path, config)
     assert second.record["attempt"] != first["attempt"]
     assert state["calls"] == ["register", "start", "register", "start"]
@@ -239,16 +240,14 @@ def test_confirmed_start_error_allows_later_new_attempt(scheduler, monkeypatch):
 
 def test_manager_failure_after_spawn_is_not_proven_failed_by_idle_task(scheduler, monkeypatch):
     path, config, state = scheduler
-    execute = host._ps
-    def uncertain(script, *, stage):
-        if stage == "start":
-            state["calls"].append(stage)
-            raise host.ServiceHostError("manager_operation_failed", stage=stage, uncertain=True)
-        return execute(script, stage=stage)
-    monkeypatch.setattr(host, "_ps", uncertain)
+    execute = manager.start
+    def uncertain(label):
+        state["calls"].append("start")
+        raise host.ServiceHostError("manager_operation_failed", stage="start", uncertain=True)
+    monkeypatch.setattr(manager, "start", uncertain)
     with pytest.raises(host.ServiceHostError):
         host.request_start(path, config)
-    monkeypatch.setattr(host, "_ps", execute)
+    monkeypatch.setattr(manager, "start", execute)
     with pytest.raises(host.ServiceHostError, match="start_outcome_unknown"):
         host.request_start(path, config)
     assert state["calls"] == ["register", "start"]
@@ -365,18 +364,6 @@ def test_serve_applies_installed_paths_before_engine_loading(tmp_path, monkeypat
         cli._serve("unused", dict(service_launch_context={"paths": {"SYNTHETIC_NATIVE_HOME": str(tmp_path)}}))
 
 
-def test_manager_ipc_is_bounded_and_spawned_failure_is_uncertain(monkeypatch):
-    from mindie_knowledge.loop import process
-    def bounded(argv, payload, **kwargs):
-        assert kwargs["timeout"] == 30 and kwargs["max_output"] == host.LIMIT
-        raise TimeoutError("private native stderr")
-    monkeypatch.setattr(process, "bounded_run", bounded)
-    with pytest.raises(host.ServiceHostError) as caught:
-        host._ps("Start-ScheduledTask", stage="start")
-    assert caught.value.uncertain
-    assert "private" not in str(caught.value)
-
-
 def test_windows_wake_uses_same_start_lock_as_query_and_retirement(tmp_path, monkeypatch):
     from types import SimpleNamespace
     from mindie_knowledge.loop import cli, handoff
@@ -485,15 +472,12 @@ def test_host_rejects_nonstatic_startup_details():
 
 def test_acl_check_returns_the_owner_it_actually_verified(tmp_path, monkeypatch):
     calls = []
-    def checked(script, *, stage):
-        calls.append(stage)
+    def checked(path):
+        calls.append(path)
         return "S-1-5-21-123"
-    monkeypatch.setattr(host, "_ps", checked)
+    monkeypatch.setattr(manager, "private_sid", checked)
     assert host._verify_private(tmp_path) == "S-1-5-21-123"
-    assert calls == ["ownership"]
-    monkeypatch.setattr(host, "_ps", lambda *a, **kw: "not-a-sid")
-    with pytest.raises(host.ServiceHostError, match="identity_unavailable"):
-        host._verify_private(tmp_path)
+    assert calls == [tmp_path]
 
 
 @pytest.fixture
@@ -513,7 +497,7 @@ def test_com_query_projects_effective_default_without_weakening_ownership(task_p
     principal = tree.find("{" + host.NS + "}Principals/{" + host.NS + "}Principal")
     principal.remove(principal.find("{" + host.NS + "}RunLevel"))
     value["xml"] = ET.tostring(tree, encoding="unicode")
-    monkeypatch.setattr(host, "_ps", lambda *a, **kw: json.dumps(value))
+    monkeypatch.setattr(manager, "task", lambda *a, **kw: dict(value))
     projected = host._task(record["label"])
     host._verify_task(projected, record, manifest)
     assert projected["last_run"] == value["last_run"]
@@ -532,7 +516,7 @@ def test_com_query_rejects_unknown_state_and_inconsistent_explicit_privilege(
         task_projection, monkeypatch, changes):
     record, _, value = task_projection
     value.update(changes)
-    monkeypatch.setattr(host, "_ps", lambda *a, **kw: json.dumps(value))
+    monkeypatch.setattr(manager, "task", lambda *a, **kw: dict(value))
     with pytest.raises(host.ServiceHostError, match="manager_status_invalid"):
         host._task(record["label"])
 
@@ -542,9 +526,9 @@ def test_com_query_does_not_turn_manager_failure_into_task_absence(monkeypatch):
                                    uncertain=True, manager_hresult=0x80070005)
     def denied(*args, **kwargs):
         raise failure
-    monkeypatch.setattr(host, "_ps", denied)
+    monkeypatch.setattr(manager, "task", denied)
     with pytest.raises(host.ServiceHostError) as caught:
         host._task("synthetic")
     assert caught.value is failure
-    monkeypatch.setattr(host, "_ps", lambda *a, **kw: "null")
+    monkeypatch.setattr(manager, "task", lambda *a, **kw: None)
     assert host._task("synthetic") is None

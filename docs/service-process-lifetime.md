@@ -14,6 +14,15 @@ environment redirector. Killing the real core closes the retained Job handle
 and stops descendants even after their intermediate worker exits. No additional
 adapter HANDLE or PPID state machine is needed.
 
+Scheduler and private-directory checks use the explicitly declared pywin32
+dependency through native COM and Win32 security APIs. They do not start a
+PowerShell process for every query, ACL check, registration, start and removal.
+COM initialization is paired only when this call acquired it, and wrappers are
+released before closing that apartment. The exact XML ownership checks and
+launch journal remain in the core service host. Task timestamps preserve the
+previous seven-digit UTC representation, including the never-run sentinel;
+a transport change cannot become evidence that an uncertain Start completed.
+
 Linux and WSL use an on-demand systemd user service with `Type=exec`,
 `ExitType=main`, `KillMode=control-group` and `Restart=no`. The supported manager
 is systemd 254 or newer with a unified cgroup hierarchy. Version 254 provides
@@ -64,8 +73,13 @@ later new attempt. Accepted Start with a failed local acknowledgement retains
 its context and reports uncertainty. Result receipts validate their attempt,
 status and integer terminal exit code before controlling another launch.
 
-Manager IPC and cleanup observations have finite bounds. They do not impose a
-deadline on indexing or model execution. Short POSIX Stop handoff only starts
+Shell-based Linux manager IPC and cleanup observations have finite bounds.
+Windows native COM calls are synchronous and no longer carry the removed
+PowerShell subprocess's 30-second IPC limit. A short Hook retains its outer
+protocol budget; interruption of a mutating call leaves the durable intent
+uncertain for exact reconciliation. No new manager thread, broker or retry
+authority is introduced to hide that boundary. None of these controls imposes
+a deadline on indexing or model execution. Short POSIX Stop handoff only starts
 the existing detached wake helper; that helper performs the manager operation
 and authenticated readiness. Status observations in the short Hook use a
 0.25-second control budget. A silent listener leaves the capture durable and

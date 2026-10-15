@@ -7,7 +7,6 @@ and lifetime authority. Task metadata is only launch/cleanup bookkeeping.
 from __future__ import annotations
 
 import argparse
-import base64
 from contextlib import contextmanager
 import hashlib
 import json
@@ -30,49 +29,6 @@ from .service_host import (LIMIT, SAFE_CODES, SAFE_STAGES, ServiceHostError,
                            _read, _write, _result_path, read_result, run_owned)
 
 
-def _quote(value):
-    return "'" + str(value).replace("'", "''") + "'"
-
-
-def _ps(script, *, stage):
-    prefix = ("$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue';"
-              "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);"
-              "$env:PSModulePath=(Join-Path $PSHOME 'Modules')+[IO.Path]::PathSeparator+$env:PSModulePath;")
-    guarded = (
-        "try{" + script + "}catch{"
-        "$e=$_.Exception;while($e.InnerException){$e=$e.InnerException};"
-        "@{mindie_manager_failure=$true;hresult=([int64]$e.HResult -band 4294967295)}"
-        "|ConvertTo-Json -Compress;exit 0}"
-    )
-    encoded = base64.b64encode((prefix + guarded).encode("utf-16-le")).decode("ascii")
-    from .process import bounded_run
-    try:
-        output = bounded_run(
-            ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden",
-             "-EncodedCommand", encoded], "", timeout=30, max_output=LIMIT,
-        )
-    except Exception as exc:
-        # Only failure before native spawn proves no manager action was sent.
-        # Timeout, nonzero exit and an interrupted reply may follow an effect.
-        raise ServiceHostError(
-            "manager_operation_failed", stage=stage,
-            uncertain=getattr(exc, "mindie_execution", None) != "not_started",
-        ) from None
-    output = output.strip().lstrip("\ufeff")
-    try:
-        error = json.loads(output)
-    except ValueError:
-        error = None
-    if isinstance(error, dict) and error.get("mindie_manager_failure") is True:
-        hresult = error.get("hresult")
-        if type(hresult) is not int or not 0 <= hresult <= 0xffffffff:
-            hresult = None
-        raise ServiceHostError("manager_operation_failed", stage=stage, uncertain=True,
-                               manager_hresult=hresult)
-    return output
-
-
-
 def _private(root):
     # Reuse the dependency's already-tested TokenUser SID ACL creation.
     from mindie_diagnostics.fallback import _private_mkdir
@@ -83,20 +39,8 @@ def _private(root):
 def _verify_private(path):
     if path.is_symlink():
         raise ServiceHostError("unowned_directory", stage="ownership")
-    script = (
-        "$p=" + _quote(str(path)) + ";$a=Get-Acl -LiteralPath $p;"
-        "$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;"
-        "if($a.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $sid){exit 9};"
-        "foreach($r in $a.Access){$id=$r.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value;"
-        "if($r.AccessControlType -eq 'Allow' -and $id -notin @($sid,'S-1-5-18','S-1-5-32-544')){exit 9}};$sid"
-    )
-    try:
-        sid = _ps(script, stage="ownership")
-    except ServiceHostError:
-        raise ServiceHostError("private_directory_unavailable", stage="ownership") from None
-    if not re.fullmatch(r"S-1-[0-9-]+", sid):
-        raise ServiceHostError("identity_unavailable", stage="identity")
-    return sid
+    from .windows_manager import private_sid
+    return private_sid(path)
 
 
 def _paths(config):
@@ -104,22 +48,10 @@ def _paths(config):
 
 
 def _task(label):
-    value = _ps(
-        "$s=New-Object -ComObject 'Schedule.Service';$s.Connect();$f=$s.GetFolder('\\');"
-        "try{$t=$f.GetTask(" + _quote(label) + ")}catch{"
-        "$e=$_.Exception;while($e.InnerException){$e=$e.InnerException};"
-        "if(([int64]$e.HResult -band 4294967295) -eq 2147942402){'null';return};throw};"
-        "$u=$t.Definition.Principal.UserId;if($u -notmatch '^S-1-'){"
-        "$u=([Security.Principal.NTAccount]::new($u)).Translate([Security.Principal.SecurityIdentifier]).Value};"
-        "$states=@{1='Disabled';2='Queued';3='Ready';4='Running'};"
-        "@{xml=$t.Xml;sid=$u;state=$states[[int]$t.State];"
-        "run_level=[int]$t.Definition.Principal.RunLevel;"
-        "last_result=([int64]$t.LastTaskResult -band 4294967295);"
-        "last_run=$t.LastRunTime.ToUniversalTime().ToString('o')}|ConvertTo-Json -Compress",
-        stage="query",
-    )
+    from .windows_manager import task as read_task
+    value = read_task(label)
     try:
-        task = json.loads(value)
+        task = value
         if task is None:
             return None
         if not isinstance(task, dict) or task.get("state") not in {"Disabled", "Queued", "Ready", "Running"}:
@@ -372,9 +304,9 @@ def _register_new(root, record, loaded):
     _write(root / "task.xml", _xml(record, manifest))
     _write(root / "operation.json", dict(attempt=record["attempt"], phase="registering"))
     try:
-        _ps("Register-ScheduledTask -TaskName " + _quote(record["label"])
-            + " -TaskPath '\\' -Xml ([IO.File]::ReadAllText(" + _quote(str(root / "task.xml"))
-            + "))" + (" -Force" if loaded else "") + "|Out-Null", stage="register")
+        from .windows_manager import register
+        register(record["label"], (root / "task.xml").read_text(encoding="utf-8"),
+                 record["sid"], replace=loaded is not None)
     except ServiceHostError as exc:
         if not exc.uncertain:
             try:
@@ -411,7 +343,8 @@ def _send_start(root, record, task):
     _write(root / "launch.json", record)
     _write(root / "operation.json", dict(attempt=record["attempt"], phase="starting"))
     try:
-        _ps("Start-ScheduledTask -TaskName " + _quote(record["label"]), stage="start")
+        from .windows_manager import start
+        start(record["label"])
     except ServiceHostError as exc:
         if not exc.uncertain:
             try:
@@ -449,8 +382,8 @@ def remove_owned(config_path, config):
         task = _task(record["label"])
         _verify_task(task, record, manifest)
     if task is not None:
-        _ps("Unregister-ScheduledTask -TaskName " + _quote(record["label"])
-            + " -Confirm:$false", stage="remove")
+        from .windows_manager import remove
+        remove(record["label"])
         if _task(record["label"]) is not None:
             raise ServiceHostError("task_removal_unconfirmed", stage="remove", uncertain=True)
     (root / (record["attempt"] + ".context")).unlink(missing_ok=True)
