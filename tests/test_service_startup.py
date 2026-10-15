@@ -83,8 +83,12 @@ def test_prepare_rejects_invalid_probe_timeout_before_configuration(tmp_path, ti
 def test_service_start_waits_for_a_transient_lock_observer(tmp_path):
     from mindie_knowledge.loop.cli import connection_path, rpc
     from mindie_knowledge.loop.locks import StartLock
+    from mindie_knowledge.loop.store import Store
 
     config = _configuration(tmp_path / 'data')
+    # This test observes consumer-lock recovery; cold schema initialization has
+    # separate startup coverage and must not consume its observation window.
+    Store(config['root'], config['domain']).close()
     path = tmp_path / 'engine.json'
     path.write_text(json.dumps(config), encoding='utf-8')
     evidence = tmp_path / 'startup-stages'
