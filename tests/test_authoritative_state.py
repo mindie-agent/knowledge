@@ -259,18 +259,20 @@ def test_authority_read_distinguishes_valid_and_dangling_directory_links(tmp_pat
 
 def test_unavailable_ancestors_preserve_original_missing_error(tmp_path, monkeypatch):
     from pathlib import Path
+    from mindie_knowledge.filesystem import filesystem_path
     from mindie_knowledge.owned_state import open_database
     path = tmp_path / 'unavailable' / 'state.sqlite3'
+    native_path = filesystem_path(path)
     missing = FileNotFoundError('original database path unavailable')
     original_lstat, original_stat = Path.lstat, Path.stat
     def unavailable_path(candidate, *args, **kwargs):
-        if candidate == path:
+        if candidate == native_path:
             raise missing
-        if candidate in path.parents:
+        if candidate in native_path.parents:
             raise FileNotFoundError('ancestor root unavailable')
         return original_lstat(candidate, *args, **kwargs)
     def unavailable_ancestor(candidate, *args, **kwargs):
-        if candidate in path.parents:
+        if candidate in native_path.parents:
             raise FileNotFoundError('ancestor root unavailable')
         return original_stat(candidate, *args, **kwargs)
     monkeypatch.setattr(Path, 'lstat', unavailable_path)
