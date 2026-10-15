@@ -138,7 +138,8 @@ def failure(detail):
 def _bytes(path, limit=MAX_JSON):
     # Follow ordinary configuration symlinks, but never wait for a FIFO writer
     # or read a device. fstat checks the opened object, avoiding a stat/open race.
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    from ..filesystem import filesystem_path
+    fd = os.open(filesystem_path(path), os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise ValueError("diagnostic metadata must be a regular file")
@@ -167,11 +168,13 @@ def _ro(path):
 
 
 def _startup_path(config):
-    return Path(config["root"]) / config["domain"] / "latest-startup.json"
+    from ..filesystem import filesystem_path
+    return filesystem_path(config["root"]) / config["domain"] / "latest-startup.json"
 
 
 def _delivery_path(config):
-    return Path(config["root"]) / config["domain"] / "latest-delivery.json"
+    from ..filesystem import filesystem_path
+    return filesystem_path(config["root"]) / config["domain"] / "latest-delivery.json"
 
 
 def _fingerprint(config):
@@ -183,7 +186,7 @@ def _fingerprint(config):
 
 def record_startup_failure(config_path, config, stage, exc):
     """Owned serve child only. Persist a small safe failure, never provider stderr."""
-    if stage not in {"store", "admission", "transcript_adapter", "engine", "service"}:
+    if stage not in {"store", "admission", "transcript_adapter", "engine", "service", "service_host"}:
         raise ValueError("invalid startup stage")
     cause = "startup_failed"
     component = config.get("transcript_adapter") if stage == "transcript_adapter" else None
@@ -195,6 +198,18 @@ def record_startup_failure(config_path, config, stage, exc):
         cause = "missing_component" if component and not Path(component).is_file() else "import_failed"
     payload = dict(status="failed", stage=stage, error_class=error_class(exc), cause=cause,
                    config_fingerprint=_fingerprint(config))
+    if stage == "service_host":
+        from .windows_service import SAFE_CODES, SAFE_STAGES
+        code = getattr(exc, "code", None)
+        host_stage = getattr(exc, "stage", None)
+        payload["host"] = dict(
+            code=code if isinstance(code, str) and code in SAFE_CODES else "service_start_failed",
+            stage=host_stage if isinstance(host_stage, str) and host_stage in SAFE_STAGES else "service",
+            uncertain=getattr(exc, "uncertain", False) is True,
+        )
+        hresult = getattr(exc, "manager_hresult", None)
+        if type(hresult) is int and 0 <= hresult <= 0xffffffff:
+            payload["host"]["manager_hresult"] = hresult
     if component:
         payload["component_path"] = str(component)
     path = _startup_path(config)
@@ -261,7 +276,7 @@ def _startup(config_path, config):
         return dict(status="unavailable", error_class=error_class(exc))
     if raw.get("config_fingerprint") != _fingerprint(config):
         return dict(status="absent")
-    if not isinstance(raw.get("stage"), str) or raw["stage"] not in {"store", "admission", "transcript_adapter", "engine", "service"}:
+    if not isinstance(raw.get("stage"), str) or raw["stage"] not in {"store", "admission", "transcript_adapter", "engine", "service", "service_host"}:
         return dict(status="unavailable", error_class="ValueError")
     result = dict(status="failed", stage=raw["stage"],
                   error_class=raw.get("error_class") if isinstance(raw.get("error_class"), str) and raw["error_class"] in _SAFE_CLASSES else "UnknownError",
@@ -269,6 +284,16 @@ def _startup(config_path, config):
     # Derive the path from the current local config, not arbitrary record content.
     if raw["stage"] == "transcript_adapter" and config.get("transcript_adapter"):
         result["component_path"] = config["transcript_adapter"]
+    if raw["stage"] == "service_host":
+        from .windows_service import SAFE_CODES, SAFE_STAGES
+        host = raw.get("host")
+        if (not isinstance(host, dict) or not isinstance(host.get("code"), str)
+                or host["code"] not in SAFE_CODES or not isinstance(host.get("stage"), str)
+                or host["stage"] not in SAFE_STAGES or type(host.get("uncertain")) is not bool):
+            return dict(status="unavailable", error_class="ValueError")
+        result["host"] = {key: host[key] for key in ("code", "stage", "uncertain")}
+        if type(host.get("manager_hresult")) is int and 0 <= host["manager_hresult"] <= 0xffffffff:
+            result["host"]["manager_hresult"] = host["manager_hresult"]
     return result
 
 

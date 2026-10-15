@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 import uuid
 from pathlib import Path
 
 from mindie_knowledge.markdown import _atomic_write_text
+from ..filesystem import filesystem_path
 
 from .locks import StartInProgress, StartLock, lock_held
 
@@ -32,7 +34,7 @@ def config_fingerprint(config_path, config=None):
 
 
 def _marker(config_path):
-    return Path(config_path).with_name(Path(config_path).name + '.retired')
+    return filesystem_path(config_path).with_name(Path(config_path).name + '.retired')
 
 
 def inspect_retirement(config_path, config=None):
@@ -65,7 +67,7 @@ def _locks(config):
 
 
 def _consumer_state(config):
-    path = Path(config['root']) / config['domain'] / 'consumer.lock'
+    path = filesystem_path(config['root']) / config['domain'] / 'consumer.lock'
     try:
         path.stat()
     except FileNotFoundError:
@@ -95,9 +97,17 @@ def acquire_consumer(config_path, config):
         time.sleep(.01)
 
 
-def _completed_retirement(config, outcome, receipt):
+def _completed_retirement(config_path, config, outcome, receipt):
     """Discard obsolete discovery only after owner exit, under both locks."""
     from .cli import connection_path
+    if os.name == "nt":
+        try:
+            from .windows_service import remove_owned
+            remove_owned(config_path, config)
+        except (OSError, ValueError, RuntimeError) as exc:
+            return dict(outcome, retirement=receipt, cleanup_failed=True,
+                        cleanup_error=dict(stage='service_host', error_type=type(exc).__name__,
+                                           operation_completed=True))
     try:
         connection_path(config).unlink(missing_ok=True)
     except OSError as exc:
@@ -123,7 +133,7 @@ def retire_service(config_path):
                     raise RuntimeError('previous service retirement has an uncertain outcome; inspect it before recovery')
                 if _consumer_state(config):
                     raise RuntimeError('retired service still owns its consumer lock')
-                return _completed_retirement(config, dict(idle=True, service='absent'), previous)
+                return _completed_retirement(config_path, config, dict(idle=True, service='absent'), previous)
             receipt = dict(schema=SCHEMA, config_fingerprint=config_fingerprint(config_path, config),
                            operation_id=uuid.uuid4().hex, status='retiring')
             _atomic_write_text(_marker(config_path), json.dumps(receipt, sort_keys=True) + '\n')
@@ -165,7 +175,7 @@ def retire_service(config_path):
                 return dict(outcome, retirement=receipt, cleanup_failed=True,
                             cleanup_error=dict(stage='consumer_ownership', error_type=type(exc).__name__,
                                                errno=exc.errno, operation_completed=True))
-            return _completed_retirement(config, outcome, receipt)
+            return _completed_retirement(config_path, config, outcome, receipt)
         finally:
             admission.release()
     finally:

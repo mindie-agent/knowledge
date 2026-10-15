@@ -172,6 +172,12 @@ def test_live_pid_in_wake_json_does_not_coalesce(tmp_path, monkeypatch):
         "mindie_knowledge.loop.handoff.subprocess.Popen",
         lambda *args, **kwargs: spawned.append(args) or _Proc(),
     )
+    # Windows selects the shared Scheduler entry before native spawn. This
+    # test only establishes that diagnostic PIDs never suppress a wake.
+    monkeypatch.setattr(
+        "mindie_knowledge.loop.windows_service.request_start",
+        lambda *args, **kwargs: spawned.append(args) or _Proc(),
+    )
     wake = tmp_path / "root" / "test" / "wake.json"
     wake.write_text(json.dumps({"wake_pid": live.pid, "service_pid": live.pid}))
     try:

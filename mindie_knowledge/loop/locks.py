@@ -17,6 +17,7 @@ import errno
 import os
 import time
 from pathlib import Path
+from ..filesystem import filesystem_path
 
 
 class StartInProgress(RuntimeError):
@@ -55,7 +56,7 @@ def lock_held(path):
     second descriptor and trying the real lock also works after owner exit.
     """
     try:
-        fd = os.open(path, os.O_RDWR)
+        fd = os.open(filesystem_path(path), os.O_RDWR)
     except OSError:
         return None
     try:
@@ -71,7 +72,7 @@ def lock_held(path):
 
 class StartLock:
     def __init__(self, path):
-        self.path = Path(path)
+        self.path = filesystem_path(path)
         self.acquired = False
         self._fd = None
 

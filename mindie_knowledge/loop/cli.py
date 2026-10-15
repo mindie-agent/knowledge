@@ -18,7 +18,7 @@ path); legacy adapter-config indirection is removed, not aliased.
 from __future__ import annotations
 
 from ..state_layout import state_root
-from ..filesystem import sqlite_file_uri
+from ..filesystem import filesystem_path, sqlite_file_uri
 
 import argparse
 import importlib.util
@@ -45,6 +45,8 @@ def config_at(path):
 def validate_config(config):
     if not isinstance(config, dict) or not {"root", "domain"} <= set(config):
         raise ValueError("configuration requires root and domain")
+    from .service_context import validate as validate_launch_context
+    validate_launch_context(config)
     if "session_activation" in config:
         raise ValueError(
             "session_activation was removed; configure the neutral "
@@ -107,7 +109,7 @@ def load_transcript_adapter(config):
 
 
 def connection_path(config):
-    return Path(config["root"]) / config["domain"] / "connection.json"
+    return filesystem_path(config["root"]) / config["domain"] / "connection.json"
 
 
 def connect(config, *, config_path=None):
@@ -157,17 +159,68 @@ def ensure_service(config_path, *, _from_detached_starter=False):
             if state in {"unknown", "worker-dead"}:
                 raise RuntimeError("knowledge service is " + state + "; startup failed")
             if state == "absent" and process is None:
-                process = spawn_service(
-                    [sys.executable, "-m", "mindie_knowledge.loop.cli", "serve",
-                     "--config", str(Path(config_path).resolve())],
-                    from_detached_starter=_from_detached_starter,
-                )
+                if os.name == "nt":
+                    from .windows_service import request_start
+                    process = request_start(config_path, config)
+                else:
+                    process = spawn_service(
+                        [sys.executable, "-m", "mindie_knowledge.loop.cli", "serve",
+                         "--config", str(Path(config_path).resolve())],
+                        from_detached_starter=_from_detached_starter,
+                    )
             # This is scheduling cadence, never an operation deadline.
             time.sleep(.1)
+    except RuntimeError as exc:
+        from .windows_service import ServiceHostError
+        if isinstance(exc, ServiceHostError):
+            from .diagnostics import record_startup_failure
+            try:
+                record_startup_failure(config_path, config, "service_host", exc)
+            except (OSError, ValueError):
+                pass
+        raise
     finally:
-        if process is not None and not ready and process.poll() is None:
+        if (process is not None and not ready
+                and not getattr(process, "externally_owned", False) and process.poll() is None):
             # Only cancellation/known failure reaches cleanup of our own child.
             terminate_tree(process)
+        lock.release()
+
+
+def prepare_service(config_path):
+    """Request one owned service without waiting for the readiness handshake.
+
+    Adapters use this for their existing nonblocking preparation operation.
+    The returned ``starting`` is not a readiness or indexing receipt.
+    """
+    from .handoff import _probe
+    from .lifecycle import require_active
+    from .locks import StartInProgress, StartLock
+    config = config_at(config_path)
+    require_active(config_path, config)
+    lock = StartLock(connection_path(config).with_name("start.lock"))
+    try:
+        lock.acquire()
+    except StartInProgress:
+        return "starting"
+    try:
+        require_active(config_path, config)
+        state = _probe(config, None, config_path=config_path)
+        if state == "ready":
+            return "ready"
+        if state == "starting":
+            return "starting"
+        if state != "absent":
+            raise RuntimeError("knowledge service is " + state + "; not starting a second service")
+        if os.name == "nt":
+            from .windows_service import request_start
+            request_start(config_path, config)
+        else:
+            from .process import spawn_service
+            spawn_service([sys.executable, "-m", "mindie_knowledge.loop.cli", "wake",
+                           "--config", str(Path(config_path).resolve())])
+        return "starting"
+    finally:
         lock.release()
 
 
@@ -308,6 +361,11 @@ def _serve(config_path, config):
     ``consumer.lock`` is the store's lifetime ownership. ``start.lock`` stays
     the startup handshake and is not held across serve.
     """
+    from .service_context import validate as validate_launch_context
+    # Fixed installation paths apply on every platform. Optional credential
+    # values still come from the caller on POSIX and the one-use transfer on
+    # Windows; neither platform acquires another provider configuration.
+    os.environ.update(validate_launch_context(config)["paths"])
     from .activation import Admission
     from .diagnostics import record_startup_failure
     from .lifecycle import acquire_consumer, config_fingerprint
