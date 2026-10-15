@@ -1,6 +1,6 @@
 """Single-active-starter lock anchored on one persistent file.
 
-The lock itself is OS-managed (``fcntl.flock`` on POSIX, ``msvcrt.locking``
+The lock itself is OS-managed (``fcntl.flock`` on POSIX, ``LockFileEx``
 on Windows) and the OS releases it when the holder exits or crashes, so a
 live holder stays exclusive for *any* duration and there is no stale
 metadata to heuristically reclaim. The file is deliberately never unlinked:
@@ -24,29 +24,76 @@ class StartInProgress(RuntimeError):
     pass
 
 
-def _lock_file_nb(fd: int) -> None:
-    """Non-blocking exclusive lock on the open file; raises OSError when held."""
-    if os.name == "nt":
-        import msvcrt
+def lock_file(fd: int, *, exclusive: bool, blocking: bool = False) -> None:
+    """Lock an existing descriptor; its owner controls lifetime and lock path.
 
-        os.lseek(fd, 0, os.SEEK_SET)
-        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    Windows locks byte [0, 1), matching the existing bootstrap msvcrt lock.
+    POSIX locks the whole file. Only contention becomes BlockingIOError; other
+    OS failures remain errors, never a false busy result. No descriptor or
+    process registry is retained here.
+    """
+    if os.name == "nt":
+        import ctypes
+        import msvcrt
+        import pywintypes
+        import win32file
+
+        flags = (2 if exclusive else 0) | (0 if blocking else 1)
+        try:
+            win32file.LockFileEx(
+                msvcrt.get_osfhandle(fd), flags, 1, 0, pywintypes.OVERLAPPED()
+            )
+        except pywintypes.error as exc:
+            if exc.winerror == 33:  # ERROR_LOCK_VIOLATION
+                raise BlockingIOError(errno.EAGAIN, "file lock is held") from None
+            raise ctypes.WinError(exc.winerror) from None
     else:
         import fcntl
 
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            fcntl.flock(fd, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+                        | (0 if blocking else fcntl.LOCK_NB))
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EAGAIN):
+                raise BlockingIOError(errno.EAGAIN, "file lock is held") from None
+            raise
 
 
-def _unlock_file(fd: int) -> None:
+def try_lock_file(fd: int, *, exclusive: bool) -> bool:
+    """Try one acquisition without waiting; False means OS lock contention."""
+    try:
+        lock_file(fd, exclusive=exclusive)
+    except BlockingIOError:
+        return False
+    return True
+
+
+def unlock_file(fd: int) -> None:
+    """Release the descriptor's matching lock without closing its file."""
     if os.name == "nt":
+        import ctypes
         import msvcrt
+        import pywintypes
+        import win32file
 
-        os.lseek(fd, 0, os.SEEK_SET)
-        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        try:
+            win32file.UnlockFileEx(
+                msvcrt.get_osfhandle(fd), 1, 0, pywintypes.OVERLAPPED()
+            )
+        except pywintypes.error as exc:
+            raise ctypes.WinError(exc.winerror) from None
     else:
         import fcntl
 
         fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+def _lock_file_nb(fd: int) -> None:
+    lock_file(fd, exclusive=True)
+
+
+def _unlock_file(fd: int) -> None:
+    unlock_file(fd)
 
 
 def lock_held(path):
