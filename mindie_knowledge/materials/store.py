@@ -653,12 +653,15 @@ class MaterialStore:
     def install_package(self, package, source="feed", source_revision=""):
         return self.install_packages([package], source=source, source_revision=source_revision, replace=False)
 
-    def install_packages(self, packages, source="feed", source_revision="", *, replace=True, promote=True):
+    def install_packages(self, packages, source="feed", source_revision="", *,
+                         replace=True, promote=True, on_validated=None):
         """Stage each package, then switch only after the entire input validates.
 
         Retain identities rather than corpus bodies. An invalid later package
         leaves the current pointers unchanged; unselected candidate files are
-        cleaned by the existing snapshot recovery path.
+        cleaned by the existing snapshot recovery path. An owning metadata
+        transaction may inspect each validated package before any file write;
+        the callback never bypasses validation or publishes current pointers.
         """
         _source(source)
         seen = set()
@@ -676,6 +679,8 @@ class MaterialStore:
                     if package['task_id'] in seen:
                         raise ValueError('duplicate task in package snapshot')
                     seen.add(package['task_id'])
+                    if on_validated is not None:
+                        on_validated(package)
                     task_id = package["task_id"]
                     for path, text in package["files"].items():
                         target = self._manifest_path(task_id, package["revision"]) if path == "index.md" else self._task_root(task_id) / path
@@ -759,6 +764,7 @@ class MaterialStore:
                 # A stale/invalid caller cursor is not a broken derived index.
                 raise
             except Exception as exc:
+                self._index.clear_query_terms()
                 self._index_failure = type(exc).__name__
                 self._index_verified = None
                 raise

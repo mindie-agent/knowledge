@@ -317,7 +317,6 @@ class Feed:
         return staged
 
     def _packages(self, commit, entries):
-        from mindie_knowledge.materials import validate_package_files
         from mindie_knowledge.materials.file_source import FileContents
 
         grouped = {}
@@ -327,13 +326,9 @@ class Feed:
         staging = self._staging_dir(commit)
         for task_id, names in sorted(grouped.items()):
             files = FileContents.from_paths(staging / 'tasks' / task_id, names)
-            checked = validate_package_files(files, self.store.domain)
-            package = checked
-            if not package["ready"]:
-                raise ValueError("published task package has unfinished material indexes")
-            if package["task_id"] != task_id:
-                raise ValueError("task package identity differs from its directory")
-            yield package
+            # The installer validates the bytes once, including this listing
+            # identity, before accepting metadata or promoting any pointers.
+            yield dict(task_id=task_id, files=files)
 
     def _clear_staging(self):
         staging = self.dir / "staging"

@@ -14,6 +14,7 @@ from .activation import activation_epoch
 from .store import digest, session_key
 from ..materials.ingest import prepare_increment
 from ..materials.references import task_ref, feedback_ref
+from ..filesystem import path_identity, resolved_path
 
 
 class HistoryImportError(ValueError):
@@ -49,8 +50,8 @@ def import_transcript(engine, *, session_id, token, source, source_session,
             raise HistoryImportError('source or current task is outside the contribution scope')
 
     gate()
-    source = str(Path(source).resolve())
-    if identity is None or identity.path != source:
+    source = str(resolved_path(source))
+    if identity is None or path_identity(identity.path) != path_identity(source):
         raise HistoryImportError('source identity is unavailable')
     parser, store = engine.transcript, engine.store
     if parser is None:

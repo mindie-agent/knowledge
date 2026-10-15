@@ -65,14 +65,15 @@ def check_branch(value):
 
 
 def normalized_roots(value):
+    from ..filesystem import git_path, path_identity, resolved_path
     if not isinstance(value, list) or not all(
         isinstance(item, str) and Path(item).is_absolute() for item in value
     ):
         raise ValueError("'project_roots' must be absolute paths")
     roots = {}
     for item in value:
-        path = str(Path(item).expanduser().resolve(strict=False))
-        roots.setdefault(path.casefold() if os.name == 'nt' else path, path)
+        path = str(resolved_path(item))
+        roots.setdefault(path_identity(path), git_path(path))
     return list(roots.values())
 
 
@@ -306,14 +307,11 @@ class CommunitySettings:
         """
         if not self.project_roots or not candidate:
             return False
+        from ..filesystem import path_is_within
         try:
-            target = Path(candidate).expanduser().resolve(strict=False)
+            return any(path_is_within(candidate, root) for root in self.project_roots)
         except (OSError, ValueError):
             return False
-        for root in self.project_roots:
-            if target == root or root in target.parents:
-                return True
-        return False
 
     def as_dict(self):
         """Private settings handed to the community package per contract §4.
@@ -427,8 +425,8 @@ def transition(previous, requested):
     policy = ('enabled', 'repository', 'branch', 'visibility', 'account', 'fork')
     data['branch'] = data.get('branch') or 'main'
     def roots(value):
-        return {str(Path(item).resolve()).casefold() if os.name == 'nt'
-                else str(Path(item).resolve()) for item in value.get('project_roots', [])}
+        from ..filesystem import path_identity
+        return {path_identity(item) for item in value.get('project_roots', [])}
     try:
         prior = normalize(old)
     except (ValueError, TypeError):

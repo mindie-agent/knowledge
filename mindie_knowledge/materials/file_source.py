@@ -85,6 +85,9 @@ class FileContents(Mapping):
     def __len__(self):
         return len(self._files)
 
+    def __contains__(self, path):
+        return path in self._files
+
     def file(self, path):
         return self._files[path]
 

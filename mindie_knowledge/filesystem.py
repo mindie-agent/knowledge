@@ -16,7 +16,7 @@ def _windows_extended(path):
 
 
 def _windows_logical(path):
-    if path.startswith("\\\\?\\UNC\\"):
+    if path[:8].casefold() == "\\\\?\\unc\\":
         return "\\\\" + path[8:]
     if path.startswith("\\\\?\\"):
         return path[4:]
@@ -28,6 +28,33 @@ def filesystem_path(path):
     if os.name == "nt":
         return Path(_windows_extended(os.path.abspath(path)))
     return Path(path)
+
+
+def resolved_path(path, *, strict=False):
+    """Resolve filesystem aliases while retaining a Windows-safe I/O spelling."""
+    return filesystem_path(Path(path).expanduser()).resolve(strict=strict)
+
+
+def path_identity(path):
+    """Canonical path components for comparison, never a substitute I/O path."""
+    value = str(resolved_path(path))
+    return ntpath.normcase(_windows_logical(value)) if os.name == "nt" else value
+
+
+def path_is_within(path, root):
+    """Resolve junctions/symlinks before comparing components, not prefixes."""
+    return Path(path_identity(path)).is_relative_to(Path(path_identity(root)))
+
+
+def path_aliases(path):
+    """Bounded spellings used by earlier path-keyed cursor versions."""
+    resolved = str(resolved_path(path))
+    if os.name != "nt":
+        return (resolved,)
+    logical = _windows_logical(resolved)
+    return tuple(dict.fromkeys((ntpath.normcase(logical), logical,
+                                _windows_extended(logical),
+                                ntpath.normcase(_windows_extended(logical)))))
 
 
 def git_path(path):
