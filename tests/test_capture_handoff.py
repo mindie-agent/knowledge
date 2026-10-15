@@ -13,7 +13,7 @@ from mindie_knowledge.loop.engine import Engine
 from mindie_knowledge.loop.store import Store
 from mindie_knowledge.loop.transcript_redaction import install_scanner
 from material_worker_fixture import command as summary_command
-from lane_support import parser_path
+from lane_support import load_parser, parser_path
 
 
 @pytest.fixture(autouse=True)
@@ -209,22 +209,23 @@ def test_partial_tail_is_not_no_new_material(tmp_path):
     project = tmp_path / "proj"
     project.mkdir()
     config, admission = _ready(tmp_path, project)
-    accepted = capture_hook(config, _event(admission, transcript_path=str(project / "t.jsonl")))
+    transcript = project / "t.jsonl"
+    transcript.write_bytes(b'{"type":"response_item"')
+    accepted = capture_hook(config, _event(admission, transcript_path=str(transcript)))
     store = Store(tmp_path / "root", "test")
     try:
         engine = Engine(store, redactor_executable=install_scanner(), settings_path=str(tmp_path / "community.json"),
-                        admission=Admission(admission))
-
-        def read_material(*_a, **_k):
-            return dict(status="unchanged", start=0, end=0, partial=True, more=True, text="", digest="0" * 64)
-
+                        admission=Admission(admission), transcript_adapter=load_parser("codex"))
+        parser = engine.transcript
         engine.transcript = type("P", (), {
-            "identify": staticmethod(lambda _path: None),
-            "read_material": staticmethod(read_material),
+            "identify": staticmethod(parser.identify),
+            "read_material": staticmethod(lambda *_a, **_k: dict(
+                status="unchanged", start=0, end=0, partial=True, more=True,
+                text="", digest="0" * 64)),
         })()
         engine._process(accepted["capture_id"])
         row = store.capture_row(accepted["capture_id"])
-        assert row["status"] == "pending"
+        assert row["status"] == "pending", row
         assert "no-new-material" not in (row["detail"] or "")
         assert store.continuation_reason(accepted["capture_id"]).startswith("partial-tail:")
     finally:

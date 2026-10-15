@@ -13,6 +13,7 @@ import pytest
 from conftest import make_admission, write_settings
 from lane_support import PARSER_NAMES, SESSIONS, append_record, load_parser, parser_path, transcript_path, write_transcript
 from material_worker_fixture import command as summary_command
+from mindie_knowledge.filesystem import path_identity
 from mindie_knowledge.loop.activation import Admission
 from mindie_knowledge.loop.engine import Engine
 from mindie_knowledge.loop.store import Store
@@ -120,12 +121,12 @@ def test_incomplete_multibyte_tail_keeps_committed_prefix_then_resumes(world):
     box['path'].write_bytes(prefix + complete[:split + 1])
     capture(box, 'tail')
     assert 'EARLYCTRL' in body(box) and 'TAILUTF' not in body(box)
-    assert box['store'].cursor(str(box['path'].resolve()))['ok_finish'] == len(prefix)
+    assert box['store'].cursor(path_identity(box['path']))['ok_finish'] == len(prefix)
     reopen(box)
     box['path'].write_bytes(prefix + complete)
     capture(box, 'tail')
     assert body(box).count('EARLYCTRL') == body(box).count('TAILUTF') == 1
-    assert box['store'].cursor(str(box['path'].resolve()))['ok_finish'] == box['path'].stat().st_size
+    assert box['store'].cursor(path_identity(box['path']))['ok_finish'] == box['path'].stat().st_size
 
 
 def test_unreturned_worker_is_unknown_and_reopen_does_not_repeat(world):

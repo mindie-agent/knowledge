@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 import pytest
 
 from conftest import make_admission, write_settings
+from mindie_knowledge.filesystem import path_identity
 from mindie_knowledge.loop.activation import Admission
 from mindie_knowledge.loop.engine import Engine
 from mindie_knowledge.loop.store import Store, digest
@@ -83,7 +84,7 @@ def test_authorized_first_turn_survives_late_runtime_initialization(tmp_path, sc
         engine._process(received['id'])
         assert store.capture_row(received['id'])['status'] == 'organized'
         assert 'FIRST_AUTHORIZED_BODY full correction survives' in store.drafts_changed()[0]['content']
-        assert store.cursor(str(path.resolve()))['ok_finish'] == path.stat().st_size
+        assert store.cursor(path_identity(path))['ok_finish'] == path.stat().st_size
 
 
 def process(engine, path, turn, **kwargs):
@@ -188,7 +189,7 @@ def test_corrupt_page_fails_without_advancing_or_publishing(pipeline):
     row = store.capture_row(event['id'])
     assert row['status'] == 'failed' and 'incomplete transcript page' in row['detail']
     assert store.drafts_changed() == []
-    assert store.cursor(str(path.resolve())) is None
+    assert store.cursor(path_identity(path)) is None
 
 
 def test_restart_and_duplicate_stop_append_one_task_record(pipeline):
@@ -207,7 +208,7 @@ def test_restart_and_duplicate_stop_append_one_task_record(pipeline):
     assert docs[0]['content'].count('second-public-marker') == 1
     assert docs[0]['title'] == 'Task experience awaiting indexing'
     assert store.db.execute('SELECT count(*) FROM material_batches').fetchone()[0] == 2
-    assert store.cursor(str(path.resolve()))['ok_finish'] == path.stat().st_size
+    assert store.cursor(path_identity(path))['ok_finish'] == path.stat().st_size
 
 
 def test_body_failure_rolls_back_cursor_then_retry_succeeds(pipeline, monkeypatch):
@@ -220,7 +221,7 @@ def test_body_failure_rolls_back_cursor_then_retry_succeeds(pipeline, monkeypatc
     monkeypatch.setattr(store, 'commit_material_increment', fail_after_write)
     event = engine.capture(session_id='manual-A', turn_id='crash', transcript_path=str(path))
     engine._process(event['id'])
-    assert store.cursor(str(path.resolve())) is None
+    assert store.cursor(path_identity(path)) is None
     assert store.drafts_changed() == []
     monkeypatch.setattr(store, 'commit_material_increment', original)
     process(engine, path, 'retry')
@@ -371,7 +372,7 @@ def test_scanner_recovers_same_notification_without_new_stop(pipeline, monkeypat
                     2 if failure == 'exit' else 0, b'not-json', b'', False))
         engine._process(event['id'])
     assert store.drafts_changed() == []
-    assert store.cursor(str(path.resolve())) is None
+    assert store.cursor(path_identity(path)) is None
     assert 'AbCdEf1234567890' not in store.capture_row(event['id'])['detail']
     assert store.continuation_reason(event['id']).startswith('public-io:')
     engine.redactor_executable = scanner
@@ -379,7 +380,7 @@ def test_scanner_recovers_same_notification_without_new_stop(pipeline, monkeypat
     try:
         wait_until(lambda: bool(store.drafts_changed()))
         assert 'AbCdEf1234567890' not in store.drafts_changed()[0]['content']
-        assert store.cursor(str(path.resolve()))['ok_finish'] == path.stat().st_size
+        assert store.cursor(path_identity(path))['ok_finish'] == path.stat().st_size
         assert store.capture_row(event['id'])['status'] == 'organized'
     finally:
         engine.shutdown()
@@ -414,7 +415,7 @@ def test_scanner_shutdown_keeps_same_capture_pending_without_advancing_cursor(pi
     with monkeypatch.context() as patcher:
         patcher.setattr(transcript_capture, 'prepare_increment', cancelled)
         engine._process(event['id'])
-    assert store.cursor(str(path.resolve())) is None
+    assert store.cursor(path_identity(path)) is None
     assert store.drafts_changed() == []
     assert store.capture_row(event['id'])['status'] in {'pending', 'deferred'}
     assert store.continuation_reason(event['id']) == 'service stopped; local work retained'
@@ -480,7 +481,7 @@ def test_slow_summary_does_not_hold_new_body_and_stale_result_is_discarded(pipel
         engine.capture(session_id='manual-A', turn_id='second', transcript_path=str(path))
         wait_until(lambda: 'second-public-marker' in store.drafts_changed()[0]['content'], seconds=3)
         assert not release.exists()
-        assert store.cursor(str(path.resolve()))['ok_finish'] == path.stat().st_size
+        assert store.cursor(path_identity(path))['ok_finish'] == path.stat().st_size
         # Settle is long enough to inspect completion of the old version alone.
         engine.last_activity = time.monotonic() + 30
         release.touch()
@@ -543,7 +544,7 @@ def test_production_parsers_preserve_large_public_messages_through_export(tmp_pa
             pytest.fail(str(store.capture_row(event['id'])))
         finally:
             engine.shutdown()
-        assert store.cursor(str(path.resolve()))['ok_finish'] == path.stat().st_size
+        assert store.cursor(path_identity(path))['ok_finish'] == path.stat().st_size
         doc = store.drafts_changed()[0]
         assert doc['content'] == '### user\n' + text + '\n\n'
         assert package_body(store.materials.export_task(doc['entry_id'])) == doc['content']
@@ -568,7 +569,7 @@ def test_kimi_lineage_recovers_without_exporting_inherited_history(tmp_path, sca
         event = engine.capture(session_id=session, turn_id='lineage', transcript_path=str(path))
         engine._process(event['id'])
         assert store.drafts_changed() == []
-        assert store.cursor(str(path.resolve())) is None
+        assert store.cursor(path_identity(path)) is None
         assert store.continuation_reason(event['id']).startswith('public-io:')
         state.write_text(json.dumps(dict(forkedFrom='parent', createdAt=int((when + 1) * 1000))), encoding='utf-8')
         engine.start()
@@ -607,7 +608,7 @@ def test_corrupt_record_blocks_incomplete_page_without_losing_source(tmp_path, s
         discarded = json.loads(row['detail'])['records']
         assert len(discarded) == 1 and discarded[0]['reason'] == 'invalid record'
         assert discarded[0]['end'] - discarded[0]['start'] == len(bad)
-        assert store.cursor(str(path.resolve())) is None
+        assert store.cursor(path_identity(path)) is None
         assert store.drafts_changed() == []
         assert bad in path.read_bytes()
         assert b'before-bad-marker' in path.read_bytes() and b'after-bad-marker' in path.read_bytes()
@@ -710,7 +711,7 @@ def test_body_event_keeps_receipt_through_noise_eof_and_duplicate_handoff(paged_
     assert json.loads(row['detail']) == receipt
     assert box['store'].capture_material_receipt(event['id']) == receipt
     assert box['store'].drafts_changed()[0]['content'] == '### user\nevent-body-canary\n\n'
-    assert box['store'].cursor(str(box['path'].resolve()))['ok_finish'] == box['path'].stat().st_size
+    assert box['store'].cursor(path_identity(box['path']))['ok_finish'] == box['path'].stat().st_size
     assert box['engine'].status()['summary_usage']['model_calls'] == 0
     config = box['root'].parent / 'engine.json'
     config.write_text(json.dumps(dict(root=str(box['root']), domain='test',
@@ -812,5 +813,5 @@ def test_capture_receipt_failure_rolls_back_body_and_cursor(paged_capture, monke
     assert box['store'].capture_row(event['id'])['status'] == 'pending'
     assert box['store'].continuation_reason(event['id']).startswith('public-io:')
     assert box['store'].capture_material_receipt(event['id']) is None
-    assert box['store'].cursor(str(box['path'].resolve())) is None
+    assert box['store'].cursor(path_identity(box['path'])) is None
     assert box['store'].drafts_changed() == []
