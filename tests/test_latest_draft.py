@@ -52,7 +52,8 @@ def test_pending_send_owns_old_payload_after_draft_advances(tmp_path):
         sent = []
         engine = Engine(store, settings_path=path)
         engine.community = {"submit_batch": lambda batch, *a, **kw: (
-            sent.append(dict(batch, files=[dict(item) for item in batch['files']])) or {"status": "submitted", "head_sha": "a" * 40,
+            sent.append(dict(batch, files=[dict(item) for item in batch['files']])) or {"status": "submitted",
+                                   "batch_id": batch["batch_id"], "revision": batch["revision"], "head_sha": "a" * 40,
                                    "pr_url": "https://example.invalid/pull/1"})}
         engine._submit(pending)
         assert len(sent) == 1 and sent[0]["files"] == sent_files

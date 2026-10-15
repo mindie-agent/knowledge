@@ -329,7 +329,8 @@ def test_reconciled_remote_result_survives_local_receipt_failure(tmp_path, monke
         store.mark_batch(batch_id, 'unknown', attempted=True, detail='original push outcome unknown')
         original = store.batch(batch_id)
         engine = Engine(store, settings_path=settings.path)
-        receipt = dict(status='submitted', head_sha='a' * 40, pr_url='https://example.invalid/pull/1')
+        receipt = dict(status='submitted', batch_id=batch_id, revision=original['revision'],
+                       head_sha='a' * 40, pr_url='https://example.invalid/pull/1')
         engine.community['reconcile_batch'] = lambda *a, **kw: receipt
         error = OSError('synthetic local receipt failure')
         def fail_record(*a, **kw):
