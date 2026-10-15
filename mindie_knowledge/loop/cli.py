@@ -23,6 +23,7 @@ from ..filesystem import filesystem_path, sqlite_file_uri
 import argparse
 import importlib.util
 import json
+import math
 import os
 import subprocess
 import sys
@@ -190,16 +191,25 @@ def ensure_service(config_path, *, _from_detached_starter=False):
         lock.release()
 
 
-def prepare_service(config_path):
+def prepare_service(config_path, *, probe_timeout=None):
     """Request one owned service without waiting for the readiness handshake.
 
     Adapters use this for their existing nonblocking preparation operation.
     The returned ``starting`` is not a readiness or indexing receipt.
+    ``probe_timeout`` bounds only status RPC observation, not business work
+    or synchronous calls to the OS service manager.
     """
     from .handoff import _probe
     from .lifecycle import require_active
     from .locks import StartInProgress, StartLock
     from .service_host import platform_backend
+    if probe_timeout is not None and (
+        isinstance(probe_timeout, bool)
+        or not isinstance(probe_timeout, (int, float))
+        or not math.isfinite(probe_timeout)
+        or probe_timeout <= 0
+    ):
+        raise ValueError("probe_timeout must be a finite positive number")
     config = config_at(config_path)
     require_active(config_path, config)
     lock = StartLock(connection_path(config).with_name("start.lock"))
@@ -209,7 +219,7 @@ def prepare_service(config_path):
         return "starting"
     try:
         require_active(config_path, config)
-        state = _probe(config, None, config_path=config_path)
+        state = _probe(config, probe_timeout, config_path=config_path)
         if state == "ready":
             return "ready"
         if state == "starting":

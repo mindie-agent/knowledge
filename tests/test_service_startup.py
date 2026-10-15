@@ -1,6 +1,7 @@
 """Service startup with an actual configured transcript adapter module."""
 
 import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import shutil
 import socket
 import subprocess
@@ -17,6 +18,65 @@ def _configuration(root):
     return dict(root=str(root), domain="test", capture_mode="public-transcript",
                 transcript_adapter=transcript_double.__file__,
                 redactor_executable=str(root.parent / "gitleaks"))
+
+
+def test_prepare_observation_timeout_never_starts_a_second_owner(tmp_path, monkeypatch):
+    from mindie_knowledge.loop import cli, process, service_host
+    from mindie_knowledge.loop.lifecycle import config_fingerprint
+    from mindie_knowledge.loop.locks import StartLock, lock_held
+
+    release = threading.Event()
+    requested = threading.Event()
+
+    class SlowStatus(BaseHTTPRequestHandler):
+        def do_POST(self):
+            requested.set()
+            release.wait(5)
+            self.close_connection = True
+
+        def log_message(self, *_):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), SlowStatus)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    config = _configuration(tmp_path / "data")
+    path = tmp_path / "engine.json"
+    path.write_text(json.dumps(config))
+    connection = cli.connection_path(config)
+    connection.parent.mkdir(parents=True)
+    connection.write_text(json.dumps(dict(
+        domain="test", token="test", url=f"http://127.0.0.1:{server.server_port}",
+        config_fingerprint=config_fingerprint(path, config))))
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("a slow observed owner must not cause a new startup")
+
+    monkeypatch.setattr(process, "spawn_service", forbidden)
+    monkeypatch.setattr(service_host, "platform_backend", forbidden)
+    try:
+        with StartLock(connection.with_name("consumer.lock")):
+            started = time.monotonic()
+            with pytest.raises(RuntimeError, match="unknown"):
+                cli.prepare_service(path, probe_timeout=.1)
+            assert time.monotonic() - started < 2
+            assert requested.is_set()
+            assert lock_held(connection.with_name("consumer.lock"))
+            assert lock_held(connection.with_name("start.lock")) is False
+    finally:
+        release.set()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.mark.parametrize("timeout", [False, 0, -1, float("nan"), float("inf"), "30"])
+def test_prepare_rejects_invalid_probe_timeout_before_configuration(tmp_path, timeout):
+    from mindie_knowledge.loop.cli import prepare_service
+
+    with pytest.raises(ValueError, match="probe_timeout"):
+        prepare_service(tmp_path / "missing.json", probe_timeout=timeout)
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_service_start_waits_for_a_transient_lock_observer(tmp_path):
