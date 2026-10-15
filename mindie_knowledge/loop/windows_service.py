@@ -105,13 +105,6 @@ def _ps(script, *, stage):
     return output
 
 
-def _sid():
-    value = _ps("[Security.Principal.WindowsIdentity]::GetCurrent().User.Value", stage="identity")
-    if not re.fullmatch(r"S-1-[0-9-]+", value):
-        raise ServiceHostError("identity_unavailable", stage="identity")
-    return value
-
-
 def _read(path):
     try:
         try:
@@ -150,7 +143,7 @@ def _private(root):
     # Reuse the dependency's already-tested TokenUser SID ACL creation.
     from mindie_diagnostics.fallback import _private_mkdir
     _private_mkdir(root, parents=True, exist_ok=True)
-    _verify_private(root)
+    return _verify_private(root)
 
 
 def _verify_private(path):
@@ -161,12 +154,15 @@ def _verify_private(path):
         "$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;"
         "if($a.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $sid){exit 9};"
         "foreach($r in $a.Access){$id=$r.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value;"
-        "if($r.AccessControlType -eq 'Allow' -and $id -notin @($sid,'S-1-5-18','S-1-5-32-544')){exit 9}}"
+        "if($r.AccessControlType -eq 'Allow' -and $id -notin @($sid,'S-1-5-18','S-1-5-32-544')){exit 9}};$sid"
     )
     try:
-        _ps(script, stage="ownership")
+        sid = _ps(script, stage="ownership")
     except ServiceHostError:
         raise ServiceHostError("private_directory_unavailable", stage="ownership") from None
+    if not re.fullmatch(r"S-1-[0-9-]+", sid):
+        raise ServiceHostError("identity_unavailable", stage="identity")
+    return sid
 
 
 def _paths(config):
@@ -175,18 +171,44 @@ def _paths(config):
 
 def _task(label):
     value = _ps(
-        "$t=@(Get-ScheduledTask | Where-Object {$_.TaskPath -eq '\\' -and $_.TaskName -eq "
-        + _quote(label) + "});if($t.Count -eq 0){'null'}else{"
-        "$t=$t[0];$i=Get-ScheduledTaskInfo -InputObject $t;"
-        "$u=$t.Principal.UserId;if($u -notmatch '^S-1-'){"
+        "$s=New-Object -ComObject 'Schedule.Service';$s.Connect();$f=$s.GetFolder('\\');"
+        "try{$t=$f.GetTask(" + _quote(label) + ")}catch{"
+        "$e=$_.Exception;while($e.InnerException){$e=$e.InnerException};"
+        "if(([int64]$e.HResult -band 4294967295) -eq 2147942402){'null';return};throw};"
+        "$u=$t.Definition.Principal.UserId;if($u -notmatch '^S-1-'){"
         "$u=([Security.Principal.NTAccount]::new($u)).Translate([Security.Principal.SecurityIdentifier]).Value};"
-        "@{xml=(Export-ScheduledTask -InputObject $t);sid=$u;state=[string]$t.State;"
-        "last_result=$i.LastTaskResult;last_run=$i.LastRunTime.ToUniversalTime().ToString('o')}|ConvertTo-Json -Compress}",
+        "$states=@{1='Disabled';2='Queued';3='Ready';4='Running'};"
+        "@{xml=$t.Xml;sid=$u;state=$states[[int]$t.State];"
+        "run_level=[int]$t.Definition.Principal.RunLevel;"
+        "last_result=([int64]$t.LastTaskResult -band 4294967295);"
+        "last_run=$t.LastRunTime.ToUniversalTime().ToString('o')}|ConvertTo-Json -Compress",
         stage="query",
     )
     try:
-        return json.loads(value)
-    except ValueError:
+        task = json.loads(value)
+        if task is None:
+            return None
+        if not isinstance(task, dict) or task.get("state") not in {"Disabled", "Queued", "Ready", "Running"}:
+            raise ValueError()
+        run_level = task.pop("run_level")
+        if type(run_level) is not int or run_level not in {0, 1}:
+            raise ValueError()
+        root = ET.fromstring(task["xml"])
+        ns = "{" + NS + "}"
+        principals = root.findall(ns + "Principals/" + ns + "Principal")
+        if len(principals) != 1:
+            raise ValueError()
+        levels = principals[0].findall(ns + "RunLevel")
+        effective = {0: "LeastPrivilege", 1: "HighestAvailable"}[run_level]
+        if not levels:
+            # COM omits the default that CIM exports explicitly. Project the
+            # observed effective value; the ownership validator stays strict.
+            ET.SubElement(principals[0], ns + "RunLevel").text = effective
+            task["xml"] = ET.tostring(root, encoding="unicode")
+        elif len(levels) != 1 or levels[0].text != effective:
+            raise ValueError()
+        return task
+    except (ValueError, TypeError, KeyError, ET.ParseError):
         raise ServiceHostError("manager_status_invalid", stage="query") from None
 
 
@@ -342,9 +364,8 @@ def _request_start(config_path, config):
     require_active(config_path, config)
     service_context.validate(config)
     root = _paths(config)
-    _private(root)
+    sid = _private(root)
     manifest = root / "launch.json"
-    sid = _sid()
     existing = _read(manifest)
     if existing:
         _validate_record(existing, config_path, config, sid)
@@ -486,8 +507,8 @@ def remove_owned(config_path, config):
     record = _read(manifest)
     if record is None:
         return
-    _verify_private(root)
-    _validate_record(record, config_path, config, _sid())
+    sid = _verify_private(root)
+    _validate_record(record, config_path, config, sid)
     task = _task(record["label"])
     _verify_task(task, record, manifest)
     # The business consumer has exited. This is a finite manager-cleanup
@@ -539,7 +560,7 @@ def _run(manifest, attempt):
     if not record or record.get("attempt") != attempt:
         raise ServiceHostError("launch_attempt_mismatch", stage="ownership")
     result_path = _result_path(root, record)
-    _verify_private(root)
+    sid = _verify_private(root)
     # One scheduler action may claim a nonce once. A stale or duplicated start
     # cannot enter serve again, even after its first action has exited.
     fd = os.open(root / (attempt + ".claimed"), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -549,7 +570,7 @@ def _run(manifest, attempt):
         from .cli import config_at, _serve
         from .lifecycle import require_active
         config = config_at(record["config"])
-        _validate_record(record, record["config"], config, _sid())
+        _validate_record(record, record["config"], config, sid)
         require_active(record["config"], config)
         environment = service_context.consume(root / (attempt + ".context"), config, _binding(record))
         service_context.apply(config, environment)

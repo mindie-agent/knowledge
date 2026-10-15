@@ -111,9 +111,11 @@ def scheduler(tmp_path, monkeypatch):
     config_path.write_text(json.dumps(config))
     sid = "S-1-5-21-123"
     state = dict(task=None, calls=[], interrupt=None)
-    monkeypatch.setattr(host, "_private", lambda path: path.mkdir(parents=True, exist_ok=True))
-    monkeypatch.setattr(host, "_verify_private", lambda path: None)
-    monkeypatch.setattr(host, "_sid", lambda: sid)
+    def private(path):
+        path.mkdir(parents=True, exist_ok=True)
+        return sid
+    monkeypatch.setattr(host, "_private", private)
+    monkeypatch.setattr(host, "_verify_private", lambda path: sid)
     monkeypatch.setattr(context, "_crypt", lambda raw, entropy, **kw: raw)
     def record(path, cfg, root, owner):
         import uuid
@@ -471,3 +473,70 @@ def test_host_rejects_nonstatic_startup_details():
         stage="private-source", error_class="TypeError", cause="import_failed"))
     assert error._mindie_startup_failure is None
     assert "private-source" not in str(error)
+
+
+def test_acl_check_returns_the_owner_it_actually_verified(tmp_path, monkeypatch):
+    calls = []
+    def checked(script, *, stage):
+        calls.append(stage)
+        return "S-1-5-21-123"
+    monkeypatch.setattr(host, "_ps", checked)
+    assert host._verify_private(tmp_path) == "S-1-5-21-123"
+    assert calls == ["ownership"]
+    monkeypatch.setattr(host, "_ps", lambda *a, **kw: "not-a-sid")
+    with pytest.raises(host.ServiceHostError, match="identity_unavailable"):
+        host._verify_private(tmp_path)
+
+
+@pytest.fixture
+def task_projection(tmp_path):
+    record = dict(label="MindIE Knowledge " + "a" * 24, sid="S-1-5-21-123",
+                  python=str(tmp_path / "pythonw.exe"), args=["-I", "-m", "synthetic"])
+    manifest = tmp_path / "launch.json"
+    value = dict(xml=host._xml(record, manifest).decode(), sid=record["sid"],
+                 state="Ready", run_level=0, last_result=267011,
+                 last_run="1999-11-29T16:00:00.0000000Z")
+    return record, manifest, value
+
+
+def test_com_query_projects_effective_default_without_weakening_ownership(task_projection, monkeypatch):
+    record, manifest, value = task_projection
+    tree = ET.fromstring(value["xml"])
+    principal = tree.find("{" + host.NS + "}Principals/{" + host.NS + "}Principal")
+    principal.remove(principal.find("{" + host.NS + "}RunLevel"))
+    value["xml"] = ET.tostring(tree, encoding="unicode")
+    monkeypatch.setattr(host, "_ps", lambda *a, **kw: json.dumps(value))
+    projected = host._task(record["label"])
+    host._verify_task(projected, record, manifest)
+    assert projected["last_run"] == value["last_run"]
+    assert projected["last_result"] == 267011
+    value["run_level"] = 1
+    with pytest.raises(host.ServiceHostError, match="foreign_task"):
+        host._verify_task(host._task(record["label"]), record, manifest)
+
+
+@pytest.mark.parametrize("changes", [
+    {"state": None}, {"state": "Unknown"}, {"state": "unsupported"},
+    {"run_level": None}, {"run_level": True}, {"run_level": 2},
+    {"run_level": 1},
+])
+def test_com_query_rejects_unknown_state_and_inconsistent_explicit_privilege(
+        task_projection, monkeypatch, changes):
+    record, _, value = task_projection
+    value.update(changes)
+    monkeypatch.setattr(host, "_ps", lambda *a, **kw: json.dumps(value))
+    with pytest.raises(host.ServiceHostError, match="manager_status_invalid"):
+        host._task(record["label"])
+
+
+def test_com_query_does_not_turn_manager_failure_into_task_absence(monkeypatch):
+    failure = host.ServiceHostError("manager_operation_failed", stage="query",
+                                   uncertain=True, manager_hresult=0x80070005)
+    def denied(*args, **kwargs):
+        raise failure
+    monkeypatch.setattr(host, "_ps", denied)
+    with pytest.raises(host.ServiceHostError) as caught:
+        host._task("synthetic")
+    assert caught.value is failure
+    monkeypatch.setattr(host, "_ps", lambda *a, **kw: "null")
+    assert host._task("synthetic") is None

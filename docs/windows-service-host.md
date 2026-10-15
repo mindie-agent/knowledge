@@ -83,6 +83,28 @@ Safe caller receipts and startup diagnostics retain static host stage/code
 and uncertainty. They do not include raw provider messages, environment
 values, transcript content or private paths.
 
+Task queries use the Scheduler COM interface to look up the exact task name.
+They do not enumerate all registered tasks. Only `ERROR_FILE_NOT_FOUND` from
+that lookup means absence; other manager errors remain failures. The owner SID
+returned by the directory ACL check is reused within the same operation.
+Registration, Start, deletion, their separate durable intents and readbacks
+remain unchanged.
+
+COM omits a default RunLevel that CIM exports explicitly. The query projection
+fills a missing XML node only from the observed effective COM RunLevel enum.
+An explicit XML/COM disagreement or unknown task state is a visible error.
+The existing strict XML ownership validator remains unchanged. Same-task
+Windows comparisons verify identical SID, state, LastRunTime and LastTaskResult
+before first execution, while running and after exit, including the never-run
+timestamp. A representation change must not become evidence to replay Start.
+
+A same-script, new-profile Windows Stop comparison reduced foreground time
+from 6.97 to 3.12 seconds; the two queries fell from 5.16 to 1.57 seconds.
+This is one controlled regression comparison, not a cross-machine latency
+guarantee. The first exact query still took 1.16 seconds, so a fixed three-second
+test guard cannot substitute for observing the required foreground result.
+No product execution deadline was changed.
+
 ## Windowless standard streams and startup errors
 
 Unlike a detached console process with redirected handles, `pythonw` may set
@@ -160,3 +182,13 @@ skill, knowledge authority or activation behavior (5, 6, 7). It reuses the
 existing detached null-output semantics and unchanged POSIX evidence without
 model calls (8). Original startup errors remain visible and allowlisted across
 the Scheduler boundary, while business exceptions still propagate (9).
+
+The task-query follow-up was reviewed against the same nine principles.
+A real synthetic Stop spent 5.16 of its 6.97 seconds in two task queries (1).
+The change replaces only the bounded lookup and reuses the already verified
+owner identity; it adds no manager process or ownership authority (2, 4).
+There are no new user parameters, skills, knowledge rules or activation
+requirements (3, 5, 6, 7). Existing write paths, transaction journals and prior
+native evidence are reused (8). Exact absence, effective privilege, unknown
+state, timestamp compatibility and uncertain Start outcomes remain explicit;
+the strict ownership validator and no-replay fault tests stay in place (9).
