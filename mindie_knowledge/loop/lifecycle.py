@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import time
 import uuid
@@ -24,6 +25,37 @@ SCHEMA = 'mindie-service-retirement/1'
 
 class ServiceRetired(RuntimeError):
     pass
+
+
+class RetirementTimeout(TimeoutError):
+    """A control observation expired; no business process was terminated."""
+
+    def __init__(self, stage):
+        self.stage = stage
+        super().__init__("service retirement observation timed out: " + stage)
+
+
+def _remaining(deadline, stage):
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RetirementTimeout(stage)
+    return remaining
+
+
+def _acquire(lock, deadline, stage):
+    try:
+        lock.acquire(wait=_remaining(deadline, stage))
+    except StartInProgress:
+        if deadline is None:
+            raise
+        raise RetirementTimeout(stage) from None
+
+
+def _pause(deadline, stage):
+    remaining = _remaining(deadline, stage)
+    time.sleep(.05 if remaining is None else min(.05, remaining))
 
 
 def config_fingerprint(config_path, config=None):
@@ -119,48 +151,71 @@ def _completed_retirement(config_path, config, outcome, receipt):
     return dict(outcome, retirement=receipt)
 
 
-def retire_service(config_path):
+def retire_service(config_path, *, control_timeout=None):
+    """Retire an idle owner, optionally bounding control waits.
+
+    A missing stop acknowledgement stays uncertain until exact owner observation.
+    A ready owner can safely receive the idempotent stop-if-idle control again;
+    stopping owners are only observed. No business operation is replayed or killed.
+    """
     from .cli import config_at, connect
     from .handoff import _probe
     from .transport import rpc
+    if control_timeout is not None and (
+        isinstance(control_timeout, bool)
+        or not isinstance(control_timeout, (int, float))
+        or not math.isfinite(control_timeout)
+        or control_timeout < 0
+    ):
+        raise ValueError("control_timeout must be a finite nonnegative number")
+    deadline = None if control_timeout is None else time.monotonic() + control_timeout
     config = config_at(config_path)
     start, admission = _locks(config)
-    start.acquire(wait=None)
+    _acquire(start, deadline, "startup_lock")
     try:
-        admission.acquire(wait=None)
+        _acquire(admission, deadline, "admission_lock")
         try:
             previous = inspect_retirement(config_path, config)
-            if previous is not None:
-                if previous['status'] != 'retired':
-                    raise RuntimeError('previous service retirement has an uncertain outcome; inspect it before recovery')
+            if previous is not None and previous['status'] == 'retired':
                 if _consumer_state(config):
                     raise RuntimeError('retired service still owns its consumer lock')
                 return _completed_retirement(config_path, config, dict(idle=True, service='absent'), previous)
-            receipt = dict(schema=SCHEMA, config_fingerprint=config_fingerprint(config_path, config),
-                           operation_id=uuid.uuid4().hex, status='retiring')
-            _atomic_write_text(_marker(config_path), json.dumps(receipt, sort_keys=True) + '\n')
-            # A direct serve may already own the consumer but still be loading.
-            # Wait for its actual readiness or lifetime-lock release.
+            # Startup locks already bar another owner. Do not mark a healthy
+            # service retired while merely observing initialization.
             while True:
-                state = _probe(config, None, config_path=config_path)
-                if state != 'starting':
+                state = _probe(config, _remaining(deadline, "readiness"), config_path=config_path)
+                _remaining(deadline, "readiness")
+                if state not in {'starting', 'stopping'}:
                     break
-                time.sleep(.05)
+                _pause(deadline, "readiness")
+            if state not in {'absent', 'ready'}:
+                raise RuntimeError('service retirement cannot establish service state: ' + state)
+            connection = connect(config, config_path=config_path) if state == 'ready' else None
+            _remaining(deadline, "stop_acknowledgement")
+            receipt = dict(previous) if previous is not None else dict(
+                schema=SCHEMA, config_fingerprint=config_fingerprint(config_path, config),
+                operation_id=uuid.uuid4().hex, status='retiring')
+            if previous is None:
+                _atomic_write_text(_marker(config_path), json.dumps(receipt, sort_keys=True) + '\n')
             if state == 'absent':
                 outcome = dict(idle=True, service='absent')
-            elif state == 'ready':
-                result = rpc(connect(config, config_path=config_path), 'stop_if_idle')
+            else:
+                try:
+                    remaining = _remaining(deadline, "stop_acknowledgement")
+                except RetirementTimeout:
+                    # Undo a new marker only: an earlier attempt is still unknown.
+                    if previous is None and inspect_retirement(config_path, config) == receipt:
+                        _marker(config_path).unlink()
+                    raise
+                result = rpc(connection, 'stop_if_idle', timeout=remaining)
                 if not isinstance(result, dict) or not isinstance(result.get('idle'), bool):
                     raise ValueError('service retirement response is invalid')
                 if not result['idle']:
-                    # Only undo this operation's newly-created, exact receipt.
                     if inspect_retirement(config_path, config) != receipt:
                         raise RuntimeError('service retirement ownership changed')
                     _marker(config_path).unlink()
                     return dict(result, service='busy', retirement=dict(receipt, status='busy'))
                 outcome = dict(result, service='stopped')
-            else:
-                raise RuntimeError('service retirement cannot establish service state: ' + state)
             # A stop acknowledgement is a known effect. Preserve it before
             # cleanup, even if filesystem/connection cleanup later fails.
             receipt['status'] = 'retired'
@@ -172,7 +227,7 @@ def retire_service(config_path):
                                                errno=exc.errno, operation_completed=True))
             try:
                 while _consumer_state(config):
-                    time.sleep(.05)
+                    _pause(deadline, "consumer_ownership")
             except OSError as exc:
                 return dict(outcome, retirement=receipt, cleanup_failed=True,
                             cleanup_error=dict(stage='consumer_ownership', error_type=type(exc).__name__,

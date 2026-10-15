@@ -158,7 +158,7 @@ def test_busy_service_rolls_back_only_this_retirement(tmp_path):
             thread.join(timeout=5)
 
 
-def test_lost_stop_reply_is_not_repeated_or_restored(tmp_path, monkeypatch):
+def test_lost_stop_reply_reconciles_owner_exit_without_repeating_rpc(tmp_path, monkeypatch):
     path, config = configuration(tmp_path)
     cli.ensure_service(path)
     real, calls = transport.rpc, []
@@ -172,11 +172,126 @@ def test_lost_stop_reply_is_not_repeated_or_restored(tmp_path, monkeypatch):
     with pytest.raises(ConnectionResetError):
         lifecycle.retire_service(path)
     assert lifecycle.inspect_retirement(path)['status'] == 'retiring'
-    with pytest.raises(RuntimeError, match='uncertain outcome'):
-        lifecycle.retire_service(path)
     with pytest.raises(ValueError, match='exact completed'):
         lifecycle.restore_service(path)
+    consumer = cli.connection_path(config).with_name('consumer.lock')
+    deadline = time.monotonic() + 5
+    while lock_held(consumer) is not False and time.monotonic() < deadline:
+        time.sleep(.01)
+    assert lock_held(consumer) is False
+    recovered = lifecycle.retire_service(path, control_timeout=2)
+    assert recovered['retirement']['status'] == 'retired'
+    assert recovered['service'] == 'absent'
+    assert not cli.connection_path(config).exists()
     assert calls == ['stop_if_idle']
+
+
+def test_uncertain_stop_rechecks_exact_owner_before_idempotent_control(tmp_path, monkeypatch):
+    path, config = configuration(tmp_path)
+    connection = cli.ensure_service(path)
+    real, calls = transport.rpc, []
+
+    def lose_request(connection, method, *args, **kwargs):
+        if method == 'stop_if_idle':
+            calls.append(method)
+            if len(calls) == 1:
+                raise ConnectionResetError('request delivery is unknown')
+        return real(connection, method, *args, **kwargs)
+
+    monkeypatch.setattr(transport, 'rpc', lose_request)
+    try:
+        with pytest.raises(ConnectionResetError):
+            lifecycle.retire_service(path, control_timeout=2)
+        with pytest.raises(ValueError, match='exact completed'):
+            lifecycle.restore_service(path)
+        assert real(connection, 'status')['worker_alive']
+        original = lifecycle.inspect_retirement(path)
+        result = lifecycle.retire_service(path, control_timeout=2)
+        assert result['idle'] and result['retirement']['status'] == 'retired'
+        assert result['retirement']['operation_id'] == original['operation_id']
+        assert calls == ['stop_if_idle', 'stop_if_idle']
+    finally:
+        if lock_held(cli.connection_path(config).with_name('consumer.lock')):
+            real(connection, 'stop')
+        deadline = time.monotonic() + 5
+        while lock_held(cli.connection_path(config).with_name('consumer.lock')) is not False and time.monotonic() < deadline:
+            time.sleep(.01)
+        lifecycle.retire_service(path, control_timeout=2)
+
+
+def test_uncertain_retirement_never_sends_control_to_foreign_owner(tmp_path, monkeypatch):
+    path, config = configuration(tmp_path)
+    lifecycle.retire_service(path)
+    marker = lifecycle._marker(path)
+    previous = json.loads(marker.read_text())
+    previous['status'] = 'retiring'
+    marker.write_text(json.dumps(previous))
+    other = tmp_path / 'other-engine.json'
+    other.write_text(json.dumps(config))
+    connection = cli.ensure_service(other)
+    real, calls = transport.rpc, []
+
+    def count_control(connection, method, *args, **kwargs):
+        calls.append(method)
+        return real(connection, method, *args, **kwargs)
+
+    monkeypatch.setattr(transport, 'rpc', count_control)
+    try:
+        with pytest.raises(RuntimeError, match='state: unknown'):
+            lifecycle.retire_service(path, control_timeout=2)
+        assert calls == []
+        assert json.loads(marker.read_text()) == previous
+        assert real(connection, 'status')['worker_alive']
+    finally:
+        lifecycle.retire_service(other)
+
+
+def test_control_timeout_does_not_mark_or_interrupt_initializing_owner(tmp_path):
+    path, config = configuration(tmp_path)
+    with StartLock(cli.connection_path(config).with_name('consumer.lock')):
+        started = time.monotonic()
+        with pytest.raises(lifecycle.RetirementTimeout) as failure:
+            lifecycle.retire_service(path, control_timeout=.1)
+        assert failure.value.stage == 'readiness'
+        assert time.monotonic() - started < 2
+        assert lifecycle.inspect_retirement(path) is None
+        assert lock_held(cli.connection_path(config).with_name('consumer.lock'))
+
+
+def test_control_timeout_leaves_contended_start_lock_and_config_untouched(tmp_path):
+    path, config = configuration(tmp_path)
+    before = path.read_bytes()
+    with StartLock(cli.connection_path(config).with_name('start.lock')):
+        with pytest.raises(lifecycle.RetirementTimeout) as failure:
+            lifecycle.retire_service(path, control_timeout=.1)
+        assert failure.value.stage == 'startup_lock'
+        assert path.read_bytes() == before
+        assert lifecycle.inspect_retirement(path) is None
+
+
+def test_known_stop_timeout_preserves_receipt_without_terminating_owner(tmp_path, monkeypatch):
+    path, config = configuration(tmp_path)
+    cli.ensure_service(path)
+    with monkeypatch.context() as patch:
+        patch.setattr(lifecycle, '_consumer_state', lambda _config: True)
+        result = lifecycle.retire_service(path, control_timeout=.1)
+    assert result['idle'] and result['retirement']['status'] == 'retired'
+    assert result['cleanup_failed']
+    assert result['cleanup_error']['stage'] == 'consumer_ownership'
+    assert result['cleanup_error']['error_type'] == 'RetirementTimeout'
+    assert result['cleanup_error']['operation_completed'] is True
+    deadline = time.monotonic() + 5
+    while lock_held(cli.connection_path(config).with_name('consumer.lock')) is not False and time.monotonic() < deadline:
+        time.sleep(.01)
+    assert lifecycle.retire_service(path, control_timeout=2)['retirement'] == result['retirement']
+
+
+@pytest.mark.parametrize('timeout', [True, -1, float('inf'), float('nan'), '30'])
+def test_invalid_control_timeout_has_no_retirement_effect(tmp_path, timeout):
+    path, _ = configuration(tmp_path)
+    with pytest.raises(ValueError, match='control_timeout'):
+        lifecycle.retire_service(path, control_timeout=timeout)
+    assert lifecycle.inspect_retirement(path) is None
 
 
 def test_known_stop_survives_retirement_receipt_cleanup_failure(tmp_path, monkeypatch):
