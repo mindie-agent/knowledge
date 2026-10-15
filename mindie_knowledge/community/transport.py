@@ -418,7 +418,11 @@ class FileTransport(Transport):
             max_output=64 * 1024,
             cancel=deadline.cancel,
         )
-        if result.code != 0 or not result.out_text.strip():
+        if result.timed_out:
+            raise TransientError("dev remote tip read timed out")
+        if result.code != 0:
+            raise CommunityError(f"cannot read dev remote tip: {result.err_text.strip()[:200]}")
+        if not result.out_text.strip():
             return None
         return result.out_text.split()[0]
 
