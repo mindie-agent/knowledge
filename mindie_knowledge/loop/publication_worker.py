@@ -9,6 +9,11 @@ from .store import Store
 def record_publication_receipt(store, batch_row, receipt, *, attempted=False):
     """Keep the publisher's exact result if recording it fails locally."""
     try:
+        confirmed = receipt.get("status") in Store.CONFIRMED_BATCH
+        for key in ("batch_id", "revision"):
+            actual = receipt.get(key)
+            if (confirmed or actual is not None) and actual != batch_row[key]:
+                raise ValueError("publication receipt does not identify the current " + key)
         store.mark_batch(
             batch_row["batch_id"], receipt.get("status", "unknown"),
             attempted=attempted, detail=receipt.get("detail", ""),

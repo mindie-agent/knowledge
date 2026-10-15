@@ -315,7 +315,11 @@ def contribution_recovery(config, operation, batch_id):
                 raise ValueError(
                     "batch is not confirmed; unresolved/failed unsent work stays available"
                 )
-            return {"batch_id": batch_id, "compacted": removed}
+            receipt = {"batch_id": batch_id, "compacted": removed}
+            if removed.get("cleanup_status") == "failed":
+                receipt.update(cleanup_failed=True,
+                               cleanup_error=removed.get("cleanup_error", "unknown"))
+            return receipt
         from mindie_knowledge.community import inspect_batch, submit_batch
 
         if operation == "contribution-reconcile":

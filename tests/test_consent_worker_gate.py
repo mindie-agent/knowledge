@@ -351,7 +351,9 @@ def _submit(tmp_path, consent):
 
     def submit_batch(*args, **kwargs):
         called.append((args, kwargs))
-        return {"status": "submitted", "detail": "recorder", "head_sha": "a"*40, "pr_url":"https://github.com/example/repo/pull/1"}
+        return {"status": "submitted", "batch_id": args[0]["batch_id"],
+                "revision": args[0]["revision"], "detail": "recorder",
+                "head_sha": "a"*40, "pr_url":"https://github.com/example/repo/pull/1"}
 
     world["engine"].community = {
         "submit_batch": submit_batch,

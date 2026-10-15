@@ -6,6 +6,8 @@ import subprocess
 import pytest
 
 from mindie_knowledge import community
+from mindie_knowledge.community.ledger import Ledger
+from mindie_knowledge.community import publish
 from mindie_knowledge.loop import cli, settings as settings_mod
 from mindie_knowledge.loop.export import build_batch
 from mindie_knowledge.loop.store import Store
@@ -158,3 +160,127 @@ def test_retry_preserves_publisher_retry_floor(failed_batch, monkeypatch, capsys
     monkeypatch.setattr(cli, "config_at", lambda path: config)
     assert cli.main(["contribution-retry", "--config", "unused.json", "--batch", batch_id]) == 2
     assert json.loads(capsys.readouterr().out)["status"] == "failed"
+
+
+def test_compact_cleanup_failure_is_nonzero(failed_batch, monkeypatch, capsys):
+    config, batch_id, _, _, _ = failed_batch
+    cli.contribution_recovery(config, "contribution-retry", batch_id)
+    monkeypatch.setattr(cli, "config_at", lambda path: config)
+    monkeypatch.setattr(Store, "compact_confirmed",
+                        lambda *a: dict(staging=0, cleanup_status="failed",
+                                       cleanup_error="synthetic"))
+    assert cli.main(["contribution-compact", "--config", "unused", "--batch", batch_id]) == 2
+    receipt = json.loads(capsys.readouterr().out)
+    assert receipt["cleanup_failed"] and receipt["compacted"]["cleanup_status"] == "failed"
+
+
+@pytest.mark.parametrize("failure", ["close", "record"])
+def test_read_only_inspection_retains_exact_remote_result(
+        failed_batch, monkeypatch, capsys, failure):
+    config, batch_id, _, _, _ = failed_batch
+    sent = cli.contribution_recovery(config, "contribution-retry", batch_id)
+    if failure == "record":
+        inspected = cli.contribution_recovery(config, "contribution-inspect", batch_id)
+        row = inspected["ledger"][0]
+        with closing(Store(config["root"], config["domain"])) as store:
+            with closing(Ledger(store.root / "outbox")) as ledger:
+                ledger.finish_publication(
+                    batch_id, row["revision"], status="unknown",
+                    head_sha=sent["head_sha"], pr_url=sent["pr_url"])
+    original_close = Ledger.close
+
+    def broken_close(ledger):
+        original_close(ledger)
+        raise OSError("synthetic ledger close failure")
+
+    def broken_record(*args, **kwargs):
+        raise OSError("synthetic ledger receipt failure")
+
+    monkeypatch.setattr(cli, "config_at", lambda path: config)
+    monkeypatch.setattr(community, "submit_batch",
+                        lambda *a, **kw: pytest.fail("read-only inspection replayed a write"))
+    with monkeypatch.context() as patch:
+        patch.setattr(Ledger, "close" if failure == "close" else "finish_publication",
+                      broken_close if failure == "close" else broken_record)
+        code = cli.main(["contribution-reconcile", "--config", "unused", "--batch", batch_id])
+    assert code == 2
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "submitted"
+    assert result["head_sha"] == sent["head_sha"] and result["pr_url"] == sent["pr_url"]
+    assert result["cleanup_failed" if failure == "close" else "recording_failed"]
+
+
+def test_inspection_read_failure_survives_secondary_close_failure(
+        failed_batch, monkeypatch):
+    config, batch_id, _, _, _ = failed_batch
+    original_close = Ledger.close
+    primary = ValueError("synthetic ledger read failure")
+
+    def broken_read(*args, **kwargs):
+        raise primary
+
+    def broken_close(ledger):
+        original_close(ledger)
+        raise OSError("synthetic secondary close failure")
+
+    monkeypatch.setattr(Ledger, "all_for_batch", broken_read)
+    monkeypatch.setattr(Ledger, "close", broken_close)
+    with pytest.raises(ValueError) as caught:
+        cli.contribution_recovery(config, "contribution-reconcile", batch_id)
+    assert caught.value is primary
+    assert "OSError" in " ".join(primary.__notes__)
+
+
+@pytest.mark.parametrize("operation", [publish.inspect_batch, publish.reconcile_batch])
+def test_later_revision_cannot_hide_an_earlier_receipt_failure(
+        failed_batch, settings, monkeypatch, operation):
+    config, batch_id, _, _, _ = failed_batch
+    sent = cli.contribution_recovery(config, "contribution-retry", batch_id)
+    inspected = cli.contribution_recovery(config, "contribution-inspect", batch_id)
+    original = inspected["ledger"][0]
+    with closing(Store(config["root"], config["domain"])) as store:
+        outbox = store.root / "outbox"
+        with closing(Ledger(outbox)) as ledger:
+            ledger.finish_publication(
+                batch_id, original["revision"], status="unknown",
+                head_sha=sent["head_sha"], pr_url=sent["pr_url"])
+            ledger.record_intent(
+                batch_id=batch_id, revision="f" * 64, domain=config["domain"],
+                repository=settings["repository"], branch=original["branch"])
+            assert len(ledger.all_for_batch(batch_id)) == 2
+    finishes = []
+
+    def broken_finish(batch, revision, **kwargs):
+        finishes.append(revision)
+        if revision == original["revision"]:
+            raise OSError("synthetic first revision receipt failure")
+        pytest.fail("later revision hid an earlier recording failure")
+
+    monkeypatch.setattr(Ledger, "finish_publication",
+                        lambda self, *a, **kw: broken_finish(*a, **kw))
+    result = operation(batch_id, settings, outbox)
+    assert result["status"] == "submitted" and result["recording_failed"]
+    assert result["head_sha"] == sent["head_sha"]
+    assert finishes == [original["revision"]]
+
+
+@pytest.mark.parametrize("identity", ["batch_id", "revision", "missing"])
+def test_foreign_or_unidentified_receipt_cannot_confirm_current_batch(
+        failed_batch, monkeypatch, capsys, identity):
+    config, batch_id, _, _, staged = failed_batch
+    before = cli.contribution_recovery(config, "contribution-inspect", batch_id)
+    known = dict(status="submitted", batch_id=batch_id,
+                 revision=before["outbox"]["revision"],
+                 head_sha="a" * 40, pr_url="https://example.invalid/pull/1")
+    if identity == "missing":
+        del known["revision"]
+    else:
+        known[identity] = "prior-batch" if identity == "batch_id" else "f" * 64
+    monkeypatch.setattr(community, "inspect_batch", lambda *a, **kw: known)
+    monkeypatch.setattr(cli, "config_at", lambda path: config)
+    assert cli.main(["contribution-reconcile", "--config", "unused", "--batch", batch_id]) == 2
+    result = json.loads(capsys.readouterr().out)
+    assert result["head_sha"] == known["head_sha"] and result["automatic_retry"] is False
+    assert result["recovery_error"]["category"] == "ValueError"
+    assert cli.contribution_recovery(config, "contribution-inspect", batch_id) == before
+    assert staged.exists()

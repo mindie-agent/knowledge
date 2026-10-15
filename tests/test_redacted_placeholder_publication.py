@@ -78,7 +78,9 @@ def test_publisher_reports_rejection_and_retains_exact_partial_remote_result(tmp
             sent.append(batch)
             if remote_outcome == 'unknown':
                 raise OSError('Synthetic uncertain remote write')
-            return dict(status='submitted', head_sha='a' * 40, pr_url='https://example.invalid/pull/1')
+            return dict(status='submitted', batch_id=batch["batch_id"],
+                        revision=batch["revision"], head_sha='a' * 40,
+                        pr_url='https://example.invalid/pull/1')
         engine.community = dict(submit_batch=submit)
         if remote_outcome == 'receipt-failed':
             original = store.mark_batch

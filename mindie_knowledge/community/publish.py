@@ -974,14 +974,9 @@ def _inspect_row(ledger, row, settings, state_dir, transport, deadline) -> dict[
         retry_at = exc.retry_at
     except CommunityError as exc:
         status, detail = "unknown", f"explicit inspection lookup failed: {exc}"
-    ledger.finish_publication(
-        row["batch_id"], row["revision"], status=status, detail=detail,
-        pr_url=pr_url, head_sha=expected,
-    )
-    return _attach_retry(
-        ledger.receipt(ledger.get_publication(row["batch_id"], row["revision"])),
-        retry_at,
-    )
+    result = dict(ledger.receipt(row), status=status, detail=detail,
+                  pr_url=pr_url, head_sha=expected, pr_number=row.get("pr_number"))
+    return _attach_retry(_finish_result(row, ledger, result), retry_at)
 
 
 def _ancestor_verdict(row, settings, state_dir, expected, pr, deadline) -> bool | None:
@@ -1026,11 +1021,13 @@ def inspect_batch(batch_id: str, settings: dict, state_dir: Path, *, transport: 
     remains reserved for proven remote failures."""
     state_dir = Path(state_dir)
     ledger = Ledger(state_dir)
+    result = None
     try:
         if not sharing_enabled(settings):
-            return {"status": "disabled", "batch_id": batch_id, "revision": None,
+            result = {"status": "disabled", "batch_id": batch_id, "revision": None,
                     "pr_url": None, "head_sha": None,
                     "detail": "community sharing is disabled or unconfigured"}
+            return result
         transport = transport or transport_from_settings(settings, state_dir)
         deadline = Deadline(settings.get("transaction_seconds"),
                             settings.get("operation_limit"))
@@ -1041,16 +1038,19 @@ def inspect_batch(batch_id: str, settings: dict, state_dir: Path, *, transport: 
         if not rows:
             latest = ledger.latest_for_batch(batch_id)
             if latest is None:
-                return {"status": "unknown", "batch_id": batch_id, "revision": None,
+                result = {"status": "unknown", "batch_id": batch_id, "revision": None,
                         "pr_url": None, "head_sha": None,
                         "detail": "no publication record for this batch"}
-            return ledger.receipt(latest)
-        result = None
+            else:
+                result = ledger.receipt(latest)
+            return result
         for row in rows:
             result = _inspect_row(ledger, row, settings, state_dir, transport, deadline)
+            if result.get("recording_failed"):
+                break
         return result
     finally:
-        ledger.close()
+        _close_ledger(ledger, result)
 
 
 def reconcile_batch(batch_id: str, settings: dict, state_dir: Path, *, transport: Transport | None = None,
@@ -1080,7 +1080,7 @@ def reconcile_batch(batch_id: str, settings: dict, state_dir: Path, *, transport
         result = None
         for row in unresolved:
             result = _resolve_unknown(ledger, row, settings, state_dir, transport, deadline)
-            if result["status"] == "unknown":
+            if result["status"] == "unknown" or result.get("recording_failed"):
                 break
         return result
     finally:

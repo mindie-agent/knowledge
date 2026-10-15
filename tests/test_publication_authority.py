@@ -36,7 +36,8 @@ def publisher(engine):
         # Use the publisher's actual cancellation gate, not only a flag assertion.
         Deadline(cancel=cancel).step("synthetic write")
         sent.append(batch)
-        return dict(status="submitted", head_sha="a" * 40,
+        return dict(status="submitted", batch_id=batch["batch_id"],
+                    revision=batch["revision"], head_sha="a" * 40,
                     pr_url="https://example.invalid/pull/1")
 
     engine.community = dict(submit_batch=submit,
