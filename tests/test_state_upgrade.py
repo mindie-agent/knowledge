@@ -9,6 +9,7 @@ import sys
 import pytest
 
 from mindie_knowledge import state_layout
+from mindie_knowledge.filesystem import filesystem_path
 from mindie_knowledge.loop.store import Store
 
 
@@ -133,7 +134,7 @@ def test_lost_layout_cannot_be_treated_as_first_use(tmp_path, monkeypatch, damag
 
 
 def test_compatibility_check_is_read_only(tmp_path, monkeypatch):
-    assert state_layout.state_root(tmp_path, 'demo') == tmp_path / 'demo/state-v1'
+    assert state_layout.state_root(tmp_path, 'demo') == filesystem_path(tmp_path) / 'demo/state-v1'
     assert not list(tmp_path.iterdir())
     monkeypatch.setattr(state_layout, 'RELEASE_VERSION', '1.0.0')
     Store(tmp_path, 'demo').close()

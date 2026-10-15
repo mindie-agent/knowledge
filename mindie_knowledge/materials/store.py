@@ -24,6 +24,7 @@ import yaml
 
 from ..loop import documents
 from ..loop.locks import StartLock
+from ..filesystem import filesystem_path
 
 TASK_SCHEMA = "mindie-material-task/1"
 BLOCK_SCHEMA = "mindie-material-block/1"
@@ -202,7 +203,7 @@ def _split_text(text):
 
 class MaterialStore:
     def __init__(self, root, domain=None):
-        self.root = Path(root).resolve()
+        self.root = filesystem_path(root).resolve()
         self.domain = domain
         self.root.mkdir(parents=True, exist_ok=True)
         self._mutex = threading.RLock()

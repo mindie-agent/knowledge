@@ -7,9 +7,9 @@ format changes require an explicit migration before selecting a new runtime.
 """
 from contextlib import contextmanager
 import json
-from pathlib import Path
 import re
 import stat
+from .filesystem import filesystem_path
 
 FORMAT = 1
 RELEASE_VERSION = '0.0.1'
@@ -47,7 +47,7 @@ def state_root(root, domain):
     from .loop.documents import DOMAIN_RE
     if not isinstance(domain, str) or not DOMAIN_RE.fullmatch(domain):
         raise ValueError('invalid domain')
-    base = Path(root).absolute() / domain
+    base = filesystem_path(root).absolute() / domain
     previous = _read(base)
     _version(RELEASE_VERSION)
     if previous is None and any(path.is_dir() and re.fullmatch(r'state-v\d+', path.name)
@@ -69,7 +69,7 @@ def prepare_layout(root, domain):
     from .markdown import _atomic_write_text
     # Validate the configured path before mkdir/resolve can follow a dangling
     # link and turn a broken existing root into a new empty target.
-    base = Path(root).absolute() / domain
+    base = filesystem_path(root).absolute() / domain
     _read(base)
     base.mkdir(parents=True, exist_ok=True)
     lock = StartLock(base / 'state-layout.lock')

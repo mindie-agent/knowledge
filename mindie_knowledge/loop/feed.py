@@ -22,6 +22,7 @@ from .store import _backoff_seconds, digest
 from mindie_knowledge.community.common import CommunityError, run_argv
 from mindie_knowledge.gitread import with_windows_longpaths, _check_cancel
 from mindie_knowledge.publication_contract import read_git_contract
+from mindie_knowledge.filesystem import filesystem_path, git_path
 
 
 def _feed_git_env():
@@ -89,7 +90,7 @@ class Feed:
         maximum = 1024 * 1024
         try:
             completed = run_argv(
-            ["git", "-C", str(self.repo), *args],
+            ["git", "-C", git_path(self.repo), *args],
                 timeout=remaining, max_output=maximum, input_bytes=b"",
                 env=_feed_git_env(), cancel=self._cancel,
             )
@@ -113,11 +114,11 @@ class Feed:
             # A local path with --depth goes through git's local-copy path,
             # which mishandles packed/multi-pack-index sources; file:// uses
             # the same pack protocol as a real remote (git's own advice).
-            url = Path(url).resolve().as_uri()
+            url = Path(git_path(filesystem_path(url).resolve())).as_uri()
         try:
             completed = run_argv(
                 ["git", "clone", "--bare", "--quiet", "--depth=1", "--single-branch", "--no-tags",
-                 "--branch", self.ref, url, str(self.repo)],
+                 "--branch", self.ref, url, git_path(self.repo)],
                 timeout=remaining, max_output=65536, input_bytes=b"",
                 env=_feed_git_env(), cancel=self._cancel,
             )
@@ -197,7 +198,7 @@ class Feed:
 
         listing_path = self.dir / "listing.tmp"
         run_stdout_to_file(
-            ["git", "-C", str(self.repo), "ls-tree", "-r", "-z", "--long", commit,
+            ["git", "-C", git_path(self.repo), "ls-tree", "-r", "-z", "--long", commit,
              "--", self.prefix or "."],
             listing_path,
             timeout=None if deadline is None else max(0, deadline - time.monotonic()),

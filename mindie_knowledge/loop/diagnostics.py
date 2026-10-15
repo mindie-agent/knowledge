@@ -6,6 +6,7 @@ may inspect a local identity, but this view grants no access and changes no stat
 from __future__ import annotations
 
 from ..state_layout import state_root
+from ..filesystem import sqlite_file_uri
 
 import hashlib
 import json
@@ -158,7 +159,7 @@ def _json(path, limit=MAX_JSON):
 
 
 def _ro(path):
-    db = sqlite3.connect(Path(path).absolute().as_uri() + "?mode=ro", uri=True, timeout=0.1)
+    db = sqlite3.connect(sqlite_file_uri(path) + "?mode=ro", uri=True, timeout=0.1)
     deadline = time.monotonic() + DB_SECONDS
     db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
     db.row_factory = sqlite3.Row

@@ -10,7 +10,7 @@ import hashlib
 import json
 import re
 import time
-from pathlib import Path
+from .filesystem import git_path
 
 CONTRACT_FILE = "publication-contract.json"
 PUBLICATION_CONTRACT_FILE = CONTRACT_FILE
@@ -106,7 +106,7 @@ def read_git_contract(repo, revision, domain, *, expected_sha256=None, deadline=
     remaining = None if deadline is None else deadline - time.monotonic()
     if remaining is not None and remaining <= 0:
         raise TimeoutError("publication contract read exceeded its deadline")
-    result = run_argv(["git", "-C", str(Path(repo)), "ls-tree", "-z", "--long", revision, "--", path],
+    result = run_argv(["git", "-C", git_path(repo), "ls-tree", "-z", "--long", revision, "--", path],
                       timeout=remaining, max_output=MAX_CONTRACT_BYTES,
                       input_bytes=b"", env=env, cancel=cancel)
     if result.timed_out:

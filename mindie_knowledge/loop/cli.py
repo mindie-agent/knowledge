@@ -18,6 +18,7 @@ path); legacy adapter-config indirection is removed, not aliased.
 from __future__ import annotations
 
 from ..state_layout import state_root
+from ..filesystem import sqlite_file_uri
 
 import argparse
 import importlib.util
@@ -217,7 +218,7 @@ def contribution_recovery(config, operation, batch_id):
         if ledger_path.is_file():
             import sqlite3
 
-            db = sqlite3.connect(ledger_path.as_uri() + "?mode=ro", uri=True)
+            db = sqlite3.connect(sqlite_file_uri(ledger_path) + "?mode=ro", uri=True)
             try:
                 names = [r[1] for r in db.execute("PRAGMA table_info(publication)")]
                 result["ledger"] = [
