@@ -116,6 +116,40 @@ def _spawn(command, stdin, scratch=None):
     )
 
 
+def _posix_group_has_writers(pgid, *, timeout):
+    """Inspect only process metadata; a zombie cannot write to owned scratch."""
+    if sys.platform != "darwin" and not sys.platform.startswith("linux"):
+        raise RuntimeError("owned process group inspection is unsupported")
+    # BSD -g selects a process group; Linux -g selects a numeric session.
+    # Our group starts a new session, and exact PGID filtering excludes any
+    # other group in that session. No command lines or environment are read.
+    result = subprocess.run(
+        ["/bin/ps", "-o", "pid=,pgid=,stat=", "-g", str(pgid)],
+        capture_output=True, text=True, timeout=timeout,
+        env={**os.environ, "LC_ALL": "C"},
+    )
+    if result.stderr.strip() or result.returncode not in (0, 1):
+        raise RuntimeError("owned process group inspection failed")
+    if result.returncode == 1:
+        if result.stdout.strip():
+            raise RuntimeError("owned process group inspection was incomplete")
+        return False
+    has_writers = False
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if (len(parts) != 3 or not parts[0].isdigit() or not parts[1].isdigit()
+                or int(parts[0]) <= 0 or int(parts[1]) <= 0):
+            raise RuntimeError("owned process group metadata is invalid")
+        if int(parts[1]) != pgid:
+            continue
+        # Unknown states remain potential writers. Only an explicit zombie
+        # state proves an existing process can no longer use the profile.
+        state = parts[2]
+        if not (state.startswith("Z") and all(c in "<>NLSsl+EWX" for c in state[1:])):
+            has_writers = True
+    return has_writers
+
+
 def terminate_tree(process, *, wait=False):
     """Terminate an owned tree; optionally prove it has no remaining writers."""
     if os.name == "nt":
@@ -138,12 +172,25 @@ def terminate_tree(process, *, wait=False):
         process.wait(timeout=1)
         deadline = time.monotonic() + 2
         while True:
+            signal_error = None
             try:
                 os.killpg(process.pid, 0)
             except ProcessLookupError:
                 break
-            if time.monotonic() >= deadline:
+            except PermissionError as exc:
+                signal_error = exc
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if signal_error is not None:
+                    raise signal_error
                 raise RuntimeError("owned process group did not exit during cleanup")
+            try:
+                if not _posix_group_has_writers(process.pid, timeout=remaining):
+                    break
+            except Exception as inspection_error:
+                if signal_error is not None:
+                    raise signal_error from inspection_error
+                raise
             time.sleep(0.01)
 
 
