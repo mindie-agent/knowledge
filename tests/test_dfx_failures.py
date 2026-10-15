@@ -73,8 +73,8 @@ def test_external_reference_is_not_dedup_authority(reports):
 def test_cleanup_fault_keeps_original_and_both_facts(reports, monkeypatch, child_code):
     from mindie_knowledge.loop import process
     original_cleanup = process.terminate_tree
-    def cleanup_fault(child):
-        original_cleanup(child)
+    def cleanup_fault(child, **kwargs):
+        original_cleanup(child, **kwargs)
         child.stdout.close()
         child.stderr.close()
         raise OSError('private_cleanup_sentinel')

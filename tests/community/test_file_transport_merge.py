@@ -8,6 +8,7 @@ from mindie_knowledge.community import submit_batch
 from mindie_knowledge.community.common import CommunityError, Deadline, ProcessResult, UnknownOutcome
 from mindie_knowledge.community import transport as transport_module
 from mindie_knowledge.filesystem import filesystem_path
+from mindie_knowledge.git_layout import MAX_GIT_DIRECTORY_BYTES, validate_git_directory
 
 from .conftest import entry_file, git, make_batch, make_entry
 
@@ -16,9 +17,19 @@ def test_deep_file_transport_merges_then_reuses_mirror_and_worktree(
     tmp_path, settings, remote_url,
 ):
     """Native Windows namespace paths reach Python, ordinary paths reach Git."""
-    # Keep the Git root within Git for Windows' -C limit; package descendants
-    # still exceed MAX_PATH, as they do under a normal installed profile.
-    state_dir = tmp_path / ("state-" + "x" * max(1, 190 - len(str(tmp_path))))
+    # The merge worktree has the longest actual gitdir, including its .git.
+    # Long package descendants are supported; an oversized Git root is not.
+    repo = settings["repository"].replace("/", "_")
+    fixed = tmp_path / "state-" / "merge-work" / repo / ".git"
+    padding = MAX_GIT_DIRECTORY_BYTES - len(str(fixed).encode("utf-8"))
+    assert padding >= 1, "test parent cannot hold the supported Git layout"
+    state_dir = tmp_path / ("state-" + "x" * padding)
+    for directory, bare in ((state_dir / "git" / repo, False),
+                            (state_dir / "merge-work" / repo, False),
+                            (state_dir / "mirrors" / repo, True)):
+        actual = directory if bare else directory / ".git"
+        assert len(str(actual).encode("utf-8")) <= MAX_GIT_DIRECTORY_BYTES
+        validate_git_directory(directory, bare=bare, role="test-precondition")
     transport = transport_module.FileTransport(
         state_dir / "dev-github.json",
         {settings["repository"]: str(filesystem_path(remote_url))},
