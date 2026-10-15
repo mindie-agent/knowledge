@@ -109,10 +109,14 @@ class PathIdentityTests(unittest.TestCase):
         aliases = [ordinary, str(self.source), ordinary.swapcase()]
         self.assertEqual(len({path_identity(value) for value in aliases}), 1)
         saved = self.cursor(100)
-        store = Cursors({ordinary: saved})
+        # The prior engine persisted Path.resolve(), not the input spelling.
+        # Windows CI's TEMP may use an 8.3 alias such as RUNNER~1.
+        legacy_key = str(Path(ordinary).resolve(strict=False))
+        store = Cursors({legacy_key: saved})
         for value in aliases:
             key, cursor = transcript_cursor(store, value, parser, parser.identify(value))
-            self.assertEqual((key, cursor), (ordinary, saved))
+            self.assertEqual((key, cursor), (legacy_key, saved))
+        self.assertEqual(store.rows, {legacy_key: saved})
         self.assertLessEqual(len(path_aliases(ordinary)), 4)
         project = self.root / "project"
         project.mkdir()
@@ -120,9 +124,10 @@ class PathIdentityTests(unittest.TestCase):
         first = admission.activate("task", project_root=git_path(project), not_before=123)
         again = admission.activate("task", project_root=str(project), not_before=456)
         self.assertEqual(first, again)
+        legacy_root = str(Path(git_path(project)).resolve(strict=False))
         previous = dict(schema="mindie-community-config/1", enabled=True,
                         generation="keep", enabled_at=123, repository="owner/repository",
-                        branch="main", project_roots=[git_path(project)], idle_seconds=300)
+                        branch="main", project_roots=[legacy_root], idle_seconds=300)
         requested = dict(previous, project_roots=[str(project)])
         updated = transition(previous, requested)
         self.assertEqual(updated["generation"], "keep")
