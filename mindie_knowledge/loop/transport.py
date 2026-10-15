@@ -309,8 +309,8 @@ class Service:
             if unavailable:
                 names = ", ".join(source["repository"] for source in unavailable)
                 raise FeedUnavailableError(
-                    "knowledge query unavailable: configured feed has no successfully installed "
-                    f"snapshot ({names}); inspect its sync result; no automatic retry was performed"
+                    "knowledge query unavailable: configured feed has no verified installed "
+                    f"snapshot receipt ({names}); inspect its sync result; no automatic retry was performed"
                 )
             result = self.store.query(
                 args.get("query"), limit=args.get("limit", 5),

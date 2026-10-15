@@ -29,7 +29,7 @@ def test_initial_source_failure_is_not_an_empty_result(configured_service, monke
         store.feed_set("feed:" + feed.ident, dict(status=status, detail="private path and secret"))
     monkeypatch.setattr(store, "query", lambda *_a, **_kw: pytest.fail("must not report an empty corpus"))
     monkeypatch.setattr(feed, "sync", lambda *_a, **_kw: pytest.fail("query must not retry sync"))
-    with pytest.raises(RuntimeError, match="configured feed has no successfully installed snapshot") as error:
+    with pytest.raises(RuntimeError, match="configured feed has no verified installed snapshot") as error:
         service.call("query", {"query": "synthetic"})
     assert "private path" not in str(error.value)
     assert service.engine.operations.snapshot()["activity"] == 0
@@ -59,7 +59,7 @@ def test_rpc_delivers_source_failure_without_reporting_a_product_defect(configur
     worker = threading.Thread(target=service.http.serve_forever)
     worker.start()
     try:
-        with pytest.raises(RuntimeError, match="configured feed has no successfully installed snapshot"):
+        with pytest.raises(RuntimeError, match="configured feed has no verified installed snapshot"):
             rpc(service.connection, "query", {"query": "synthetic"}, timeout=5)
     finally:
         service.http.shutdown()
