@@ -25,7 +25,7 @@ import threading
 import time
 
 from .dfx import failure
-from . import summary_scratch
+from . import posix_owner, summary_scratch
 
 
 def spawn_service(command, *, from_detached_starter=False):
@@ -106,6 +106,9 @@ def _spawn(command, stdin, scratch=None):
             stderr=subprocess.PIPE,
             env=env,
         )
+    from .service_host import process_is_contained
+    if sys.platform == "darwin" or (sys.platform.startswith("linux") and not process_is_contained()):
+        return posix_owner.spawn(command, stdin=stdin, env=env)
     return subprocess.Popen(
         command,
         stdin=stdin,
@@ -126,7 +129,9 @@ def _posix_group_has_writers(pgid, *, timeout):
     result = subprocess.run(
         ["/bin/ps", "-o", "pid=,pgid=,stat=", "-g", str(pgid)],
         capture_output=True, text=True, timeout=timeout,
-        env={**os.environ, "LC_ALL": "C"},
+        # WSL reached through a Windows SSH console can inherit an invalid
+        # terminal width. This metadata-only query has no terminal formatting.
+        env={**os.environ, "LC_ALL": "C", "COLUMNS": "80", "LINES": "24"},
     )
     if result.stderr.strip() or result.returncode not in (0, 1):
         raise RuntimeError("owned process group inspection failed")
@@ -156,6 +161,19 @@ def terminate_tree(process, *, wait=False):
         from mindie_knowledge.windows_process import terminate_owned
         terminate_owned(process, wait=wait)
         return
+    try:
+        _terminate_posix_tree(process, wait=wait)
+    finally:
+        original_error = sys.exc_info()[1]
+        try:
+            posix_owner.release(process)
+        except OSError as cleanup_error:
+            if original_error is None:
+                raise
+            original_error.add_note("owned attempt lifetime pipe did not close")
+
+
+def _terminate_posix_tree(process, *, wait):
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except (ProcessLookupError, PermissionError):
@@ -233,9 +251,13 @@ def bounded_run(command, payload, *, timeout=None, max_output, cancel=None, clea
             if on_result is not None:
                 scratch = summary_scratch.create_root()
             process = _spawn(command, input_file, scratch)
-        except OSError as exc:
-            exc.mindie_execution = 'not_started'
-            if scratch is not None:
+        except (OSError, posix_owner.LaunchError) as exc:
+            if not hasattr(exc, "mindie_execution"):
+                exc.mindie_execution = 'not_started'
+            if getattr(exc, "cleanup_failed", False):
+                if cleanup_receipt is not None:
+                    cleanup_receipt["cleanup_failed"] = True
+            elif scratch is not None:
                 try:
                     shutil.rmtree(scratch)
                 except OSError as cleanup_error:
@@ -243,7 +265,8 @@ def bounded_run(command, payload, *, timeout=None, max_output, cancel=None, clea
                             exception=cleanup_error)
                     if cleanup_receipt is not None:
                         cleanup_receipt['cleanup_failed'] = True
-            raise annotated_error(exc, 'configuration', started, stage='start')
+            raise annotated_error(exc, getattr(exc, "mindie_category", "configuration"),
+                                  started, stage='start')
         chunks = queue.Queue(maxsize=max(2, max_output // 4096 + 1))
         readers_stop = threading.Event()
         read_errors = []

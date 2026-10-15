@@ -47,6 +47,8 @@ def validate_config(config):
         raise ValueError("configuration requires root and domain")
     from .service_context import validate as validate_launch_context
     validate_launch_context(config)
+    from .client_contract import fingerprint as client_fingerprint
+    client_fingerprint(config)
     if "session_activation" in config:
         raise ValueError(
             "session_activation was removed; configure the neutral "
@@ -124,6 +126,17 @@ def connect(config, *, config_path=None):
     return connection
 
 
+def ensure_client_service(config_path):
+    """Use a compatible live owner or the exact completed service handoff."""
+    from .client_contract import ensure_service as ensure_client
+    return ensure_client(config_path)
+
+
+def prepare_client_service(config_path):
+    from .client_contract import prepare_service as prepare_client
+    return prepare_client(config_path)
+
+
 def ensure_service(config_path, *, _from_detached_starter=False):
     """Own one startup until ready or a real failure; elapsed time is no fault."""
     from .handoff import _probe
@@ -131,6 +144,7 @@ def ensure_service(config_path, *, _from_detached_starter=False):
     from .process import spawn_service, terminate_tree
     from .diagnostics import clear_startup_failure
     from .lifecycle import require_active
+    from .service_host import platform_backend
 
     config = config_at(config_path)
     require_active(config_path, config)
@@ -159,9 +173,9 @@ def ensure_service(config_path, *, _from_detached_starter=False):
             if state in {"unknown", "worker-dead"}:
                 raise RuntimeError("knowledge service is " + state + "; startup failed")
             if state == "absent" and process is None:
-                if os.name == "nt":
-                    from .windows_service import request_start
-                    process = request_start(config_path, config)
+                backend = platform_backend()
+                if backend is not None:
+                    process = backend.request_start(config_path, config)
                 else:
                     process = spawn_service(
                         [sys.executable, "-m", "mindie_knowledge.loop.cli", "serve",
@@ -171,7 +185,7 @@ def ensure_service(config_path, *, _from_detached_starter=False):
             # This is scheduling cadence, never an operation deadline.
             time.sleep(.1)
     except RuntimeError as exc:
-        from .windows_service import ServiceHostError
+        from .service_host import ServiceHostError
         if isinstance(exc, ServiceHostError):
             from .diagnostics import record_startup_failure
             try:
@@ -196,6 +210,7 @@ def prepare_service(config_path):
     from .handoff import _probe
     from .lifecycle import require_active
     from .locks import StartInProgress, StartLock
+    from .service_host import platform_backend
     config = config_at(config_path)
     require_active(config_path, config)
     lock = StartLock(connection_path(config).with_name("start.lock"))
@@ -212,9 +227,9 @@ def prepare_service(config_path):
             return "starting"
         if state != "absent":
             raise RuntimeError("knowledge service is " + state + "; not starting a second service")
-        if os.name == "nt":
-            from .windows_service import request_start
-            request_start(config_path, config)
+        backend = platform_backend()
+        if backend is not None and os.name == "nt":
+            backend.request_start(config_path, config)
         else:
             from .process import spawn_service
             spawn_service([sys.executable, "-m", "mindie_knowledge.loop.cli", "wake",
@@ -386,10 +401,12 @@ def _serve(config_path, config):
                         redactor_executable=config.get("redactor_executable"),
                         summary_command=config.get("summary_command"))
         stage = "service"
+        from .client_contract import fingerprint as client_fingerprint
         service = Service(engine, connection_path=connection_path(config),
                           admission=admission, feeds=_feeds(config, store),
                           config_path=config_path,
-                          config_fingerprint=config_fingerprint(config_path, config))
+                          config_fingerprint=config_fingerprint(config_path, config),
+                          client_fingerprint=client_fingerprint(config))
         service.serve()
         return 0
     except Exception as exc:

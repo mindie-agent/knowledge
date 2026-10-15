@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 
 SCHEMA = "mindie-service-context/1"
 LIMIT = 128 * 1024
@@ -31,6 +32,10 @@ class ContextError(ValueError):
     def __init__(self, code):
         super().__init__(code)
         self.code, self.stage = code, "context"
+
+
+def _windows():
+    return os.name == "nt"
 
 
 def _name(key):
@@ -100,16 +105,33 @@ def capture(config, binding):
     raw = json.dumps(value, sort_keys=True, ensure_ascii=True).encode()
     if len(raw) > LIMIT:
         raise ContextError("service_launch_context_too_large")
-    return _crypt(raw, json.dumps(binding, sort_keys=True).encode())
+    return (_crypt(raw, json.dumps(binding, sort_keys=True).encode())
+            if _windows() else raw)
 
 
 def consume(path, config, binding):
     path = Path(path)
-    if path.is_symlink() or not path.is_file() or path.stat().st_size > LIMIT + 4096:
-        raise ContextError("service_context_file_invalid")
     try:
-        raw = _crypt(path.read_bytes(), json.dumps(binding, sort_keys=True).encode(), decrypt=True)
+        if _windows():
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > LIMIT + 4096:
+                raise ContextError("service_context_file_invalid")
+            raw = _crypt(path.read_bytes(), json.dumps(binding, sort_keys=True).encode(), decrypt=True)
+        else:
+            # systemd does not inherit the caller's environment. Its one-use
+            # transfer is private to the current UID, never a unit property.
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, "rb") as stream:
+                info = os.fstat(stream.fileno())
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                        or stat.S_IMODE(info.st_mode) & 0o077 or info.st_nlink != 1
+                        or info.st_size > LIMIT):
+                    raise ContextError("service_context_file_invalid")
+                raw = stream.read(LIMIT + 1)
+                if len(raw) > LIMIT:
+                    raise ContextError("service_context_file_invalid")
         value = json.loads(raw)
+    except ContextError:
+        raise
     except (OSError, ValueError):
         raise ContextError("service_context_unavailable") from None
     declaration = validate(config)
@@ -130,10 +152,11 @@ def consume(path, config, binding):
 
 def apply(config, values):
     """Apply the authenticated caller projection, including declared absence."""
-    declared = {key.casefold() for key in validate(config)["environment"]}
+    normalize = str.casefold if _windows() else lambda key: key
+    declared = {normalize(key) for key in validate(config)["environment"]}
     # A scheduled task can inherit stale user-level credentials/proxies.
     # Explicitly absent caller values must remain absent in its service.
     for key in list(os.environ):
-        if key.casefold() in declared:
+        if normalize(key) in declared:
             del os.environ[key]
     os.environ.update(values)

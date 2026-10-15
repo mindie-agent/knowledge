@@ -9,6 +9,14 @@ from mindie_knowledge.loop import service_context as context
 from mindie_knowledge.loop import windows_service as host
 
 
+@pytest.fixture(autouse=True)
+def windows_context_semantics(monkeypatch):
+    """Exercise the Windows transfer contract even on non-Windows CI."""
+    from mindie_knowledge.loop import service_host
+    monkeypatch.setattr(context, "_windows", lambda: True)
+    monkeypatch.setattr(service_host, "platform_backend", lambda: host)
+
+
 def test_context_projects_only_declared_present_values_and_consumes_once(tmp_path, monkeypatch):
     monkeypatch.setenv("SELECTED_KEY", "synthetic-secret")
     monkeypatch.setenv("OTHER_SECRET", "must-not-transfer")

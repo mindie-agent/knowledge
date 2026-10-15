@@ -26,6 +26,7 @@ from .store import (
 )
 
 SUMMARY_LIMIT = 32768
+WAKE_PROBE_SECONDS = .25  # Control-plane observation; never a business deadline.
 _HARNESS = __import__("re").compile(r"[a-z][a-z0-9_-]{0,31}\Z")
 _TERMINAL = {
     "organized": "organized",
@@ -151,7 +152,7 @@ def _accept_row(db, *, namespace, root_hash, session, turn, transcript, summary,
         raise
 
 
-def _probe(config, timeout, *, config_path=None):
+def _probe(config, timeout, *, config_path=None, compatible=False):
     from .cli import connect
     from .locks import lock_held
     from .transport import rpc
@@ -173,13 +174,17 @@ def _probe(config, timeout, *, config_path=None):
     if owner is False:
         return "absent"
     try:
-        connection = connect(config, config_path=config_path)
+        client = compatible and config.get("client_contract") is not None
+        connection = connect(config, config_path=None if client else config_path)
     except FileNotFoundError:
         return "starting" if owner is True else "absent"
     except (OSError, ValueError):
         return "unknown"
     try:
         status = rpc(connection, "status", timeout=timeout)
+        if client:
+            from .client_contract import verify_service_identity
+            verify_service_identity(config_path, config, connection, status)
     except FileNotFoundError:
         return "absent"
     except TimeoutError:
@@ -227,9 +232,13 @@ def request_wake(config_path, *, session_id, event=None):
         return out
     try:
         config = config_at(config_path)
-        require_active(config_path, config)
+        from .client_contract import resolve_config
+        config_path, config = resolve_config(config_path)
     except ServiceRetired:
         out.update(wake='not-applicable', runtime='retired', reason='service-retired')
+        return out
+    except RuntimeError:
+        out.update(wake="failed", runtime="unavailable", reason="service-handoff")
         return out
     except (OSError, ValueError):
         out.update(wake="failed", runtime="unavailable", reason="configuration")
@@ -259,7 +268,7 @@ def request_wake(config_path, *, session_id, event=None):
             return out
         out.update(wake="not-applicable", reason="not-activated")
         return out
-    state = _probe(config, None, config_path=config_path)
+    state = _probe(config, WAKE_PROBE_SECONDS, config_path=config_path, compatible=True)
     if state == "ready":
         out.update(wake="running", runtime="ready", reason="worker-ready")
         return out
@@ -285,8 +294,9 @@ def request_wake(config_path, *, session_id, event=None):
         if isinstance(event, str) and len(event) == 64:
             argv.extend(["--event", event])
         try:
-            if os.name == "nt":
-                from .windows_service import request_start
+            from .service_host import platform_backend
+            backend = platform_backend()
+            if backend is not None and os.name == "nt":
                 from .cli import connection_path
                 start = StartLock(connection_path(config).with_name("start.lock"))
                 try:
@@ -297,14 +307,14 @@ def request_wake(config_path, *, session_id, event=None):
                 try:
                     # A query starter may have won while the wake lock was
                     # acquired; the scheduler never replaces a live consumer.
-                    current = _probe(config, None, config_path=config_path)
+                    current = _probe(config, WAKE_PROBE_SECONDS, config_path=config_path, compatible=True)
                     if current == "ready":
                         out.update(wake="running", runtime="ready", reason="worker-ready")
                         return out
                     if current != "absent":
                         out.update(wake="not-requested", runtime="unknown", reason=current)
                         return out
-                    process = request_start(config_path, config)
+                    process = backend.request_start(config_path, config)
                 finally:
                     start.release()
             else:
@@ -313,7 +323,7 @@ def request_wake(config_path, *, session_id, event=None):
         except (OSError, ValueError, RuntimeError) as exc:
             out.update(wake="failed", runtime="unavailable", reason="wake-failed",
                        recovery=_RECOVERY["wake-failed"])
-            from .windows_service import ServiceHostError
+            from .service_host import ServiceHostError
             if isinstance(exc, ServiceHostError):
                 out["host"] = dict(stage=exc.stage, code=exc.code, uncertain=exc.uncertain)
             return out
@@ -546,7 +556,7 @@ def accept_stop(config_path, event):
             reason="stored", summary_dropped=dropped,
         )
     if status == "processing":
-        state = _probe(config, None, config_path=config_path)
+        state = _probe(config, WAKE_PROBE_SECONDS, config_path=config_path, compatible=True)
         return _result(
             stage="processing", capture_id=capture_id, duplicate=duplicate,
             wake="not-applicable",
@@ -559,7 +569,7 @@ def accept_stop(config_path, event):
         stage_name = "accepted-local"
     else:
         stage_name = "accepted-local"
-    state = _probe(config, None, config_path=config_path)
+    state = _probe(config, WAKE_PROBE_SECONDS, config_path=config_path, compatible=True)
     if state == "ready" and status in _UNPROCESSED_CAPTURE | {"pending", "deferred", "queued"}:
         clear_delivery_event(config, event_id)
         return _result(

@@ -1,5 +1,10 @@
 # Summary process and temporary profile ownership
 
+The shared [service and attempt lifetime](service-process-lifetime.md) contract
+now also covers abrupt owner death on macOS, Windows and Linux/WSL. The historical
+verification below describes the earlier scratch change; it does not stand in
+for the newer platform and native acceptance.
+
 Status: source-level native-process regressions passed; final installation
 acceptance pending, 2026-10-15.
 

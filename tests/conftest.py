@@ -112,19 +112,22 @@ os.chmod(_policy_path, 0o600)
 import pytest
 
 @pytest.fixture(autouse=True)
-def lifecycle_tests_use_explicit_process_backend_on_windows(request, monkeypatch):
-    """These two suites test real service locks/RPC/retirement, not Scheduler.
+def lifecycle_tests_use_explicit_process_backend(request, monkeypatch):
+    """These suites test real locks/RPC/handoff, not the platform service manager.
 
     CI has no interactive login token. The scheduler's own contract is tested
     separately; native lifetime acceptance runs on the real Windows host.
     This replacement is selected before a test, never after manager failure.
     """
-    if os.name != "nt" or request.node.path.name not in {
-        "test_service_startup.py", "test_service_retirement.py",
+    if request.node.path.name not in {
+        "test_service_startup.py", "test_service_retirement.py", "test_client_contract.py",
     }:
         return
     import sys
-    from mindie_knowledge.loop import process, windows_service
+    from mindie_knowledge.loop import process, service_host
+    backend = service_host.platform_backend()
+    if backend is None:
+        return
 
     def direct_test_service(config_path, config):
         return process.spawn_service(
@@ -133,7 +136,7 @@ def lifecycle_tests_use_explicit_process_backend_on_windows(request, monkeypatch
             from_detached_starter=True,
         )
 
-    monkeypatch.setattr(windows_service, "request_start", direct_test_service)
+    monkeypatch.setattr(backend, "request_start", direct_test_service)
 
 
 def pytest_configure(config):

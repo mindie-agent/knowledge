@@ -53,6 +53,17 @@ def inspect_retirement(config_path, config=None):
         raise ValueError('service retirement receipt is invalid')
     if value['config_fingerprint'] != fingerprint:
         raise ValueError('service retirement receipt belongs to a different configuration')
+    successor = value.get('successor')
+    if successor is not None and (
+            not isinstance(successor, dict)
+            or set(successor) != {'config_path', 'config_fingerprint'}
+            or not isinstance(successor.get('config_path'), str)
+            or not Path(successor['config_path']).is_absolute()
+            or not isinstance(successor.get('config_fingerprint'), str)
+            or len(successor['config_fingerprint']) != 64
+            or any(char not in '0123456789abcdef'
+                   for char in successor['config_fingerprint'])):
+        raise ValueError('service successor receipt is invalid')
     return value
 
 
@@ -100,10 +111,11 @@ def acquire_consumer(config_path, config):
 def _completed_retirement(config_path, config, outcome, receipt):
     """Discard obsolete discovery only after owner exit, under both locks."""
     from .cli import connection_path
-    if os.name == "nt":
+    from .service_host import platform_backend
+    backend = platform_backend()
+    if backend is not None:
         try:
-            from .windows_service import remove_owned
-            remove_owned(config_path, config)
+            backend.remove_owned(config_path, config)
         except (OSError, ValueError, RuntimeError) as exc:
             return dict(outcome, retirement=receipt, cleanup_failed=True,
                         cleanup_error=dict(stage='service_host', error_type=type(exc).__name__,
@@ -117,7 +129,7 @@ def _completed_retirement(config_path, config, outcome, receipt):
     return dict(outcome, retirement=receipt)
 
 
-def retire_service(config_path):
+def retire_service(config_path, *, successor_config_path=None):
     from .cli import config_at, connect
     from .handoff import _probe
     from .transport import rpc
@@ -127,15 +139,26 @@ def retire_service(config_path):
     try:
         admission.acquire(wait=None)
         try:
+            successor = None
+            if successor_config_path is not None:
+                from .client_contract import successor_binding, resolve_config
+                successor = successor_binding(config_path, config, successor_config_path)
+                target, _ = resolve_config(successor_config_path)
+                if target != Path(successor_config_path).resolve():
+                    raise ValueError('service successor is already retired')
             previous = inspect_retirement(config_path, config)
             if previous is not None:
                 if previous['status'] != 'retired':
                     raise RuntimeError('previous service retirement has an uncertain outcome; inspect it before recovery')
+                if successor is not None and previous.get('successor') != successor:
+                    raise ValueError('completed service handoff cannot be replaced')
                 if _consumer_state(config):
                     raise RuntimeError('retired service still owns its consumer lock')
                 return _completed_retirement(config_path, config, dict(idle=True, service='absent'), previous)
             receipt = dict(schema=SCHEMA, config_fingerprint=config_fingerprint(config_path, config),
                            operation_id=uuid.uuid4().hex, status='retiring')
+            if successor is not None:
+                receipt['successor'] = successor
             _atomic_write_text(_marker(config_path), json.dumps(receipt, sort_keys=True) + '\n')
             # A direct serve may already own the consumer but still be loading.
             # Wait for its actual readiness or lifetime-lock release.

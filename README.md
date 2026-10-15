@@ -54,6 +54,8 @@ ordinary task/feedback contributions from contract, workflow and policy changes.
 
 See [framework stability and verification](docs/framework-stability.md) for the
 current behavior, reproducible checks and acceptance boundaries.
+See [service and attempt lifetime](docs/service-process-lifetime.md) for platform
+ownership, short Hook handoff and compatible service clients.
 
 ## Development
 

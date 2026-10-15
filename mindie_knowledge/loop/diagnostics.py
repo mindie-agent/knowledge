@@ -220,7 +220,7 @@ def record_startup_failure(config_path, config, stage, exc):
         payload.update(original)
         component = config.get("transcript_adapter") if original["stage"] == "transcript_adapter" else None
     if stage == "service_host":
-        from .windows_service import SAFE_CODES, SAFE_STAGES
+        from .service_host import SAFE_CODES, SAFE_STAGES
         code = getattr(exc, "code", None)
         host_stage = getattr(exc, "stage", None)
         payload["host"] = dict(
@@ -312,7 +312,7 @@ def _startup(config_path, config):
     if raw["stage"] == "transcript_adapter" and config.get("transcript_adapter"):
         result["component_path"] = config["transcript_adapter"]
     if raw["stage"] == "service_host":
-        from .windows_service import SAFE_CODES, SAFE_STAGES
+        from .service_host import SAFE_CODES, SAFE_STAGES
         host = raw.get("host")
         if (not isinstance(host, dict) or not isinstance(host.get("code"), str)
                 or host["code"] not in SAFE_CODES or not isinstance(host.get("stage"), str)

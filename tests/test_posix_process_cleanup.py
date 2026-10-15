@@ -53,6 +53,17 @@ def test_supported_ps_empty_selection_is_absence(monkeypatch):
     assert not process._posix_group_has_writers(10, timeout=.5)
 
 
+def test_metadata_query_replaces_bogus_inherited_terminal_dimensions(monkeypatch):
+    monkeypatch.setenv("COLUMNS", "131072")
+    monkeypatch.setenv("LINES", "1")
+    run = Mock(return_value=subprocess.CompletedProcess([], 1, "", ""))
+    monkeypatch.setattr(process.subprocess, "run", run)
+    assert not process._posix_group_has_writers(10, timeout=.5)
+    assert run.call_args.kwargs["env"]["COLUMNS"] == "80"
+    assert run.call_args.kwargs["env"]["LINES"] == "24"
+    assert os.environ["COLUMNS"] == "131072" and os.environ["LINES"] == "1"
+
+
 def test_permission_error_needs_writer_proof_and_keeps_primary_error(monkeypatch):
     denied = PermissionError(errno.EPERM, "synthetic signal denied")
     def killpg(_pgid, sig):
