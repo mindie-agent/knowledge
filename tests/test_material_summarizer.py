@@ -222,3 +222,24 @@ def test_summary_failure_details_are_static_and_cannot_expose_source():
         summary.outcome(req, status="failed", error="invalid_result", error_reason="PRIVATE_SOURCE_VALUE")
     with pytest.raises(ValueError, match="failure diagnostic"):
         summary.failure_detail(dict(error="invalid_result", error_reason="PRIVATE_SOURCE_VALUE"))
+
+
+def test_native_terminal_limits_remain_distinct_in_caller_failure_details():
+    req = request("K3-04")
+    reasons = {
+        "native_max_turns": "native-execution",
+        "native_budget_exhausted": "native-execution",
+        "native_structured_output_exhausted": "native-output",
+    }
+    for reason, stage in reasons.items():
+        failed = summary.outcome(
+            req, status="failed", error="native", error_reason=reason,
+            model_calls=1, usage_known=True,
+            usage=dict(input_tokens=120, cached_input_tokens=0, output_tokens=30),
+            raw_result="PRIVATE_NATIVE_OUTPUT")
+        summary.validate_outcome(failed, req)
+        detail = summary.failure_detail(failed)
+        assert detail["reason"] == reason
+        assert detail["stage"] == stage
+        assert "PRIVATE_NATIVE_OUTPUT" not in json.dumps(detail)
+        assert failed["billing_status"] == "reported"
