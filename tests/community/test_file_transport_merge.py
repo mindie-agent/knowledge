@@ -1,12 +1,52 @@
 """Real dev merges preserve package bytes and expose each Git outcome."""
 
+import subprocess
+
 import pytest
 
 from mindie_knowledge.community import submit_batch
 from mindie_knowledge.community.common import CommunityError, Deadline, ProcessResult, UnknownOutcome
 from mindie_knowledge.community import transport as transport_module
+from mindie_knowledge.filesystem import filesystem_path
 
 from .conftest import entry_file, git, make_batch, make_entry
+
+
+def test_deep_file_transport_merges_then_reuses_mirror_and_worktree(
+    tmp_path, settings, remote_url,
+):
+    """Native Windows namespace paths reach Python, ordinary paths reach Git."""
+    # Keep the Git root within Git for Windows' -C limit; package descendants
+    # still exceed MAX_PATH, as they do under a normal installed profile.
+    state_dir = tmp_path / ("state-" + "x" * max(1, 190 - len(str(tmp_path))))
+    transport = transport_module.FileTransport(
+        state_dir / "dev-github.json",
+        {settings["repository"]: str(filesystem_path(remote_url))},
+    )
+    for number in (1, 2):
+        batch = make_batch(f"deep-{number}", [
+            entry_file(make_entry(entry_id=f"entry-{number}",
+                                  content=f"Complete public observation {number}.")),
+        ])
+        assert max(len(str(state_dir / "git" / "acme_npu-knowledge" / item["path"]))
+                   for item in batch["files"]) > 260
+        submitted = submit_batch(batch, settings, state_dir, transport=transport)
+        assert submitted["status"] == "submitted", submitted.get("detail")
+        merged = transport.merge_pull_request(
+            settings["repository"], number, sha=submitted["head_sha"],
+            method="squash", deadline=Deadline(120, 100),
+        )
+        assert merged["merged"] is True
+        assert git(["--git-dir", remote_url, "rev-parse", "refs/heads/main"]) == merged["sha"]
+        for item in batch["files"]:
+            actual = subprocess.run(
+                ["git", "-c", "core.longpaths=true", "--git-dir", remote_url,
+                 "show", "refs/heads/main:" + item["path"]],
+                capture_output=True, check=True,
+            )
+            assert actual.stdout == item["content"].encode("utf-8")
+        recorded = transport.get_pull_request(settings["repository"], number, Deadline(120, 100))
+        assert recorded["state"] == "closed" and recorded["merged"] is True
 
 
 @pytest.mark.parametrize("operation", ["fetch", "rev-parse", "push"])

@@ -16,6 +16,7 @@ from mindie_knowledge.community import reconcile_batch, submit_batch
 from mindie_knowledge.community.batch import contribution_branch
 from mindie_knowledge.community.common import UnknownOutcome
 from mindie_knowledge.community.transport import FileTransport
+from mindie_knowledge.filesystem import filesystem_path, git_path
 from mindie_knowledge.loop import documents, settings as loop_settings
 from mindie_knowledge.loop.documents import make_entry, render_entry
 from mindie_knowledge.loop.engine import Engine
@@ -57,15 +58,15 @@ def _branch(domain, batch_id):
 
 
 def _branch_file(remote_url, branch, path, tmp_path, name):
-    work = tmp_path / name
-    git(["clone", "--quiet", "-b", branch, remote_url, str(work)])
+    work = filesystem_path(tmp_path / name)
+    git(["clone", "--quiet", "-b", branch, remote_url, git_path(work)])
     return (work / path).read_text(encoding="utf-8")
 
 
 def _branch_task(remote_url, branch, task_id, tmp_path, name):
     from mindie_knowledge.materials import validate_package_files
-    work = tmp_path / name
-    git(["clone", "--quiet", "-b", branch, remote_url, str(work)])
+    work = filesystem_path(tmp_path / name)
+    git(["clone", "--quiet", "-b", branch, remote_url, git_path(work)])
     root = work / "tasks" / task_id
     files = {path.relative_to(root).as_posix(): path.read_bytes().decode("utf-8")
              for path in root.rglob("*.md")}
@@ -75,29 +76,29 @@ def _branch_task(remote_url, branch, task_id, tmp_path, name):
 
 def _bot_package(remote_url, branch, doc, tmp_path, name):
     import shutil
-    work = tmp_path / name
-    git(["clone", "--quiet", "-b", branch, remote_url, str(work)])
+    work = filesystem_path(tmp_path / name)
+    git(["clone", "--quiet", "-b", branch, remote_url, git_path(work)])
     root = work / "tasks" / doc["entry_id"]
     shutil.rmtree(root)
     for item in package_files(doc):
         target = work / item["path"]
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(item["content"].encode("utf-8"))
-    git(["add", "-A"], cwd=work)
+    git(["add", "-A"], cwd=git_path(work))
     git(["-c", "user.name=bot", "-c", "user.email=bot@example.invalid",
-         "commit", "-m", "correct current task package"], cwd=work)
-    git(["push", "origin", "HEAD"], cwd=work)
+         "commit", "-m", "correct current task package"], cwd=git_path(work))
+    git(["push", "origin", "HEAD"], cwd=git_path(work))
 
 
 def _bot_rewrite(remote_url, branch, path, new_text, tmp_path, name):
     """A maintainer/bot commit directly on our contribution branch."""
-    work = tmp_path / name
-    git(["clone", "--quiet", "-b", branch, remote_url, str(work)])
+    work = filesystem_path(tmp_path / name)
+    git(["clone", "--quiet", "-b", branch, remote_url, git_path(work)])
     (work / path).write_text(new_text, encoding="utf-8", newline="\n")
-    git(["add", "-A"], cwd=work)
+    git(["add", "-A"], cwd=git_path(work))
     git(["-c", "user.name=bot", "-c", "user.email=bot@example.invalid",
-         "commit", "-m", "bot edit"], cwd=work)
-    git(["push", "origin", "HEAD"], cwd=work)
+         "commit", "-m", "bot edit"], cwd=git_path(work))
+    git(["push", "origin", "HEAD"], cwd=git_path(work))
 
 
 def _sync_pr_ref(transport, remote_url, number):

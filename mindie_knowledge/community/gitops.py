@@ -22,7 +22,7 @@ from .common import (
     run_argv,
 )
 from mindie_knowledge.gitread import with_windows_longpaths
-from mindie_knowledge.filesystem import git_path
+from mindie_knowledge.filesystem import filesystem_path, git_path
 
 MAX_GIT_OUTPUT = 256 * 1024
 _CANONICAL_CHECKOUT = ["-c", "core.autocrlf=false", "-c", "core.eol=lf"]
@@ -141,6 +141,7 @@ def remote_tip(remote_url: str, ref: str, deadline: Deadline, *, env=None) -> st
 
 def ensure_clone(remote_url: str, work_dir: Path, deadline: Deadline, *, env=None) -> Path:
     """Fetch objects into the private clone, without materializing unvalidated paths."""
+    work_dir = filesystem_path(work_dir)
     if (work_dir / ".git").is_dir():
         _git(["fetch", "origin", "--prune"], deadline, cwd=Path(git_path(work_dir)), env=env)
     else:
@@ -171,7 +172,7 @@ def checkout_existing(work_dir: Path, branch: str, deadline: Deadline, *, env=No
 
 
 def tree_sha256(work_dir: Path, path: str) -> str | None:
-    target = work_dir / path
+    target = filesystem_path(work_dir) / path
     if not target.is_file() or target.is_symlink():
         return None
     raw = target.read_bytes()
@@ -181,7 +182,7 @@ def tree_sha256(work_dir: Path, path: str) -> str | None:
 
 
 def read_tree_file(work_dir: Path, path: str) -> str | None:
-    target = work_dir / path
+    target = filesystem_path(work_dir) / path
     if not target.is_file() or target.is_symlink():
         return None
     raw = target.read_bytes()
@@ -192,6 +193,7 @@ def read_tree_file(work_dir: Path, path: str) -> str | None:
 
 def apply_files(work_dir: Path, files: Sequence[Mapping[str, Any]]) -> list[str]:
     """Write canonical LF bytes, plain 100644 files only; returns paths written."""
+    work_dir = filesystem_path(work_dir)
     written = []
     for item in files:
         path = item["path"]
