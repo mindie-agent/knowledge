@@ -272,9 +272,28 @@ def test_control_timeout_leaves_contended_start_lock_and_config_untouched(tmp_pa
 def test_known_stop_timeout_preserves_receipt_without_terminating_owner(tmp_path, monkeypatch):
     path, config = configuration(tmp_path)
     cli.ensure_service(path)
+    acknowledgements = []
+    actual_rpc, actual_pause = transport.rpc, lifecycle._pause
+
+    def observe_rpc(connection, method, *args, **kwargs):
+        result = actual_rpc(connection, method, *args, **kwargs)
+        if method == 'stop_if_idle':
+            acknowledgements.append(result)
+        return result
+
+    def timeout_after_ack(deadline, stage):
+        if stage == 'consumer_ownership':
+            assert len(acknowledgements) == 1 and acknowledgements[0]['idle'] is True
+            assert lifecycle.inspect_retirement(path)['status'] == 'retired'
+            raise lifecycle.RetirementTimeout(stage)
+        return actual_pause(deadline, stage)
+
     with monkeypatch.context() as patch:
+        patch.setattr(transport, 'rpc', observe_rpc)
         patch.setattr(lifecycle, '_consumer_state', lambda _config: True)
-        result = lifecycle.retire_service(path, control_timeout=.1)
+        patch.setattr(lifecycle, '_pause', timeout_after_ack)
+        result = lifecycle.retire_service(path)
+    assert result['service'] == 'stopped'
     assert result['idle'] and result['retirement']['status'] == 'retired'
     assert result['cleanup_failed']
     assert result['cleanup_error']['stage'] == 'consumer_ownership'
