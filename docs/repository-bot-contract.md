@@ -1,5 +1,7 @@
 # Repository bot contract — `mindie-content-review/2`
 
+[中文](repository-bot-contract.zh.md) | English · [Documentation Index](README.en.md)
+
 This is configuration guidance for the maintainer's existing Grok Bot app.
 MindIE ships the contributor, content validator and feed sync; it does not ship
 a separate bot runtime, model service or scheduler.

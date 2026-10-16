@@ -1,5 +1,7 @@
 # Summary process and temporary profile ownership
 
+[中文](summary-process-ownership.zh.md) | English · [Documentation Index](README.en.md)
+
 The shared [service and attempt lifetime](service-process-lifetime.md) contract
 now also covers abrupt owner death on macOS, Windows and Linux/WSL. The historical
 verification below describes the earlier scratch change; it does not stand in

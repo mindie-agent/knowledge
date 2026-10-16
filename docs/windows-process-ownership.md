@@ -1,5 +1,7 @@
 # Windows process ownership
 
+[中文](windows-process-ownership.zh.md) | English · [Documentation Index](README.en.md)
+
 Both organizer execution and community Git/gh subprocesses use
 `mindie_knowledge.windows_process.spawn_owned`. The child is created suspended,
 assigned to a Job with `KILL_ON_JOB_CLOSE`, and resumed through the documented

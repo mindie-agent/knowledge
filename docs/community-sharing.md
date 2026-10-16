@@ -1,5 +1,7 @@
 # Community sharing: contributor-side publication
 
+[中文](community-sharing.zh.md) | English · [Documentation Index](README.en.md)
+
 This document covers what this package actually ships: the deterministic
 contributor-side publication path (`submit_batch` / `reconcile_batch` and the
 `python -m mindie_knowledge.community submit|reconcile` CLI). Repository-side
