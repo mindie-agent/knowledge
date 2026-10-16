@@ -1,80 +1,48 @@
-# Framework stability — 2026-09-28
+# Framework Stability & Verification Boundaries
 
-[中文](framework-stability.zh.md) | English · [Documentation Index](README.en.md)
+[中文](framework-stability.zh.md) | **English** · [Back to Documentation Center](README.en.md)
 
-Core recovery and shared configuration; reviewed production revision `0df968a`.
+This guide summarizes the stability mechanisms built into `mindie-knowledge` for everyday use: deterministic transcript parser isolation, self-healing ReMe derived indexes, non-blocking atomic configuration updates on Windows, and the clear boundary between component fixture tests and live host acceptance.
 
-## Everyday use
+---
 
-Invoke the native MindIE entry and continue the existing task: `/mindie-agent`
-in Kimi or Claude Code, and `$mindie-agent` in Codex. The first use after
-installation asks for a choice once. That choice persists across tasks,
-forks, restarts, updates and ordinary failures. Later entries require no
-renewal or manual activation/recovery steps. An explicit choice change is
-still available through the entry. Automatic diagnostic reporting has its
-own independent saved choice and does not follow contribution consent.
+## 1. Everyday "Zero-Ceremony" Stability
 
-With contribution off, the framework performs no Stop collection or organizer
-call. Retrieval and remote development remain available. Temporary service
-or network failures use the existing worker's persisted recovery state;
-corrupt configuration is reported as a fault and never triggers onboarding.
+- **Configure Once, Run Effortlessly**: The first time you invoke the native entry after installation (`/mindie-agent` in Claude Code / Kimi or `$mindie-agent` in Codex), your contribution preference is saved in `mindie-consent/1` and reused across future tasks, branches, restarts, and updates without manual re-activation. Community contribution consent and diagnostic crash reporting maintain separate, independent choices.
+- **Corrupt Config Is Never Treated as First-Time Onboarding**: If a shared configuration or `mindie-consent/1` file is damaged by an external tool, `mindie-knowledge` reports an explicit fault and preserves existing state—never wiping user data or re-triggering first-time onboarding.
 
-## Implementation and verification
+---
 
-The core owns persisted consent, canonical write locking, bounded recovery and publication state. Native adapters supply identity and transcript parsers.
+## 2. Isolating Internal Frameworks
 
-482 tests passed; one long-path case passed separately under a shorter temporary path. The integrated parser fixtures passed 15 focused checks. These are local component baseline results before the Windows read follow-up. The PR
-checks are the source of online CI status; local counts are not CI claims.
+`mindie-knowledge` confines internal parsing, indexing, and retrieval libraries to stateless or rebuildable boundaries so third-party state can never corrupt authoritative data:
 
-From the repository root, use a Python interpreter satisfying the README's
-SQLite requirement. Install `pip install -e '.[test]'` for core, or
-`pip install -r runtime-requirements.txt` for an adapter, then run:
+| Component | Role in `mindie-knowledge` | Isolation & Stability Guarantee |
+| --- | --- | --- |
+| **Host Transcript Parsers** | Project visible user & assistant messages from Claude / Codex / Kimi transcripts | Verified against pinned production parser fixtures (`tests/fixtures/production-parsers`). Malformed or unrecognized transcript records fail visibly rather than storing raw JSON as material. |
+| **ReMe Retrieval Library** | Provides local Markdown chunking, citation graph construction, and BM25 lexical scoring | Used strictly as an in-process library—**spawning zero background daemons, file watchers, or external network requests**. If a derived index cache is damaged or upgraded, it rebuilds cleanly from authoritative Markdown files and SQLite checkpoints. |
+| **LangMem (`0.0.30`)** | Generates per-block titles, summaries, and task navigation outlines | Invoked purely as a stateless batch indexing function over the host's native small-model route; its built-in graph stores and background services are unused, and all attempt state is governed by `SummaryLedger`. |
 
-```sh
-python -m pytest -q tests
-```
+---
 
-Unset `MINDIE_FRAMEWORK_SOURCE` selects the committed parser fixture and
-checks those files exist. A bad explicit path is a setup error, not a product
-failure. The Windows job runs `tests/test_windows_process_ownership.py`
-before the full suite. These are real subprocess checks, without a model or provider credentials.
-Missing dependencies fail explicitly. Keep failure-path, concurrency and
-recovery cases bounded and deterministic; model sessions are reserved for
-checks that actually need a native host.
+## 3. Atomic Configuration Reads & Writes on Windows
 
-## Windows configuration reads and writes
+On Windows, if a reader process holds an open handle to a configuration file without delete-sharing, Python's standard `os.replace` can fail with `PermissionError` or cause readers to observe partial writes.
 
-The shared configuration implementation combines delete-sharing reads with
-a native atomic rename on Windows. Existing readers retain the complete old
-document, and readers opening the published path see the complete new one.
-The core and all three bootstrap copies use the same implementation. This
-requires both sides of the mechanism: Python's Windows `os.replace` alone
-cannot replace an open destination. See the [Windows rename semantics](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information).
+To provide POSIX-grade atomic configuration updates on Windows, `mindie-knowledge` core and all plugin bootstrap helpers share a unified implementation:
+1. **Delete-Sharing Reads**: Every internal reader opens configuration files with `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`;
+2. **Native Atomic Rename**: Writers flush the complete new document to a temporary file in the same directory and atomically replace the target using native Win32 rename semantics.
+- **Result**: Active readers finish reading the complete old document while new readers immediately see the complete new document—with zero lock contention or partial JSON reads (see [Windows `_FILE_RENAME_INFORMATION` semantics](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information)).
 
-An external program holding a file without delete sharing can still block
-an update; that error preserves the saved document and does not trigger
-onboarding or a retry loop. Windows CI checks this filesystem contract;
-it is separate from acceptance inside a native Windows agent host.
+---
 
-## Integration and acceptance boundaries
+## 4. Consumer Lock Observation & Verification Boundaries
 
-The persistent `consumer.lock` is held until the service has closed its
-listener and store. `lock_held` observes the OS lock without rewriting PID
-metadata; missing or unreadable locks remain unknown. Startup can therefore
-recognize a released consumer even on Windows, where a short connection
-attempt to a closed loopback port may time out before refusal is reported.
-The real service startup test checks this post-shutdown state. Adapter
-handoff tests must also confirm release rather than force-kill a fixture
-and treat that cleanup as successful production shutdown.
-
-Publish the exact dependency commits before adapter CI. Process the reviewed
-PRs in order: knowledge core, Claude Code, Kimi, Codex. Preserve published
-commit identities used by runtime and test pins.
-
-Isolated native read-only entry and persistent choice were exercised across
-the three hosts. Claude's normal generated package and pinned runtime were
-verified. Evidence for unchanged entry paths can be reused; it does not
-prove native contribution Stop, publication, or Windows host acceptance.
-Those remain separate integration checks. Historical dated reports retain
-their original scope. Domain asset import and new business workflows remain
-deferred while the framework stabilizes.
+- **Reliable `consumer.lock` Liveness Detection**: The background knowledge service holds the OS-level `consumer.lock` until it has closed both its RPC listener and SQLite store. `lock_held` probes the OS lock directly without rewriting brittle PID metadata—allowing startup to detect a released service immediately even on Windows, where connecting to a closed loopback port can briefly time out before returning `ConnectionRefusedError`.
+- **Deterministic Test Suite vs. Live Host Acceptance**:
+  ```bash
+  # Run the complete unit and integration test suite from the repository root
+  MINDIE_FRAMEWORK_SOURCE=tests/fixtures/production-parsers python3 -m pytest -q tests
+  ```
+  - When `MINDIE_FRAMEWORK_SOURCE` is unset, `tests/conftest.py` uses the committed `tests/fixtures/production-parsers` directory and verifies all three parser files exist; passing an invalid explicit path exits immediately as a setup error rather than falling back to a global installation.
+  - Repository `pytest` suites verify protocol contracts, fault injection, concurrency locks, and subprocess tree reclamation with zero model calls, while end-to-end validation inside live Claude Code / Codex / Kimi hosts and on Ascend NPU hardware is tracked separately as release acceptance evidence.

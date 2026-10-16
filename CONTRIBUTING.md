@@ -1,64 +1,55 @@
-# 贡献指南（Contributing）
+# 参与贡献（Contributing to `mindie-knowledge`）
 
-中文 | [English](CONTRIBUTING.en.md)
+**中文** | [English](CONTRIBUTING.en.md) · [返回仓库首页](README.md)
 
-感谢关注并参与 **MindIE Knowledge**（`mindie-agent/knowledge`）的开发与维护。本仓库承载 MindIE Agent 的共享领域知识与任务经验闭环运行时。
+欢迎参与 **MindIE Knowledge**（`mindie-agent/knowledge`）的开发与改进！本仓库提供 MindIE Agent 的领域知识同步、本地 BM25 检索、双层隐私脱敏与社区经验外发运行时。
 
-提交代码、配置、构建/CI 或文档变更前，请遵循以下工程边界与验证要求。
-
----
-
-## 核心工程契约
-
-1. **遵循领域闭环契约**：所有改动必须符合 [领域闭环运行时契约](docs/mindie-loop.zh.md)（[English](docs/mindie-loop.md)）。
-2. **严格区分概念边界**：保持**知识（knowledge）**、**任务经验（experience）**、**实际业务使用（actual use）**与**独立反馈（independent feedback）**的边界清晰分离。检索命中、摘要生成、投票或合入均不赋予条目决策权威。
-3. **坚守隐私脱敏防线**：任何涉及公开发布、同步或社区共享的变更必须保持闭锁式（fail-closed）脱敏边界，严禁将原始会话记录、未脱敏正文、本地私有路径、凭据或内部使用证据带入公共分发路径。
-4. **保持当前入口与命名**：当前命令行入口为 `mindie-knowledge`（包名 `mindie-knowledge`，模块 `mindie_knowledge`）。请勿恢复已退役的旧工作区安装方式或遗留别名。
-5. **保持实现状态与真实验收证据分离**：固定夹具（fixture）测试仅验证协议与组件行为；任何关于真实模型、原生宿主或昇腾 NPU 的结论必须具备可追溯的实际验收记录。
+为了让代码库始终保持高可维护性、零隐私泄漏和清晰的故障可观测性，提交 Pull Request 前请了解以下开发约定。
 
 ---
 
-## 本地开发与必做检查
+## 1. 核心工程约定（为什么这么设计？）
 
-在仓库根目录下安装测试依赖并执行完整检查：
+1. **知识仅供参考，不喧宾夺主**：
+   检索命中、小模型导航摘要、有用性投票或 PR 合入都**不代表对某条经验的权威认证**。请保持“公开知识包”、“本地任务草稿”、“实际业务使用”与“独立反馈”之间的清晰边界。
+2. **严守双层闭锁式脱敏（Fail-Closed Redaction）**：
+   任何涉及对话采集、索引、外发或同步的改动，都必须确保未脱敏原文、工具调用噪音、隐藏推理链、内网地址、`<user>@<host>` 登录目标、个人目录路径或凭据绝不会进入公开分发路径。
+3. **禁止静默降级或隐藏错误**：
+   当读取失败、配置损坏、脱敏扫描器异常或子进程超时发生时，必须向调用者如实报告失败阶段与原因——绝不能把读取失败伪装成“无匹配结果”，不能把配置损坏伪装成“首次安装引导”，更不能对结果不确定（`unknown`）的外部写入或付费模型调用做盲目自动重试。
+4. **保持简洁统一命名**：
+   当前 CLI 入口为 `mindie-knowledge`（包名 `mindie-knowledge`，模块 `mindie_knowledge`），请勿引入已废弃的旧别名或第二套状态库。
+5. **区分固定夹具测试与实机验收证据**：
+   仓库内的单元测试使用确定性夹具验证协议与异常分支；涉及真实大模型、客户端宿主或昇腾 NPU 的结论需基于可追溯的实机验证记录，不虚构验收证据。
 
-```sh
-# 1. 安装可编辑包与测试依赖
-python -m pip install -e '.[test]'
+---
+
+## 2. 本地开发环境与必跑检查
+
+在提交代码或文档前，请在仓库根目录下运行以下两条验证命令：
+
+```bash
+# 1. 安装可编辑运行时与测试依赖
+python3 -m pip install -e '.[test]'
 
 # 2. 运行单元与集成测试套件
-MINDIE_FRAMEWORK_SOURCE=tests/fixtures/production-parsers python -m pytest -q tests
+MINDIE_FRAMEWORK_SOURCE=tests/fixtures/production-parsers python3 -m pytest -q tests
 
-# 3. 扫描所有公开文档与技能文件，确保零敏感数据命中
-python -m mindie_knowledge.redact --check README.md README.en.md CONTRIBUTING.md CONTRIBUTING.en.md docs mindie_knowledge/skills
+# 3. 运行确定性隐私脱敏扫描，确保公开文档与技能文件零敏感信息命中
+python3 -m mindie_knowledge.redact --check README.md README.en.md CONTRIBUTING.md CONTRIBUTING.en.md docs mindie_knowledge/skills
 ```
 
-- 当 `MINDIE_FRAMEWORK_SOURCE` 未设置时，测试套件默认使用仓库内提交的 `tests/fixtures/production-parsers` 并校验三个解析器文件存在；若显式传入了错误的路径，测试会作为配置错误直接失败退出，不会静默回退到系统安装目录。
-- 若改动涉及社区发布（`mindie_knowledge/community`）或公开知识仓库校验（`mindie_knowledge/publication_check.py`），请确保对应的格式、契约与传输测试全部通过。
-- 请勿在任何 Markdown 文档、测试固定数据或 PR 描述中写入类似内网 IP、SSH 登录目标、包含真实用户名的本地目录路径、访问令牌或内部邮箱的字符串。
+> [!TIP]
+> **编写文档与测试数据时的防踩坑提示**：
+> - `mindie_knowledge.redact` 对公开文档同样严格执行扫描。在举例说明路径、机器名或登录串时，请使用带尖括号的占位符（如 `/home/<user>/workspace`、`C:\Users\<user>\...`、`<user>@<host>`），或使用 RFC 5737 文档专用网段（`192.0.2.x`）。
+> - 当未设置 `MINDIE_FRAMEWORK_SOURCE` 时，测试套件会自动使用仓库内的 `tests/fixtures/production-parsers`；若显式传入了不存在的路径，测试会直接报错退出，而不会静默回退到系统目录。
 
 ---
 
-## 提交 PR 前必做的设计原则审查（Mandatory Design-Principles Review）
+## 3. 提交 PR 前的设计原则自检
 
-在创建或更新任何开发 PR（包括 Draft PR，涵盖代码、配置、依赖、CI 与项目文档变更）之前，贡献者**必须**阅读最新的 [MindIE Agent 九条设计原则](https://github.com/mindie-agent/mindie-agent/blob/main/docs/design-principles.md)，并对照最终 diff 与受影响行为逐条完成审查：
+在创建或更新开发 PR（包括代码、配置、依赖、CI 与文档改动）前，请先阅读 [MindIE Agent 工程设计原则](https://github.com/mindie-agent/mindie-agent/blob/main/docs/design-principles.md)，并在 PR 描述中按模板（[`.github/pull_request_template.md`](.github/pull_request_template.md)）简要填写 `## 设计原则 Review`：
 
-1. **以完成用户实际目标的总成本衡量 Agent 效率**
-2. **只将边界明确的封闭问题工具化**
-3. **不能增加 Agent 的理解负担**
-4. **每个工具有明确的边界和定义**
-5. **Skill 主要提供信息**
-6. **知识仅供参考**
-7. **所有工具和 Skill 按需介入**
-8. **优先复用成熟机制与已有有效成果**
-9. **工具可观察、可定位，禁止隐藏错误**
-
-### 审查与 PR 描述要求
-
-- **错误必须对调用者可见**：严禁将必要步骤失败转化为成功、空结果、首次使用引导、用户停用或未记录的降级行为。必须明确区分已完成工作、失败与结果不确定的外部副作用；不得自动重放结果不确定的外部写入，也不得用后续清理异常掩盖主错误。
-- **提交前修正违规项**：审查中发现违反设计原则的问题，必须在提交 PR 前修复并复查。
-- **在 PR 描述中完整记录审查结论**：按照 [`.github/pull_request_template.md`](.github/pull_request_template.md) 填写 `## 设计原则 Review` 章节，明确记录：
-  - 审查覆盖的提交哈希（commit SHA）与设计原则文档版本（revision）；
-  - 九条原则的具体审查结论与适用性依据（不适用项需结合本次 diff 说明具体原因，不得使用笼统的 `N/A` 或“已遵循全部原则”代替）；
-  - 发现的问题与修正措施；
-  - 实际运行的验证命令及尚未覆盖的外部环境边界。
+- **这次改动降低了什么实际成本？** 是否引入了不必要的常驻开销、重复计算或额外心智负担？
+- **组件边界是否清晰？** 是否复用了宿主与操作系统的成熟机制，并在替代旧实现后清理了重复状态？
+- **所有受影响的失败路径是否对调用者可见？** 是否区分了“已完成”、“失败”与“外部副作用不确定（`unknown`）”？
+- **实际运行了哪些验证命令？** 哪些外部环境边界尚未在本次变更中验证？
