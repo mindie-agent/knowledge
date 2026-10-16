@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 320" role="img" aria-labelledby="title desc">
+  <title id="title">MindIE Knowledge</title>
+  <desc id="desc">Shared Knowledge Runtime for MindIE Agent. Public Sync, Local Indexing, Redacted Sharing, Independent Feedback.</desc>
+  <defs>
+    <linearGradient id="bg-dark" x1="0" y1="0" x2="1200" y2="320" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#0F172A"/>
+      <stop offset="60%" stop-color="#111827"/>
+      <stop offset="100%" stop-color="#0B253A"/>
+    </linearGradient>
+    <linearGradient id="accent-dark" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#14B8A6"/>
+      <stop offset="100%" stop-color="#38BDF8"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="320" rx="24" fill="url(#bg-dark)" stroke="#1E293B" stroke-width="2"/>
+  <path d="M940 0L1200 260M990 0L1200 210M890 0L1200 310" stroke="#1E293B" stroke-width="2"/>
+  <circle cx="1080" cy="160" r="110" fill="none" stroke="#1E293B" stroke-width="1.5" stroke-dasharray="6 6"/>
+  <g transform="translate(64, 82)">
+    <rect width="156" height="156" rx="32" fill="url(#accent-dark)"/>
+    <rect x="28" y="30" width="68" height="84" rx="10" fill="none" stroke="#0F172A" stroke-width="6"/>
+    <path d="M44 54H80M44 72H80M44 90H66" stroke="#0F172A" stroke-width="5" stroke-linecap="round"/>
+    <circle cx="106" cy="104" r="22" fill="#0F172A"/>
+    <path d="M98 104L104 110L116 97" fill="none" stroke="#5EEAD4" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+    <text x="252" y="106" font-size="14" font-weight="700" letter-spacing="3" fill="#5EEAD4">MINDIE AGENT / SHARED KNOWLEDGE RUNTIME</text>
+    <text x="250" y="164" font-size="50" font-weight="800" letter-spacing="-1" fill="#F8FAFC">MindIE Knowledge</text>
+    <text x="252" y="204" font-size="22" font-weight="500" fill="#CBD5E1">Bounded Capture · Local Indexing · Redacted Sharing · Git Feed Sync</text>
+    <text x="252" y="246" font-size="14" font-weight="700" letter-spacing="1.5" fill="#38BDF8">PUBLIC PACKAGES  /  LOCAL MATERIALS  /  FAIL-CLOSED REDACTION  /  BM25 RETRIEVAL</text>
+  </g>
+</svg>

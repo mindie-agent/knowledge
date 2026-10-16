@@ -1,5 +1,7 @@
 # Release eligibility and installed-operation locks
 
+[中文](release-compatibility.zh.md) | English · [Documentation Index](README.en.md)
+
 `mindie_knowledge.releases` selects releases; it does not install, activate,
 persist a catalog, or change authorization. `semantic-version==2.10.0` supplies
 SemVer parsing and precedence. The native Harness remains the installer.

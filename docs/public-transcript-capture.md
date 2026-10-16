@@ -1,5 +1,7 @@
 # Public transcript material and incremental indexing
 
+[中文](public-transcript-capture.zh.md) | English · [Documentation Index](README.en.md)
+
 `public-transcript` is the only capture pipeline. The adapter provides its own
 `transcript_adapter`, an installed absolute `redactor_executable`, and the
 `summary_command` used for required retrieval metadata. The removed

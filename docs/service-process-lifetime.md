@@ -1,5 +1,7 @@
 # Service and attempt lifetime
 
+[中文](service-process-lifetime.zh.md) | English · [Documentation Index](README.en.md)
+
 The knowledge core owns admitted work, result persistence and final scratch
 cleanup. Native adapters validate the existing shared scratch declaration once;
 they do not add another definition of whether a managed core is alive.

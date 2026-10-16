@@ -1,5 +1,7 @@
 # Framework stability — 2026-09-28
 
+[中文](framework-stability.zh.md) | English · [Documentation Index](README.en.md)
+
 Core recovery and shared configuration; reviewed production revision `0df968a`.
 
 ## Everyday use

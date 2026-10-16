@@ -1,5 +1,7 @@
 # MindIE domain loop
 
+[中文](mindie-loop.zh.md) | English · [Documentation Index](README.en.md)
+
 `mindie-knowledge` owns deterministic capture, local storage and contribution.
 Current adapters select `capture_mode: public-transcript`, their own
 `transcript_adapter`, an installed `redactor_executable`, and an optional

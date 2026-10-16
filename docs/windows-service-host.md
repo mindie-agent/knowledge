@@ -1,5 +1,7 @@
 # Windows knowledge service ownership
 
+[中文](windows-service-host.zh.md) | English · [Documentation Index](README.en.md)
+
 The knowledge consumer must outlive the native application that accepted a
 Stop event. A detached child is insufficient when the native application owns
 an ancestor Windows Job with kill-on-close and no breakaway permission. A

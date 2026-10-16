@@ -1,5 +1,7 @@
 # Explicit historical transcript import
 
+[中文](history-import.zh.md) | English · [Documentation Index](README.en.md)
+
 `mindie_knowledge.loop.history_import.import_transcript` is the shared intake
 behind a Harness's explicit history-import entry. The caller selects native
 source files. Startup, Stop capture, synchronization and retrieval never discover
