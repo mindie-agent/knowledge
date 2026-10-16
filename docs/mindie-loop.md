@@ -316,8 +316,6 @@ checkpoint rows in `tests/test_incremental_resources.py`. The standalone
 `benchmarks/resource_paths.py` reports measured CPU, elapsed time, memory,
 descriptors and storage for synthetic workloads (requires developer-only
 `psutil`). Its workload counts and measurement windows are never runtime limits.
-Observed costs and limitations are recorded in
-[local resource validation](resource-validation-2026-10-05.md).
 
 ## MCP surface
 
