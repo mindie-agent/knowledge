@@ -22,9 +22,9 @@ def test_quiet_and_progressing_owned_processes_have_no_default_execution_deadlin
 def test_result_is_saved_before_cleanup_and_cleanup_cannot_erase_it(monkeypatch):
     saved, state = [], {}
     original = runner.terminate_tree
-    def failed_cleanup(process):
+    def failed_cleanup(process, **options):
         assert saved == [dict(status='returned', value='durable')]
-        original(process)
+        original(process, **options)
         raise OSError('synthetic cleanup failure')
     monkeypatch.setattr(runner, 'terminate_tree', failed_cleanup)
     command = [sys.executable, '-c', 'import json; print(json.dumps({"status":"returned","value":"durable"}),flush=True)']

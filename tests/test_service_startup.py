@@ -1,6 +1,8 @@
 """Service startup with an actual configured transcript adapter module."""
 
 import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 import shutil
 import socket
 import subprocess
@@ -19,47 +21,116 @@ def _configuration(root):
                 redactor_executable=str(root.parent / "gitleaks"))
 
 
+def test_prepare_observation_timeout_never_starts_a_second_owner(tmp_path, monkeypatch):
+    from mindie_knowledge.loop import cli, process, service_host
+    from mindie_knowledge.loop.lifecycle import config_fingerprint
+    from mindie_knowledge.loop.locks import StartLock, lock_held
+
+    release = threading.Event()
+    requested = threading.Event()
+
+    class SlowStatus(BaseHTTPRequestHandler):
+        def do_POST(self):
+            requested.set()
+            release.wait(5)
+            self.close_connection = True
+
+        def log_message(self, *_):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), SlowStatus)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    config = _configuration(tmp_path / "data")
+    path = tmp_path / "engine.json"
+    path.write_text(json.dumps(config))
+    connection = cli.connection_path(config)
+    connection.parent.mkdir(parents=True)
+    connection.write_text(json.dumps(dict(
+        domain="test", token="test", url=f"http://127.0.0.1:{server.server_port}",
+        config_fingerprint=config_fingerprint(path, config))))
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("a slow observed owner must not cause a new startup")
+
+    monkeypatch.setattr(process, "spawn_service", forbidden)
+    monkeypatch.setattr(service_host, "platform_backend", forbidden)
+    try:
+        with StartLock(connection.with_name("consumer.lock")):
+            started = time.monotonic()
+            with pytest.raises(RuntimeError, match="unknown"):
+                cli.prepare_service(path, probe_timeout=.1)
+            assert time.monotonic() - started < 2
+            assert requested.is_set()
+            assert lock_held(connection.with_name("consumer.lock"))
+            assert lock_held(connection.with_name("start.lock")) is False
+    finally:
+        release.set()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.mark.parametrize("timeout", [False, 0, -1, float("nan"), float("inf"), "30"])
+def test_prepare_rejects_invalid_probe_timeout_before_configuration(tmp_path, timeout):
+    from mindie_knowledge.loop.cli import prepare_service
+
+    with pytest.raises(ValueError, match="probe_timeout"):
+        prepare_service(tmp_path / "missing.json", probe_timeout=timeout)
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_service_start_waits_for_a_transient_lock_observer(tmp_path):
     from mindie_knowledge.loop.cli import connection_path, rpc
     from mindie_knowledge.loop.locks import StartLock
+    from mindie_knowledge.loop.store import Store
 
     config = _configuration(tmp_path / 'data')
+    # This test observes consumer-lock recovery; cold schema initialization has
+    # separate startup coverage and must not consume its observation window.
+    Store(config['root'], config['domain']).close()
     path = tmp_path / 'engine.json'
     path.write_text(json.dumps(config), encoding='utf-8')
-    attempted = tmp_path / 'attempted'
-    bootstrap = (
-        'import runpy; from pathlib import Path; from mindie_knowledge.loop import locks\n'
-        'real = locks._lock_file_nb\n'
-        'def observed(fd):\n'
-        f'    Path({str(attempted)!r}).write_text("attempted")\n'
-        '    return real(fd)\n'
-        'locks._lock_file_nb = observed\n'
-        'runpy.run_module("mindie_knowledge.loop.cli", run_name="__main__")\n'
-    )
-    process = None
-    try:
-        with StartLock(connection_path(config).with_name('consumer.lock')):
-            process = subprocess.Popen([sys.executable, '-c', bootstrap, 'serve', '--config', str(path)],
-                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            deadline = time.monotonic() + 5
-            while not attempted.exists() and time.monotonic() < deadline:
-                assert process.poll() is None
-                time.sleep(.01)
-            assert attempted.exists()
-            with pytest.raises(subprocess.TimeoutExpired):
-                process.wait(timeout=.15)
-        deadline = time.monotonic() + 5
-        while not connection_path(config).exists() and time.monotonic() < deadline:
-            assert process.poll() is None
+    evidence = tmp_path / 'startup-stages'
+    diagnostics = tmp_path / 'service.log'
+    connection_file = connection_path(config)
+    consumer_file = connection_file.with_name('consumer.lock')
+
+    def wait_for(target, stage, deadline):
+        while not target.exists() and time.monotonic() < deadline:
+            assert process.poll() is None, diagnostics.read_text(encoding='utf-8')
             time.sleep(.01)
-        connection = json.loads(connection_path(config).read_text())
-        assert rpc(connection, 'status', timeout=1)['worker_alive']
-        assert rpc(connection, 'stop_if_idle', timeout=1)['idle']
-        assert process.wait(timeout=3) == 0
-    finally:
-        if process is not None and process.poll() is None:
-            process.kill()
-            process.wait(timeout=3)
+        assert target.exists(), f"{stage} not observed:\n{diagnostics.read_text(encoding='utf-8')}"
+
+    process = None
+    with diagnostics.open('w', encoding='utf-8') as log:
+        try:
+            with StartLock(consumer_file):
+                process = subprocess.Popen(
+                    [sys.executable, str(Path(__file__).with_name('startup_observer.py')),
+                     str(path), str(consumer_file), str(evidence)],
+                    stdout=log, stderr=log,
+                )
+                wait_for(evidence / 'consumer_busy', 'exact consumer contention',
+                         time.monotonic() + 5)
+                assert not (evidence / 'consumer_acquired').exists()
+                assert not connection_file.exists()
+                with pytest.raises(subprocess.TimeoutExpired):
+                    process.wait(timeout=.15)
+            deadline = time.monotonic() + 5
+            wait_for(evidence / 'consumer_acquired', 'consumer acquisition after release', deadline)
+            wait_for(connection_file, 'service readiness', deadline)
+            connection = json.loads(connection_file.read_text())
+            assert rpc(connection, 'status', timeout=1)['worker_alive']
+            assert rpc(connection, 'stop_if_idle', timeout=1)['idle']
+            assert process.wait(timeout=3) == 0, diagnostics.read_text(encoding='utf-8')
+        except BaseException:
+            print(diagnostics.read_text(encoding='utf-8'), file=sys.stderr)
+            raise
+        finally:
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait(timeout=3)
 
 
 def test_cold_wake_spawn_failure_is_visible_and_releases_ownership(tmp_path, monkeypatch):

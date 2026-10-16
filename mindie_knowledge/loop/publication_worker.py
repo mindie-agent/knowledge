@@ -6,6 +6,28 @@ creates a new write; a returned result survives receipt or cleanup failures.
 from .store import Store
 
 
+def record_publication_receipt(store, batch_row, receipt, *, attempted=False):
+    """Keep the publisher's exact result if recording it fails locally."""
+    try:
+        confirmed = receipt.get("status") in Store.CONFIRMED_BATCH
+        for key in ("batch_id", "revision"):
+            actual = receipt.get(key)
+            if (confirmed or actual is not None) and actual != batch_row[key]:
+                raise ValueError("publication receipt does not identify the current " + key)
+        store.mark_batch(
+            batch_row["batch_id"], receipt.get("status", "unknown"),
+            attempted=attempted, detail=receipt.get("detail", ""),
+            pr_url=receipt.get("pr_url"), head_sha=receipt.get("head_sha"),
+            actual_files=receipt.get("files"), retry_at=receipt.get("retry_at"),
+        )
+    except Exception as exc:
+        exc.mindie_publication_result = receipt
+        exc.add_note(
+            "publication result was returned before runtime receipt failure: "
+            + receipt.get("status", "unknown"))
+        raise
+
+
 class PublicationWorker:
     def __init__(self, engine):
         self.engine = engine
@@ -130,15 +152,8 @@ class PublicationWorker:
     def _record_publication_receipt(self, batch_row, receipt, *, attempted=False):
         """A returned write or read result survives a local recording failure."""
         try:
-            self.store.mark_batch(
-                batch_row["batch_id"], receipt.get("status", "unknown"),
-                attempted=attempted, detail=receipt.get("detail", ""),
-                pr_url=receipt.get("pr_url"), head_sha=receipt.get("head_sha"),
-                actual_files=receipt.get("files"), retry_at=receipt.get("retry_at"),
-            )
+            record_publication_receipt(self.store, batch_row, receipt, attempted=attempted)
         except Exception as exc:
-            exc.mindie_publication_result = receipt
-            exc.add_note('publication result was returned before runtime receipt failure: ' + receipt.get('status', 'unknown'))
             self.engine._fault('knowledge.publish', 'receipt', 'publication_recording_failed', exc)
             raise
         self.engine._clear_faults('knowledge.publish', {'receipt'})

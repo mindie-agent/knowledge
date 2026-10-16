@@ -25,6 +25,8 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Mapping
 
+from mindie_knowledge.filesystem import filesystem_path, git_path
+
 from .common import (
     CommunityError,
     Deadline,
@@ -371,7 +373,7 @@ class FileTransport(Transport):
     """
 
     def __init__(self, path: Path, remotes: Mapping[str, str] | None = None):
-        self.path = Path(path)
+        self.path = filesystem_path(path)
         self.remotes = dict(remotes or {})
         self.lock = threading.RLock()
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -410,12 +412,17 @@ class FileTransport(Transport):
             return None
         remaining = deadline.step("git ls-remote")
         result = run_argv(
-            ["git", "ls-remote", url, f"refs/heads/{branch}"],
+            ["git", "-c", "core.longpaths=true", "ls-remote", git_path(url),
+             f"refs/heads/{branch}"],
             timeout=remaining,
             max_output=64 * 1024,
             cancel=deadline.cancel,
         )
-        if result.code != 0 or not result.out_text.strip():
+        if result.timed_out:
+            raise TransientError("dev remote tip read timed out")
+        if result.code != 0:
+            raise CommunityError(f"cannot read dev remote tip: {result.err_text.strip()[:200]}")
+        if not result.out_text.strip():
             return None
         return result.out_text.split()[0]
 
@@ -510,7 +517,8 @@ class FileTransport(Transport):
                 # GitHub exposes for that PR. No second host and no force.
                 remaining = deadline.step("record PR head ref")
                 result = run_argv(
-                    ["git", "--git-dir", url, "update-ref", f"refs/pull/{number}/head", sha],
+                    ["git", "-c", "core.longpaths=true", "--git-dir", git_path(url),
+                     "update-ref", f"refs/pull/{number}/head", sha],
                     timeout=remaining,
                     max_output=64 * 1024,
                     cancel=deadline.cancel,
@@ -544,10 +552,12 @@ class FileTransport(Transport):
         mirror = self.path.parent / "mirrors" / repo.replace("/", "_")
         remaining = deadline.step("git mirror sync")
         if mirror.is_dir():
-            argv = ["git", "-C", str(mirror), "fetch", "origin", "+refs/heads/*:refs/remotes/origin/*"]
+            argv = ["git", "-c", "core.longpaths=true", "-C", git_path(mirror),
+                    "fetch", "origin", "+refs/heads/*:refs/remotes/origin/*"]
         else:
             mirror.parent.mkdir(parents=True, exist_ok=True)
-            argv = ["git", "clone", "--mirror", url, str(mirror)]
+            argv = ["git", "-c", "core.longpaths=true", "clone", "--mirror",
+                    git_path(url), git_path(mirror)]
         result = run_argv(argv, timeout=remaining, max_output=128 * 1024, cancel=deadline.cancel)
         if result.code != 0:
             raise CommunityError(f"cannot sync dev remote mirror: {result.err_text[:200]}")
@@ -603,23 +613,23 @@ class FileTransport(Transport):
             return result.out_text.strip()
 
         if (work / ".git").is_dir():
-            git("fetch", "-C", str(work), "fetch", "origin", "--prune")
+            git("fetch", "-C", git_path(work), "fetch", "origin", "--prune")
         else:
             work.parent.mkdir(parents=True, exist_ok=True)
-            git("clone", "clone", "--quiet", url, str(work))
+            git("clone", "clone", "--quiet", git_path(url), git_path(work))
         base = pr["base"]["ref"]
         head = pr["head"]["ref"]
-        git("checkout", "-C", str(work), "checkout", "--quiet", "-B", base, f"origin/{base}")
-        git("merge", "-C", str(work), "merge", "--squash", "--quiet", f"origin/{head}")
-        git("commit", "-C", str(work), "-c", "user.name=mindie-dev-transport",
+        git("checkout", "-C", git_path(work), "checkout", "--quiet", "-B", base, f"origin/{base}")
+        git("merge", "-C", git_path(work), "merge", "--squash", "--quiet", f"origin/{head}")
+        git("commit", "-C", git_path(work), "-c", "user.name=mindie-dev-transport",
             "-c", "user.email=dev-transport@example.invalid",
             "commit", "--quiet", "-m", f"merge {head} into {base}")
         # Resolve before the external write, so a read failure cannot disguise
         # a completed push or produce a successful receipt with an empty SHA.
-        commit = git("rev-parse", "-C", str(work), "rev-parse", "HEAD")
+        commit = git("rev-parse", "-C", git_path(work), "rev-parse", "HEAD")
         if not re.fullmatch(r"[0-9a-f]{40}", commit):
             raise CommunityError("dev merge rev-parse returned an invalid commit")
-        git("push", "-C", str(work), "push", "origin", f"HEAD:refs/heads/{base}")
+        git("push", "-C", git_path(work), "push", "origin", f"HEAD:refs/heads/{base}")
         return commit
 
 

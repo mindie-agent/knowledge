@@ -1,10 +1,10 @@
 """Consent must gate the real Stop/worker and the outbound write.
 
-community.enabled=true is not enough once consent_config names the profile
+community.enabled=true is not enough: consent_config must name the profile
 authority. Missing, unreadable, corrupt, and non-contribute choices stop
 transcript reads, model spawns, and submission. enabled=false still wins.
 A present but null, empty, relative, or non-string consent_config is a
-fault, not a legacy file. A non-boolean enabled value is a fault, not an
+fault, as is an absent reference. A non-boolean enabled value is a fault, not an
 explicit off switch. A consent document with only reporting is undetermined,
 not read-only/later/disabled. Reporting does not overwrite a contribute
 choice. Local retrieval stays available. The production Kimi parser is the
@@ -20,6 +20,7 @@ import pytest
 from mindie_knowledge.loop.activation import Admission
 from mindie_knowledge.loop.engine import Engine
 from mindie_knowledge.loop.store import Store
+from mindie_knowledge.loop import settings as settings_mod
 
 from conftest import make_admission, write_settings
 from material_worker_fixture import command as summary_command
@@ -271,7 +272,7 @@ def _assert_faulted(world, captured):
 
 @pytest.mark.parametrize("consent", _SHAPES)
 def test_malformed_gate_skips_a_new_stop(tmp_path, consent):
-    """Key absent stays legacy. A present bad value, a bad enabled type, or
+    """A missing or bad reference, a bad enabled type, or
     a consent file with no choice does not read or spawn."""
     world = _world(tmp_path, enabled=True, consent=consent)
     try:
@@ -301,16 +302,17 @@ def test_contribute_still_captures_with_reporting_later(tmp_path):
         _cleanup(world)
 
 
-def test_old_community_file_without_consent_config_still_captures(tmp_path):
-    """No consent_config is the pre-migration format, not a new denial.
-    It is also not proof that an upgrade installed the authority."""
+def test_missing_consent_reference_faults_without_read_or_model(tmp_path):
+    """Enabled configuration cannot substitute for a saved explicit choice."""
     world = _world(tmp_path, enabled=True, consent=None)
     try:
         raw = json.loads(world["settings"].read_text())
         assert "consent_config" not in raw
         captured = _stop(world)
-        assert captured.get("status") == "queued", captured
-        _assert_captured(world)
+        _assert_faulted(world, captured)
+        status = settings_mod.load(world["settings"]).public_status()
+        assert status["consent"]["state"] == "invalid"
+        assert status["enabled"] is True
     finally:
         _cleanup(world)
 
@@ -349,7 +351,9 @@ def _submit(tmp_path, consent):
 
     def submit_batch(*args, **kwargs):
         called.append((args, kwargs))
-        return {"status": "submitted", "detail": "recorder", "head_sha": "a"*40, "pr_url":"https://github.com/example/repo/pull/1"}
+        return {"status": "submitted", "batch_id": args[0]["batch_id"],
+                "revision": args[0]["revision"], "detail": "recorder",
+                "head_sha": "a"*40, "pr_url":"https://github.com/example/repo/pull/1"}
 
     world["engine"].community = {
         "submit_batch": submit_batch,
@@ -372,8 +376,8 @@ def test_contribute_consent_reaches_the_write_boundary(tmp_path):
 
 @pytest.mark.parametrize(
     "consent",
-    ["corrupt", ("read-only", "disabled"), ("later", "later")],
-    ids=["corrupt", "read-only", "later"],
+    [None, "corrupt", ("read-only", "disabled"), ("later", "later")],
+    ids=["missing-reference", "corrupt", "read-only", "later"],
 )
 def test_non_contribute_consent_does_not_submit(tmp_path, consent):
     world, called = _submit(tmp_path, consent)

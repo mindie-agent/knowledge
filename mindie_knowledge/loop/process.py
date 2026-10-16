@@ -16,6 +16,7 @@ and after an explicit inherited-pipe deadline for the community caller.
 
 import os
 import queue
+import shutil
 import signal
 import subprocess
 import sys
@@ -24,6 +25,7 @@ import threading
 import time
 
 from .dfx import failure
+from . import posix_owner, summary_scratch
 
 
 def spawn_service(command, *, from_detached_starter=False):
@@ -88,32 +90,90 @@ def annotated_error(exc, category, started, exit_code=None, stage="run"):
     return exc
 
 
-def _spawn(command, stdin):
+def _spawn(command, stdin, scratch=None):
+    env = {**os.environ, "MINDIE_MAINTENANCE_GROUP": "1",
+           "MINDIE_MAINTENANCE_OWNER": str(os.getpid())}
+    env.pop(summary_scratch.ENVIRONMENT_KEY, None)
+    if scratch is not None:
+        env[summary_scratch.ENVIRONMENT_KEY] = summary_scratch.declaration(scratch)
     if os.name == "nt":
         from mindie_knowledge.windows_process import spawn_owned
         return spawn_owned(
             command,
+            job_name=summary_scratch.job_name(scratch) if scratch is not None else None,
             stdin=stdin,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env={**os.environ, "MINDIE_MAINTENANCE_GROUP": "1", "MINDIE_MAINTENANCE_OWNER": str(os.getpid())},
+            env=env,
         )
+    from .service_host import process_is_contained
+    if sys.platform == "darwin" or (sys.platform.startswith("linux") and not process_is_contained()):
+        return posix_owner.spawn(command, stdin=stdin, env=env)
     return subprocess.Popen(
         command,
         stdin=stdin,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         start_new_session=True,
-        env={**os.environ, "MINDIE_MAINTENANCE_GROUP": "1", "MINDIE_MAINTENANCE_OWNER": str(os.getpid())},
+        env=env,
     )
 
 
-def terminate_tree(process):
-    """Terminate the whole owned tree rooted at ``process``; never raises."""
+def _posix_group_has_writers(pgid, *, timeout):
+    """Inspect only process metadata; a zombie cannot write to owned scratch."""
+    if sys.platform != "darwin" and not sys.platform.startswith("linux"):
+        raise RuntimeError("owned process group inspection is unsupported")
+    # BSD -g selects a process group; Linux -g selects a numeric session.
+    # Our group starts a new session, and exact PGID filtering excludes any
+    # other group in that session. No command lines or environment are read.
+    result = subprocess.run(
+        ["/bin/ps", "-o", "pid=,pgid=,stat=", "-g", str(pgid)],
+        capture_output=True, text=True, timeout=timeout,
+        # WSL reached through a Windows SSH console can inherit an invalid
+        # terminal width. This metadata-only query has no terminal formatting.
+        env={**os.environ, "LC_ALL": "C", "COLUMNS": "80", "LINES": "24"},
+    )
+    if result.stderr.strip() or result.returncode not in (0, 1):
+        raise RuntimeError("owned process group inspection failed")
+    if result.returncode == 1:
+        if result.stdout.strip():
+            raise RuntimeError("owned process group inspection was incomplete")
+        return False
+    has_writers = False
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if (len(parts) != 3 or not parts[0].isdigit() or not parts[1].isdigit()
+                or int(parts[0]) <= 0 or int(parts[1]) <= 0):
+            raise RuntimeError("owned process group metadata is invalid")
+        if int(parts[1]) != pgid:
+            continue
+        # Unknown states remain potential writers. Only an explicit zombie
+        # state proves an existing process can no longer use the profile.
+        state = parts[2]
+        if not (state.startswith("Z") and all(c in "<>NLSsl+EWX" for c in state[1:])):
+            has_writers = True
+    return has_writers
+
+
+def terminate_tree(process, *, wait=False):
+    """Terminate an owned tree; optionally prove it has no remaining writers."""
     if os.name == "nt":
         from mindie_knowledge.windows_process import terminate_owned
-        terminate_owned(process)
+        terminate_owned(process, wait=wait)
         return
+    try:
+        _terminate_posix_tree(process, wait=wait)
+    finally:
+        original_error = sys.exc_info()[1]
+        try:
+            posix_owner.release(process)
+        except OSError as cleanup_error:
+            if original_error is None:
+                raise
+            original_error.add_note("owned attempt lifetime pipe did not close")
+
+
+def _terminate_posix_tree(process, *, wait):
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except (ProcessLookupError, PermissionError):
@@ -126,6 +186,30 @@ def terminate_tree(process):
         os.killpg(process.pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
         pass
+    if wait:
+        process.wait(timeout=1)
+        deadline = time.monotonic() + 2
+        while True:
+            signal_error = None
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                break
+            except PermissionError as exc:
+                signal_error = exc
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if signal_error is not None:
+                    raise signal_error
+                raise RuntimeError("owned process group did not exit during cleanup")
+            try:
+                if not _posix_group_has_writers(process.pid, timeout=remaining):
+                    break
+            except Exception as inspection_error:
+                if signal_error is not None:
+                    raise signal_error from inspection_error
+                raise
+            time.sleep(0.01)
 
 
 def _reader(stream, tag, chunks, cancel, errors):
@@ -162,11 +246,27 @@ def bounded_run(command, payload, *, timeout=None, max_output, cancel=None, clea
     with tempfile.TemporaryFile() as input_file:
         input_file.write(payload.encode())
         input_file.seek(0)
+        scratch = None
         try:
-            process = _spawn(command, input_file)
-        except OSError as exc:
-            exc.mindie_execution = 'not_started'
-            raise annotated_error(exc, 'configuration', started, stage='start')
+            if on_result is not None:
+                scratch = summary_scratch.create_root()
+            process = _spawn(command, input_file, scratch)
+        except (OSError, posix_owner.LaunchError) as exc:
+            if not hasattr(exc, "mindie_execution"):
+                exc.mindie_execution = 'not_started'
+            if getattr(exc, "cleanup_failed", False):
+                if cleanup_receipt is not None:
+                    cleanup_receipt["cleanup_failed"] = True
+            elif scratch is not None:
+                try:
+                    shutil.rmtree(scratch)
+                except OSError as cleanup_error:
+                    failure("organizer.process", stage="scratch-cleanup", category="cleanup",
+                            exception=cleanup_error)
+                    if cleanup_receipt is not None:
+                        cleanup_receipt['cleanup_failed'] = True
+            raise annotated_error(exc, getattr(exc, "mindie_category", "configuration"),
+                                  started, stage='start')
         chunks = queue.Queue(maxsize=max(2, max_output // 4096 + 1))
         readers_stop = threading.Event()
         read_errors = []
@@ -271,9 +371,10 @@ def bounded_run(command, payload, *, timeout=None, max_output, cancel=None, clea
                 raise annotated_error(exc, "invalid_result", started, stage="decode")
         finally:
             original_error = sys.exc_info()[1]
+            cleanup_stage = "cleanup"
             try:
                 readers_stop.set()
-                terminate_tree(process)
+                terminate_tree(process, wait=scratch is not None)
                 try:
                     process.wait(timeout=1)
                 except subprocess.TimeoutExpired:
@@ -286,10 +387,13 @@ def bounded_run(command, payload, *, timeout=None, max_output, cancel=None, clea
                         stream.close()
                 if any(reader.is_alive() for reader in readers):
                     raise RuntimeError('owned protocol pipes did not close during cleanup')
+                if scratch is not None:
+                    cleanup_stage = "scratch-cleanup"
+                    shutil.rmtree(scratch)
             except Exception as cleanup_error:
                 failure(
                     "organizer.process",
-                    stage="cleanup",
+                    stage=cleanup_stage,
                     category="cleanup",
                     exception=cleanup_error,
                     elapsed_ms=(time.monotonic() - started) * 1000,

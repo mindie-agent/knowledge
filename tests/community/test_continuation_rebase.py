@@ -11,6 +11,7 @@ import pytest
 
 from mindie_knowledge.community import submit_batch
 from mindie_knowledge.community.common import Deadline
+from mindie_knowledge.filesystem import filesystem_path, git_path
 from mindie_knowledge.loop.export import build_batch
 from mindie_knowledge.loop.feed import Feed
 from mindie_knowledge.loop.store import Store, digest
@@ -59,14 +60,14 @@ def corrected_package(tmp_path):
 
 
 def amend_main(tmp_path, remote_url, package=None, name="maintainer"):
-    work = tmp_path / name
-    git(["clone", "--quiet", remote_url, str(work)])
+    work = filesystem_path(tmp_path / name)
+    git(["clone", "--quiet", remote_url, git_path(work)])
     shutil.rmtree(work / "tasks" / TASK)
     if package is not None:
         write_package(work, package)
-    git(["add", "-A"], cwd=work)
-    git(["-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-qm", "maintainer correction"], cwd=work)
-    git(["push", "--quiet", "origin", "main"], cwd=work)
+    git(["add", "-A"], cwd=git_path(work))
+    git(["-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-qm", "maintainer correction"], cwd=git_path(work))
+    git(["push", "--quiet", "origin", "main"], cwd=git_path(work))
 
 
 def package_from_batch(batch):

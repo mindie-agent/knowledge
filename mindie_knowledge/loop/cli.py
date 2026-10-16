@@ -18,10 +18,12 @@ path); legacy adapter-config indirection is removed, not aliased.
 from __future__ import annotations
 
 from ..state_layout import state_root
+from ..filesystem import filesystem_path, sqlite_file_uri
 
 import argparse
 import importlib.util
 import json
+import math
 import os
 import subprocess
 import sys
@@ -44,6 +46,10 @@ def config_at(path):
 def validate_config(config):
     if not isinstance(config, dict) or not {"root", "domain"} <= set(config):
         raise ValueError("configuration requires root and domain")
+    from .service_context import validate as validate_launch_context
+    validate_launch_context(config)
+    if "client_contract" in config:
+        raise ValueError("cross-runtime client compatibility is unsupported; reload the installed runtime")
     if "session_activation" in config:
         raise ValueError(
             "session_activation was removed; configure the neutral "
@@ -106,7 +112,7 @@ def load_transcript_adapter(config):
 
 
 def connection_path(config):
-    return Path(config["root"]) / config["domain"] / "connection.json"
+    return filesystem_path(config["root"]) / config["domain"] / "connection.json"
 
 
 def connect(config, *, config_path=None):
@@ -128,6 +134,7 @@ def ensure_service(config_path, *, _from_detached_starter=False):
     from .process import spawn_service, terminate_tree
     from .diagnostics import clear_startup_failure
     from .lifecycle import require_active
+    from .service_host import platform_backend
 
     config = config_at(config_path)
     require_active(config_path, config)
@@ -156,17 +163,78 @@ def ensure_service(config_path, *, _from_detached_starter=False):
             if state in {"unknown", "worker-dead"}:
                 raise RuntimeError("knowledge service is " + state + "; startup failed")
             if state == "absent" and process is None:
-                process = spawn_service(
-                    [sys.executable, "-m", "mindie_knowledge.loop.cli", "serve",
-                     "--config", str(Path(config_path).resolve())],
-                    from_detached_starter=_from_detached_starter,
-                )
+                backend = platform_backend()
+                if backend is not None:
+                    process = backend.request_start(config_path, config)
+                else:
+                    process = spawn_service(
+                        [sys.executable, "-m", "mindie_knowledge.loop.cli", "serve",
+                         "--config", str(Path(config_path).resolve())],
+                        from_detached_starter=_from_detached_starter,
+                    )
             # This is scheduling cadence, never an operation deadline.
             time.sleep(.1)
+    except RuntimeError as exc:
+        from .service_host import ServiceHostError
+        if isinstance(exc, ServiceHostError):
+            from .diagnostics import record_startup_failure
+            try:
+                record_startup_failure(config_path, config, "service_host", exc)
+            except (OSError, ValueError):
+                pass
+        raise
     finally:
-        if process is not None and not ready and process.poll() is None:
+        if (process is not None and not ready
+                and not getattr(process, "externally_owned", False) and process.poll() is None):
             # Only cancellation/known failure reaches cleanup of our own child.
             terminate_tree(process)
+        lock.release()
+
+
+def prepare_service(config_path, *, probe_timeout=None):
+    """Request one owned service without waiting for the readiness handshake.
+
+    Adapters use this for their existing nonblocking preparation operation.
+    The returned ``starting`` is not a readiness or indexing receipt.
+    ``probe_timeout`` bounds only status RPC observation, not business work
+    or synchronous calls to the OS service manager.
+    """
+    from .handoff import _probe
+    from .lifecycle import require_active
+    from .locks import StartInProgress, StartLock
+    from .service_host import platform_backend
+    if probe_timeout is not None and (
+        isinstance(probe_timeout, bool)
+        or not isinstance(probe_timeout, (int, float))
+        or not math.isfinite(probe_timeout)
+        or probe_timeout <= 0
+    ):
+        raise ValueError("probe_timeout must be a finite positive number")
+    config = config_at(config_path)
+    require_active(config_path, config)
+    lock = StartLock(connection_path(config).with_name("start.lock"))
+    try:
+        lock.acquire()
+    except StartInProgress:
+        return "starting"
+    try:
+        require_active(config_path, config)
+        state = _probe(config, probe_timeout, config_path=config_path)
+        if state == "ready":
+            return "ready"
+        if state == "starting":
+            return "starting"
+        if state != "absent":
+            raise RuntimeError("knowledge service is " + state + "; not starting a second service")
+        backend = platform_backend()
+        if backend is not None and os.name == "nt":
+            backend.request_start(config_path, config)
+        else:
+            from .process import spawn_service
+            spawn_service([sys.executable, "-m", "mindie_knowledge.loop.cli", "wake",
+                           "--config", str(Path(config_path).resolve())])
+        return "starting"
+    finally:
         lock.release()
 
 
@@ -217,7 +285,7 @@ def contribution_recovery(config, operation, batch_id):
         if ledger_path.is_file():
             import sqlite3
 
-            db = sqlite3.connect(ledger_path.as_uri() + "?mode=ro", uri=True)
+            db = sqlite3.connect(sqlite_file_uri(ledger_path) + "?mode=ro", uri=True)
             try:
                 names = [r[1] for r in db.execute("PRAGMA table_info(publication)")]
                 result["ledger"] = [
@@ -236,6 +304,7 @@ def contribution_recovery(config, operation, batch_id):
         raise ValueError("no knowledge store exists for this domain")
     state_dir = state_root(config["root"], config["domain"]) / "outbox"
     settings = settings_mod.from_engine_config(config)
+    receipt = None
     try:
         row = store.batch(batch_id)
         if row is None:
@@ -246,7 +315,11 @@ def contribution_recovery(config, operation, batch_id):
                 raise ValueError(
                     "batch is not confirmed; unresolved/failed unsent work stays available"
                 )
-            return {"batch_id": batch_id, "compacted": removed}
+            receipt = {"batch_id": batch_id, "compacted": removed}
+            if removed.get("cleanup_status") == "failed":
+                receipt.update(cleanup_failed=True,
+                               cleanup_error=removed.get("cleanup_error", "unknown"))
+            return receipt
         from mindie_knowledge.community import inspect_batch, submit_batch
 
         if operation == "contribution-reconcile":
@@ -261,19 +334,40 @@ def contribution_recovery(config, operation, batch_id):
                     "uncertain (unknown/unresolved) write is inspected with "
                     "contribution-reconcile, never replayed"
                 )
-            batch = json.loads(row["batch"])
+            from ..materials.publication import load_batch_payload
+
+            batch = load_batch_payload(store, row)
             batch["explicit_retry"] = True
-            receipt = submit_batch(batch, settings.as_dict(), state_dir)
-        store.mark_batch(
-            batch_id, receipt.get("status", "unknown"),
-            detail=receipt.get("detail", ""), pr_url=receipt.get("pr_url"),
-            head_sha=receipt.get("head_sha"),
-        )
+            receipt = submit_batch(
+                batch, settings.as_dict(), state_dir,
+                authority_guard=store.db.assert_authority)
+        from .publication_worker import record_publication_receipt
+
+        record_publication_receipt(
+            store, row, receipt, attempted=operation == "contribution-retry")
         if receipt.get("status") in Store.CONFIRMED_BATCH:
-            store.compact_confirmed(batch_id)
+            try:
+                cleanup = store.compact_confirmed(batch_id)
+            except Exception as exc:
+                exc.mindie_publication_result = receipt
+                exc.add_note("Publication confirmed before local cleanup failure")
+                raise
+            if cleanup.get("cleanup_status") == "failed":
+                receipt = dict(receipt, cleanup_failed=True,
+                               cleanup_error=cleanup.get("cleanup_error", "unknown"))
         return receipt
     finally:
-        store.close()
+        primary_error = sys.exc_info()[1]
+        try:
+            store.close()
+        except Exception as exc:
+            if primary_error is not None:
+                primary_error.add_note("recovery store close also failed: " + type(exc).__name__)
+            else:
+                if receipt is not None:
+                    exc.mindie_publication_result = receipt
+                    exc.add_note("Publication result returned before recovery store close failure")
+                raise
 
 
 def _feeds(config, store):
@@ -307,6 +401,11 @@ def _serve(config_path, config):
     ``consumer.lock`` is the store's lifetime ownership. ``start.lock`` stays
     the startup handshake and is not held across serve.
     """
+    from .service_context import validate as validate_launch_context
+    # Fixed installation paths apply on every platform. Optional credential
+    # values still come from the caller on POSIX and the one-use transfer on
+    # Windows; neither platform acquires another provider configuration.
+    os.environ.update(validate_launch_context(config)["paths"])
     from .activation import Admission
     from .diagnostics import record_startup_failure
     from .lifecycle import acquire_consumer, config_fingerprint
@@ -425,9 +524,23 @@ def main(argv=None):
     if args.operation.startswith("contribution-"):
         if not args.batch:
             parser.error(f"{args.operation} requires --batch")
-        result = contribution_recovery(config, args.operation, args.batch)
+        try:
+            result = contribution_recovery(config, args.operation, args.batch)
+        except Exception as exc:
+            result = getattr(exc, "mindie_publication_result", None)
+            if not isinstance(result, dict):
+                raise
+            result = dict(result, recovery_error=dict(
+                category=type(exc).__name__, stage="local-receipt-or-cleanup"),
+                automatic_retry=False)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 2
         print(json.dumps(result, ensure_ascii=False, indent=2))
-        return 0
+        incomplete = (
+            result.get("cleanup_failed") or result.get("recording_failed")
+            or ("status" in result and result["status"] not in Store.CONFIRMED_BATCH)
+        )
+        return 2 if incomplete else 0
     if args.operation == "sync":
         # Standalone model-free knowledge update; never starts the service.
         store = Store(config["root"], config["domain"])

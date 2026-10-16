@@ -34,7 +34,7 @@ def scanner():
 @pytest.fixture
 def case(tmp_path, scanner):
     settings = tmp_path / 'community.json'
-    write_settings(settings, roots=[tmp_path])
+    write_settings(settings, consent_choice="contribute", roots=[tmp_path])
     authority = Admission(make_admission(tmp_path, project_root=tmp_path))
     store = Store(tmp_path / 'store', 'test')
     engine = Engine(store, settings_path=settings, admission=authority,
@@ -114,7 +114,7 @@ def test_denial_happens_before_public_read(case, monkeypatch, denial):
     if denial == 'inactive':
         args['session_id'] = 'not-active'
     elif denial == 'sharing-off':
-        write_settings(engine.settings_path, enabled=False, roots=[source.parent])
+        write_settings(engine.settings_path, consent_choice="contribute", enabled=False, roots=[source.parent])
     elif denial == 'source-scope':
         args['source_scope'] = str(source.parent / '..' / 'another-project')
     else:
@@ -189,7 +189,7 @@ def test_revocation_mid_read_stops_before_redaction_and_commit(case, monkeypatch
     real = engine.transcript.read_material
     def revoke(*args, **kwargs):
         result = real(*args, **kwargs)
-        write_settings(engine.settings_path, enabled=False, roots=[source.parent])
+        write_settings(engine.settings_path, consent_choice="contribute", enabled=False, roots=[source.parent])
         return result
     monkeypatch.setattr(engine.transcript, 'read_material', revoke)
     with pytest.raises(RuntimeError):
@@ -296,7 +296,7 @@ def test_import_summary_does_not_spawn_after_contribution_revocation(case):
     engine.summary_command = [sys.executable, '-c', f'from pathlib import Path; Path({str(marker)!r}).touch()']
     append(source, message('saved result'))
     contribute(case)
-    write_settings(engine.settings_path, enabled=False, roots=[source.parent])
+    write_settings(engine.settings_path, consent_choice="contribute", enabled=False, roots=[source.parent])
     summary_due(engine)
     assert not marker.exists()
     assert engine.store.db.execute('SELECT summary_status FROM transcript_tasks').fetchone()[0] == 'cancelled'

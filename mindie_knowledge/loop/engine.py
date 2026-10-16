@@ -10,6 +10,8 @@ writes remain subject to read-only reconciliation.
 
 from __future__ import annotations
 
+import hashlib
+import os
 import queue
 import threading
 import time
@@ -23,6 +25,7 @@ from .store import canonical, session_key
 from .operations import OperationOwner
 from .index_queue import IndexQueue
 from .publication_worker import PublicationWorker
+from ..filesystem import path_aliases, resolved_path
 
 _EOF_SETTLE_LIMIT = 3
 _PARTIAL_LIMIT = 4
@@ -38,6 +41,54 @@ class GateFault(Exception):
 
 class CursorConflict(Exception):
     """The shared cursor moved. Do not call the model or count a failure."""
+
+
+class TranscriptCursorError(ValueError):
+    def __init__(self, code):
+        detail = {
+            "persisted_identity_invalid": "persisted transcript identity is unusable; not rereading",
+            "transcript_cursor_alias_conflict": "multiple transcript cursor aliases exist; not rereading",
+            "transcript_cursor_identity_mismatch": "saved transcript identity cannot be confirmed; not rereading",
+            "transcript_unavailable": "transcript identity is unavailable; not treating it as first use",
+        }
+        super().__init__(detail[code])
+        self.code = code
+
+
+def _cursor_identity_matches(source, expected, identity):
+    if (identity is None or expected.dev != identity.dev or expected.ino != identity.ino
+            or not expected.anchor_len):
+        return False
+    if expected.anchor_len == identity.anchor_len:
+        return expected.anchor_digest == identity.anchor_digest
+    try:
+        with open(resolved_path(source), "rb") as stream:
+            info = os.fstat(stream.fileno())
+            return (info.st_dev == expected.dev and info.st_ino == expected.ino
+                    and hashlib.sha256(stream.read(expected.anchor_len)).hexdigest()
+                    == expected.anchor_digest)
+    except (OSError, ValueError):
+        return False
+
+
+def transcript_cursor(store, source, parser, identity):
+    """Reuse one proven prior spelling; an alias never resets a saved cursor."""
+    aliases = path_aliases(source)
+    existing = [(key, cursor) for key in aliases if (cursor := store.cursor(key)) is not None]
+    if len(existing) > 1:
+        raise TranscriptCursorError("transcript_cursor_alias_conflict")
+    if not existing:
+        if identity is None:
+            raise TranscriptCursorError("transcript_unavailable")
+        return aliases[0], None
+    key, cursor = existing[0]
+    expected = parser.FileIdentity.unserialize(
+        cursor.get("identity") or "", identity.path if identity is not None else str(resolved_path(source)))
+    if expected is None:
+        raise TranscriptCursorError("persisted_identity_invalid")
+    if not _cursor_identity_matches(source, expected, identity):
+        raise TranscriptCursorError("transcript_cursor_identity_mismatch")
+    return key, cursor
 
 
 class Engine:
@@ -328,15 +379,19 @@ class Engine:
                                     error_code='parser_unconfigured', failed_stage='configuration')
             return None
         boundary = row["boundary"] or settings.enabled_at
-        key = str(Path(row["transcript"]).resolve(strict=False))
-        cursor = self.store.cursor(key)
+        identity = parser.identify(row["transcript"])
+        try:
+            key, cursor = transcript_cursor(self.store, row["transcript"], parser, identity)
+        except TranscriptCursorError as exc:
+            self.store.mark_capture(row["id"], "failed", str(exc),
+                                    error_code=exc.code, failed_stage="identity")
+            return None
         observed_cursor = None
         if cursor is not None:
             observed_cursor = {
                 "identity": cursor.get("identity") or "",
                 "finish": int(cursor["finish"]),
             }
-        identity = parser.identify(row["transcript"])
         idtext = identity.serialize() if identity else ""
 
         def reserve(start, finish, rdigest, status="attempted", detail=""):
@@ -354,7 +409,7 @@ class Engine:
         expected = None
         if cursor:
             expected = parser.FileIdentity.unserialize(
-                cursor["identity"], key
+                cursor["identity"], identity.path
             )
             if expected is None:
                 # A missing/malformed persisted identity fails closed: the

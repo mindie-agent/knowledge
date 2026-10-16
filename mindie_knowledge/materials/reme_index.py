@@ -8,6 +8,7 @@ and graph maintenance remain the pinned ReMe implementations.
 from __future__ import annotations
 
 import asyncio
+from bisect import bisect_left
 import json
 import logging
 import re
@@ -152,6 +153,27 @@ class ReMeIndex:
         self._generation = None
         self.checkpoint = None
         self._eligible_cache = {}
+        self._chunk_body_terms = {}
+        self._body_term_pool = {}
+
+    def clear_query_terms(self):
+        self._chunk_body_terms.clear()
+        self._body_term_pool.clear()
+
+    def _compact_term_pool(self):
+        self._body_term_pool = {
+            term: term for _, terms in self._chunk_body_terms.values() for term in terms
+        }
+
+    def _prune_query_terms(self):
+        live = self.store.file_chunks
+        retained = {
+            ident: value for ident, value in self._chunk_body_terms.items()
+            if ident in live and value[0] == live[ident].metadata.get("mindie_body_offset")
+        }
+        if len(retained) != len(self._chunk_body_terms):
+            self._chunk_body_terms = retained
+            self._compact_term_pool()
 
     async def _start(self, records):
         # Default ReMe config is deliberately not loaded: no session copies,
@@ -196,6 +218,7 @@ class ReMeIndex:
                     first_error = exc
         self.components = []
         self.store = None
+        self.clear_query_terms()
         if first_error is not None:
             raise first_error
 
@@ -254,7 +277,7 @@ class ReMeIndex:
                 self.task_paths.pop(task_id, None)
         if deleted:
             self.runner.run(self.store.delete(list(deleted)))
-        changed = {}
+        changed, upserts = {}, []
         for rel, block in desired.items():
             # Validate authoritative bytes before ReMe's derived text
             # normalization; universal-newline reads would hide corruption.
@@ -275,12 +298,17 @@ class ReMeIndex:
                 chunk.text = prefix + chunk.text
                 chunk.set_hash_id()
             node.chunk_ids = [chunk.id for chunk in chunks]
-            self.runner.run(self.store.upsert([(node, chunks)]))
+            upserts.append((node, chunks))
             binding = dict(descriptor=_digest(block), signature=signature(self.root / rel))
             metadata = dict(body_tokens=direct_tokens, cites=cites)
             changed[rel] = dict(binding=binding, metadata=metadata, node=node.model_dump(mode="json"),
                 chunks=[dict(value=chunk.model_dump(mode="json"),
                              frequencies=dict(Counter(self.store.keyword_index._tokenize(chunk.text)))) for chunk in chunks])
+        # ReMe's native batch API extends each term posting once. A call per
+        # block repeatedly copies the growing arrays. These are references to
+        # the chunks the in-memory store must retain, not a second body corpus.
+        if upserts:
+            self.runner.run(self.store.upsert(upserts))
         self.checkpoint.commit(changed, deleted, generation)
         for path in deleted:
             self.bindings.pop(path, None)
@@ -293,6 +321,7 @@ class ReMeIndex:
             self.runner.run(keyword.optimize_index())
         self._generation = generation
         self._eligible_cache.clear()
+        self._prune_query_terms()
 
     def verify_path(self, path, descriptor):
         binding = self.bindings.get(path)
@@ -399,10 +428,29 @@ class ReMeIndex:
                     raise ValueError("ReMe citation metadata is inconsistent; rebuild the index")
                 body = chunk.text[metadata["mindie_body_offset"]:]
                 matched_terms = set(source_metadata["body_tokens"]) & query_terms
-                chunk_terms = set(body_tokens(body)) & query_terms
+                # Chunk IDs bind immutable text. Keep the body split with the
+                # query-independent terms so header words never become evidence.
+                cached_terms = self._chunk_body_terms.get(chunk.id)
+                offset = metadata["mindie_body_offset"]
+                if cached_terms is None or cached_terms[0] != offset:
+                    if cached_terms is not None:
+                        del self._chunk_body_terms[chunk.id]
+                        self._compact_term_pool()
+                    cached_terms = (
+                        offset, tuple(self._body_term_pool.setdefault(term, term)
+                                      for term in body_tokens(body)),
+                    )
+                    self._chunk_body_terms[chunk.id] = cached_terms
+                terms = cached_terms[1]
+                chunk_matches = False
+                for term in query_terms:
+                    position = bisect_left(terms, term)
+                    if position < len(terms) and terms[position] == term:
+                        chunk_matches = True
+                        break
                 # If a header-only chunk outscored the body-containing chunk,
                 # still show the latter's actual evidence to the reader.
-                selection_rank = (bool(chunk_terms), chunk.score)
+                selection_rank = (chunk_matches, chunk.score)
                 if chunk.path in output and output[chunk.path]["_selection_rank"] >= selection_rank:
                     continue
                 entry = task["entry"]

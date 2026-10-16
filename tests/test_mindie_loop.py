@@ -202,7 +202,7 @@ def gated(tmp_path):
     """Enabled settings + admission lease + fixture runner engine."""
     project = tmp_path / "proj"
     project.mkdir()
-    settings = write_settings(tmp_path / "community.json", enabled=True,
+    settings = write_settings(tmp_path / "community.json", consent_choice="contribute", enabled=True,
                               roots=[project])
     adapter = make_admission(tmp_path, project_root=project)
     store = Store(tmp_path / "store", "test")
@@ -222,7 +222,7 @@ def gated(tmp_path):
 
 def test_community_off_produces_zero_capture_state(tmp_path):
     settings_path = tmp_path / "community.json"
-    write_settings(settings_path, enabled=False, roots=[tmp_path])
+    write_settings(settings_path, consent_choice="contribute", enabled=False, roots=[tmp_path])
     adapter = make_admission(tmp_path, project_root=tmp_path)
     store = Store(tmp_path / "store", "test")
     from mindie_knowledge.loop.activation import Admission
@@ -342,7 +342,7 @@ def test_failed_index_keeps_complete_body_and_later_capture_does_not_replay_it(g
 def test_disable_while_queued_cancels_without_model(gated, tmp_path):
     store, engine, settings, _ = gated
     result = capture_public(engine, "Queued public material.", "t1")
-    write_settings(tmp_path / "community.json", enabled=False, roots=[tmp_path])
+    write_settings(tmp_path / "community.json", consent_choice="contribute", enabled=False, roots=[tmp_path])
     engine._process(result["id"])
     assert store.capture_row(result["id"])["status"] == "cancelled"
     assert store.db.execute("SELECT count(*) FROM material_batches").fetchone()[0] == 0
@@ -411,7 +411,7 @@ def test_legacy_session_activation_config_is_rejected(tmp_path):
 def test_hook_short_circuits_when_sharing_off(tmp_path):
     engine_config = tmp_path / "engine.json"
     settings_path = tmp_path / "community.json"
-    write_settings(settings_path, enabled=False, roots=[tmp_path])
+    write_settings(settings_path, consent_choice="contribute", enabled=False, roots=[tmp_path])
     adapter = make_admission(tmp_path, project_root=tmp_path)
     engine_config.write_text(json.dumps(dict(
         root=str(tmp_path / "root"), domain="test",
@@ -432,7 +432,7 @@ def test_transport_loopback_and_identity(tmp_path):
     project = tmp_path / "proj"
     project.mkdir()
     settings_path = tmp_path / "community.json"
-    write_settings(settings_path, enabled=True, roots=[project])
+    write_settings(settings_path, consent_choice="contribute", enabled=True, roots=[project])
     adapter = make_admission(tmp_path, project_root=project)
     store = Store(tmp_path / "store", "test")
     from mindie_knowledge.loop.activation import Admission
@@ -491,8 +491,8 @@ def test_unsent_draft_never_backfills_after_reenable(gated, tmp_path):
     gen_a = settings_mod.load(tmp_path / "community.json").generation
     assert store.drafts_changed(generation=gen_a)  # publishable under A
     engine._cancel_unsent("sharing disabled; unsent work cancelled")
-    write_settings(tmp_path / "community.json", enabled=False, roots=[tmp_path / "proj"])
-    write_settings(tmp_path / "community.json", enabled=True, roots=[tmp_path / "proj"])
+    write_settings(tmp_path / "community.json", consent_choice="contribute", enabled=False, roots=[tmp_path / "proj"])
+    write_settings(tmp_path / "community.json", consent_choice="contribute", enabled=True, roots=[tmp_path / "proj"])
     gen_c = settings_mod.load(tmp_path / "community.json").generation
     assert gen_c != gen_a
     assert store.drafts_changed(generation=gen_c) == []
@@ -514,8 +514,8 @@ def test_old_pending_batch_disabled_after_restart(gated, tmp_path):
     built = build_batch(store, settings=current, revision_fn=_revision_double)
     batch_id = built[0]
     assert store.batch(batch_id)["status"] == "pending"
-    write_settings(tmp_path / "community.json", enabled=False, roots=[tmp_path / "proj"])
-    write_settings(tmp_path / "community.json", enabled=True, roots=[tmp_path / "proj"])
+    write_settings(tmp_path / "community.json", consent_choice="contribute", enabled=False, roots=[tmp_path / "proj"])
+    write_settings(tmp_path / "community.json", consent_choice="contribute", enabled=True, roots=[tmp_path / "proj"])
     restarted = Engine(store,
                        settings_path=tmp_path / "community.json",
                        admission=engine.admission)
@@ -532,8 +532,8 @@ def test_old_generation_update_id_cannot_republish(gated, tmp_path):
     store, engine, _, _ = gated
     gen_a = settings_mod.load(tmp_path / "community.json").generation
     doc = draft(store, generation=gen_a)
-    write_settings(tmp_path / "community.json", enabled=False, roots=[tmp_path / "proj"])
-    write_settings(tmp_path / "community.json", enabled=True, roots=[tmp_path / "proj"])
+    write_settings(tmp_path / "community.json", consent_choice="contribute", enabled=False, roots=[tmp_path / "proj"])
+    write_settings(tmp_path / "community.json", consent_choice="contribute", enabled=True, roots=[tmp_path / "proj"])
     gen_c = settings_mod.load(tmp_path / "community.json").generation
     with pytest.raises(ValueError, match="generation"):
         store.append_observation(doc["entry_id"], "smuggled update", producer=PRODUCER,

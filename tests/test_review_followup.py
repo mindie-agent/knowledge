@@ -22,7 +22,7 @@ def _ready(tmp_path):
     project = tmp_path / "proj"
     project.mkdir()
     settings = tmp_path / "community.json"
-    write_settings(settings, enabled=True, roots=[project])
+    write_settings(settings, consent_choice="contribute", enabled=True, roots=[project])
     admission = make_admission(tmp_path, project_root=project)
     Store(tmp_path / "root", "test").close()
     config = tmp_path / "engine.json"
@@ -170,6 +170,12 @@ def test_live_pid_in_wake_json_does_not_coalesce(tmp_path, monkeypatch):
     live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     monkeypatch.setattr(
         "mindie_knowledge.loop.handoff.subprocess.Popen",
+        lambda *args, **kwargs: spawned.append(args) or _Proc(),
+    )
+    # Windows selects the shared Scheduler entry before native spawn. This
+    # test only establishes that diagnostic PIDs never suppress a wake.
+    monkeypatch.setattr(
+        "mindie_knowledge.loop.windows_service.request_start",
         lambda *args, **kwargs: spawned.append(args) or _Proc(),
     )
     wake = tmp_path / "root" / "test" / "wake.json"

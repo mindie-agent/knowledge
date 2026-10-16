@@ -1,7 +1,7 @@
 """Independent contract for mindie_knowledge.consent_store.
 
-The parallel design fixes the names read / record_choice / record_reporting /
-migrate and the mindie-consent/1 semantics. These tests judge the file on
+The current contract exposes read / record_choice / record_reporting and
+the mindie-consent/1 semantics. These tests judge the file on
 disk and the returned state. They do not skip when the module is absent.
 """
 
@@ -61,7 +61,7 @@ def api():
             "mindie_knowledge.consent_store is not importable; "
             f"kimi-core has not published the shared store ({exc})"
         )
-    for name in ("read", "record_choice", "record_reporting", "migrate"):
+    for name in ("read", "record_choice", "record_reporting"):
         if not callable(getattr(consent_store, name, None)):
             pytest.fail(f"consent_store.{name} is missing")
     return consent_store
@@ -214,7 +214,7 @@ def test_record_merges_one_field_and_refuses_to_clear_a_bad_file(api, tmp_path):
     after_choice = _load(noted)
     assert after_choice["note"] == "keep"
     assert after_choice["reporting"] == "disabled"
-    assert "migrated_from" not in after_choice
+    assert after_choice["migrated_from"] == ["legacy"]
 
     damaged = tmp_path / "damaged.json"
     damaged.write_bytes(b"{not json\n")
@@ -233,116 +233,44 @@ def test_record_merges_one_field_and_refuses_to_clear_a_bad_file(api, tmp_path):
     assert damaged.read_bytes() == raw
 
 
-def test_migrate_writes_once_only_when_evidence_agrees(api, tmp_path):
-    path = tmp_path / "consent.json"
-    agreed = [
-        {"choice": "read-only", "reporting": "disabled", "source": "kimi-marker"},
-        {"choice": "read-only", "reporting": "disabled", "source": "cc-marker"},
-    ]
-    result = _view(api.migrate(path, agreed))
-    assert result["status"] == "migrated"
-    seen = api.read(path)
-    assert seen["state"] == "ok"
-    assert seen["choice"] == "read-only"
-    assert seen["reporting"] == "disabled"
-    written = path.read_bytes()
-    again = _view(api.migrate(path, agreed))
-    assert again["status"] == "kept"
-    assert path.read_bytes() == written
-    assert api.read(path)["choice"] == "read-only"
-
-    conflict = tmp_path / "conflict.json"
-    failed = _view(
-        api.migrate(
-            conflict,
-            [
-                {"choice": "later", "reporting": "later", "source": "kimi"},
-                {"choice": "contribute", "reporting": "later", "source": "codex"},
-            ],
-        )
-    )
-    assert failed["status"] == "conflict"
-    assert failed["error"] or failed["detail"]
-    assert not conflict.exists()
-
-    reporting_conflict = tmp_path / "reporting.json"
-    failed = _view(
-        api.migrate(
-            reporting_conflict,
-            [
-                {"choice": "later", "reporting": "disabled", "source": "kimi"},
-                {"choice": "later", "reporting": "enabled", "source": "cc"},
-            ],
-        )
-    )
-    assert failed["status"] == "conflict"
-    assert not reporting_conflict.exists()
-
-    # A source with no reporting evidence does not contradict the one that has it.
-    filled = tmp_path / "filled.json"
-    filled_result = _view(
-        api.migrate(
-            filled,
-            [
-                {"choice": "later", "reporting": "disabled", "source": "kimi"},
-                {"choice": "later", "reporting": None, "source": "cc"},
-            ],
-        )
-    )
-    assert filled_result["status"] == "migrated"
-    assert api.read(filled)["choice"] == "later"
-    assert api.read(filled)["reporting"] == "disabled"
-
-    bad = tmp_path / "bad.json"
-    with pytest.raises(ValueError):
-        api.migrate(
-            bad,
-            [{"choice": "yes-please", "reporting": "enabled", "source": "mystery"}],
-        )
-    assert not bad.exists()
-    empty = tmp_path / "empty.json"
-    absent = _view(api.migrate(empty, []))
-    assert absent["status"] == "absent"
-    assert not empty.exists()
+def test_oversized_authority_is_bounded_and_never_rewritten(api, tmp_path):
+    path = tmp_path / "oversized.json"
+    # Valid JSON plus excess whitespace must not pass just because parsing
+    # the bounded prefix would succeed.
+    raw = b'{"schema":"mindie-consent/1","choice":"contribute"}' + b" " * api.MAX_BYTES
+    path.write_bytes(raw)
+    assert len(api._read_bytes(path)) == api.MAX_BYTES + 1
+    assert api.read(path)["state"] == "corrupt"
+    with pytest.raises(api.ConsentError) as failure:
+        api.record_reporting(path, "disabled")
+    assert failure.value.state == "corrupt"
+    assert path.read_bytes() == raw
 
 
-def test_migrate_keeps_existing_authority_and_corrupt_bytes(api, tmp_path):
-    path = tmp_path / "consent.json"
-    path.write_text(
-        json.dumps(
-            {
-                "schema": CONSENT_SCHEMA,
-                "choice": "later",
-                "reporting": "later",
-                "source": "previous",
-            }
-        )
-        + "\n"
-    )
-    original = path.read_bytes()
-    result = _view(
-        api.migrate(
-            path,
-            [{"choice": "contribute", "reporting": "enabled", "source": "upgrade"}],
-        )
-    )
-    assert result["status"] == "kept"
-    assert path.read_bytes() == original
-    assert api.read(path)["choice"] == "later"
-    assert api.read(path)["reporting"] == "later"
-
-    corrupt = tmp_path / "corrupt.json"
-    blob = b"{not-valid-consent"
-    corrupt.write_bytes(blob)
-    failed = _view(
-        api.migrate(
-            corrupt,
-            [{"choice": "contribute", "reporting": "enabled", "source": "guess"}],
-        )
-    )
-    assert failed["status"] == "error"
-    assert failed["error"] or failed["detail"]
-    assert corrupt.read_bytes() == blob
+@pytest.mark.skipif(os.name == "nt", reason="POSIX FIFO boundary")
+def test_fifo_without_writer_fails_without_blocking_or_replacement(api, tmp_path):
+    path = tmp_path / "consent.fifo"
+    os.mkfifo(path)
+    identity = path.stat().st_ino
+    code = """
+import json, sys
+from mindie_knowledge import consent_store
+path = sys.argv[1]
+result = consent_store.read(path)
+try:
+    consent_store.record_choice(path, "contribute")
+except consent_store.ConsentError as exc:
+    result["write_state"] = exc.state
+else:
+    raise AssertionError("FIFO must not be overwritten")
+print(json.dumps(result))
+"""
+    result = subprocess.run([sys.executable, "-c", code, str(path)],
+                            capture_output=True, text=True, timeout=3, check=True)
+    view = json.loads(result.stdout)
+    assert view["state"] == view["write_state"] == "unreadable"
+    assert stat.S_ISFIFO(path.stat().st_mode)
+    assert path.stat().st_ino == identity
 
 
 def _product_read_stream(api, path):

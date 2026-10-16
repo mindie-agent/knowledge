@@ -22,6 +22,8 @@ from .common import (
     run_argv,
 )
 from mindie_knowledge.gitread import with_windows_longpaths
+from mindie_knowledge.filesystem import filesystem_path, git_path
+from mindie_knowledge.git_layout import UnsupportedGitLayout, validate_git_directory
 
 MAX_GIT_OUTPUT = 256 * 1024
 _CANONICAL_CHECKOUT = ["-c", "core.autocrlf=false", "-c", "core.eol=lf"]
@@ -117,7 +119,7 @@ def _git(
         timeout=remaining,
         max_output=MAX_GIT_OUTPUT,
         input_bytes=input_bytes,
-        cwd=cwd,
+        cwd=Path(git_path(cwd)) if cwd is not None else None,
         env=_resolve_git_env(env),
         cancel=deadline.cancel,
     )
@@ -140,13 +142,19 @@ def remote_tip(remote_url: str, ref: str, deadline: Deadline, *, env=None) -> st
 
 def ensure_clone(remote_url: str, work_dir: Path, deadline: Deadline, *, env=None) -> Path:
     """Fetch objects into the private clone, without materializing unvalidated paths."""
+    work_dir = filesystem_path(work_dir)
+    try:
+        validate_git_directory(work_dir, bare=False, role="publication")
+    except UnsupportedGitLayout as exc:
+        # Reconciliation must retain any earlier unknown publication outcome.
+        raise CommunityError(str(exc), status="unavailable") from exc
     if (work_dir / ".git").is_dir():
-        _git(["fetch", "origin", "--prune"], deadline, cwd=work_dir, env=env)
+        _git(["fetch", "origin", "--prune"], deadline, cwd=Path(git_path(work_dir)), env=env)
     else:
         work_dir.parent.mkdir(parents=True, exist_ok=True)
         # Package hashes describe repository LF bytes. A host's checkout
         # conversion must not look like an independent maintainer edit.
-        _git([*_CANONICAL_CHECKOUT, "clone", "--no-checkout", "--quiet", remote_url, str(work_dir)], deadline, env=env)
+        _git([*_CANONICAL_CHECKOUT, "clone", "--no-checkout", "--quiet", remote_url, git_path(work_dir)], deadline, env=env)
     return work_dir
 
 
@@ -155,7 +163,7 @@ def checkout_new(work_dir: Path, branch: str, base_ref: str, deadline: Deadline,
     # remote revision. Force also rematerializes an older clone's CRLF files;
     # merely changing autocrlf can leave Git's cached worktree bytes untouched.
     _git([*_CANONICAL_CHECKOUT, "checkout", "--force", "--quiet", "-B", branch, base_ref],
-         deadline, cwd=work_dir, env=env)
+         deadline, cwd=Path(git_path(work_dir)), env=env)
 
 
 def checkout_existing(work_dir: Path, branch: str, deadline: Deadline, *, env=None) -> bool:
@@ -163,14 +171,14 @@ def checkout_existing(work_dir: Path, branch: str, deadline: Deadline, *, env=No
     _git(
         [*_CANONICAL_CHECKOUT, "checkout", "--force", "--quiet", "-B", branch, f"origin/{branch}"],
         deadline,
-        cwd=work_dir,
+        cwd=Path(git_path(work_dir)),
         env=env,
     )
     return True
 
 
 def tree_sha256(work_dir: Path, path: str) -> str | None:
-    target = work_dir / path
+    target = filesystem_path(work_dir) / path
     if not target.is_file() or target.is_symlink():
         return None
     raw = target.read_bytes()
@@ -180,7 +188,7 @@ def tree_sha256(work_dir: Path, path: str) -> str | None:
 
 
 def read_tree_file(work_dir: Path, path: str) -> str | None:
-    target = work_dir / path
+    target = filesystem_path(work_dir) / path
     if not target.is_file() or target.is_symlink():
         return None
     raw = target.read_bytes()
@@ -191,6 +199,7 @@ def read_tree_file(work_dir: Path, path: str) -> str | None:
 
 def apply_files(work_dir: Path, files: Sequence[Mapping[str, Any]]) -> list[str]:
     """Write canonical LF bytes, plain 100644 files only; returns paths written."""
+    work_dir = filesystem_path(work_dir)
     written = []
     for item in files:
         path = item["path"]
@@ -230,7 +239,7 @@ def stage_and_commit(
         # to this command; do not rewrite repository or user Git settings.
         [*_CANONICAL_CHECKOUT, "add", "--pathspec-from-file=-", "--pathspec-file-nul"],
         deadline,
-        cwd=work_dir,
+        cwd=Path(git_path(work_dir)),
         env=env,
         input_bytes=spec,
     )
@@ -241,7 +250,7 @@ def stage_and_commit(
         ["git", "diff", "--cached", "--quiet"],
         timeout=remaining,
         max_output=4096,
-        cwd=work_dir,
+        cwd=Path(git_path(work_dir)),
         env=_resolve_git_env(env),
         cancel=deadline.cancel,
     )
@@ -272,7 +281,7 @@ def _commit(work_dir: Path, message: str, deadline: Deadline, *, env=None) -> No
         timeout=remaining,
         max_output=MAX_GIT_OUTPUT,
         input_bytes=message.encode("utf-8"),
-        cwd=work_dir,
+        cwd=Path(git_path(work_dir)),
         env=_resolve_git_env(env),
         cancel=deadline.cancel,
     )
@@ -281,7 +290,7 @@ def _commit(work_dir: Path, message: str, deadline: Deadline, *, env=None) -> No
 
 
 def current_head(work_dir: Path, deadline: Deadline, *, env=None) -> str:
-    return _git(["rev-parse", "HEAD"], deadline, cwd=work_dir, env=env).strip()
+    return _git(["rev-parse", "HEAD"], deadline, cwd=Path(git_path(work_dir)), env=env).strip()
 
 
 def fetch_ref(
@@ -299,7 +308,7 @@ def fetch_ref(
         ["git", "fetch", "--quiet", remote, ref],
         timeout=remaining,
         max_output=MAX_GIT_OUTPUT,
-        cwd=work_dir,
+        cwd=Path(git_path(work_dir)),
         env=_resolve_git_env(env),
         cancel=deadline.cancel,
     )
@@ -310,7 +319,7 @@ def fetch_ref(
         if _is_transient_git_error(detail):
             raise TransientError(f"git fetch {ref} failed: {detail}")
         raise CommunityError(f"cannot fetch {ref}")
-    return _git(["rev-parse", "FETCH_HEAD"], deadline, cwd=work_dir, env=env).strip()
+    return _git(["rev-parse", "FETCH_HEAD"], deadline, cwd=Path(git_path(work_dir)), env=env).strip()
 
 
 def fetch_pr_head(
@@ -342,7 +351,7 @@ def ls_tree(work_dir: Path, commit: str, deadline: Deadline, *, env=None,
     modes = {}
     with tempfile.TemporaryDirectory(prefix="mindie-git-tree-") as temporary:
         target = Path(temporary) / "tree"
-        argv = ["git", "-C", str(work_dir), "ls-tree", "-r", "-z", commit]
+        argv = ["git", "-C", git_path(work_dir), "ls-tree", "-r", "-z", commit]
         if task_ids is not None:
             argv += ["--", "tasks/"]
         try:
@@ -384,7 +393,7 @@ def show_file(work_dir: Path, commit: str, path: str, deadline: Deadline, *, env
         ["git", "cat-file", "-e", f"{commit}^{{commit}}"],
         timeout=remaining,
         max_output=64 * 1024,
-        cwd=work_dir,
+        cwd=Path(git_path(work_dir)),
         env=env,
         cancel=deadline.cancel,
     )
@@ -403,7 +412,7 @@ def show_file(work_dir: Path, commit: str, path: str, deadline: Deadline, *, env
         ["git", "show", f"{commit}:{path}", "--"],
         timeout=remaining,
         max_output=MAX_FILE_BYTES + 64 * 1024,
-        cwd=work_dir,
+        cwd=Path(git_path(work_dir)),
         env=env,
         cancel=deadline.cancel,
     )
@@ -437,7 +446,7 @@ def fetch_commit(work_dir: Path, sha: str, deadline: Deadline, *, env=None) -> b
         ["git", "cat-file", "-e", sha],
         timeout=remaining,
         max_output=4096,
-        cwd=work_dir,
+        cwd=Path(git_path(work_dir)),
         env=_resolve_git_env(env),
         cancel=deadline.cancel,
     )
@@ -447,7 +456,7 @@ def fetch_commit(work_dir: Path, sha: str, deadline: Deadline, *, env=None) -> b
         ["git", "fetch", "--quiet", "origin", sha],
         timeout=deadline.step("git fetch exact commit"),
         max_output=MAX_GIT_OUTPUT,
-        cwd=work_dir,
+        cwd=Path(git_path(work_dir)),
         env=_resolve_git_env(env),
         cancel=deadline.cancel,
     )
@@ -463,7 +472,7 @@ def is_ancestor(work_dir: Path, old: str, new: str, deadline: Deadline, *, env=N
         ["git", "merge-base", "--is-ancestor", old, new],
         timeout=remaining,
         max_output=MAX_GIT_OUTPUT,
-        cwd=work_dir,
+        cwd=Path(git_path(work_dir)),
         env=_resolve_git_env(env),
         cancel=deadline.cancel,
     )
@@ -483,7 +492,7 @@ def push_branch(work_dir: Path, branch: str, deadline: Deadline, *, env=None, ca
         ["git", "push", "--no-force-with-lease", "origin", f"HEAD:refs/heads/{branch}"],
         timeout=remaining,
         max_output=MAX_GIT_OUTPUT,
-        cwd=work_dir,
+        cwd=Path(git_path(work_dir)),
         env=_resolve_git_env(env),
         cancel=cancel if cancel is not None else deadline.cancel,
     )

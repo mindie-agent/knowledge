@@ -111,6 +111,34 @@ os.chmod(_policy_path, 0o600)
 
 import pytest
 
+@pytest.fixture(autouse=True)
+def lifecycle_tests_use_explicit_process_backend(request, monkeypatch):
+    """These suites test real locks/RPC/handoff, not the platform service manager.
+
+    CI has no interactive login token. The scheduler's own contract is tested
+    separately; native lifetime acceptance runs on the real Windows host.
+    This replacement is selected before a test, never after manager failure.
+    """
+    if request.node.path.name not in {
+        "test_service_startup.py", "test_service_retirement.py",
+    }:
+        return
+    import sys
+    from mindie_knowledge.loop import process, service_host
+    backend = service_host.platform_backend()
+    if backend is None:
+        return
+
+    def direct_test_service(config_path, config):
+        return process.spawn_service(
+            [sys.executable, "-m", "mindie_knowledge.loop.cli", "serve",
+             "--config", str(Path(config_path).resolve())],
+            from_detached_starter=True,
+        )
+
+    monkeypatch.setattr(backend, "request_start", direct_test_service)
+
+
 def pytest_configure(config):
     if _FIXTURE_ERRORS:
         pytest.exit("\n".join(_FIXTURE_ERRORS), returncode=2)
@@ -138,7 +166,15 @@ def store(tmp_path):
 
 
 def write_settings(path, *, enabled=True, repository="mindie-agent/knowledge-vllm-ascend",
-                   roots=None, idle_seconds=300, **extensions):
+                   roots=None, idle_seconds=300, consent_choice=None, **extensions):
+    """Write synthetic settings; only an explicit choice creates consent."""
+    if consent_choice is not None:
+        from mindie_knowledge import consent_store
+        if "consent_config" in extensions:
+            raise ValueError("fixture must choose a saved reference or an explicit choice")
+        consent = Path(path).with_name(Path(path).name + ".consent.json")
+        consent_store.record_choice(consent, consent_choice)
+        extensions["consent_config"] = str(consent.resolve())
     return settings_mod.write(
         path,
         enabled=enabled,

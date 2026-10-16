@@ -73,8 +73,8 @@ def test_external_reference_is_not_dedup_authority(reports):
 def test_cleanup_fault_keeps_original_and_both_facts(reports, monkeypatch, child_code):
     from mindie_knowledge.loop import process
     original_cleanup = process.terminate_tree
-    def cleanup_fault(child):
-        original_cleanup(child)
+    def cleanup_fault(child, **kwargs):
+        original_cleanup(child, **kwargs)
         child.stdout.close()
         child.stderr.close()
         raise OSError('private_cleanup_sentinel')
@@ -132,7 +132,7 @@ def test_capture_hook_reports_authorized_unavailable_but_not_disabled(reports, t
     from conftest import write_settings, make_admission, admission_token
     from mindie_knowledge.loop import cli
     sharing = tmp_path / 'sharing.json'
-    write_settings(sharing, enabled=enabled, roots=[tmp_path])
+    write_settings(sharing, consent_choice="contribute", enabled=enabled, roots=[tmp_path])
     admission = make_admission(tmp_path, project_root=tmp_path)
     config = tmp_path / 'config.json'
     config.write_text(json.dumps({'root': str(tmp_path / 'knowledge'), 'domain': 'fixture', 'community_config': str(sharing), 'admission_path': str(admission), 'capture_mode': 'public-transcript', 'transcript_adapter': __import__('transcript_double').__file__, 'redactor_executable': str(tmp_path / 'gitleaks')}))

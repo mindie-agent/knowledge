@@ -218,7 +218,9 @@ class Admission:
             now = time.time()
             if automatic and row and not row[2]:
                 raise ValueError("task binding was explicitly revoked")
-            if row and row[2] == 1 and row[4] == scope:
+            from ..filesystem import path_identity
+            if (row and row[2] == 1 and isinstance(row[4], str)
+                    and path_identity(row[4]) == path_identity(scope)):
                 # Healthy re-activation: keep the token and original boundary.
                 db.execute(
                     "UPDATE leases SET root_session=COALESCE(?, root_session) "

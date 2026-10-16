@@ -6,6 +6,7 @@ may inspect a local identity, but this view grants no access and changes no stat
 from __future__ import annotations
 
 from ..state_layout import state_root
+from ..filesystem import sqlite_file_uri
 
 import hashlib
 import json
@@ -32,6 +33,21 @@ _SAFE_CLASSES = frozenset({
     "ImportError", "ModuleNotFoundError", "SyntaxError", "SummaryWorkerPaused",
     "MaintenanceCancelled", "CommandTimedOut", "OutputLimitExceeded", "AdmissionUnavailable",
 })
+_STARTUP_STAGES = {"store", "admission", "transcript_adapter", "engine", "service"}
+_STARTUP_CAUSES = {"startup_failed", "permission", "database", "missing_component", "import_failed"}
+
+
+def startup_failure_details(value):
+    """Allow only static details from the same failed startup attempt."""
+    if (not isinstance(value, dict)
+            or not isinstance(value.get("stage"), str) or value["stage"] not in _STARTUP_STAGES
+            or not isinstance(value.get("error_class"), str)
+            or value["error_class"] not in _SAFE_CLASSES | {"UnknownError"}
+            or not isinstance(value.get("cause"), str) or value["cause"] not in _STARTUP_CAUSES):
+        return None
+    return {key: value[key] for key in ("stage", "error_class", "cause")}
+
+
 _NATIVE_FAILURE = re.compile(
     r"RuntimeError: maintenance agent exited (-?\d{1,5}); "
     r"category=([a-z_]+); elapsed=(\d{1,7}(?:\.\d{1,6})?)s\Z"
@@ -137,7 +153,8 @@ def failure(detail):
 def _bytes(path, limit=MAX_JSON):
     # Follow ordinary configuration symlinks, but never wait for a FIFO writer
     # or read a device. fstat checks the opened object, avoiding a stat/open race.
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    from ..filesystem import filesystem_path
+    fd = os.open(filesystem_path(path), os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise ValueError("diagnostic metadata must be a regular file")
@@ -158,7 +175,7 @@ def _json(path, limit=MAX_JSON):
 
 
 def _ro(path):
-    db = sqlite3.connect(Path(path).absolute().as_uri() + "?mode=ro", uri=True, timeout=0.1)
+    db = sqlite3.connect(sqlite_file_uri(path) + "?mode=ro", uri=True, timeout=0.1)
     deadline = time.monotonic() + DB_SECONDS
     db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
     db.row_factory = sqlite3.Row
@@ -166,11 +183,13 @@ def _ro(path):
 
 
 def _startup_path(config):
-    return Path(config["root"]) / config["domain"] / "latest-startup.json"
+    from ..filesystem import filesystem_path
+    return filesystem_path(config["root"]) / config["domain"] / "latest-startup.json"
 
 
 def _delivery_path(config):
-    return Path(config["root"]) / config["domain"] / "latest-delivery.json"
+    from ..filesystem import filesystem_path
+    return filesystem_path(config["root"]) / config["domain"] / "latest-delivery.json"
 
 
 def _fingerprint(config):
@@ -182,7 +201,7 @@ def _fingerprint(config):
 
 def record_startup_failure(config_path, config, stage, exc):
     """Owned serve child only. Persist a small safe failure, never provider stderr."""
-    if stage not in {"store", "admission", "transcript_adapter", "engine", "service"}:
+    if stage not in {"store", "admission", "transcript_adapter", "engine", "service", "service_host"}:
         raise ValueError("invalid startup stage")
     cause = "startup_failed"
     component = config.get("transcript_adapter") if stage == "transcript_adapter" else None
@@ -194,8 +213,32 @@ def record_startup_failure(config_path, config, stage, exc):
         cause = "missing_component" if component and not Path(component).is_file() else "import_failed"
     payload = dict(status="failed", stage=stage, error_class=error_class(exc), cause=cause,
                    config_fingerprint=_fingerprint(config))
+    original = startup_failure_details(getattr(exc, "_mindie_startup_failure", None))
+    if stage == "service_host" and original is not None:
+        # The host transports this attempt's safe cause; it must not replace
+        # a component failure with its own generic polling exception.
+        payload.update(original)
+        component = config.get("transcript_adapter") if original["stage"] == "transcript_adapter" else None
+    if stage == "service_host":
+        from .service_host import SAFE_CODES, SAFE_STAGES
+        code = getattr(exc, "code", None)
+        host_stage = getattr(exc, "stage", None)
+        payload["host"] = dict(
+            code=code if isinstance(code, str) and code in SAFE_CODES else "service_start_failed",
+            stage=host_stage if isinstance(host_stage, str) and host_stage in SAFE_STAGES else "service",
+            uncertain=getattr(exc, "uncertain", False) is True,
+        )
+        hresult = getattr(exc, "manager_hresult", None)
+        if type(hresult) is int and 0 <= hresult <= 0xffffffff:
+            payload["host"]["manager_hresult"] = hresult
     if component:
         payload["component_path"] = str(component)
+    detail = startup_failure_details(payload)
+    if detail is not None:
+        try:
+            exc._mindie_startup_failure = detail
+        except Exception:
+            pass
     path = _startup_path(config)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     _atomic_write_text(path, json.dumps(payload) + "\n")
@@ -260,7 +303,7 @@ def _startup(config_path, config):
         return dict(status="unavailable", error_class=error_class(exc))
     if raw.get("config_fingerprint") != _fingerprint(config):
         return dict(status="absent")
-    if not isinstance(raw.get("stage"), str) or raw["stage"] not in {"store", "admission", "transcript_adapter", "engine", "service"}:
+    if not isinstance(raw.get("stage"), str) or raw["stage"] not in {"store", "admission", "transcript_adapter", "engine", "service", "service_host"}:
         return dict(status="unavailable", error_class="ValueError")
     result = dict(status="failed", stage=raw["stage"],
                   error_class=raw.get("error_class") if isinstance(raw.get("error_class"), str) and raw["error_class"] in _SAFE_CLASSES else "UnknownError",
@@ -268,6 +311,16 @@ def _startup(config_path, config):
     # Derive the path from the current local config, not arbitrary record content.
     if raw["stage"] == "transcript_adapter" and config.get("transcript_adapter"):
         result["component_path"] = config["transcript_adapter"]
+    if raw["stage"] == "service_host":
+        from .service_host import SAFE_CODES, SAFE_STAGES
+        host = raw.get("host")
+        if (not isinstance(host, dict) or not isinstance(host.get("code"), str)
+                or host["code"] not in SAFE_CODES or not isinstance(host.get("stage"), str)
+                or host["stage"] not in SAFE_STAGES or type(host.get("uncertain")) is not bool):
+            return dict(status="unavailable", error_class="ValueError")
+        result["host"] = {key: host[key] for key in ("code", "stage", "uncertain")}
+        if type(host.get("manager_hresult")) is int and 0 <= host["manager_hresult"] <= 0xffffffff:
+            result["host"]["manager_hresult"] = host["manager_hresult"]
     return result
 
 

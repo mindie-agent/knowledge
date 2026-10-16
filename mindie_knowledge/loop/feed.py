@@ -22,6 +22,8 @@ from .store import _backoff_seconds, digest
 from mindie_knowledge.community.common import CommunityError, run_argv
 from mindie_knowledge.gitread import with_windows_longpaths, _check_cancel
 from mindie_knowledge.publication_contract import read_git_contract
+from mindie_knowledge.filesystem import filesystem_path, git_path
+from mindie_knowledge.git_layout import feed_repository_path, validate_git_directory
 
 
 def _feed_git_env():
@@ -75,9 +77,10 @@ class Feed:
         self.prefix = (config.get("prefix") or "").strip("/")
         self.url = config.get("url") or f"https://github.com/{repository}.git"
         self.ident = feed_ident(repository, ref, self.prefix)
-        self.dir = store.root / "feed" / self.ident
+        self.repo = feed_repository_path(store.root, self.ident)
+        validate_git_directory(self.repo, bare=True, role="feed")
+        self.dir = self.repo.parent
         self.dir.mkdir(parents=True, exist_ok=True)
-        self.repo = self.dir / "repo.git"
         self._cancel = None
 
     # -------------------------------------------------------------- git I/O
@@ -89,7 +92,7 @@ class Feed:
         maximum = 1024 * 1024
         try:
             completed = run_argv(
-            ["git", "-C", str(self.repo), *args],
+            ["git", "-C", git_path(self.repo), *args],
                 timeout=remaining, max_output=maximum, input_bytes=b"",
                 env=_feed_git_env(), cancel=self._cancel,
             )
@@ -113,11 +116,11 @@ class Feed:
             # A local path with --depth goes through git's local-copy path,
             # which mishandles packed/multi-pack-index sources; file:// uses
             # the same pack protocol as a real remote (git's own advice).
-            url = Path(url).resolve().as_uri()
+            url = Path(git_path(filesystem_path(url).resolve())).as_uri()
         try:
             completed = run_argv(
                 ["git", "clone", "--bare", "--quiet", "--depth=1", "--single-branch", "--no-tags",
-                 "--branch", self.ref, url, str(self.repo)],
+                 "--branch", self.ref, url, git_path(self.repo)],
                 timeout=remaining, max_output=65536, input_bytes=b"",
                 env=_feed_git_env(), cancel=self._cancel,
             )
@@ -157,6 +160,30 @@ class Feed:
     def _candidate(self):
         return self.store.feed_get(f"feed-candidate:{self.ident}") or {}
 
+    def read_availability(self):
+        """Project saved sync outcomes without fetching or retrying a source."""
+        receipt = self.store.feed_get("feed:" + self.ident) or {}
+        candidate = self._candidate()
+        commit = receipt.get("commit")
+        contract = receipt.get("contract_sha256")
+        installed = (isinstance(commit, str)
+                     and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit)
+                     and isinstance(contract, str) and re.fullmatch(r"[0-9a-f]{64}", contract))
+        sync_status = receipt.get("status", "not-synced")
+        if sync_status not in {"synced", "unchanged", "unavailable", "invalid", "deferred"}:
+            sync_status = "unknown"
+        candidate_status = candidate.get("status")
+        failed_candidate = candidate_status in {"invalid", "unavailable", "new"}
+        healthy = sync_status in {"synced", "unchanged"} and not failed_candidate
+        result = dict(repository=self.repository,
+                      status="ready" if installed and healthy else "stale" if installed else "unavailable",
+                      sync_status=sync_status)
+        if installed:
+            result["retained_commit"] = commit
+        if failed_candidate:
+            result["candidate_status"] = candidate_status
+        return result
+
     def _save_candidate(self, value):
         self.store.feed_set(f"feed-candidate:{self.ident}", value)
 
@@ -173,7 +200,7 @@ class Feed:
 
         listing_path = self.dir / "listing.tmp"
         run_stdout_to_file(
-            ["git", "-C", str(self.repo), "ls-tree", "-r", "-z", "--long", commit,
+            ["git", "-C", git_path(self.repo), "ls-tree", "-r", "-z", "--long", commit,
              "--", self.prefix or "."],
             listing_path,
             timeout=None if deadline is None else max(0, deadline - time.monotonic()),
@@ -292,7 +319,6 @@ class Feed:
         return staged
 
     def _packages(self, commit, entries):
-        from mindie_knowledge.materials import validate_package_files
         from mindie_knowledge.materials.file_source import FileContents
 
         grouped = {}
@@ -302,13 +328,9 @@ class Feed:
         staging = self._staging_dir(commit)
         for task_id, names in sorted(grouped.items()):
             files = FileContents.from_paths(staging / 'tasks' / task_id, names)
-            checked = validate_package_files(files, self.store.domain)
-            package = checked
-            if not package["ready"]:
-                raise ValueError("published task package has unfinished material indexes")
-            if package["task_id"] != task_id:
-                raise ValueError("task package identity differs from its directory")
-            yield package
+            # The installer validates the bytes once, including this listing
+            # identity, before accepting metadata or promoting any pointers.
+            yield dict(task_id=task_id, files=files)
 
     def _clear_staging(self):
         staging = self.dir / "staging"

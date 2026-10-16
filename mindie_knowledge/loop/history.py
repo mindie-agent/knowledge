@@ -14,6 +14,7 @@ import json
 import sys
 import time
 from pathlib import Path
+from ..filesystem import path_identity, resolved_path
 
 
 def _load_parser(path):
@@ -39,7 +40,7 @@ def plan(source, session_id, output, *, parser, max_bytes=64*1024*1024, max_seco
     FileIdentity, identify, read_material = (
         parser.FileIdentity, parser.identify, parser.read_material
     )
-    source = Path(source).resolve()
+    source = resolved_path(source)
     output = Path(output)
     if not 1 <= max_bytes <= 1024*1024*1024 or not 0 < max_seconds <= 60:
         raise ValueError("history plan exceeds invocation budget")
@@ -47,7 +48,7 @@ def plan(source, session_id, output, *, parser, max_bytes=64*1024*1024, max_seco
     manifest = output / "plan.json"
     if manifest.exists():
         state = json.loads(manifest.read_text())
-        if state["source"] != str(source) or state["session_id"] != session_id:
+        if path_identity(state["source"]) != path_identity(source) or state["session_id"] != session_id:
             raise ValueError("plan belongs to another source or task")
         expected = FileIdentity.unserialize(state["identity"], str(source))
         if expected is None:

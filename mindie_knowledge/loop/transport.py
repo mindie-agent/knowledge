@@ -38,6 +38,10 @@ class RequestRejected(ValueError):
         self.read_ref = read_ref
 
 
+class FeedUnavailableError(RuntimeError):
+    """A known source failure, not a successful no-match or a product defect."""
+
+
 def rpc(connection, method, arguments=None, *, timeout=None):
     url = connection["url"]
     if not url.startswith("http://127.0.0.1:"):
@@ -72,8 +76,12 @@ def rpc(connection, method, arguments=None, *, timeout=None):
         if result.get("error_kind") == "invalid_request":
             raise RequestRejected(error, error_code=result.get("error_code", "read_rejected"),
                                   read_ref=result.get("read_ref"))
-        exception = (MaterialReadError(error, read_ref=result.get("read_ref"))
-                     if result.get("error_code") == "material_corrupt" else RuntimeError(error))
+        if result.get("error_code") == "material_corrupt":
+            exception = MaterialReadError(error, read_ref=result.get("read_ref"))
+        elif result.get("error_code") == "feed_unavailable":
+            exception = FeedUnavailableError(error)
+        else:
+            exception = RuntimeError(error)
         attach_reference(exception, result.get("diagnostic"))
         raise exception
     try:
@@ -175,6 +183,9 @@ class Service:
                     result = dict(ok=False, error_kind="invalid_request", error=str(exc), error_code=exc.code)
                     if exc.read_ref is not None:
                         result["read_ref"] = exc.read_ref
+                except FeedUnavailableError as exc:
+                    result = dict(ok=False, error_kind="operation_failed",
+                                  error=str(exc), error_code="feed_unavailable")
                 except MaterialReadError as exc:
                     failure("knowledge.rpc", stage="query" if payload["method"] == "query" else "read",
                             category="material_corrupt", exception=exc)
@@ -225,6 +236,8 @@ class Service:
         )
         if config_fingerprint is not None:
             self.connection['config_fingerprint'] = config_fingerprint
+        if config_path is not None:
+            self.connection['config_path'] = str(Path(config_path).resolve())
 
     # -------------------------------------------------------------- routing
 
@@ -297,11 +310,26 @@ class Service:
             # capture lease for ordinary public knowledge reads.
             args, session, lease = self._identify(args, read_only=True)
         if method == "query":
-            return self.store.query(
+            sources = [feed.read_availability() for feed in self.feeds]
+            unavailable = [source for source in sources if source["status"] == "unavailable"]
+            if unavailable:
+                names = ", ".join(source["repository"] for source in unavailable)
+                raise FeedUnavailableError(
+                    "knowledge query unavailable: configured feed has no verified installed "
+                    f"snapshot receipt ({names}); inspect its sync result; no automatic retry was performed"
+                )
+            result = self.store.query(
                 args.get("query"), limit=args.get("limit", 5),
                 conditions=args.get("conditions"),
                 continuation=args.get("continuation"),
             )
+            stale = [source for source in sources if source["status"] == "stale"]
+            if stale:
+                result = dict(result, source_status=dict(status="stale", feeds=stale),
+                              note=(result.get("note", "") + " Results use a retained snapshot; "
+                                    "a configured feed refresh failed or is incomplete. "
+                                    "No match does not establish absence from the current source.").strip())
+            return result
         if method == "explain":
             if set(args) != {"ref"}:
                 raise ValueError("explain accepts only ref; whole-document offset/limit reading is unavailable")

@@ -1201,18 +1201,19 @@ class Store:
         the selected revisions together after commit. Only entry headers and
         memberships are retained in SQLite.
         """
-        from mindie_knowledge.materials import validate_package_files
-
         headers = []
-        def candidates():
-            for package in packages:
-                value = validate_package_files(package['files'], self.domain)
-                headers.append(value['entry'])
-                yield value
+
+        def accept_metadata(package):
+            if not package["ready"]:
+                raise ValueError("published task package has unfinished material indexes")
+            headers.append(package["entry"])
+
         now = time.time()
         with self._write_txn():
-            self.materials.install_packages(candidates(), source="feed",
-                                            source_revision=source_revision, promote=False)
+            self.materials.install_packages(
+                packages, source="feed", source_revision=source_revision,
+                promote=False, on_validated=accept_metadata,
+            )
             self.db.execute("UPDATE entries SET feed_active=0 WHERE feed_active=1")
             for doc in headers:
                 row = self._row(doc["entry_id"])

@@ -11,6 +11,7 @@ from mindie_knowledge.loop.transport import RequestRejected, rpc
 @pytest.mark.parametrize('payload,error', [
     ({'ok': False, 'error_kind': 'invalid_request', 'error': 'unknown reference'}, RequestRejected),
     ({'ok': False, 'error_kind': 'operation_failed', 'error': 'broken database'}, RuntimeError),
+    ({'ok': False, 'error_kind': 'operation_failed', 'error': 'feed_unavailable'}, RuntimeError),
     ({'ok': False, 'error': 'untyped service failure'}, RuntimeError),
     (b'{not json}', ValueError),
 ])
@@ -31,6 +32,8 @@ def test_only_explicit_request_rejection_is_nonfatal(payload, error):
     try:
         with pytest.raises(error) as caught:
             rpc({'url': f'http://127.0.0.1:{server.server_port}', 'token': 'test'}, 'query', {'query': 'rms_norm'})
+        if error is RuntimeError:
+            assert type(caught.value) is RuntimeError
         assert isinstance(caught.value, RequestRejected) == (error is RequestRejected)
     finally:
         server.shutdown()

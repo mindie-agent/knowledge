@@ -184,9 +184,9 @@ _DECLARED_PARSERS = {
         "92daa12f74ad494da386b12e931cdbbc80139163241e50bb58061ed7b17fc2b1",
     ),
     "codex": (
-        "bc5be27ade096524d44ff5049724938182a7736f",
+        "52966a915a23bf76bb52d1c1415d702c22afc267",
         "plugins/mindie-agent/scripts/codex_transcript.py",
-        "2f387855db93563da32d02b92a53aaaeb204732b8d8b3147cab1002c60ad004d",
+        "7420fe832bf0832a41cb135f4adfb99ddc6414feef1419c9ba78c552f47b3e0e",
     ),
 }
 

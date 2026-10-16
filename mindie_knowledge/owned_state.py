@@ -14,6 +14,7 @@ import stat
 import threading
 
 from .loop.locks import StartLock
+from .filesystem import filesystem_path, sqlite_file_uri
 
 _SQL_TOKENS = re.compile(r'''--[^\n]*|/\*.*?\*/|'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[[^]]*\]|[A-Za-z_][A-Za-z_0-9]*|[^\s]''', re.S)
 
@@ -203,7 +204,7 @@ class OwnedCursor(sqlite3.Cursor):
 def open_database(path, *, schema, required, initialize, residue=(), validate=None,
                   initialize_missing=True, validate_current=None, timeout=None):
     """Initialize only a demonstrably new store; preserve every damaged file."""
-    path = Path(path)
+    path = filesystem_path(path)
     marker = path.with_name(path.name + '.owner')
     leftovers = (*residue, *(path.with_name(path.name + suffix) for suffix in ('-wal', '-shm', '-journal')))
     if (not initialize_missing and not _present(path) and not _present(marker)
@@ -231,7 +232,7 @@ def open_database(path, *, schema, required, initialize, residue=(), validate=No
         if not fresh and (not path.is_file() or path.stat().st_size == 0):
             raise ValueError('authoritative state database is empty or invalid; state was not rebuilt')
         before = None if fresh else _file_identity(path)
-        db = sqlite3.connect(path if fresh else path.absolute().as_uri() + '?mode=rw',
+        db = sqlite3.connect(path if fresh else sqlite_file_uri(path) + '?mode=rw',
                              uri=not fresh, check_same_thread=False, factory=OwnedConnection,
                              timeout=5.0 if timeout is None else timeout)
         if before is not None and _file_identity(path) != before:

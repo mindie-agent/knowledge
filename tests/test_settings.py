@@ -20,6 +20,61 @@ def test_missing_or_malformed_settings_fail_closed(tmp_path):
     assert not settings_mod.load(wrong_schema).allows_capture()
 
 
+def test_oversized_settings_are_corrupt_and_not_repaired(tmp_path):
+    from mindie_knowledge import consent_store
+
+    path = tmp_path / "oversized.json"
+    raw = b'{"schema":"mindie-community-config/1","enabled":false}' + b" " * consent_store.MAX_BYTES
+    path.write_bytes(raw)
+    loaded = settings_mod.load(path)
+    assert loaded.state == "corrupt"
+    assert loaded.capture_block_kind() == "fault"
+    with pytest.raises(ValueError, match="corrupt"):
+        settings_mod.write(path, enabled=False, repository=None, project_roots=[])
+    assert path.read_bytes() == raw
+
+
+def test_missing_choice_reference_is_a_fault_without_rewriting_saved_choice(tmp_path):
+    from mindie_knowledge import consent_store
+
+    consent = tmp_path / "consent.json"
+    consent_store.record_choice(consent, "contribute")
+    consent_store.record_reporting(consent, "disabled")
+    saved = consent.read_bytes()
+    path = tmp_path / "community.json"
+    original = write_settings(path, roots=[tmp_path], consent_config=str(consent))
+    raw = json.loads(path.read_text())
+    del raw["consent_config"]
+    path.write_text(json.dumps(raw))
+    broken = path.read_bytes()
+    for _ in range(2):
+        loaded = settings_mod.load(path)
+        assert loaded.capture_block_kind() == "fault"
+        assert loaded.public_status()["consent"]["state"] == "invalid"
+        assert "invalid" in loaded.contribution_block_reason()
+        assert path.read_bytes() == broken
+        assert consent.read_bytes() == saved
+    # Wiring repair reuses the saved choice and authorization boundary.
+    settings_mod.update_extensions(path, consent_config=str(consent))
+    restored = settings_mod.load(path)
+    assert restored.allows_capture()
+    assert restored.generation == original.generation
+    assert restored.enabled_at == original.enabled_at
+    assert consent.read_bytes() == saved
+
+
+def test_missing_enabled_field_is_not_an_explicit_optout(tmp_path):
+    path = tmp_path / "community.json"
+    original = write_settings(path, consent_choice="contribute", roots=[tmp_path])
+    raw = dict(original.raw)
+    del raw["enabled"]
+    path.write_text(json.dumps(raw))
+    loaded = settings_mod.load(path)
+    assert loaded.state == "corrupt"
+    assert loaded.capture_block_kind() == "fault"
+    assert not loaded.allows_capture()
+
+
 def test_states_distinguish_missing_corrupt_disabled_and_enabled(tmp_path):
     """A damaged file is never a never-configured install, and a saved
     explicit off is neither missing nor damaged (no fresh onboarding, no
@@ -35,9 +90,9 @@ def test_states_distinguish_missing_corrupt_disabled_and_enabled(tmp_path):
     wrong_schema = tmp_path / "wrong.json"
     wrong_schema.write_text(json.dumps({"schema": "other/9", "enabled": True}))
     assert settings_mod.load(wrong_schema).state == "corrupt"
-    off = write_settings(tmp_path / "off.json", enabled=False, roots=[tmp_path])
+    off = write_settings(tmp_path / "off.json", consent_choice="contribute", enabled=False, roots=[tmp_path])
     assert off.state == "disabled" and off.configured and not off.enabled
-    on = write_settings(tmp_path / "on.json", enabled=True, roots=[tmp_path])
+    on = write_settings(tmp_path / "on.json", consent_choice="contribute", enabled=True, roots=[tmp_path])
     assert on.state == "enabled" and on.configured and on.allows_capture()
     assert settings_mod.load(tmp_path / "off.json").state == "disabled"
     assert "state" in on.public_status()
@@ -45,7 +100,7 @@ def test_states_distinguish_missing_corrupt_disabled_and_enabled(tmp_path):
 
 def test_enabled_requires_generation_boundary_and_roots(tmp_path):
     path = tmp_path / "community.json"
-    settings = write_settings(path, enabled=True, roots=[tmp_path])
+    settings = write_settings(path, consent_choice="contribute", enabled=True, roots=[tmp_path])
     assert settings.allows_capture()
     assert isinstance(settings.generation, str) and settings.generation
     raw = json.loads(path.read_text())
@@ -67,7 +122,7 @@ def test_enabled_requires_generation_boundary_and_roots(tmp_path):
 def test_scope_is_canonical_containment(tmp_path):
     root = tmp_path / "proj"
     (root / "sub").mkdir(parents=True)
-    settings = write_settings(tmp_path / "c.json", enabled=True, roots=[root])
+    settings = write_settings(tmp_path / "c.json", consent_choice="contribute", enabled=True, roots=[root])
     assert settings.in_scope(root)
     assert settings.in_scope(root / "sub")
     assert settings.in_scope(str(root / "sub" / ".."))
@@ -78,19 +133,19 @@ def test_scope_is_canonical_containment(tmp_path):
 
 def test_toggle_preserves_extension_keys_and_bumps_generation(tmp_path):
     path = tmp_path / "c.json"
-    first = write_settings(path, enabled=True, roots=[tmp_path],
+    first = write_settings(path, consent_choice="contribute", enabled=True, roots=[tmp_path],
                            fork="me/knowledge-vllm-ascend", bot={"name": "grok"})
-    second = write_settings(path, enabled=False, roots=[tmp_path])
+    second = write_settings(path, consent_choice="contribute", enabled=False, roots=[tmp_path])
     assert second.generation != first.generation
     assert second.raw["fork"] == "me/knowledge-vllm-ascend"
     assert second.raw["bot"] == {"name": "grok"}
     assert not second.allows_capture()
-    third = write_settings(path, enabled=True, roots=[tmp_path])
+    third = write_settings(path, consent_choice="contribute", enabled=True, roots=[tmp_path])
     assert third.enabled_at is not None and third.raw["fork"] == "me/knowledge-vllm-ascend"
 
 
 def test_as_dict_keeps_schema_extensions_and_config_path(tmp_path):
-    settings = write_settings(tmp_path / "c.json", enabled=True, roots=[tmp_path],
+    settings = write_settings(tmp_path / "c.json", consent_choice="contribute", enabled=True, roots=[tmp_path],
                               transaction={"mode": "batch"})
     data = settings.as_dict()
     assert data["schema"] == "mindie-community-config/1"
@@ -131,7 +186,7 @@ def test_authority_fault_does_not_renew_existing_permission(tmp_path, fault):
 
 def test_removed_policy_extension_stays_removed_and_changes_boundary_once(tmp_path):
     path = tmp_path / 'community.json'
-    original = write_settings(path, roots=[tmp_path], fork='owner/fork', bot=dict(name='bot'))
+    original = write_settings(path, consent_choice="contribute", roots=[tmp_path], fork='owner/fork', bot=dict(name='bot'))
     with settings_mod.CommunityWriteContext(path) as writer:
         removed = writer.write(path, enabled=True, repository=original.repository,
                                project_roots=[tmp_path], fork=None)
@@ -149,7 +204,7 @@ def test_scope_aliases_duplicates_and_order_do_not_rewrite_authority(tmp_path):
     left, right = tmp_path / 'left', tmp_path / 'right'
     left.mkdir()
     right.mkdir()
-    original = write_settings(path, roots=[left, right])
+    original = write_settings(path, consent_choice="contribute", roots=[left, right])
     before = path.read_bytes()
     alias = str(left) + '/../left'
     assert settings_mod.normalized_roots([str(left), alias]) == [str(left.resolve())]

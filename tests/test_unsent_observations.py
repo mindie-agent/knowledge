@@ -30,7 +30,7 @@ def test_rewritten_whole_document_cannot_guess_unsent_parts_after_remote_correct
     """A whole-document rewrite lacks stable sent blocks and cannot be safely
     separated into old removed text and new observations.
     """
-    settings = write_settings(tmp_path / "community.json", enabled=True,
+    settings = write_settings(tmp_path / "community.json", consent_choice="contribute", enabled=True,
                               roots=[tmp_path])
     store = Store(tmp_path / "store", "test")
     try:
@@ -67,7 +67,7 @@ def test_rewritten_whole_document_cannot_guess_unsent_parts_after_remote_correct
 
 def test_feed_sync_drops_only_a_byte_identical_published_candidate(tmp_path):
     """An exact main package retires its matching candidate without body history."""
-    settings = write_settings(tmp_path / "community.json", enabled=True,
+    settings = write_settings(tmp_path / "community.json", consent_choice="contribute", enabled=True,
                               roots=[tmp_path])
     store = Store(tmp_path / "store", "test")
     try:
@@ -93,7 +93,7 @@ def test_feed_sync_drops_only_a_byte_identical_published_candidate(tmp_path):
 def test_flush_chunks_oversized_flush_without_dropping(tmp_path, monkeypatch):
     """A flush bigger than the per-batch envelope splits into sequential
     automatic batches; nothing is dropped and no batch is user-managed."""
-    settings = write_settings(tmp_path / "community.json", enabled=True,
+    settings = write_settings(tmp_path / "community.json", consent_choice="contribute", enabled=True,
                               roots=[tmp_path])
     store = Store(tmp_path / "store", "test")
     try:
@@ -130,7 +130,7 @@ def test_frozen_package_preserves_exact_utf8_bytes_and_metadata_only_receipt(tmp
     import hashlib
     store = Store(tmp_path, "test")
     try:
-        settings = write_settings(tmp_path / "community.json", enabled=True, roots=[tmp_path])
+        settings = write_settings(tmp_path / "community.json", consent_choice="contribute", enabled=True, roots=[tmp_path])
         store.create_draft(kind="experience", title="Measure", summary="s",
                           content='Body with "escapes" ü and a newline.\nNext line.',
                           owner=PRODUCER, generation=settings.generation)

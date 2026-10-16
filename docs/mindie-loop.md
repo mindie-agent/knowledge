@@ -30,17 +30,17 @@ and delivery timing do not revoke authorization.
 ## The gate
 
 `capture_allowed = active adapter lease AND community enabled AND the lease's
-canonical project_root inside the configured scope AND — when the shared
-config carries the consent_config extension — a saved contribute choice in the
+canonical project_root inside the configured scope AND a saved contribute choice in the
 named mindie-consent/1 authority`. The shared settings file is re-read before
 transcript reading, before every model spawn and before any outbound write;
 the consent document named by `consent_config` (absolute path) is re-read with
 it. A missing, unreadable, corrupt or non-contribute consent closes the same
 capture/model/write paths while read-only helpers keep working, and the fault
 is reported as itself, never as first-time onboarding. The field grants no
-permission by itself: explicit `enabled=false` always wins, and a config
-without the field keeps its previous read behavior until the owning adapter
-wires it at install/upgrade/entry. When community contribution is off — the
+permission by itself: explicit `enabled=false` always wins. A config without
+the reference is an authority fault and never authorizes contribution.
+Runtime installation and reload preserve the saved authority; they do not
+request consent again. When community contribution is off — the
 default — there is no automatic capture, extraction or sanitization at all:
 the Hook short-circuits and creates no capture, cursor, draft or model
 call. Read-only retrieval, plugin updates and knowledge sync keep working; an

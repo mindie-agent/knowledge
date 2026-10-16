@@ -4,12 +4,10 @@ One small JSON document (``mindie-consent/1``) per installation profile. Every
 adapter sharing the profile reads the same saved choice; an isolated profile
 has its own file and never inherits another profile's choice.
 
-This module is the ONE shared implementation of that document: pure stdlib
-and fully self-contained (no imports from the ``mindie_knowledge`` package),
-so an adapter that cannot load the runtime before first setup may carry a
-byte-identical bootstrap copy instead of a third hand-written fork.
+This module is the shared implementation used by adapters and the knowledge
+runtime. Runtime installation does not create or replace the saved choice.
 
-Semantics (the precise contract is the lane's ``API.md``):
+Semantics:
 
 - ``read`` has zero side effects and never migrates; it distinguishes
   ``ok``/``missing``/``unreadable``/``corrupt`` strictly. A damaged document
@@ -19,10 +17,6 @@ Semantics (the precise contract is the lane's ``API.md``):
   the other field and every untouched key, then a unique temp file, fsync
   and an atomic replace. A corrupt or unreadable file is never silently
   cleared by a field update — the update fails and the bytes stay.
-- ``migrate`` imports already validated legacy choices exactly once at an
-  explicit install/upgrade/entry boundary. An existing valid authority
-  always wins; evidence that is missing or conflicting yields a diagnosable
-  no-write result, preserving the original data.
 
 Platform note: on Windows a stdlib ``open`` shares read/write but denies
 delete, and MoveFileExW (``os.replace``) refuses a destination with ANY
@@ -40,7 +34,9 @@ change semantics.
 from __future__ import annotations
 
 import json
+import errno
 import os
+import stat
 import struct
 import tempfile
 import time
@@ -64,7 +60,6 @@ __all__ = [
     "read",
     "record_choice",
     "record_reporting",
-    "migrate",
 ]
 
 
@@ -215,7 +210,8 @@ def _open_for_read(path):
     OSError.
     """
     if os.name != "nt":
-        return open(path, "rb")
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        return os.fdopen(fd, "rb")
     handle = _CreateFileW(
         str(path), _GENERIC_READ, _SHARE_READ_WRITE_DELETE,
         None, _OPEN_EXISTING, _FILE_ATTRIBUTE_NORMAL, None,
@@ -232,7 +228,9 @@ def _open_for_read(path):
 
 def _read_bytes(path):
     with _open_for_read(path) as stream:
-        return stream.read()
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise OSError(errno.EINVAL, "authority is not a regular file")
+        return stream.read(MAX_BYTES + 1)
 
 
 def _read_raw(path):
@@ -243,6 +241,8 @@ def _read_raw(path):
         return "missing", None
     except OSError:
         return "unreadable", None
+    if len(raw) > MAX_BYTES:
+        return "corrupt", None
     try:
         data = json.loads(raw)
     except ValueError:
@@ -396,8 +396,7 @@ def _record(path, mutate):
 def record_choice(path, choice):
     """Persist one explicit contribution choice; merge everything else.
 
-    The reporting value and all untouched metadata survive. ``migrated_from``
-    is dropped: an explicit choice supersedes migration provenance. A missing
+    The reporting value and all untouched metadata survive. A missing
     file is created (explicit first choice); a corrupt or unreadable one is
     preserved and reported, never silently cleared.
     """
@@ -407,7 +406,6 @@ def record_choice(path, choice):
     def mutate(document):
         if document.get("choice") == choice:
             return
-        document.pop("migrated_from", None)
         document.update(schema=SCHEMA, choice=choice, choice_at=time.time())
 
     return _record(path, mutate)
@@ -416,8 +414,8 @@ def record_choice(path, choice):
 def record_reporting(path, value):
     """Persist one explicit reporting choice; merge everything else.
 
-    The contribution choice and all untouched metadata (including
-    ``migrated_from``) survive; the two consents never overwrite each other.
+    The contribution choice and all untouched metadata survive; the two
+    consents never overwrite each other.
     """
     if value not in REPORTING:
         raise ValueError("reporting must be enabled, disabled or later")
@@ -426,119 +424,3 @@ def record_reporting(path, value):
         document.update(schema=SCHEMA, reporting=value, reporting_at=time.time())
 
     return _record(path, mutate)
-
-
-# ------------------------------------------------------------------ migrate
-
-
-def _check_candidates(candidates):
-    validated = []
-    for candidate in candidates:
-        if not isinstance(candidate, dict):
-            raise ValueError("each migration candidate must be a mapping")
-        choice = candidate.get("choice")
-        reporting = candidate.get("reporting")
-        source = candidate.get("source")
-        if not isinstance(source, str) or not source.strip():
-            raise ValueError("each migration candidate names its source")
-        if choice is not None and choice not in CHOICES:
-            raise ValueError(f"candidate {source!r} carries an invalid choice")
-        if reporting is not None and reporting not in REPORTING:
-            raise ValueError(f"candidate {source!r} carries an invalid reporting value")
-        validated.append(
-            dict(choice=choice, reporting=reporting, source=source.strip())
-        )
-    return validated
-
-
-def migrate(path, candidates):
-    """Import validated legacy choices exactly once, at an explicit boundary.
-
-    An existing valid saved choice always wins (``kept``). Otherwise the
-    import writes only when every choice-carrying candidate agrees
-    (``migrated``); missing evidence is ``absent`` and conflicting evidence is
-    a diagnosable ``conflict`` — both without a write. A corrupt or
-    unreadable authority is an ``error``: the original data is preserved and
-    no public authorization is ever guessed.
-    """
-    path = Path(path)
-    validated = _check_candidates(candidates)
-    with _UpdateLock(path.with_name(path.name + ".lock")):
-        state, data = _read_raw(path)
-        if state == "ok":
-            error = _validate(data)
-            state = "corrupt" if error is not None else "ok"
-        result = dict(
-            status=None, state=state, choice=None, reporting=None,
-            path=str(path), error=None, detail="", sources=[],
-        )
-        if state in ("corrupt", "unreadable"):
-            result.update(
-                status="error",
-                error=f"consent file is {state}; original data preserved",
-            )
-            return result
-        if state == "ok" and data.get("choice") in CHOICES:
-            view = read(path)
-            result.update(
-                status="kept", choice=view["choice"],
-                reporting=view["reporting"],
-                detail="a valid saved choice already exists; authority kept",
-            )
-            return result
-        choices = sorted({c["choice"] for c in validated if c["choice"] is not None})
-        if len(choices) > 1:
-            result.update(
-                status="conflict",
-                error="legacy sources disagree on the saved choice",
-                detail="conflicting choices: " + ", ".join(
-                    f"{c['source']}={c['choice']}"
-                    for c in validated
-                    if c["choice"] is not None
-                ),
-                sources=[c["source"] for c in validated if c["choice"] is not None],
-            )
-            return result
-        document = dict(data) if state == "ok" else {}
-        if not choices:
-            if state == "ok":
-                result["reporting"] = read(path)["reporting"]
-            result.update(
-                status="absent",
-                detail="no legacy choice evidence; nothing written",
-            )
-            return result
-        reportings = sorted(
-            {c["reporting"] for c in validated if c["reporting"] is not None}
-        )
-        fills_reporting = document.get("reporting") not in REPORTING and reportings
-        if fills_reporting and len(reportings) > 1:
-            result.update(
-                status="conflict",
-                error="legacy sources disagree on the reporting choice",
-                detail="conflicting reporting values: " + ", ".join(
-                    f"{c['source']}={c['reporting']}"
-                    for c in validated
-                    if c["reporting"] is not None
-                ),
-                sources=[c["source"] for c in validated if c["reporting"] is not None],
-            )
-            return result
-        document["schema"] = SCHEMA
-        document["choice"] = choices[0]
-        document["choice_at"] = time.time()
-        if fills_reporting:
-            document["reporting"] = reportings[0]
-            document["reporting_at"] = time.time()
-        document["migrated_from"] = sorted(
-            {c["source"] for c in validated if c["choice"] or c["reporting"]}
-        )
-        _write_document(path, document)
-        view = read(path)
-        result.update(
-            status="migrated", state="ok", choice=view["choice"],
-            reporting=view["reporting"],
-            detail="legacy choice imported once",
-            sources=list(document["migrated_from"]),
-        )
-        return result

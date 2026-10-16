@@ -14,9 +14,11 @@ authors = [
 ]
 dependencies = [
   "PyYAML>=6.0",
+  "semantic-version==2.10.0",
   "reme-ai[as] @ git+https://github.com/agentscope-ai/ReMe@4c54c2b650038eff2a5d0d77aaa61b3e836f1b18",
   "langmem==0.0.30",
-  "mindie-diagnostics @ git+https://github.com/mindie-agent/diagnostics@210e96dcbbde364f13a6cd45a4f50488226a8a29",
+  "pywin32==312; sys_platform == 'win32'",
+  "mindie-diagnostics @ git+https://github.com/mindie-agent/diagnostics@10cc3391ed358d7b7e0e1acb99ca5be4d1934b47",
 ]
 
 [project.optional-dependencies]

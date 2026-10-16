@@ -24,7 +24,7 @@ def test_wake_survives_hook_process_group_kill(tmp_path):
     project = tmp_path / "proj"
     project.mkdir()
     settings = tmp_path / "community.json"
-    write_settings(settings, enabled=True, roots=[project])
+    write_settings(settings, consent_choice="contribute", enabled=True, roots=[project])
     admission = make_admission(tmp_path, project_root=project)
     calls = tmp_path / "calls.txt"
     from datetime import datetime, timezone

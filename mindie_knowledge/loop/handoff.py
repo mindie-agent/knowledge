@@ -6,8 +6,10 @@ Stop does not migrate the store, open a transcript, or call a model.
 from __future__ import annotations
 
 from ..state_layout import state_root
+from ..filesystem import filesystem_path
 
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -24,6 +26,7 @@ from .store import (
 )
 
 SUMMARY_LIMIT = 32768
+WAKE_PROBE_SECONDS = .25  # Control-plane observation; never a business deadline.
 _HARNESS = __import__("re").compile(r"[a-z][a-z0-9_-]{0,31}\Z")
 _TERMINAL = {
     "organized": "organized",
@@ -58,7 +61,10 @@ def _result(**kwargs):
         summary_dropped=False, recovery=None,
     )
     value.update(kwargs)
-    return {key: value[key] for key in _KEYS}
+    result = {key: value[key] for key in _KEYS}
+    if kwargs.get("host") is not None:
+        result["host"] = kwargs["host"]
+    return result
 
 
 def _event_hash(harness, kind, session, key):
@@ -154,7 +160,7 @@ def _probe(config, timeout, *, config_path=None):
     # The service holds this OS lock until storage and listener are closed.
     # Windows may report a closed loopback port as a timeout for ~2 seconds;
     # a released lifetime lock is stronger evidence than a short TCP probe.
-    consumer = Path(config["root"]) / config["domain"] / "consumer.lock"
+    consumer = filesystem_path(config["root"]) / config["domain"] / "consumer.lock"
     owner = lock_held(consumer)
     if owner is None:
         try:
@@ -254,7 +260,7 @@ def request_wake(config_path, *, session_id, event=None):
             return out
         out.update(wake="not-applicable", reason="not-activated")
         return out
-    state = _probe(config, None, config_path=config_path)
+    state = _probe(config, WAKE_PROBE_SECONDS, config_path=config_path)
     if state == "ready":
         out.update(wake="running", runtime="ready", reason="worker-ready")
         return out
@@ -280,11 +286,38 @@ def request_wake(config_path, *, session_id, event=None):
         if isinstance(event, str) and len(event) == 64:
             argv.extend(["--event", event])
         try:
-            from .process import spawn_service
-            process = spawn_service(argv)
-        except OSError:
+            from .service_host import platform_backend
+            backend = platform_backend()
+            if backend is not None and os.name == "nt":
+                from .cli import connection_path
+                start = StartLock(connection_path(config).with_name("start.lock"))
+                try:
+                    start.acquire()
+                except StartInProgress:
+                    out.update(wake="coalesced", runtime="unavailable", reason="coalesced")
+                    return out
+                try:
+                    # A query starter may have won while the wake lock was
+                    # acquired; the scheduler never replaces a live consumer.
+                    current = _probe(config, WAKE_PROBE_SECONDS, config_path=config_path)
+                    if current == "ready":
+                        out.update(wake="running", runtime="ready", reason="worker-ready")
+                        return out
+                    if current != "absent":
+                        out.update(wake="not-requested", runtime="unknown", reason=current)
+                        return out
+                    process = backend.request_start(config_path, config)
+                finally:
+                    start.release()
+            else:
+                from .process import spawn_service
+                process = spawn_service(argv)
+        except (OSError, ValueError, RuntimeError) as exc:
             out.update(wake="failed", runtime="unavailable", reason="wake-failed",
                        recovery=_RECOVERY["wake-failed"])
+            from .service_host import ServiceHostError
+            if isinstance(exc, ServiceHostError):
+                out["host"] = dict(stage=exc.stage, code=exc.code, uncertain=exc.uncertain)
             return out
         payload = {"wake_pid": process.pid, "at": time.time()}
         target = _wake_file(config)
@@ -515,7 +548,7 @@ def accept_stop(config_path, event):
             reason="stored", summary_dropped=dropped,
         )
     if status == "processing":
-        state = _probe(config, None, config_path=config_path)
+        state = _probe(config, WAKE_PROBE_SECONDS, config_path=config_path)
         return _result(
             stage="processing", capture_id=capture_id, duplicate=duplicate,
             wake="not-applicable",
@@ -528,7 +561,7 @@ def accept_stop(config_path, event):
         stage_name = "accepted-local"
     else:
         stage_name = "accepted-local"
-    state = _probe(config, None, config_path=config_path)
+    state = _probe(config, WAKE_PROBE_SECONDS, config_path=config_path)
     if state == "ready" and status in _UNPROCESSED_CAPTURE | {"pending", "deferred", "queued"}:
         clear_delivery_event(config, event_id)
         return _result(
@@ -562,4 +595,5 @@ def accept_stop(config_path, event):
         cause=None if wake.get("wake") != "failed" else "wake-failed",
         summary_dropped=dropped,
         recovery=wake.get("recovery"),
+        host=wake.get("host"),
     )

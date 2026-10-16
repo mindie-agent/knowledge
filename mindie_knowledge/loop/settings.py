@@ -15,16 +15,17 @@ distinctly — ``unconfigured``, ``missing``, ``unreadable``, ``corrupt``,
 never-configured installation (no fresh onboarding) and a missing one is never
 treated as an explicit opt-out.
 
-The optional ``consent_config`` extension key (absolute path) names the
+The ``consent_config`` key (absolute path) names the
 profile-shared ``mindie-consent/1`` authority implemented by
-``mindie_knowledge.consent_store``. When present, every gate additionally
+``mindie_knowledge.consent_store``. Every contribution gate additionally
 requires that document's saved ``contribute`` choice: a missing, unreadable,
 corrupt or non-contribute consent stops capture, model and write paths while
 read-only helpers keep working, and the fault is reported as itself — never as
 first-time onboarding. The field grants no permission by itself: an explicit
-``enabled=false`` here always wins. Configs without the field keep their
-previous read behavior; the owning adapter wires the field once at its
-install/upgrade/entry boundary.
+``enabled=false`` here always wins. A missing field is an authority fault,
+not an implicit contribution choice or a request for new consent. The saved
+authority is independent of runtime installation and remains unchanged by
+runtime reload.
 """
 
 from __future__ import annotations
@@ -65,14 +66,15 @@ def check_branch(value):
 
 
 def normalized_roots(value):
+    from ..filesystem import git_path, path_identity, resolved_path
     if not isinstance(value, list) or not all(
         isinstance(item, str) and Path(item).is_absolute() for item in value
     ):
         raise ValueError("'project_roots' must be absolute paths")
     roots = {}
     for item in value:
-        path = str(Path(item).expanduser().resolve(strict=False))
-        roots.setdefault(path.casefold() if os.name == 'nt' else path, path)
+        path = str(resolved_path(item))
+        roots.setdefault(path_identity(path), git_path(path))
     return list(roots.values())
 
 
@@ -96,7 +98,7 @@ def normalize(data):
     if not isinstance(data, dict) or data.get("schema") != SCHEMA:
         raise ValueError(f"sharing settings must declare schema {SCHEMA}")
     out = dict(data)
-    enabled = data.get("enabled", False)
+    enabled = data.get("enabled")
     if type(enabled) is not bool:
         raise ValueError("'enabled' must be a boolean")
     out["enabled"] = enabled
@@ -186,16 +188,10 @@ class CommunitySettings:
             self.idle_seconds = bounded_idle(self.raw.get("idle_seconds"))
         except ValueError:
             self.idle_seconds = DEFAULT_IDLE_SECONDS
-        # Consent gate extension: ``consent_config`` names the profile-shared
-        # consent authority (absolute path). It is re-read fresh together with
-        # this settings file, so a changed or damaged saved choice is observed
-        # at the same boundaries. The key is distinguished by EXISTENCE: only
-        # a wholly absent key is the legacy format; a present key holding
-        # null, an empty/non-string value or a relative path is a malformed
-        # field — ``state="invalid"`` — which fails closed like any other
-        # unreadable authority.
+        # Read the saved authority at every gate. A missing reference does not
+        # turn an enabled setting into permission to capture, model or write.
         self.consent = None
-        if self.schema_ok and CONSENT_FIELD in self.raw:
+        if self.schema_ok:
             consent_ref = self.raw.get(CONSENT_FIELD)
             if (
                 not isinstance(consent_ref, str)
@@ -225,20 +221,13 @@ class CommunitySettings:
     def consent_allows_contribution(self):
         """The consent half of the capture/contribution gate.
 
-        Only a config carrying the ``consent_config`` extension consults the
-        saved choice; a legacy config without the field keeps its previous
-        read behavior (the owning adapter wires the field once at its
-        install/upgrade/entry boundary — the legacy format is read
-        compatibility, not a bypass). A configured authority must hold an
-        explicit ``contribute`` choice: missing, unreadable, corrupt, an
-        invalid field value or any other saved choice stops capture, model
-        and outbound-write paths while read-only helpers keep working. The
-        field never grants permission by itself — an explicit enabled=false
-        always wins.
+        The named authority must hold an explicit ``contribute`` choice.
+        A missing reference, unreadable/corrupt document or another saved
+        choice stops capture, model and outbound-write paths. Read-only
+        helpers keep working. The reference itself grants no permission,
+        and explicit enabled=false always wins.
         """
-        if self.consent is None:
-            return True
-        return (
+        return bool(self.consent and
             self.consent.get("state") == "ok"
             and self.consent.get("choice") == "contribute"
         )
@@ -246,8 +235,8 @@ class CommunitySettings:
     def allows_capture(self):
         """The whole capture/extraction/sanitization chain needs an explicit,
         well-formed on: schema, enabled, opaque generation, a finite positive
-        authorization boundary and at least one absolute canonical root — plus,
-        when the config names a consent authority, a saved ``contribute``
+        authorization boundary and at least one absolute canonical root plus
+        a named consent authority holding a saved ``contribute``
         choice. Any malformed enabled config authorizes nothing."""
         return self._base_allows_capture() and self.consent_allows_contribution()
 
@@ -278,7 +267,7 @@ class CommunitySettings:
 
         ``fault`` is every other closed state: the settings file or the named
         consent document missing, unreadable, corrupt or malformed (including
-        a present but null/non-string/relative ``consent_config`` value and a
+        a missing/null/non-string/relative ``consent_config`` value and a
         valid consent document with no saved choice — undetermined is not an
         opt-out). A fault is not a user revocation: already-received work and
         saved results must be kept locatable and resumed after the authority
@@ -306,14 +295,11 @@ class CommunitySettings:
         """
         if not self.project_roots or not candidate:
             return False
+        from ..filesystem import path_is_within
         try:
-            target = Path(candidate).expanduser().resolve(strict=False)
+            return any(path_is_within(candidate, root) for root in self.project_roots)
         except (OSError, ValueError):
             return False
-        for root in self.project_roots:
-            if target == root or root in target.parents:
-                return True
-        return False
 
     def as_dict(self):
         """Private settings handed to the community package per contract §4.
@@ -362,7 +348,7 @@ class CommunitySettings:
 
 
 def load(path) -> CommunitySettings:
-    """Read the settings file once. Never raises; failures mean disabled.
+    """Read the settings file once. Never raises; faults close contribution.
 
     The reported ``state`` keeps a missing file, an unreadable one, a damaged
     one and an explicit saved choice strictly apart. The read goes through
@@ -383,6 +369,10 @@ def load(path) -> CommunitySettings:
     except OSError:
         return CommunitySettings(
             path, {}, error="settings file is unreadable", state="unreadable",
+        )
+    if len(raw) > consent_store.MAX_BYTES:
+        return CommunitySettings(
+            path, {}, error="settings file exceeds the size limit", state="corrupt",
         )
     try:
         data = json.loads(raw)
@@ -427,8 +417,8 @@ def transition(previous, requested):
     policy = ('enabled', 'repository', 'branch', 'visibility', 'account', 'fork')
     data['branch'] = data.get('branch') or 'main'
     def roots(value):
-        return {str(Path(item).resolve()).casefold() if os.name == 'nt'
-                else str(Path(item).resolve()) for item in value.get('project_roots', [])}
+        from ..filesystem import path_identity
+        return {path_identity(item) for item in value.get('project_roots', [])}
     try:
         prior = normalize(old)
     except (ValueError, TypeError):
