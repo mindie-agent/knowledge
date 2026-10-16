@@ -1,106 +1,47 @@
-# Summary process and temporary profile ownership
+# Summary Process & Temporary Profile Ownership
 
-[中文](summary-process-ownership.zh.md) | English · [Documentation Index](README.en.md)
+[中文](summary-process-ownership.zh.md) | **English** · [Back to Documentation Center](README.en.md)
 
-The shared [service and attempt lifetime](service-process-lifetime.md) contract
-now also covers abrupt owner death on macOS, Windows and Linux/WSL. The historical
-verification below describes the earlier scratch change; it does not stand in
-for the newer platform and native acceptance.
+When `mindie-knowledge` invokes a host CLI (such as the Codex or Claude Code lightweight summary route) to index new material blocks, the host CLI often spawns helper subprocesses that read and write a temporary profile directory.
 
-Status: source-level native-process regressions passed; final installation
-acceptance pending, 2026-10-15.
+This guide explains why **temporary directory cleanup belongs exclusively to the core runtime rather than the adapter wrapper**, and how a strict four-step teardown sequence eliminates race conditions between descendant processes and directory deletion.
 
-A native terminal result does not prove that its process or descendants have
-stopped using the temporary profile. Codex intentionally delivers a result
-before the shared owner closes its process tree. Claude Code also leaves
-inherited-group descendants to that owner after reaping its direct child.
-Deleting either profile inside the adapter therefore races with live writers.
+---
 
-## One cleanup owner
+## 1. Why Adapter-Side Cleanup Races with Live Writers
 
-Only `bounded_run` calls with a durable `on_result` callback create a fresh
-private scratch root. The existing diagnostics directory primitive creates
-it with private POSIX permissions or the Windows user's SID. The adapter
-creates its temporary profile inside this root and leaves deletion to core.
-Core retains the root locally; it never accepts a deletion path from a worker
-result.
+In real host executions, receiving a terminal JSON result on stdout **does not prove that all child and grandchild processes have exited**:
+- Codex intentionally flushes its result before its background process tree finishes shutting down;
+- Claude Code reaps its direct child while inherited-group descendants may still be flushing logs or state files into the temporary profile directory.
 
-The order is:
+If the adapter deletes the temporary profile directory immediately upon reading the result, it races with live descendant writers—causing file-in-use errors (especially on Windows) or masking a valid, already-paid model result behind a cleanup exception.
 
-1. Validate and persist the terminal result and known usage through the
-   existing callback and ledger.
-2. Close the existing owned process tree. On Windows, retain the Job handle
-   until `ActiveProcesses` reaches zero. On POSIX, reap the leader and observe
-   that its process group has exited.
-3. Drain and close owned protocol pipes.
-4. Remove only the private scratch root created for this invocation.
+---
 
-Cancellation and failure use the same cleanup order. An uncertain tree exit
-retains the private root and reports cleanup failure. A cleanup error cannot
-erase a saved result, its usage, or the primary exception, and does not
-authorize another model call. The small cleanup waits apply after completion
-or cancellation, not to the business operation's execution time.
+## 2. Single Cleanup Owner & Four-Step Teardown Order
 
-## Internal owner contract
+To eliminate this race, **only `bounded_run` calls with a durable `on_result` callback create and delete the private scratch root**. The adapter creates its temporary profile inside that root and leaves deletion entirely to `mindie-knowledge` core (which retains its own local path reference and never accepts an arbitrary deletion path from a worker).
 
-`MINDIE_SUMMARY_SCRATCH` is an internal parent/worker declaration, not product
-configuration. It carries a schema, owner PID, private root, and Windows Job
-identity. Every spawn clears inherited declarations before creating its own.
-Service launch configuration cannot inject this name, and adapters remove it
-before launching native model processes.
+Whether an invocation succeeds, fails, or is cancelled, teardown always follows this exact **four-step order**:
 
-On POSIX the adapter verifies its direct parent and owned process group. On
-Windows a virtual-environment launcher may start the actual interpreter as
-its child, so direct-parent equality is not a valid ownership test. Core gives
-the existing Job a random name, rejects an existing object with that name
-before modifying it, and assigns the suspended worker before resuming it.
-The adapter briefly opens that exact Job for query, verifies membership, then
-closes the query handle before invoking the model. This creates no additional
-Job or resident owner and preserves kill-on-close behavior.
+```mermaid
+flowchart LR
+  S1["Step 1: Persist Result First<br/>Commit model output & known token usage<br/>via callback & SummaryLedger"] --> S2["Step 2: Terminate Process Tree<br/>Windows: wait for Job ActiveProcesses == 0<br/>POSIX: reap leader & confirm group exit"]
+  S2 --> S3["Step 3: Drain & Close Pipes<br/>Close all owned stdio protocol pipes"]
+  S3 --> S4["Step 4: Remove Scratch Root<br/>Delete the private directory created<br/>for this specific invocation"]
+```
 
-A direct adapter worker without a maintenance owner retains its existing
-self-cleanup behavior. A managed worker with an absent or invalid declaration
-fails before invoking a model. The adapters and core must be installed at
-compatible pins; an old incomplete owner declaration is not permission to
-defer directory cleanup. Installation probes check the new API.
+### Three Guarantees of This Ordering
+1. **Cleanup Errors Never Trigger Paid Model Replay**: Because the model output and token usage are committed to `SummaryLedger` in Step 1, any secondary error during tree termination or directory deletion preserves the saved result and never re-invokes the model.
+2. **Zero Active Writers During Deletion**: Step 4 runs only after the OS confirms that the entire Windows Job (`ActiveProcesses == 0`) or POSIX process group has exited and all pipes are closed.
+3. **Private Permissions**: The scratch root is created with private POSIX permissions (`0700`) or the current Windows user's SID ACL.
 
-This is not a durable scratch journal. An abrupt core death can leave a
-private directory, and the change does not claim crash-proof deletion or scan
-old directories automatically.
+---
 
-## Verification and review
+## 3. Internal Ownership Verification (`MINDIE_SUMMARY_SCRATCH`)
 
-Synthetic process tests exercise a descendant that still writes its profile
-when the result callback runs, then require that both the tree and scratch
-have gone when core returns. Separate tests cover direct execution, invalid
-ownership before native start, cancellation, callback failure, spawn failure,
-and cleanup failure with preserved usage. These tests call no model. Native
-Windows must additionally exercise the actual venv launcher and Job boundary;
-POSIX success alone does not establish that behavior.
-
-The targeted macOS core selection passed 48 tests, with 9 Windows-only skips.
-Lenovo passed the 20 scratch/lifetime cases, then both additional foreign-Job
-and Job-name-collision cases. The actual venv redirector and descendant writer
-are included. Codex's affected macOS adapter selection passed 52 tests and
-31 subtests; Claude Code passed 33 tests and 6 subtests on macOS, and 31 tests
-and 6 subtests on Windows with 2 POSIX-only skips. These are model-free source
-tests, not a new installed candidate or natural Stop acceptance.
-
-All nine design principles were reviewed against official design-principles
-blob `62cdd5ae40553df2f0f7f7d022141123792d2944`:
-
-1. The change removes a reproduced cleanup race and prevents paid-call replay;
-   it adds one temporary root only to an admitted summary invocation.
-2. It handles the closed problem of process-owned temporary resources, not
-   generic task orchestration.
-3. It adds no user parameter, activation step, or required cleanup procedure.
-4. The existing process owner and ledger remain authoritative. Adapters do not
-   acquire another cleanup owner or return arbitrary deletion targets.
-5. No Skill requirement changes.
-6. No knowledge entry gains authority, and no historical material is replayed.
-7. No extra model call, polling service, or background activation is introduced.
-8. Existing process groups, Jobs, private-directory creation, result callbacks,
-   and unchanged native evidence are reused.
-9. Invalid ownership fails before a model call; tree, pipe, and scratch failure
-   preserve the actual business result. Failure branches receive explicit
-   regression coverage. Native validation remains separate from source tests.
+Core passes an internal parent/worker declaration via `MINDIE_SUMMARY_SCRATCH` (containing the schema, owner PID, private scratch root, and Windows Job name):
+- **Sanitized Across Boundaries**: Every spawn clears any inherited `MINDIE_SUMMARY_SCRATCH` value before creating its own; service launch configs reject external injection of this variable, and adapters strip it from the environment before spawning the native model CLI.
+- **Platform Ownership Proof**:
+  - **POSIX (macOS / Linux)**: The adapter verifies its direct parent PID and process group (PGID);
+  - **Windows**: Because a Python virtual-environment launcher (`python.exe` redirector) may sit between the parent and the actual interpreter, direct PPID equality is not a reliable check. Instead, core assigns the suspended worker to a randomly named Job Object (`KILL_ON_JOB_CLOSE`) before resuming it; the adapter briefly opens that exact named Job for query, verifies its own membership, and closes the query handle before invoking the model.

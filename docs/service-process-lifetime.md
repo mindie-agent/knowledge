@@ -1,122 +1,47 @@
-# Service and attempt lifetime
+# Service & Attempt Process Lifetime
 
-[中文](service-process-lifetime.zh.md) | English · [Documentation Index](README.en.md)
+[中文](service-process-lifetime.zh.md) | **English** · [Back to Documentation Center](README.en.md)
 
-The knowledge core owns admitted work, result persistence and final scratch
-cleanup. Native adapters validate the existing shared scratch declaration once;
-they do not add another definition of whether a managed core is alive.
-An adapter's narrower native subprocess group or Job still owns its terminal
-protocol, pipe draining and local cancellation.
+During normal MindIE Agent operation, three execution scopes with very different lifetimes interact:
+1. **Short-lived foreground calls and Hooks** (such as a `Stop Hook` that exits in milliseconds);
+2. **The on-demand background knowledge service** (`mindie-knowledge serve`, which must survive after the short Hook exits to finish redaction, chunking, and indexing);
+3. **Per-attempt worker subprocess trees** (such as the small-model summary worker or Gitleaks scanner, whose entire descendant tree must be terminated cleanly if the operation is cancelled or the parent service dies).
 
-## Platform mechanisms
+This guide explains how `mindie-knowledge` uses native OS containment mechanisms across Windows, Linux/WSL, and macOS to guarantee both service survival and zero orphan processes.
 
-Windows keeps the existing Task Scheduler service host and per-attempt
-kill-on-close Job. The named Job membership proof includes the virtual
-environment redirector. Killing the real core closes the retained Job handle
-and stops descendants even after their intermediate worker exits. No additional
-adapter HANDLE or PPID state machine is needed.
+---
 
-Scheduler and private-directory checks use the explicitly declared pywin32
-dependency through native COM and Win32 security APIs. They do not start a
-PowerShell process for every query, ACL check, registration, start and removal.
-COM initialization is paired only when this call acquired it, and wrappers are
-released before closing that apartment. The exact XML ownership checks and
-launch journal remain in the core service host. Task timestamps preserve the
-previous seven-digit UTC representation, including the never-run sentinel;
-a transport change cannot become evidence that an uncertain Start completed.
+## 1. Platform Containment Matrix
 
-Linux and WSL use an on-demand systemd user service with `Type=exec`,
-`ExitType=main`, `KillMode=control-group` and `Restart=no`. The supported manager
-is systemd 254 or newer with a unified cgroup hierarchy. Version 254 provides
-`systemd-run --expand-environment=no`, needed to preserve literal invocation
-arguments. An unavailable user manager, unsupported version or unverified
-containment is an explicit error. A failed manager launch never falls back to
-an unprotected core.
+| Platform | Background Service Host (Survives Short Hook Exit) | Per-Attempt Subprocess Tree Containment (Prevents Orphans) |
+| --- | --- | --- |
+| **Native Windows** | **On-Demand Task Scheduler Action** (registered per user SID via native `pywin32` COM APIs running `pythonw.exe`) | **Named Job Object** (`CREATE_SUSPENDED` + `KILL_ON_JOB_CLOSE`; kills all descendants even if an intermediate venv launcher exits early) |
+| **Linux / WSL** | **On-Demand `systemd` User Service** (requires `systemd 254+` unified cgroup hierarchy with `Type=exec`, `ExitType=main`, `KillMode=control-group`) | **Per-Attempt Process Group + Service cgroup Boundary** (normal cancellation reaps the process group; abrupt service crash is cleaned up by the unit's control group) |
+| **macOS** *(and direct non-systemd calls)* | **Detached Service Process Group** coordinated via startup lock & authenticated local loopback RPC | **`owner-pipe` Watcher Process** (core holds the sole write end of a pipe; if core closes the pipe or crashes, EOF triggers the watcher to kill the entire attempt process group) |
 
-The service main verifies its exact unit command, properties, MainPID and
-`/proc/self/cgroup` before marking itself contained. This private process-local
-mark is bound to the PID and cannot be inherited by a fork or set through
-caller configuration. Normal summary cancellation retains per-attempt process
-groups; the service cgroup supplies the core-crash boundary.
+> [!NOTE]
+> **Why an `owner-pipe` watcher on macOS instead of `launchd`?**
+> On macOS, `launchd` only reaps its direct job process group; descendants that enter a separate session or outlive an exited intermediate launcher can survive if the parent core crashes. With the lightweight `owner-pipe` watcher, only `mindie-knowledge` holds the pipe's write descriptor: if the core process dies for any reason (even `SIGKILL`), the kernel closes the pipe immediately and the watcher reaps the entire attempt process group.
 
-macOS launchd only reaps its job's process group. Moving the core under launchd
-does not cover summary processes in a separate session; an independent
-per-attempt launchd job also survives unrelated core death. Both limitations
-were reproduced with synthetic processes, including an exited intermediate
-worker. Core therefore uses one small owner-pipe watcher per attempt. The
-launcher forks the watcher and then execs the adapter in the same PID, retaining
-the existing PPID/PGID contract. Only core retains the pipe's write end. The
-watcher closes protocol stdio and kills its own retained group when core closes
-the pipe or dies. It has no model, retry, result, scratch or service state.
+---
 
-Direct Linux APIs and history imports outside the verified service reuse this
-same watcher. This is an explicit execution boundary chosen before launch,
-not a fallback after systemd fails. Fork, descriptor and exec failures cannot
-continue without protection. Proven pre-exec failure is distinguished from a
-lost or uncertain launch acknowledgement.
+## 2. One-Use Encrypted/Private Launch Context
 
-## One-use context and manager transactions
+When a short-lived Hook starts the background service, it must pass the selected configuration path bindings and optional environment variables (such as `HTTPS_PROXY` or provider credential env names) **without ever writing secret values into Task Scheduler XML or `systemd` unit properties**:
 
-The immutable engine configuration declares permitted path bindings and
-optional environment names. Windows continues using current-user DPAPI.
-Linux uses a private current-UID regular file with mode 0600; symlinks, FIFOs,
-foreign owners and group/world-readable transfers are rejected. Neither Task
-Scheduler metadata nor systemd unit properties contain credential values.
-The transfer is bound to the exact config, attempt, owner and cwd, validated
-and deleted before serving. Declared absent environment values are removed;
-POSIX names remain case-sensitive and Windows names case-insensitive.
+- **Windows**: Protects the one-use transfer file with current-user **DPAPI**, bound to the user SID, configuration fingerprint, launch nonce, and working directory;
+- **Linux / POSIX**: Writes a private `0600` regular file owned by the current UID (rejecting symlinks, FIFOs, and group/world-readable files);
+- **Consume Once & Delete**: The service host validates and deletes the transfer file before serving, clearing declared absent ambient variables so stale host environment values never leak into the service.
 
-The existing start lock serializes launch and retirement. A durable intent
-precedes the systemd start request. The exact unit command and manager properties
-are verified through structured properties, not a formatted command string.
-An inactive or absent unit does not prove an uncertain Start was unsent or
-finished. Only an exact terminal result or terminal manager failure permits a
-later new attempt. Accepted Start with a failed local acknowledgement retains
-its context and reports uncertainty. Result receipts validate their attempt,
-status and integer terminal exit code before controlling another launch.
+---
 
-Shell-based Linux manager IPC and cleanup observations have finite bounds.
-Windows native COM calls are synchronous and no longer carry the removed
-PowerShell subprocess's 30-second IPC limit. A short Hook retains its outer
-protocol budget; interruption of a mutating call leaves the durable intent
-uncertain for exact reconciliation. No new manager thread, broker or retry
-authority is introduced to hide that boundary. None of these controls imposes
-a deadline on indexing or model execution. Short POSIX Stop handoff only starts
-the existing detached wake helper; that helper performs the manager operation
-and authenticated readiness. Status observations in the short Hook use a
-0.25-second control budget. A silent listener leaves the capture durable and
-reports unknown runtime state instead of blocking the Hook or claiming delivery.
+## 3. Serialized Startup, Honest Uncertainty & Exact Retirement
 
-## Exact configuration and retirement
-
-Every client uses the exact installed engine configuration. The service
-fingerprint includes its path and complete configuration; a mismatch is an
-error, not permission to attach to another owner or start a second service.
-Updates require the native session to reload. The unpublished 0.0.1 does not
-promise transparent operation by clients loaded from a different runtime.
-
-The 0.0.1 adapters support first installation into an empty profile. A different
-existing binding is rejected explicitly; this release does not implement
-binding replacement or a transparent upgrade transaction. Exact retirement
-still supports idle shutdown and uninstall: a busy owner stays running and
-each immutable engine configuration retains its retirement receipt so a late
-helper cannot restart it. The core neither follows successor links nor selects
-plugin versions. Old compatibility declarations and successor receipts are
-rejected, not migrated. This does not delete business data, authorization,
-captures, paid receipts or uncertain external effects.
-
-## Results and validation
-
-The durable terminal-result callback still precedes tree cleanup, pipe drain
-and scratch deletion. Known usage survives cleanup failure. Unknown paid work
-is preserved and never replayed by these mechanisms. Abrupt core death can
-leave private scratch or an uncertain attempt receipt; crash-safe process
-termination does not claim crash-safe directory deletion.
-
-Model-free tests cover owner death before and after worker exit, launch
-failure, invalid result receipts, uncertain manager effects, exact ownership,
-context privacy and absence, silent status listeners, and exact configuration
-rejection. Platform evidence remains separate from native adapter acceptance.
-The existing Windows Task Scheduler contract and descriptor layout are retained.
-The common `service_host` module only shares receipt IO, static errors and the
-one-use runner; platform manager transactions remain explicit.
+- **Serialized Launch & No Blind Replay**:
+  The domain startup lock serializes all launch and retirement operations. A durable launch intent is recorded before calling Task Scheduler or `systemd`. If a manager call times out or local receipt persistence fails, the runtime reports the uncertain state and reconciles against actual service readiness rather than blindly spawning a duplicate service.
+- **No Arbitrary Deadlines on Healthy Work**:
+  Short Hook status probes use a tight foreground observation budget (0.25s) so the Hook returns promptly, **without imposing any execution deadline on ongoing background redaction, indexing, or model calls**.
+- **Exact Configuration Fingerprints & Safe Retirement (`retire_service`)**:
+  Every service instance is bound to its exact configuration fingerprint. During an idle shutdown or version switch, `retire_service` checks whether any RPC call, worker, or admitted capture is active:
+  - If busy, retirement rolls back cleanly so active work is never killed;
+  - If idle, it records a durable retirement receipt for that exact configuration fingerprint so late wake helpers cannot accidentally restart the retired service.
