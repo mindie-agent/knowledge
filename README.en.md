@@ -1,10 +1,3 @@
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/banner-dark.svg">
-    <img src="assets/brand/banner-light.svg" alt="MindIE Knowledge — Shared Knowledge Runtime for MindIE Agent" width="960">
-  </picture>
-</p>
-
 # MindIE Knowledge
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-0284C7.svg)](pyproject.toml)
