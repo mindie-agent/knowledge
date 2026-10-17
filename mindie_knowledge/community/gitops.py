@@ -18,6 +18,7 @@ from .common import (
     Deadline,
     TransientError,
     UnknownOutcome,
+    git_executable,
     lf_bytes,
     run_argv,
 )
@@ -115,7 +116,7 @@ def _git(
     operation = argv[command_index]
     remaining = deadline.step(f"git {operation}")
     result = run_argv(
-        ["git", *argv],
+        [git_executable(), *argv],
         timeout=remaining,
         max_output=MAX_GIT_OUTPUT,
         input_bytes=input_bytes,
@@ -247,7 +248,7 @@ def stage_and_commit(
     from .common import run_argv as _run
 
     diff = _run(
-        ["git", "diff", "--cached", "--quiet"],
+        [git_executable(), "diff", "--cached", "--quiet"],
         timeout=remaining,
         max_output=4096,
         cwd=Path(git_path(work_dir)),
@@ -273,7 +274,7 @@ def _commit(work_dir: Path, message: str, deadline: Deadline, *, env=None) -> No
 
     result = _run(
         [
-            "git",
+            git_executable(),
             "-c", "user.name=mindie-community-bot",
             "-c", "user.email=mindie-community-bot@localhost.invalid",
             "commit", "--quiet", "-F", "-",
@@ -305,7 +306,7 @@ def fetch_ref(
     from .common import run_argv as _run
 
     result = _run(
-        ["git", "fetch", "--quiet", remote, ref],
+        [git_executable(), "fetch", "--quiet", remote, ref],
         timeout=remaining,
         max_output=MAX_GIT_OUTPUT,
         cwd=Path(git_path(work_dir)),
@@ -351,7 +352,7 @@ def ls_tree(work_dir: Path, commit: str, deadline: Deadline, *, env=None,
     modes = {}
     with tempfile.TemporaryDirectory(prefix="mindie-git-tree-") as temporary:
         target = Path(temporary) / "tree"
-        argv = ["git", "-C", git_path(work_dir), "ls-tree", "-r", "-z", commit]
+        argv = [git_executable(), "-C", git_path(work_dir), "ls-tree", "-r", "-z", commit]
         if task_ids is not None:
             argv += ["--", "tasks/"]
         try:
@@ -390,7 +391,7 @@ def show_file(work_dir: Path, commit: str, path: str, deadline: Deadline, *, env
     env = _resolve_git_env(env)
     remaining = deadline.step("git show")
     present = _run(
-        ["git", "cat-file", "-e", f"{commit}^{{commit}}"],
+        [git_executable(), "cat-file", "-e", f"{commit}^{{commit}}"],
         timeout=remaining,
         max_output=64 * 1024,
         cwd=Path(git_path(work_dir)),
@@ -409,7 +410,7 @@ def show_file(work_dir: Path, commit: str, path: str, deadline: Deadline, *, env
     # room covers git's stderr without turning a legal body into a truncation.
     remaining = deadline.step("git show")
     result = _run(
-        ["git", "show", f"{commit}:{path}", "--"],
+        [git_executable(), "show", f"{commit}:{path}", "--"],
         timeout=remaining,
         max_output=MAX_FILE_BYTES + 64 * 1024,
         cwd=Path(git_path(work_dir)),
@@ -443,7 +444,7 @@ def fetch_commit(work_dir: Path, sha: str, deadline: Deadline, *, env=None) -> b
     from .common import run_argv as _run
 
     have = _run(
-        ["git", "cat-file", "-e", sha],
+        [git_executable(), "cat-file", "-e", sha],
         timeout=remaining,
         max_output=4096,
         cwd=Path(git_path(work_dir)),
@@ -453,7 +454,7 @@ def fetch_commit(work_dir: Path, sha: str, deadline: Deadline, *, env=None) -> b
     if have.code == 0:
         return True
     result = _run(
-        ["git", "fetch", "--quiet", "origin", sha],
+        [git_executable(), "fetch", "--quiet", "origin", sha],
         timeout=deadline.step("git fetch exact commit"),
         max_output=MAX_GIT_OUTPUT,
         cwd=Path(git_path(work_dir)),
@@ -469,7 +470,7 @@ def is_ancestor(work_dir: Path, old: str, new: str, deadline: Deadline, *, env=N
     from .common import run_argv as _run
 
     result = _run(
-        ["git", "merge-base", "--is-ancestor", old, new],
+        [git_executable(), "merge-base", "--is-ancestor", old, new],
         timeout=remaining,
         max_output=MAX_GIT_OUTPUT,
         cwd=Path(git_path(work_dir)),
@@ -489,7 +490,7 @@ def push_branch(work_dir: Path, branch: str, deadline: Deadline, *, env=None, ca
     from .common import run_argv as _run
 
     result = _run(
-        ["git", "push", "--no-force-with-lease", "origin", f"HEAD:refs/heads/{branch}"],
+        [git_executable(), "push", "--no-force-with-lease", "origin", f"HEAD:refs/heads/{branch}"],
         timeout=remaining,
         max_output=MAX_GIT_OUTPUT,
         cwd=Path(git_path(work_dir)),

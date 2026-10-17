@@ -24,6 +24,7 @@ import time
 
 from .loop.process import terminate_tree
 from .filesystem import git_path
+from .gitbin import resolve_git
 
 _HEADER_RE = re.compile(rb"^([0-9a-f]{40,64}) (blob|commit|tree|tag) ([0-9]+)$")
 _MAX_HEADER = 4096
@@ -181,7 +182,7 @@ class CatFileBatch:
             spawn["start_new_session"] = True
         try:
             self._process = subprocess.Popen(
-                ["git", "-C", git_path(repo), "cat-file", "--batch"],
+                [resolve_git(), "-C", git_path(repo), "cat-file", "--batch"],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,

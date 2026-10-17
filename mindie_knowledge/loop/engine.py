@@ -875,7 +875,16 @@ class Engine:
         import shutil
         transport = settings.as_dict().get("transport", "gh")
         required = ["git", "gh"] if transport == "gh" else ["git"]
-        missing = [name for name in required if shutil.which(name) is None]
+        missing = []
+        for name in required:
+            if name == "git":
+                from mindie_knowledge.gitbin import GitUnavailableError, resolve_git
+                try:
+                    resolve_git()
+                except GitUnavailableError:
+                    missing.append(name)
+            elif shutil.which(name) is None:
+                missing.append(name)
         activity = self.operations.snapshot()
         from ..materials.summarizer import SummaryLedger
         with self.store._write_txn():
