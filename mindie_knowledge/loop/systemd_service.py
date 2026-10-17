@@ -170,6 +170,23 @@ def _validate_record(record, config_path, config, uid):
         raise ServiceHostError("foreign_launch_record", stage="ownership")
 
 
+def _accepted_process_dead(result):
+    """The recorded accepted process provably exited; only its exit code is unknown.
+
+    Without a process receipt the Start job may still be queued, and a live
+    pid is never retired. A recycled pid simply keeps the attempt unknown.
+    """
+    if result is None or result.get("status") != "starting":
+        return False
+    try:
+        os.kill(result["pid"], 0)
+    except ProcessLookupError:
+        return True
+    except (OSError, OverflowError):
+        pass  # A denied, unsupported or out-of-range query proves nothing.
+    return False
+
+
 class UserService:
     externally_owned = True
     pid = None
@@ -228,10 +245,16 @@ def _request_start(config_path, config):
         phase = operation.get("phase")
         if phase in {"starting", "started"}:
             terminal = result and result.get("status") in {"failed", "finished"}
-            # An inactive unit can still have a queued Start job. Its mere
-            # existence/absence does not prove the accepted attempt finished.
             if not terminal and not (unit and unit["ActiveState"] == "failed"):
-                raise ServiceHostError("start_outcome_unknown", stage="reconcile", uncertain=True)
+                # An inactive unit can still have a queued Start job. Its mere
+                # existence/absence does not prove the accepted attempt finished.
+                # A dead recorded pid does: the accepted process ended without a
+                # terminal receipt, so only its exit code remains unknown.
+                if not _accepted_process_dead(result):
+                    raise ServiceHostError("start_outcome_unknown", stage="reconcile", uncertain=True)
+                from .dfx import failure as record_failure
+                record_failure("knowledge.service", stage="reconcile",
+                               category="stale_launch_attempt_retired", reportable=False)
         elif phase == "prepared":
             if unit is not None:
                 raise ServiceHostError("launch_operation_invalid", stage="reconcile", uncertain=True)

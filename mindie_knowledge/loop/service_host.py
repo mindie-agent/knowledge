@@ -37,6 +37,10 @@ SAFE_CODES = {
 }
 
 
+class _ExternalStop(BaseException):
+    """The manager's stop signal ended this attempt; it is not a serve failure."""
+
+
 class ServiceHostError(RuntimeError):
     def __init__(self, code, *, stage, uncertain=False, manager_hresult=None, startup=None):
         from .diagnostics import startup_failure_details
@@ -123,6 +127,20 @@ def read_result(root, record):
     return result
 
 
+def _handle_sigterm():
+    """Route the manager's stop signal through the terminal receipt path."""
+    if os.name != "posix":
+        return None
+    import signal
+    previous = signal.getsignal(signal.SIGTERM)
+
+    def stop(_signum, _frame):
+        raise _ExternalStop()
+
+    signal.signal(signal.SIGTERM, stop)
+    return signal, previous
+
+
 def run_owned(manifest, attempt, *, verify_owner, validate_record, binding,
               validate_process=None):
     manifest = resolved_path(manifest)
@@ -137,6 +155,7 @@ def run_owned(manifest, attempt, *, verify_owner, validate_record, binding,
     fd = os.open(root / (attempt + ".claimed"), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     os.close(fd)
     result = None
+    handler = _handle_sigterm()
     try:
         from .cli import config_at, _serve
         from .lifecycle import require_active
@@ -152,6 +171,12 @@ def run_owned(manifest, attempt, *, verify_owner, validate_record, binding,
         os.chdir(filesystem_path(record["cwd"]))
         _write(result_path, dict(attempt=attempt, status="starting", pid=os.getpid()))
         code = _serve(record["config"], config)
+    except _ExternalStop:
+        # systemctl stop delivers SIGTERM: the accepted attempt ended cleanly,
+        # without a serve failure. Record the terminal receipt before exiting.
+        result = dict(attempt=attempt, status="finished", exit_code=0, stop="sigterm")
+        _write(result_path, result)
+        return 0
     except Exception as exc:
         # Static class/stage only: the source exception can contain private
         # paths or provider credentials. Existing service DFX retains its own
@@ -182,6 +207,8 @@ def run_owned(manifest, attempt, *, verify_owner, validate_record, binding,
         _write(result_path, result)
         return code
     finally:
+        if handler is not None:
+            handler[0].signal(handler[0].SIGTERM, handler[1])
         # A failed transfer remains diagnosable through the static result,
         # but its encrypted values must not become a long-lived secret cache.
         try:

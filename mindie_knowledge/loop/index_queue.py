@@ -75,14 +75,26 @@ class IndexQueue:
         store = self.store
         with store._write_txn():
             row = store._row(entry_id)
-            task = store.materials.read_task(entry_id, revision=row['draft_revision'], source='draft')
-            indexed = {b['block_id'] for b in task['blocks'] if b['indexed']}
-            for batch in store.db.execute(
-                    "SELECT batch_id,block_ids FROM material_batches WHERE entry_id=? AND status!='complete'",
-                    (entry_id,)).fetchall():
-                if set(json.loads(batch['block_ids'])) <= indexed:
-                    store.db.execute("UPDATE material_batches SET status='complete',detail='' WHERE batch_id=?",
-                                     (batch['batch_id'],))
+            try:
+                task = store.materials.read_task(entry_id, revision=row['draft_revision'], source='draft')
+            except KeyError:
+                task = None
+            if task is None:
+                # The draft body is expired or missing: no pending batch can
+                # ever be indexed. Settle the durable fault visibly instead of
+                # staying due forever and pinning the service alive.
+                store.db.execute(
+                    "UPDATE material_batches SET status='failed',detail=? "
+                    "WHERE entry_id=? AND status IN ('pending','retry-requested')",
+                    ('draft material expired or missing', entry_id))
+            else:
+                indexed = {b['block_id'] for b in task['blocks'] if b['indexed']}
+                for batch in store.db.execute(
+                        "SELECT batch_id,block_ids FROM material_batches WHERE entry_id=? AND status!='complete'",
+                        (entry_id,)).fetchall():
+                    if set(json.loads(batch['block_ids'])) <= indexed:
+                        store.db.execute("UPDATE material_batches SET status='complete',detail='' WHERE batch_id=?",
+                                         (batch['batch_id'],))
             batches = store.db.execute('SELECT status,detail FROM material_batches WHERE entry_id=?',
                                        (entry_id,)).fetchall()
             statuses = {r['status'] for r in batches}
@@ -94,9 +106,15 @@ class IndexQueue:
                       ('; '.join(details) if details else 'explicit recovery required'))[:500]
             if status not in {'complete', 'pending'} and details and details[0].startswith('{'):
                 detail = details[0]
-            store.db.execute(
-                'UPDATE transcript_tasks SET summary_status=?,summary_detail=?,body_digest=?,summary_due=? WHERE entry_id=?',
-                (status, detail, task['entry']['material_digest'], time.time(), entry_id))
+            if task is None:
+                # The missing body cannot prove its digest; keep the stored one.
+                store.db.execute(
+                    'UPDATE transcript_tasks SET summary_status=?,summary_detail=?,summary_due=? WHERE entry_id=?',
+                    (status, detail, time.time(), entry_id))
+            else:
+                store.db.execute(
+                    'UPDATE transcript_tasks SET summary_status=?,summary_detail=?,body_digest=?,summary_due=? WHERE entry_id=?',
+                    (status, detail, task['entry']['material_digest'], time.time(), entry_id))
 
     def postpone(self, entry_id, detail, due):
         with self.store._write_txn():

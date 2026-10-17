@@ -119,6 +119,93 @@ def test_inactive_unit_without_terminal_result_is_not_a_finished_attempt(manager
     assert len(state["calls"]) == 1
 
 
+def _dead_pid():
+    import subprocess
+    import sys
+    process = subprocess.Popen([sys.executable, "-c", ""])
+    assert process.wait() == 0
+    return process.pid
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX pid liveness")
+def test_dead_attempt_with_live_receipt_retires_and_starts_anew(manager):
+    path, config, state = manager
+    first = host.request_start(path, config)
+    host._write(host._result_path(first.root, first.record),
+                dict(attempt=first.record["attempt"], status="starting", pid=_dead_pid()))
+    state["unit"] = None
+    second = host.request_start(path, config)
+    assert second.record["attempt"] != first.record["attempt"]
+    assert not (first.root / (first.record["attempt"] + ".context")).exists()
+    assert [stage for stage, _ in state["calls"]] == ["start", "start"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX pid liveness")
+def test_dead_attempt_retires_with_inactive_unit_and_cleans_up(manager, monkeypatch):
+    records = []
+    monkeypatch.setattr("mindie_knowledge.loop.dfx.failure",
+                        lambda *args, **kwargs: records.append((args, kwargs)))
+    path, config, state = manager
+    first = host.request_start(path, config)
+    host._write(host._result_path(first.root, first.record),
+                dict(attempt=first.record["attempt"], status="starting", pid=_dead_pid()))
+    state["unit"]["ActiveState"] = "inactive"
+    second = host.request_start(path, config)
+    assert second.record["attempt"] != first.record["attempt"]
+    assert [stage for stage, _ in state["calls"]] == ["start", "remove", "start"]
+    assert records == [(("knowledge.service",), dict(stage="reconcile",
+                                                    category="stale_launch_attempt_retired",
+                                                    reportable=False))]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX pid liveness")
+def test_live_recorded_pid_is_never_retired(manager):
+    path, config, state = manager
+    first = host.request_start(path, config)
+    host._write(host._result_path(first.root, first.record),
+                dict(attempt=first.record["attempt"], status="starting", pid=os.getpid()))
+    state["unit"] = None
+    with pytest.raises(host.ServiceHostError, match="start_outcome_unknown"):
+        host.request_start(path, config)
+    assert len(state["calls"]) == 1
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX SIGTERM")
+def test_sigterm_stop_writes_terminal_finished_receipt(tmp_path, monkeypatch):
+    import signal
+    from mindie_knowledge.loop import cli
+    import transcript_double
+    config = dict(root=str(tmp_path / "data"), domain="test",
+                  redactor_executable=str(tmp_path / "scanner"),
+                  transcript_adapter=transcript_double.__file__)
+    config_path = tmp_path / "engine.json"
+    config_path.write_text(json.dumps(config))
+    root = tmp_path / "service"
+    root.mkdir()
+    attempt = "b" * 32
+    record = dict(attempt=attempt, config=str(config_path), cwd=str(tmp_path))
+    service_host._write(root / "launch.json", record)
+    binding = {"attempt": attempt, "cwd": str(tmp_path)}
+    service_host._write(root / (attempt + ".context"), context.capture(config, binding))
+
+    def stopped(_config_path, _config):
+        os.kill(os.getpid(), signal.SIGTERM)
+        raise AssertionError("SIGTERM did not interrupt serve")
+
+    monkeypatch.setattr(cli, "_serve", stopped)
+    monkeypatch.chdir(tmp_path)
+    previous = signal.getsignal(signal.SIGTERM)
+    code = service_host.run_owned(root / "launch.json", attempt,
+                                  verify_owner=lambda _root: 123,
+                                  validate_record=lambda *args: None,
+                                  binding=lambda _record: binding)
+    assert code == 0
+    result = service_host.read_result(root, record)
+    assert result["status"] == "finished" and result["exit_code"] == 0
+    assert signal.getsignal(signal.SIGTERM) == previous
+    assert not (root / (attempt + ".context")).exists()
+
+
 def test_known_terminal_result_allows_new_attempt_after_exact_cleanup(manager):
     path, config, state = manager
     first = host.request_start(path, config)

@@ -131,6 +131,8 @@ class Engine:
         self.last_activity = time.monotonic()
         self._observed_authority = None
         self._worker_failed = False
+        self._flush_attempts = 0
+        self._flush_not_before = 0.0
         self._reported_faults = set()
         self._fault_lock = threading.Lock()
         # Publication belongs to this package. A broken installation is a
@@ -718,6 +720,26 @@ class Engine:
     def _flush(self):
         return self.publisher.flush()
 
+    def _flush_with_backoff(self):
+        """A repeatedly failing flush backs off exponentially instead of
+        hot-looping; the durable cause stays visible until one success
+        restores normal scheduling. Quarantine rejections already published
+        the rest of the material — they are a result, not a retryable fault."""
+        from .export import ExportQuarantinedError
+        try:
+            self._flush()
+        except ExportQuarantinedError:
+            raise
+        except Exception as exc:
+            self._flush_attempts += 1
+            self._flush_not_before = time.monotonic() + min(300, 2 ** min(self._flush_attempts, 8))
+            self.background_errors["outbox"] = type(exc).__name__
+            raise
+        else:
+            self._flush_attempts = 0
+            self._flush_not_before = 0.0
+            self.background_errors.pop("outbox", None)
+
     def _outbox_loop(self):
         """Model-free idle worker: lives for the service lifetime so the
         silent window always elapses before delivery; it never disappears
@@ -779,8 +801,9 @@ class Engine:
                         if (
                             (idle_for >= settings.idle_seconds or deactivated)
                             and not self._is_frozen()
+                            and time.monotonic() >= self._flush_not_before
                         ):
-                            self._flush()
+                            self._flush_with_backoff()
                 self._clear_faults('knowledge.publish', {'worker'})
             except Exception as exc:
                 self._fault('knowledge.publish', 'worker', 'publication_worker_failed', exc)

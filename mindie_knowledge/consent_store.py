@@ -25,10 +25,12 @@ This module therefore does BOTH halves: reads open with FILE_SHARE_DELETE
 (``_open_for_read``), and writes supersede via the NTFS POSIX-semantics
 rename ``SetFileInformationByHandle(FileRenameInfoEx, REPLACE_IF_EXISTS|
 POSIX_SEMANTICS)`` (``_atomic_replace``), which tolerates existing handles
-and keeps old handles valid for reads. On a filesystem/platform without
-that support the write fails honestly with the preserved document and the
-original WinError — no retry wrapper, no fallback that would silently
-change semantics.
+and keeps old handles valid for reads. A handle opened WITHOUT
+FILE_SHARE_DELETE still fails the rename with WinError 32; that transient
+sharing violation alone is retried for a bounded time (``_replace_windows``),
+and any other failure — or a persistent holder — raises the original
+WinError with the preserved document. No fallback silently changes
+semantics on a filesystem without that support.
 """
 
 from __future__ import annotations
@@ -49,6 +51,8 @@ STATES = ("ok", "missing", "unreadable", "corrupt")
 MAX_BYTES = 64 * 1024
 LOCK_WAIT_SECONDS = 5.0
 LOCK_POLL_SECONDS = 0.05
+RENAME_RETRY_SECONDS = 5.0
+_WINERROR_SHARING_VIOLATION = 32
 
 __all__ = [
     "SCHEMA",
@@ -316,12 +320,39 @@ def _atomic_replace(source, target):
     with existing handles, keeps old handles valid for reads, and opens the
     renamed file at the target name afterwards. The source handle is closed
     in all cases. Errors keep the WinError as OSError/PermissionError via
-    ``_map_win_error``. No retry, no delete-then-move gap, no fallback that
-    would silently change the semantics on filesystems without support.
+    ``_map_win_error``. No delete-then-move gap, no fallback that would
+    silently change the semantics on filesystems without support.
     """
     if os.name != "nt":
         os.replace(source, target)
         return
+    _replace_windows(source, target)
+
+
+def _replace_windows(source, target):
+    """One bounded retry loop around ``_rename_windows_once``.
+
+    A handle on the destination opened WITHOUT FILE_SHARE_DELETE (a plain
+    stdlib reader, an indexer) still fails the POSIX-semantics rename with
+    ERROR_SHARING_VIOLATION (WinError 32). That holder is transient, so the
+    replace retries only that exclusive-sharing failure for a bounded time;
+    any other WinError is raised at once, and a persistent holder re-raises
+    the original WinError 32 with both files byte-identical — never a silent
+    skip, never a partial state.
+    """
+    deadline = time.monotonic() + RENAME_RETRY_SECONDS
+    while True:
+        try:
+            _rename_windows_once(source, target)
+            return
+        except OSError as exc:
+            if (getattr(exc, "winerror", None) != _WINERROR_SHARING_VIOLATION
+                    or time.monotonic() >= deadline):
+                raise
+            time.sleep(LOCK_POLL_SECONDS)
+
+
+def _rename_windows_once(source, target):
     handle = _CreateFileW(
         str(source), _DELETE_ACCESS, _SHARE_READ_WRITE_DELETE,
         None, _OPEN_EXISTING, _FILE_ATTRIBUTE_NORMAL, None,
