@@ -150,9 +150,7 @@ def _record(config_path, config, root, sid):
         raise ServiceHostError("interpreter_path_unsupported", stage="interpreter")
     attempt = uuid.uuid4().hex
     manifest = root / "launch.json"
-    label = "MindIE Knowledge " + hashlib.sha256(
-        (sid + "\n" + path_identity(root.parent)).encode()).hexdigest()[:24]
-    return dict(schema=MARKER, sid=sid, label=label, attempt=attempt,
+    return dict(schema=MARKER, sid=sid, label=_label(sid, root), attempt=attempt,
                 # Retirement fingerprints retain the caller's resolved
                 # spelling. Do not strip an explicit extended namespace.
                 config=str(Path(config_path).resolve()),
@@ -161,6 +159,11 @@ def _record(config_path, config, root, sid):
                 python=git_path(resolved_path(python)),
                 args=["-I", "-m", "mindie_knowledge.loop.windows_service", "--manifest",
                       str(manifest), "--attempt", attempt])
+
+
+def _label(sid, root):
+    return "MindIE Knowledge " + hashlib.sha256(
+        (sid + "\n" + path_identity(root.parent)).encode()).hexdigest()[:24]
 
 
 def _binding(record):
@@ -176,6 +179,172 @@ def _validate_record(record, config_path, config, sid):
             or not isinstance(record.get("attempt"), str)
             or not re.fullmatch(r"[a-f0-9]{32}", record.get("attempt", ""))):
         raise ServiceHostError("foreign_launch_record", stage="ownership")
+
+
+def _validate_superseded(record, config_path, config, sid):
+    """Same ownership chain, older generation: every ``_validate_record``
+    identity check except the necessarily changed configuration fingerprint.
+    An update while the service was off changes exactly that one field."""
+    from .lifecycle import config_fingerprint
+    fingerprint = record.get("fingerprint") if isinstance(record, dict) else None
+    if (not isinstance(record, dict) or record.get("schema") != MARKER
+            or record.get("sid") != sid
+            or not isinstance(fingerprint, str) or not re.fullmatch(r"[a-f0-9]{64}", fingerprint)
+            or fingerprint == config_fingerprint(config_path, config)
+            or path_identity(record.get("config", "")) != path_identity(config_path)
+            or not isinstance(record.get("cwd"), str) or not Path(record["cwd"]).is_absolute()
+            or not isinstance(record.get("attempt"), str)
+            or not re.fullmatch(r"[a-f0-9]{32}", record.get("attempt", ""))):
+        raise ServiceHostError("foreign_launch_record", stage="ownership")
+
+
+def _pid_dead(pid):
+    """The recorded pid provably refers to an exited process.
+
+    A live, recycled, inaccessible or out-of-range pid is never proof.
+    """
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except (OSError, OverflowError):
+            pass
+        return False
+    import pywintypes
+    import win32api
+    import win32con
+    try:
+        handle = win32api.OpenProcess(win32con.PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    except pywintypes.error as exc:
+        return exc.winerror == 87  # ERROR_INVALID_PARAMETER: no such process
+    try:
+        try:
+            return win32api.GetExitCodeProcess(handle) != win32con.STILL_ACTIVE
+        except pywintypes.error:
+            return False
+    finally:
+        win32api.CloseHandle(handle)
+
+
+def _process_proof_dead(root, attempt, result):
+    """Local receipts/nonces prove the accepted process ended (or never ran)."""
+    if result is not None and result.get("status") in {"finished", "failed"}:
+        return True
+    if result is not None and result.get("status") == "starting":
+        return _pid_dead(result["pid"])
+    # Without the one-use nonce the action never entered the owned runner.
+    return not (root / (attempt + ".claimed")).exists()
+
+
+def _attempt_inert(root, record, task, result):
+    """The record's accepted action provably ended; it can never serve again."""
+    if task is not None and task["state"] in _TRANSIENT:
+        return False
+    if result is not None and result.get("status") == "starting":
+        # A live recorded pid vetoes every other proof, always.
+        return _pid_dead(result["pid"])
+    if _process_proof_dead(root, record["attempt"], result):
+        return True
+    # The manager confirms the action exited even without a receipt — but
+    # only against a recorded pre-Start run stamp; a record from before the
+    # Start was sent proves nothing about execution.
+    return (task is not None and record.get("before_run") is not None
+            and task["last_run"] != record["before_run"])
+
+
+def _orphan_attempt(task, manifest, sid):
+    """The consumed attempt nonce of a same-chain orphaned registered task.
+
+    The label already pins install and user (the task was queried by name);
+    the XML must still carry this install's exact manifest identity, the
+    owned module invocation and the strict single-action shape. The
+    interpreter path is deliberately NOT pinned: a superseded venv is the
+    normal update case. Anything else stays a hard foreign task.
+    """
+    if task["sid"] != sid:
+        raise ServiceHostError("foreign_task", stage="ownership")
+    try:
+        root = ET.fromstring(task["xml"])
+        def values(name):
+            return [node.text or "" for node in root.iter() if node.tag == "{" + NS + "}" + name]
+        expected = {
+            "Description": MARKER + ":" + str(manifest),
+            "LogonType": "InteractiveToken", "RunLevel": "LeastPrivilege",
+            "MultipleInstancesPolicy": "IgnoreNew", "ExecutionTimeLimit": "PT0S",
+        }
+        actions = root.findall("{" + NS + "}Actions")
+        principals = root.findall("{" + NS + "}Principals")
+        triggers = root.findall("{" + NS + "}Triggers")
+        if (len(actions) != 1 or len(list(actions[0])) != 1
+                or actions[0][0].tag != "{" + NS + "}Exec"
+                or len(principals) != 1 or len(list(principals[0])) != 1
+                or principals[0][0].tag != "{" + NS + "}Principal"
+                or {node.tag for node in principals[0][0]} != {
+                    "{" + NS + "}" + name for name in ("UserId", "LogonType", "RunLevel")}
+                or len(triggers) != 1 or list(triggers[0])
+                or values("WorkingDirectory")
+                or any(values(key) != [value] for key, value in expected.items())):
+            raise ValueError()
+        prefix = subprocess.list2cmdline(
+            ["-I", "-m", "mindie_knowledge.loop.windows_service",
+             "--manifest", str(manifest), "--attempt"])
+        arguments = values("Arguments")
+        if (len(arguments) != 1 or not arguments[0].startswith(prefix + " ")
+                or not re.fullmatch(r"[a-f0-9]{32}", arguments[0][len(prefix) + 1:])):
+            raise ValueError()
+        return arguments[0][len(prefix) + 1:]
+    except (ValueError, KeyError, TypeError, ET.ParseError):
+        raise ServiceHostError("foreign_task", stage="ownership") from None
+
+
+def _orphan_inert(root, task, attempt):
+    """An orphaned task is inert only when its action is provably finished."""
+    if task["state"] in _TRANSIENT:
+        return False
+    try:
+        result = read_result(root, dict(attempt=attempt))
+    except ServiceHostError:
+        return False  # An unreadable receipt proves nothing.
+    return _process_proof_dead(root, attempt, result)
+
+
+def _remove_task(label):
+    from .windows_manager import remove
+    remove(label)
+    if _task(label) is not None:
+        raise ServiceHostError("task_removal_unconfirmed", stage="remove", uncertain=True)
+
+
+def _retire_orphan(root, task, label, manifest, sid, *, stage):
+    attempt = _orphan_attempt(task, manifest, sid)
+    if not _orphan_inert(root, task, attempt):
+        raise ServiceHostError("foreign_task", stage="ownership")
+    from .dfx import failure as record_failure
+    record_failure("knowledge.service", stage=stage,
+                   category="stale_registered_task_retired", reportable=False)
+    _remove_task(label)
+
+
+def _retire_record(root, record, config_path, config, sid, manifest, *, stage):
+    """Retire a superseded launch record once it is provably inert.
+
+    A live task, a live recorded pid, or any identity beyond the
+    configuration fingerprint keeps the original foreign guard verdict.
+    """
+    _validate_superseded(record, config_path, config, sid)
+    task = _task(record["label"])
+    _verify_task(task, record, manifest)
+    result = read_result(root, record)
+    if not _attempt_inert(root, record, task, result):
+        raise ServiceHostError("foreign_launch_record", stage="ownership")
+    from .dfx import failure as record_failure
+    record_failure("knowledge.service", stage=stage,
+                   category="stale_launch_record_retired", reportable=False)
+    if task is not None:
+        _remove_task(record["label"])
+    (root / (record["attempt"] + ".context")).unlink(missing_ok=True)
+    manifest.unlink()
 
 
 
@@ -230,7 +399,18 @@ def _request_start(config_path, config):
     manifest = root / "launch.json"
     existing = _read(manifest)
     if existing:
-        _validate_record(existing, config_path, config, sid)
+        try:
+            _validate_record(existing, config_path, config, sid)
+        except ServiceHostError as exc:
+            if exc.code != "foreign_launch_record":
+                raise
+            # An update changed the engine configuration while the service
+            # was off. A provably inert leftover of the same ownership chain
+            # is retired; anything live or unprovable keeps the foreign verdict.
+            _retire_record(root, existing, config_path, config, sid, manifest,
+                           stage="reconcile")
+            existing = None
+    if existing:
         task = _task(existing["label"])
         _verify_task(task, existing, manifest)
         operation = _read(root / "operation.json")
@@ -264,6 +444,12 @@ def _request_start(config_path, config):
         task = None
     record = _record(config_path, config, root, sid)
     loaded = _task(record["label"])
+    if loaded is not None and existing is None:
+        # A registered task outliving its launch record (manual archive, lost
+        # manifest) still blocks registration. Retire it only when it is
+        # provably this install's own chain and provably inert.
+        _retire_orphan(root, loaded, record["label"], manifest, sid, stage="reconcile")
+        loaded = None
     _verify_task(loaded, existing, manifest)
     record["before_run"] = loaded["last_run"] if loaded else None
     blob = service_context.capture(config, _binding(record))
@@ -367,9 +553,21 @@ def remove_owned(config_path, config):
     manifest = root / "launch.json"
     record = _read(manifest)
     if record is None:
+        if not root.is_dir():
+            return
+        sid = _verify_private(root)
+        task = _task(_label(sid, root))
+        if task is not None:
+            _retire_orphan(root, task, _label(sid, root), manifest, sid, stage="remove")
         return
     sid = _verify_private(root)
-    _validate_record(record, config_path, config, sid)
+    try:
+        _validate_record(record, config_path, config, sid)
+    except ServiceHostError as exc:
+        if exc.code != "foreign_launch_record":
+            raise
+        _retire_record(root, record, config_path, config, sid, manifest, stage="remove")
+        return
     task = _task(record["label"])
     _verify_task(task, record, manifest)
     # The business consumer has exited. This is a finite manager-cleanup
@@ -382,10 +580,7 @@ def remove_owned(config_path, config):
         task = _task(record["label"])
         _verify_task(task, record, manifest)
     if task is not None:
-        from .windows_manager import remove
-        remove(record["label"])
-        if _task(record["label"]) is not None:
-            raise ServiceHostError("task_removal_unconfirmed", stage="remove", uncertain=True)
+        _remove_task(record["label"])
     (root / (record["attempt"] + ".context")).unlink(missing_ok=True)
     _write(root / "operation.json", dict(attempt=record["attempt"], phase="removed"))
     manifest.unlink()
