@@ -216,7 +216,9 @@ def _pid_dead(pid):
     import win32con
     import win32process
     try:
-        handle = win32process.OpenProcess(win32con.PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        # pywin32 splits this family: OpenProcess/CloseHandle live in
+        # win32api, GetExitCodeProcess lives in win32process.
+        handle = win32api.OpenProcess(win32con.PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     except pywintypes.error as exc:
         return exc.winerror == 87  # ERROR_INVALID_PARAMETER: no such process
     try:
