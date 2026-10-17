@@ -9,6 +9,8 @@ succeeds against an open Windows file.
 
 import json
 
+import pytest
+
 from mindie_knowledge import consent_store
 from mindie_knowledge.loop import settings as settings_mod
 
@@ -51,3 +53,75 @@ def test_held_product_read_keeps_old_community_json(tmp_path):
     assert new["generation"] != old_doc["generation"]
     assert new["consent_config"] == stamp
     assert new["fork"] == "lane/fork"
+
+
+def _winerror(code, path):
+    exc = PermissionError(13, "The process cannot access the file because it "
+                          "is being used by another process", str(path))
+    exc.winerror = code
+    return exc
+
+
+def test_replace_retries_a_transient_sharing_holder(tmp_path, monkeypatch):
+    """A plain-open reader (no FILE_SHARE_DELETE) fails WinError 32 briefly."""
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    source.write_bytes(b"new document")
+    target.write_bytes(b"old document")
+    calls = []
+
+    def held_briefly(src, dst):
+        calls.append(src)
+        if len(calls) < 3:
+            raise _winerror(32, dst)
+        import os
+        os.replace(src, dst)
+
+    monkeypatch.setattr(consent_store, "_rename_windows_once", held_briefly)
+    consent_store._replace_windows(source, target)
+    assert len(calls) == 3
+    assert target.read_bytes() == b"new document"
+    assert not source.exists()
+
+
+def test_replace_permanent_holder_reraises_the_original_sharing_error(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    source.write_bytes(b"new document")
+    target.write_bytes(b"old document")
+    calls = []
+
+    def held_forever(src, dst):
+        calls.append(src)
+        raise _winerror(32, dst)
+
+    clock = [100.0]
+    monkeypatch.setattr(consent_store, "_rename_windows_once", held_forever)
+    monkeypatch.setattr(consent_store.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(consent_store.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    with pytest.raises(PermissionError) as caught:
+        consent_store._replace_windows(source, target)
+    assert caught.value.winerror == 32
+    assert 1 < len(calls) <= 2 + consent_store.RENAME_RETRY_SECONDS / consent_store.LOCK_POLL_SECONDS
+    # Neither side is torn: the old document and the staged replacement survive.
+    assert target.read_bytes() == b"old document"
+    assert source.read_bytes() == b"new document"
+
+
+def test_replace_non_sharing_error_is_never_retried(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    source.write_bytes(b"new document")
+    target.write_bytes(b"old document")
+    calls = []
+
+    def denied(src, dst):
+        calls.append(src)
+        raise _winerror(5, dst)
+
+    monkeypatch.setattr(consent_store, "_rename_windows_once", denied)
+    with pytest.raises(PermissionError) as caught:
+        consent_store._replace_windows(source, target)
+    assert caught.value.winerror == 5
+    assert len(calls) == 1
+    assert target.read_bytes() == b"old document"
