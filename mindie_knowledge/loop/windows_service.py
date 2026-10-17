@@ -181,17 +181,24 @@ def _validate_record(record, config_path, config, sid):
         raise ServiceHostError("foreign_launch_record", stage="ownership")
 
 
-def _validate_superseded(record, config_path, config, sid):
+def _validate_superseded(record, config_path, config, sid, root):
     """Same ownership chain, older generation: every ``_validate_record``
-    identity check except the necessarily changed configuration fingerprint.
-    An update while the service was off changes exactly that one field."""
+    identity check except the two an update legitimately changes — the
+    configuration fingerprint and the configuration FILE PATH. The stable
+    ownership identity is the domain state root the record was minted for:
+    ``label`` is exactly the registration name derived from sid +
+    root/domain at first launch, so two configs that differ only by
+    generation path but serve the same state root and domain are the same
+    chain. A different state root or domain yields a different label and
+    stays hard foreign."""
     from .lifecycle import config_fingerprint
     fingerprint = record.get("fingerprint") if isinstance(record, dict) else None
     if (not isinstance(record, dict) or record.get("schema") != MARKER
             or record.get("sid") != sid
             or not isinstance(fingerprint, str) or not re.fullmatch(r"[a-f0-9]{64}", fingerprint)
             or fingerprint == config_fingerprint(config_path, config)
-            or path_identity(record.get("config", "")) != path_identity(config_path)
+            or record.get("label") != _label(sid, root)
+            or not isinstance(record.get("config"), str) or not Path(record["config"]).is_absolute()
             or not isinstance(record.get("cwd"), str) or not Path(record["cwd"]).is_absolute()
             or not isinstance(record.get("attempt"), str)
             or not re.fullmatch(r"[a-f0-9]{32}", record.get("attempt", ""))):
@@ -335,7 +342,7 @@ def _retire_record(root, record, config_path, config, sid, manifest, *, stage):
     A live task, a live recorded pid, or any identity beyond the
     configuration fingerprint keeps the original foreign guard verdict.
     """
-    _validate_superseded(record, config_path, config, sid)
+    _validate_superseded(record, config_path, config, sid, root)
     task = _task(record["label"])
     _verify_task(task, record, manifest)
     result = read_result(root, record)
