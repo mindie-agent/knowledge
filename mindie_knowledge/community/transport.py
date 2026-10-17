@@ -33,6 +33,7 @@ from .common import (
     TransientError,
     UnknownOutcome,
     check_repository,
+    git_executable,
     run_argv,
 )
 
@@ -412,7 +413,7 @@ class FileTransport(Transport):
             return None
         remaining = deadline.step("git ls-remote")
         result = run_argv(
-            ["git", "-c", "core.longpaths=true", "ls-remote", git_path(url),
+            [git_executable(), "-c", "core.longpaths=true", "ls-remote", git_path(url),
              f"refs/heads/{branch}"],
             timeout=remaining,
             max_output=64 * 1024,
@@ -517,7 +518,7 @@ class FileTransport(Transport):
                 # GitHub exposes for that PR. No second host and no force.
                 remaining = deadline.step("record PR head ref")
                 result = run_argv(
-                    ["git", "-c", "core.longpaths=true", "--git-dir", git_path(url),
+                    [git_executable(), "-c", "core.longpaths=true", "--git-dir", git_path(url),
                      "update-ref", f"refs/pull/{number}/head", sha],
                     timeout=remaining,
                     max_output=64 * 1024,
@@ -552,11 +553,11 @@ class FileTransport(Transport):
         mirror = self.path.parent / "mirrors" / repo.replace("/", "_")
         remaining = deadline.step("git mirror sync")
         if mirror.is_dir():
-            argv = ["git", "-c", "core.longpaths=true", "-C", git_path(mirror),
+            argv = [git_executable(), "-c", "core.longpaths=true", "-C", git_path(mirror),
                     "fetch", "origin", "+refs/heads/*:refs/remotes/origin/*"]
         else:
             mirror.parent.mkdir(parents=True, exist_ok=True)
-            argv = ["git", "-c", "core.longpaths=true", "clone", "--mirror",
+            argv = [git_executable(), "-c", "core.longpaths=true", "clone", "--mirror",
                     git_path(url), git_path(mirror)]
         result = run_argv(argv, timeout=remaining, max_output=128 * 1024, cancel=deadline.cancel)
         if result.code != 0:
@@ -599,7 +600,7 @@ class FileTransport(Transport):
             # This disposable checkout must materialize the same package bytes
             # as the publisher, including full task paths on Windows.
             result = run_argv(
-                ["git", "-c", "core.longpaths=true", "-c", "core.autocrlf=false",
+                [git_executable(), "-c", "core.longpaths=true", "-c", "core.autocrlf=false",
                  "-c", "core.eol=lf", *args],
                 timeout=deadline.step(f"dev merge {operation}"),
                 max_output=128 * 1024,

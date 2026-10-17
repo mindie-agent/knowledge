@@ -513,7 +513,7 @@ def test_cached_diff_failure_does_not_commit(tmp_path, monkeypatch, timed_out):
     real_run = common.run_argv
 
     def failed_diff(argv, **kwargs):
-        if argv[:4] == ["git", "diff", "--cached", "--quiet"]:
+        if argv[:4] == [common.git_executable(), "diff", "--cached", "--quiet"]:
             return common.ProcessResult(128, b"", b"synthetic cached diff failure", timed_out)
         return real_run(argv, **kwargs)
 

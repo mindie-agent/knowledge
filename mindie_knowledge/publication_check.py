@@ -21,7 +21,7 @@ import argparse,importlib.metadata,json,os,re,sys,tempfile
 from contextlib import closing
 from pathlib import Path
 from .community.batch import check_path,validate_feedback
-from .community.common import SCHEMA_FEEDBACK,CommunityError,run_argv,sha256_text
+from .community.common import SCHEMA_FEEDBACK,CommunityError,git_executable,run_argv,sha256_text
 from .gitread import CatFileBatch,iter_file_records,run_stdout_to_file,with_windows_longpaths
 from .loop import documents
 from .loop.documents import MAX_FILE_BYTES
@@ -130,7 +130,7 @@ def _save_checkpoint(path,revision,context,verified):
     os.replace(tmp,target)
 
 def _git(repo,args,maximum):
-    result=run_argv(['git','-C',str(repo),*args],timeout=None,max_output=maximum,input_bytes=b'',
+    result=run_argv([git_executable(),'-C',str(repo),*args],timeout=None,max_output=maximum,input_bytes=b'',
                     env=_git_env())
     if result.code:raise ValueError('Cannot read the candidate Git publication')
     return result.out
@@ -185,7 +185,7 @@ def _validate_tree(repo,revision,domain,state_path,context,verified,stats):
     listing_file=Path(listing_name)
     try:
         run_stdout_to_file(
-            ['git','-C',str(repo),'ls-tree','-r','-z','--long',revision],
+            [git_executable(),'-C',str(repo),'ls-tree','-r','-z','--long',revision],
             listing_file,timeout=None,
             env=_git_env())
         reader=None
@@ -266,7 +266,7 @@ def classify_changes(repo, base_revision, revision):
     with tempfile.TemporaryDirectory(prefix="mindie-publication-diff-") as directory:
         listing = Path(directory) / "paths"
         run_stdout_to_file(
-            ["git", "-C", str(repo), "diff", "--no-renames", "--name-status", "-z", base_revision, revision, "--"],
+            [git_executable(), "-C", str(repo), "diff", "--no-renames", "--name-status", "-z", base_revision, revision, "--"],
             listing, timeout=None, env=_git_env(),
         )
         count, development = 0, []

@@ -102,3 +102,4 @@ Agent 在实际参考某条知识完成任务后，可调用 `knowledge_feedback
 - `sync` 命令完全不依赖大模型，即使关闭了社区共享也可随时运行。
 - 它通过单个持久 `git cat-file --batch` 进程流式读取候选提交中的每个 Git Blob，逐一校验 `publication-contract.json`、目录拓扑、UTF-8/LF 编码、分块 SHA-256 与隐私脱敏规则，并按路径记录校验检查点（断点续验，无需从零重跑）。
 - 只有当整个候选提交 100% 校验通过后，才在一次极短的本地事务中原子切换当前可见视图；若上游删除了某个任务包，本地自动将其转化为撤下标记（`withdrawn`）。
+- 所有 Git 调用（Feed 同步、发件箱发布、合约读取）都通过同一个确定性顺序解析可执行文件：先取 `MINDIE_GIT_BIN` 绝对路径钉选，再查 `PATH`，最后在 Windows 上查 Git for Windows 标准安装目录。精简 PATH 的环境（如 Task Scheduler Session 0）因此仍能正常同步；解析不到时以 `unavailable` 如实报错并给出补救方式，绝不使用猜测路径。
