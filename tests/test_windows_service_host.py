@@ -357,6 +357,16 @@ def test_superseded_record_with_live_task_is_never_retired(scheduler):
     assert (host._paths(updated) / "launch.json").exists()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="exercises the real win32process API")
+def test_pid_dead_uses_the_real_pywin32_process_api():
+    import subprocess
+    import sys
+    assert host._pid_dead(os.getpid()) is False
+    process = subprocess.Popen([sys.executable, "-c", ""])
+    process.wait()
+    assert host._pid_dead(process.pid) is True
+
+
 def test_superseded_record_with_live_pid_is_never_retired(scheduler):
     path, config, state = scheduler
     first = host.request_start(path, config)

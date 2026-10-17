@@ -214,13 +214,14 @@ def _pid_dead(pid):
     import pywintypes
     import win32api
     import win32con
+    import win32process
     try:
-        handle = win32api.OpenProcess(win32con.PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        handle = win32process.OpenProcess(win32con.PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     except pywintypes.error as exc:
         return exc.winerror == 87  # ERROR_INVALID_PARAMETER: no such process
     try:
         try:
-            return win32api.GetExitCodeProcess(handle) != win32con.STILL_ACTIVE
+            return win32process.GetExitCodeProcess(handle) != win32con.STILL_ACTIVE
         except pywintypes.error:
             return False
     finally:
