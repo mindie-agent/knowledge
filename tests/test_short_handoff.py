@@ -11,7 +11,8 @@ from tests.test_capture_handoff import _event
 from tests.test_review_followup import _ready
 
 
-def test_silent_listener_leaves_capture_durable_and_returns_unknown(tmp_path):
+def test_silent_listener_leaves_capture_durable_and_returns_unknown(tmp_path, monkeypatch):
+    monkeypatch.setenv("MINDIE_KNOWLEDGE_WAKE_PROBE_SECONDS", "0.2")
     path, admission, *_ = _ready(tmp_path)
     config = cli.config_at(path)
     stop = threading.Event()

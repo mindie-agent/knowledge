@@ -367,8 +367,8 @@ class ReMeIndex:
         return paths
 
     def search(self, tasks, query, limit, conditions, allowed_ids, continuation=None, *, catalog):
-        lock = StartLock(self.root / ".index.lock")
-        lock.acquire(wait=None)
+        lock = StartLock(self.root / ".index.lock", wait=5.0)
+        lock.acquire(wait=5.0)
         try:
             self._refresh(tasks, catalog)
             cacheable = allowed_ids is None or isinstance(allowed_ids, CurrentVisibility)
@@ -485,8 +485,8 @@ class ReMeIndex:
             lock.release()
 
     def refresh(self, tasks, *, catalog):
-        lock = StartLock(self.root / ".index.lock")
-        lock.acquire(wait=None)
+        lock = StartLock(self.root / ".index.lock", wait=5.0)
+        lock.acquire(wait=5.0)
         try:
             self._refresh(tasks, catalog)
         finally:

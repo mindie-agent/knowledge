@@ -107,7 +107,7 @@ class Admission:
 
     # ------------------------------------------------------------- internals
 
-    def _database(self, *, initialize_missing=False, timeout=0.1):
+    def _database(self, *, initialize_missing=False, timeout=2.0):
         """Use the shared authority contract; absence is valid only before use."""
         try:
             return open_database(
@@ -320,7 +320,7 @@ class Admission:
             )
         return lease
 
-    def capture_authorization(self, session, token, *, timeout):
+    def capture_authorization(self, session, token, *, timeout=2.0):
         """Read one lease for a Stop handoff.
 
         Returns ``state`` of ``admitted``, ``inactive``, or ``schema``. A
@@ -337,7 +337,7 @@ class Admission:
             or len(token) > 512
         ):
             return {"state": "inactive"}
-        timeout = max(0.05, min(float(timeout), 0.25))
+        timeout = max(0.05, min(float(timeout), 10.0))
         db = self._database(timeout=timeout)
         if db is None:
             return {"state": "inactive"}
@@ -390,7 +390,7 @@ class Admission:
         finally:
             db.close()
 
-    def resolve_capture_lease(self, session, *, timeout):
+    def resolve_capture_lease(self, session, *, timeout=2.0):
         """Read one live lease for an internal Stop that did not pass a token.
 
         The stored token is used only to compute the activation epoch and is
@@ -406,14 +406,14 @@ class Admission:
             or len(session) > 256
         ):
             return {"state": "inactive"}
-        timeout = max(0.05, min(float(timeout), 0.25))
+        timeout = max(0.05, min(float(timeout), 10.0))
         db = self._database(timeout=timeout)
         if db is None:
             return {"state": "inactive"}
         try:
             db.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
             deadline = time.monotonic() + timeout
-            db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+            db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 10000)
             columns = [row[1] for row in db.execute("PRAGMA table_info(leases)")]
             if not columns:
                 raise AdmissionUnavailable("lease schema is missing")

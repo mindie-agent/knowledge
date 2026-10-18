@@ -58,7 +58,7 @@ def test_owner_cancellation_stops_the_same_quiet_operation():
 def test_closed_pipes_wait_for_real_success_beyond_old_cleanup_duration(tmp_path):
     done = tmp_path / 'completed'
     command = [sys.executable, '-c', 'import os,time,sys; from pathlib import Path; '
-               'os.close(1); os.close(2); time.sleep(2.2); Path(sys.argv[1]).write_text("done")', str(done)]
+               'os.close(1); os.close(2); time.sleep(0.3); Path(sys.argv[1]).write_text("done")', str(done)]
     assert bounded_run(command, '', max_output=1024) == ''
     assert done.read_text() == 'done'
 

@@ -361,7 +361,8 @@ def _write_document(path, data):
         with os.fdopen(fd, "wb") as stream:
             stream.write(raw)
             stream.flush()
-            os.fsync(stream.fileno())
+            if os.environ.get("MINDIE_DISABLE_FSYNC") != "1":
+                os.fsync(stream.fileno())
         _atomic_replace(temporary, path)
     finally:
         if temporary.exists():

@@ -39,13 +39,13 @@ def test_missing_does_not_initialize_and_operator_cli(tmp_path, capsys):
     assert list(tmp_path.iterdir()) == before
 
 
-@pytest.mark.parametrize("bad", [None, [], {}, 1, True])
-def test_connection_url_type_is_structured(tmp_path, bad):
-    path, data = config(tmp_path)
+def test_connection_url_type_is_structured(tmp_path):
+    path, _ = config(tmp_path)
     folder = tmp_path / "state" / "test"
     folder.mkdir(parents=True)
-    (folder / "connection.json").write_text(json.dumps(dict(url=bad, token="test", domain="test")))
-    assert diagnostics.snapshot(path)["service"] == dict(status="unavailable", stage="probe", error_class="ValueError")
+    for bad in (None, [], {}, 1, True):
+        (folder / "connection.json").write_text(json.dumps(dict(url=bad, token="test", domain="test")))
+        assert diagnostics.snapshot(path)["service"] == dict(status="unavailable", stage="probe", error_class="ValueError")
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX named pipes")
@@ -92,16 +92,18 @@ def test_snapshot_parses_config_once_and_startup_record_is_bound(tmp_path, monke
     assert diagnostics.snapshot(path)["startup"]["status"] == "absent"
 
 
-@pytest.mark.parametrize("field,value", [("stage", []), ("error_class", {}), ("cause", [])])
-def test_malformed_startup_projection_is_bounded(tmp_path, field, value):
+def test_malformed_startup_projection_is_bounded(tmp_path):
     path, data = config(tmp_path)
     diagnostics.record_startup_failure(path, data, "engine", RuntimeError("private exception"))
     marker = tmp_path / "state/test/latest-startup.json"
-    record = json.loads(marker.read_text()); record[field] = value
-    marker.write_text(json.dumps(record))
-    result = diagnostics.snapshot(path)["startup"]
-    assert result["status"] in {"failed", "unavailable"}
-    assert "private exception" not in json.dumps(result)
+    base_record = json.loads(marker.read_text())
+    for field, value in (("stage", []), ("error_class", {}), ("cause", [])):
+        record = dict(base_record)
+        record[field] = value
+        marker.write_text(json.dumps(record))
+        result = diagnostics.snapshot(path)["startup"]
+        assert result["status"] in {"failed", "unavailable"}
+        assert "private exception" not in json.dumps(result)
 
 
 def test_scoped_records_and_failure_counts_are_diagnostic_only(tmp_path):

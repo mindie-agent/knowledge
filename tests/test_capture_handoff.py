@@ -114,7 +114,7 @@ def test_locked_store_is_not_accepted(tmp_path):
     held.execute("BEGIN IMMEDIATE")
     started = time.monotonic()
     try:
-        result = capture_hook(config, _event(admission, budget_seconds=0.4))
+        result = capture_hook(config, _event(admission, budget_seconds=0.4), timeout=0.1)
     finally:
         held.rollback()
         held.close()

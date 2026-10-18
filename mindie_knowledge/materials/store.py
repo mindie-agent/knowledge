@@ -207,7 +207,7 @@ class MaterialStore:
         self.domain = domain
         self.root.mkdir(parents=True, exist_ok=True)
         self._mutex = threading.RLock()
-        self._write_lock = StartLock(self.root / ".write.lock")
+        self._write_lock = StartLock(self.root / ".write.lock", wait=5.0)
         self._index = None
         self._index_verified = None
         self._index_failure = None
@@ -238,7 +238,8 @@ class MaterialStore:
             with tmp.open("x", encoding="utf-8", newline="") as stream:
                 stream.write(text)
                 stream.flush()
-                os.fsync(stream.fileno())
+                if os.environ.get("MINDIE_DISABLE_FSYNC") != "1":
+                    os.fsync(stream.fileno())
             os.replace(tmp, path)
         except BaseException as exc:
             try:
@@ -255,7 +256,7 @@ class MaterialStore:
         with self._mutex:
             owned = self._write_lock.acquired
             if not owned:
-                self._write_lock.acquire(wait=None)
+                self._write_lock.acquire(wait=5.0)
             try:
                 yield
             finally:
@@ -341,7 +342,7 @@ class MaterialStore:
         _source(source)
         lock = self._lock()
         with self._mutex:
-            lock.acquire(wait=None)
+            lock.acquire(wait=5.0)
             try:
                 selected = revision if revision is not None else self._pointers()[source].get(task_id)
                 prior = self._header(task_id, selected, source) if selected is not None else None
@@ -386,7 +387,7 @@ class MaterialStore:
                   for i, text in enumerate(_split_text(doc["content"]))]
         lock = self._lock()
         with self._mutex:
-            lock.acquire(wait=None)
+            lock.acquire(wait=5.0)
             try:
                 descriptors = [self._write_block(task_id, block) for block in blocks]
                 result = self._write_manifest(doc, descriptors, doc["summary"], "incomplete")
@@ -427,7 +428,7 @@ class MaterialStore:
         navigation_ref = task_ref(self.domain, task_id)
         lock = self._lock()
         with self._mutex:
-            lock.acquire(wait=None)
+            lock.acquire(wait=5.0)
             try:
                 pointers = self.root / "current.json"
                 if pointers.is_symlink():
@@ -476,7 +477,7 @@ class MaterialStore:
         _source(source)
         lock = self._lock()
         with self._mutex:
-            lock.acquire(wait=None)
+            lock.acquire(wait=5.0)
             try:
                 prior = self._header(task_id, revision, source)
                 changes = {item["block_id"]: item for item in indexes}
@@ -515,7 +516,7 @@ class MaterialStore:
         """
         lock = self._lock()
         with self._mutex:
-            lock.acquire(wait=None)
+            lock.acquire(wait=5.0)
             try:
                 draft = self._header(task_id, draft_revision, "draft")
                 public = self._header(task_id, published_revision, "feed")
@@ -559,7 +560,7 @@ class MaterialStore:
         """Atomically promote all metadata-committed tasks, then retire garbage."""
         lock = self._lock()
         with self._mutex, self.validated_headers():
-            lock.acquire(wait=None)
+            lock.acquire(wait=5.0)
             try:
                 if complete:
                     updates = dict(updates)
@@ -667,7 +668,7 @@ class MaterialStore:
         seen = set()
         lock = self._lock()
         with self._mutex:
-            lock.acquire(wait=None)
+            lock.acquire(wait=5.0)
             try:
                 state = self._pointers()
                 old_ids = set(state[source])
@@ -818,7 +819,7 @@ class MaterialStore:
         import shutil
         self.close()
         lock = StartLock(self.root / ".index.lock")
-        lock.acquire(wait=None)
+        lock.acquire(wait=5.0)
         try:
             path = self.root / ".reme-index"
             if path.exists():

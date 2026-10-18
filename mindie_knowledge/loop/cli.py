@@ -238,7 +238,7 @@ def prepare_service(config_path, *, probe_timeout=None):
         lock.release()
 
 
-def capture_hook(config_path, event):
+def capture_hook(config_path, event, *, timeout=None):
     """Adapter-facing Stop handoff. The returned dict is the stage contract.
 
     Hook stdout stays ``{}``. This function commits one capture row when the
@@ -246,7 +246,7 @@ def capture_hook(config_path, event):
     """
     from .handoff import accept_stop
 
-    return accept_stop(config_path, event)
+    return accept_stop(config_path, event, timeout=timeout)
 
 
 def contribution_recovery(config, operation, batch_id):

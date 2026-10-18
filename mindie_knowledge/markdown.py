@@ -32,7 +32,8 @@ def _atomic_write_bytes(path: Path, raw: bytes) -> None:
         with os.fdopen(fd, "wb") as stream:
             stream.write(raw)
             stream.flush()
-            os.fsync(stream.fileno())
+            if os.environ.get("MINDIE_DISABLE_FSYNC") != "1":
+                os.fsync(stream.fileno())
         os.replace(temporary, path)
     except BaseException as error:
         try:

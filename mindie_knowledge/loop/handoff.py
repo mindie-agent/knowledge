@@ -26,7 +26,14 @@ from .store import (
 )
 
 SUMMARY_LIMIT = 32768
-WAKE_PROBE_SECONDS = .25  # Control-plane observation; never a business deadline.
+WAKE_PROBE_SECONDS = 2.0  # Control-plane observation; never a business deadline.
+
+
+def _wake_probe_seconds():
+    raw = getattr(os, "environ", {}).get("MINDIE_KNOWLEDGE_WAKE_PROBE_SECONDS")
+    return float(raw) if raw is not None else WAKE_PROBE_SECONDS
+
+
 _HARNESS = __import__("re").compile(r"[a-z][a-z0-9_-]{0,31}\Z")
 _TERMINAL = {
     "organized": "organized",
@@ -260,7 +267,7 @@ def request_wake(config_path, *, session_id, event=None):
             return out
         out.update(wake="not-applicable", reason="not-activated")
         return out
-    state = _probe(config, WAKE_PROBE_SECONDS, config_path=config_path)
+    state = _probe(config, _wake_probe_seconds(), config_path=config_path)
     if state == "ready":
         out.update(wake="running", runtime="ready", reason="worker-ready")
         return out
@@ -299,7 +306,7 @@ def request_wake(config_path, *, session_id, event=None):
                 try:
                     # A query starter may have won while the wake lock was
                     # acquired; the scheduler never replaces a live consumer.
-                    current = _probe(config, WAKE_PROBE_SECONDS, config_path=config_path)
+                    current = _probe(config, _wake_probe_seconds(), config_path=config_path)
                     if current == "ready":
                         out.update(wake="running", runtime="ready", reason="worker-ready")
                         return out
@@ -360,7 +367,7 @@ def _record(config, **kwargs):
         pass
 
 
-def accept_stop(config_path, event):
+def accept_stop(config_path, event, *, timeout=None):
     """Durable Stop handoff. See the shared contract for the returned stage."""
     from . import settings as settings_mod
     from .cli import config_at
@@ -463,9 +470,14 @@ def accept_stop(config_path, event):
     admission_path = config.get("admission_path")
     if not isinstance(admission_path, str):
         return _result(stage="inert", reason="not-activated", summary_dropped=dropped)
+    stop_timeout = (
+        float(timeout)
+        if timeout is not None
+        else float(os.environ.get("MINDIE_KNOWLEDGE_STOP_TIMEOUT_SECONDS", 5.0))
+    )
     try:
         admission = Admission(admission_path)
-        auth_timeout = 0.25  # SQLite lock contention is a resource-busy refusal.
+        auth_timeout = min(2.0, stop_timeout)
         if resolve_lease:
             auth = admission.resolve_capture_lease(session, timeout=auth_timeout)
         else:
@@ -493,9 +505,21 @@ def accept_stop(config_path, event):
             summary_dropped=dropped,
             recovery=_RECOVERY["store-not-ready"],
         )
-    timeout = 0.25
     try:
-        db = sqlite3.connect(path, timeout=timeout)
+        db = sqlite3.connect(path, timeout=stop_timeout)
+        db.execute(f"PRAGMA busy_timeout={int(stop_timeout * 1000)}")
+    except sqlite3.OperationalError as exc:
+        text = str(exc).lower()
+        if "locked" in text or "busy" in text:
+            _record(config, stage="accept", cause="store-locked", event=event_id)
+            return _result(
+                stage="unavailable", reason="store-locked", cause="store-locked",
+                summary_dropped=dropped,
+                recovery=_RECOVERY["store-locked"],
+            )
+        _record(config, stage="accept", cause="store-not-ready", event=event_id)
+        return _result(stage="unavailable", reason="store-not-ready", cause="store-not-ready",
+                       summary_dropped=dropped)
     except sqlite3.Error:
         _record(config, stage="accept", cause="store-not-ready", event=event_id)
         return _result(stage="unavailable", reason="store-not-ready", cause="store-not-ready",
@@ -548,7 +572,7 @@ def accept_stop(config_path, event):
             reason="stored", summary_dropped=dropped,
         )
     if status == "processing":
-        state = _probe(config, WAKE_PROBE_SECONDS, config_path=config_path)
+        state = _probe(config, _wake_probe_seconds(), config_path=config_path)
         return _result(
             stage="processing", capture_id=capture_id, duplicate=duplicate,
             wake="not-applicable",
@@ -561,7 +585,7 @@ def accept_stop(config_path, event):
         stage_name = "accepted-local"
     else:
         stage_name = "accepted-local"
-    state = _probe(config, WAKE_PROBE_SECONDS, config_path=config_path)
+    state = _probe(config, _wake_probe_seconds(), config_path=config_path)
     if state == "ready" and status in _UNPROCESSED_CAPTURE | {"pending", "deferred", "queued"}:
         clear_delivery_event(config, event_id)
         return _result(

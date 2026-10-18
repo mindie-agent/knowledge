@@ -75,18 +75,38 @@ def commit_tree_file(repository, parent, path, content, *, mode="100644"):
                       data=b"Add unsupported task path\n").strip().decode("ascii")
 
 
+_REMOTE_TEMPLATES: dict[str, Path] = {}
+_REMOTE_TEMPLATE_DIR = None
+_ENTRY_CACHE: dict[tuple, tuple[dict, dict]] = {}
+
+
+def _template_bare(name: str) -> Path:
+    global _REMOTE_TEMPLATE_DIR
+    if name not in _REMOTE_TEMPLATES:
+        import tempfile
+        if _REMOTE_TEMPLATE_DIR is None:
+            _REMOTE_TEMPLATE_DIR = tempfile.TemporaryDirectory(prefix="mindie-remote-template-")
+        root = Path(_REMOTE_TEMPLATE_DIR.name) / name
+        root.mkdir(parents=True, exist_ok=True)
+        bare = root / f"{name}.git"
+        git(["init", "--bare", "-b", "main", str(bare)])
+        work = root / f"{name}-seed"
+        git(["clone", str(bare), str(work)])
+        (work / "README.md").write_text(f"# {name}\n", encoding="utf-8")
+        (work / "publication-contract.json").write_bytes(render_contract(make_contract("npu", "a" * 40)).encode("utf-8"))
+        git(["add", "README.md", "publication-contract.json"], cwd=work)
+        git(["-c", "user.name=seed", "-c", "user.email=seed@example.invalid",
+             "commit", "-m", "init"], cwd=work)
+        git(["push", "origin", "main"], cwd=work)
+        _REMOTE_TEMPLATES[name] = bare
+    return _REMOTE_TEMPLATES[name]
+
+
 def make_remote(tmp_path: Path, name: str) -> str:
     """A real bare remote with one initial commit on main."""
+    import shutil
     bare = tmp_path / f"{name}.git"
-    git(["init", "--bare", "-b", "main", str(bare)])
-    work = tmp_path / f"{name}-seed"
-    git(["clone", str(bare), str(work)])
-    (work / "README.md").write_text(f"# {name}\n", encoding="utf-8")
-    (work / "publication-contract.json").write_bytes(render_contract(make_contract("npu", "a" * 40)).encode("utf-8"))
-    git(["add", "README.md", "publication-contract.json"], cwd=work)
-    git(["-c", "user.name=seed", "-c", "user.email=seed@example.invalid",
-         "commit", "-m", "init"], cwd=work)
-    git(["push", "origin", "main"], cwd=work)
+    shutil.copytree(_template_bare(name), bare)
     return str(bare)
 
 
@@ -102,6 +122,7 @@ def make_entry(entry_id="entry-1", domain="npu", title="Container device numberi
                revision=None, kind="experience", conditions=None,
                summary="How device numbering works"):
     from contextlib import closing
+    import copy
     import hashlib
     import re
     import tempfile
@@ -109,13 +130,20 @@ def make_entry(entry_id="entry-1", domain="npu", title="Container device numberi
 
     if not re.fullmatch(r"[0-9a-f]{64}", entry_id):
         entry_id = hashlib.sha256(entry_id.encode("utf-8")).hexdigest()
-    doc = documents.make_entry(entry_id=entry_id, domain=domain, kind=kind,
-                              title=title, summary=summary, content=content,
-                              conditions=conditions or {"driver": "cann 8.0"})
-    with tempfile.TemporaryDirectory(prefix="mindie-package-fixture-") as directory, \
-            closing(MaterialStore(Path(directory), domain)) as materials:
-        doc = materials.put_document(doc)
-        package = materials.export_task(entry_id, revision=doc["revision"])
+    cond = conditions or {"driver": "cann 8.0"}
+    cache_key = (entry_id, domain, title, content, kind, json.dumps(cond, sort_keys=True), summary)
+    if cache_key in _ENTRY_CACHE:
+        cached_doc, package = _ENTRY_CACHE[cache_key]
+        doc = copy.deepcopy(cached_doc)
+    else:
+        doc = documents.make_entry(entry_id=entry_id, domain=domain, kind=kind,
+                                   title=title, summary=summary, content=content,
+                                   conditions=cond)
+        with tempfile.TemporaryDirectory(prefix="mindie-package-fixture-") as directory, \
+                closing(MaterialStore(Path(directory), domain)) as materials:
+            doc = materials.put_document(doc)
+            package = materials.export_task(entry_id, revision=doc["revision"])
+        _ENTRY_CACHE[cache_key] = (copy.deepcopy(doc), package)
     _PACKAGES[doc["revision"]] = package
     _INDEXES[sha256_text(package["files"]["index.md"])] = package
     if revision is not None:

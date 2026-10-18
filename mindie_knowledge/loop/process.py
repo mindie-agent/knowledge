@@ -300,6 +300,12 @@ def bounded_run(command, payload, *, timeout=None, max_output, cancel=None, clea
                         "deadline",
                         started,
                     )
+                if not open_streams:
+                    try:
+                        process.wait(timeout=0.05 if remaining is None else min(0.05, remaining))
+                    except subprocess.TimeoutExpired:
+                        pass
+                    continue
                 try:
                     tag, chunk = chunks.get(timeout=0.1 if remaining is None else min(0.1, remaining))
                 except queue.Empty:

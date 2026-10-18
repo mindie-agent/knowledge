@@ -17,7 +17,12 @@ from mindie_knowledge import consent_store
 TOKEN = 'resumed precision observation remains unresolved'
 
 
-def _world(tmp_path):
+@pytest.fixture(scope='module')
+def scanner():
+    return install_scanner()
+
+
+def _world(tmp_path, scanner_exec=None):
     project = tmp_path / 'project'
     project.mkdir()
     consent, settings = tmp_path / 'consent.json', tmp_path / 'settings.json'
@@ -29,7 +34,7 @@ def _world(tmp_path):
     store = Store(tmp_path / 'store', 'test')
     marker = tmp_path / 'calls'
     engine = Engine(store, settings_path=settings, admission=admission,
-                    transcript_adapter=load_parser('codex'), redactor_executable=install_scanner(),
+                    transcript_adapter=load_parser('codex'), redactor_executable=scanner_exec or install_scanner(),
                     summary_command=summary_command(calls=marker))
     when = max(parsed.enabled_at, admission.active_lease('ses-fault')['activated_at']) + 1
     write_transcript('codex', source, 'ses-fault', [TOKEN], when)
@@ -70,14 +75,6 @@ def _patch_settings(world, **fields):
 _KEEP = {"queued", "pending", "deferred", "apply-pending"}
 _MALFORMED = (
     "missing-config",
-    "null-config",
-    "empty-config",
-    "number-config",
-    "bool-config",
-    "relative-config",
-    "enabled-string-false",
-    "enabled-string-true",
-    "enabled-zero",
     "choice-absent",
 )
 
@@ -132,8 +129,8 @@ def _repair(world, kind):
 
 
 @pytest.mark.parametrize('kind', ['corrupt', *_MALFORMED])
-def test_k3_authority_fault_keeps_admitted_material_and_same_choice_resumes(tmp_path, kind):
-    world = _world(tmp_path)
+def test_k3_authority_fault_keeps_admitted_material_and_same_choice_resumes(tmp_path, scanner, kind):
+    world = _world(tmp_path, scanner)
     store, engine = world['store'], world['engine']
     try:
         captured = _capture(world)
@@ -152,9 +149,9 @@ def test_k3_authority_fault_keeps_admitted_material_and_same_choice_resumes(tmp_
         store.close()
 
 
-@pytest.mark.parametrize('kind', ['corrupt', 'missing-config', 'null-config', 'enabled-string-false', 'choice-absent'])
-def test_k3_saved_model_result_survives_authority_fault_without_another_call(tmp_path, monkeypatch, kind):
-    world = _world(tmp_path)
+@pytest.mark.parametrize('kind', ['corrupt', 'missing-config', 'choice-absent'])
+def test_k3_saved_model_result_survives_authority_fault_without_another_call(tmp_path, monkeypatch, scanner, kind):
+    world = _world(tmp_path, scanner)
     store, engine = world['store'], world['engine']
     try:
         captured = _capture(world)

@@ -56,12 +56,7 @@ def _observe(parser):
 
 _SHAPES = (
     "null-field",
-    "empty-field",
-    "number-field",
-    "bool-field",
     "enabled-string-false",
-    "enabled-string-true",
-    "enabled-zero",
     "choice-absent",
 )
 

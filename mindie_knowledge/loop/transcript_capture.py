@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -90,11 +91,12 @@ def summarize_due(engine):
         ledger = SummaryLedger(store.db)
         attempt = engine.index_queue.latest(batch['entry_id'], batch_identity(selected))
         invoke = False
+        summary_timeout = float(os.environ.get('MINDIE_SUMMARY_TIMEOUT_SECONDS', 120.0))
         if attempt is None or attempt['status'] == 'prepared' or batch['status'] == 'retry-requested':
             if not engine.summary_command:
                 raise ValueError('configuration: summary worker is not configured')
             identity = validate_identity(json.loads(bounded_run([*engine.summary_command, '--identity'], '{}',
-                                                                timeout=None, max_output=8192, cancel=cancel)))
+                                                                timeout=summary_timeout, max_output=8192, cancel=cancel)))
             request = make_request(task_id=batch['entry_id'], body_version=batch_identity(selected), blocks=selected,
                                    prior_navigation=prior_navigation, identity=identity)
             attempt = engine.index_queue.claim(batch, request)
@@ -115,7 +117,7 @@ def summarize_due(engine):
                         diagnostic_failure('index.summary', stage='receipt', category='summary_completed_recording_failed', exception=exc)
                         raise
                 store.db.assert_authority()
-                raw = bounded_run(engine.summary_command, canonical(request), timeout=None,
+                raw = bounded_run(engine.summary_command, canonical(request), timeout=summary_timeout,
                                   max_output=MAX_RESPONSE_BYTES * 3, cancel=cancel,
                                   cleanup_receipt=cleanup_receipt, on_result=save_result)
                 response = json.loads(raw)

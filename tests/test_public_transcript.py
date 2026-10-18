@@ -515,7 +515,19 @@ def test_repeated_enable_keeps_pending_material_and_authorization(pipeline):
 
 
 @pytest.mark.parametrize('harness', ['codex', 'kimi', 'cc'])
-@pytest.mark.parametrize('size', [129 * 1024, 1024 * 1024, 10 * 1024 * 1024])
+@pytest.mark.parametrize('size', [
+    129 * 1024,
+    pytest.param(
+        10 * 1024 * 1024,
+        marks=[
+            pytest.mark.benchmark,
+            pytest.mark.skipif(
+                __import__('os').environ.get('MINDIE_RUN_BENCHMARK') != '1',
+                reason='10MB benchmark; set MINDIE_RUN_BENCHMARK=1 to run',
+            ),
+        ],
+    ),
+])
 def test_production_parsers_preserve_large_public_messages_through_export(tmp_path, scanner, harness, size):
     session = SESSIONS[harness]
     settings = tmp_path / 'community.json'

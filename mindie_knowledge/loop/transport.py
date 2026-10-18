@@ -96,7 +96,7 @@ class _BoundedHTTPServer(ThreadingHTTPServer):
 
     daemon_threads = True
 
-    def __init__(self, address, handler, *, max_workers, slot_wait):
+    def __init__(self, address, handler, *, max_workers, slot_wait=2.0):
         self.slots = threading.BoundedSemaphore(max_workers)
         self.slot_wait = slot_wait
         super().__init__(address, handler)
@@ -131,7 +131,7 @@ class _BoundedHTTPServer(ThreadingHTTPServer):
 
 class Service:
     def __init__(self, engine, *, connection_path=None, admission=None, feeds=(),
-                 max_workers=8, request_timeout=None, config_path=None,
+                 max_workers=8, request_timeout=30.0, slot_wait=2.0, config_path=None,
                  config_fingerprint=None):
         self.engine, self.store = engine, engine.store
         self.admission = admission
@@ -226,7 +226,7 @@ class Service:
             ("127.0.0.1", 0),
             Handler,
             max_workers=max_workers,
-            slot_wait=0,  # Reject exhausted server capacity before admitting work.
+            slot_wait=slot_wait,
         )
         self.http.service_actions = self._check_config_lifetime
         self.connection = dict(

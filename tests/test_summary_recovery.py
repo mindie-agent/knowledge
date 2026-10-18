@@ -132,7 +132,7 @@ def test_identity_stage_obeys_owner_cancellation_without_execution_deadline(pipe
     original = transcript_capture.bounded_run
     def run(command, payload, **options):
         observed.append(options.get('cancel') is not None and engine.operations.snapshot()['activity'] > 0)
-        assert options.get('timeout') is None
+        assert options.get('timeout') == 120.0
         if when == 'before-spawn':
             engine.stop.set()
             engine.operations.cancel('index')

@@ -105,6 +105,8 @@ class CurrentCatalog:
                         or (pending is None and "pointer_signature" not in values)):
                     raise ValueError("existing current material catalog has invalid metadata")
             self.db.execute("PRAGMA journal_mode=WAL")
+            if __import__("os").environ.get("MINDIE_DISABLE_FSYNC") == "1":
+                self.db.execute("PRAGMA synchronous=OFF")
             if not existed:
                 self.db.executescript("""
                     CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);

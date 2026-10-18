@@ -86,6 +86,13 @@ _state = ISOLATION_ROOT / "state"
 _diag_root = ISOLATION_ROOT / "diagnostics"
 for _directory in (_home, _config, _state, _diag_root):
     _directory.mkdir(parents=True, exist_ok=True)
+_real_gitleaks = REAL_HOME / ".cache" / "mindie-agent" / "gitleaks"
+_isolated_gitleaks = _home / ".cache" / "mindie-agent" / "gitleaks"
+if _real_gitleaks.is_dir() and not _isolated_gitleaks.exists():
+    import shutil as _shutil
+    _isolated_gitleaks.parent.mkdir(parents=True, exist_ok=True)
+    _shutil.copytree(_real_gitleaks, _isolated_gitleaks)
+os.environ.setdefault("MINDIE_DISABLE_FSYNC", "1")
 os.environ["HOME"] = str(_home)
 os.environ["USERPROFILE"] = str(_home)
 os.environ["XDG_CONFIG_HOME"] = str(_config)
@@ -140,6 +147,7 @@ def lifecycle_tests_use_explicit_process_backend(request, monkeypatch):
 
 
 def pytest_configure(config):
+    config.addinivalue_line("markers", "benchmark: large payload throughput benchmark")
     if _FIXTURE_ERRORS:
         pytest.exit("\n".join(_FIXTURE_ERRORS), returncode=2)
 
