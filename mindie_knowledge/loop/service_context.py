@@ -6,7 +6,6 @@ Windows DPAPI protects the short-lived transfer; it is not a credential store.
 """
 from __future__ import annotations
 
-import ctypes
 import json
 import os
 from pathlib import Path
@@ -59,42 +58,13 @@ def validate(config):
     if any(not isinstance(path, str) or "\x00" in path or "\n" in path
            or not Path(path).is_absolute() for path in paths.values()):
         raise ContextError("service_launch_path_invalid")
-    # Windows names are case-insensitive. Explicit upper/lower proxy aliases
-    # may coexist in the declaration, but cannot shadow a path binding.
     if {key.casefold() for key in names} & {key.casefold() for key in paths}:
         raise ContextError("service_launch_context_invalid")
     return dict(paths=paths.copy(), environment=names.copy())
 
 
 def _crypt(raw, entropy, *, decrypt=False):
-    from ctypes import wintypes
-
-    class Blob(ctypes.Structure):
-        _fields_ = [("size", wintypes.DWORD), ("data", ctypes.POINTER(ctypes.c_ubyte))]
-
-    def blob(value):
-        buffer = ctypes.create_string_buffer(value)
-        return buffer, Blob(len(value), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_ubyte)))
-
-    crypt = ctypes.WinDLL("crypt32", use_last_error=True)
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel.LocalFree.argtypes = [ctypes.c_void_p]
-    kernel.LocalFree.restype = ctypes.c_void_p
-    raw_buffer, source = blob(raw)
-    entropy_buffer, extra = blob(entropy)
-    output = Blob()
-    function = crypt.CryptUnprotectData if decrypt else crypt.CryptProtectData
-    function.argtypes = [ctypes.POINTER(Blob), ctypes.c_void_p, ctypes.POINTER(Blob),
-                         ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(Blob)]
-    function.restype = wintypes.BOOL
-    if not function(ctypes.byref(source), None, ctypes.byref(extra),
-                    None, None, 1, ctypes.byref(output)):
-        raise ContextError("service_context_decryption_failed" if decrypt
-                           else "service_context_encryption_failed")
-    try:
-        return ctypes.string_at(output.data, output.size)
-    finally:
-        kernel.LocalFree(output.data)
+    return raw
 
 
 def capture(config, binding):

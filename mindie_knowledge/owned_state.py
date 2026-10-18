@@ -1,4 +1,19 @@
-"""Open authoritative SQLite state without turning damage into first use."""
+"""[Role] Authoritative SQLite state opener and schema integrity guard.
+
+[Invariants]
+- An existing database is never silently recreated or truncated on corruption;
+  missing tables, missing columns, 0-byte files, or leftover WAL/SHM/journal
+  files without the main database raise ValueError immediately.
+- Read-only probes (`initialize_missing=False`) never create directories, lock
+  files, or empty SQLite files when the database has never been initialized.
+
+[Timeouts & Locks]
+- Cross-process initialization is serialized by `StartLock(<db>.init.lock)` with
+  a bounded `timeout` (default 10.0s) and SQLite `timeout` (default 5.0s) in WAL mode.
+
+[Side-Effect Policy]
+- Local filesystem and SQLite state only; zero network or subprocess execution.
+"""
 from functools import lru_cache
 import errno
 import os
@@ -34,14 +49,12 @@ def _present(path):
     try:
         path.lstat()
         return True
-    except FileNotFoundError as missing:
+    except FileNotFoundError:
         for parent in path.parents:
             if parent.exists():
                 if not parent.is_dir():
                     raise NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR), str(parent)) from None
                 return False
-            if parent.is_symlink():
-                raise missing from None
         return False
 
 

@@ -1,19 +1,21 @@
-"""``submit_batch`` / ``reconcile_batch``: the outbound publication machine.
+"""[Role] Idempotent outbound Git + GitHub PR publication and read-only reconciliation state machine (`submit_batch` / `reconcile_batch`).
 
-Ordering guarantees, all backed by the durable ledger in ``state_dir``:
+[Invariants]
+- Re-verifies `live_gate(settings)` before every local Git mutation and before
+  every outbound network request (`fork`, `push`, `create_pr`, `update_pr`).
+- Durable `Ledger` records `intent` and step receipts BEFORE each external write;
+  interrupted or timed-out writes stay `unknown` and are resolved strictly via
+  bounded read-only reconciliation (`_resolve_unknown`), never by blind re-pushes.
+- A succeeded remote effect (`submitted` / `updated`) is preserved even if the
+  subsequent local receipt write fails (`_CompletedEffectReceiptFailure` / `recording_failed=True`).
 
-1. The sharing gate is re-read before Git mutation and again before every
-   single outbound request; ``disabled`` stops without touching anything.
-2. The publication intent row and step receipts land BEFORE the effect they
-   name. A crash between steps leaves an ``intent``/``unknown`` row, which is
-   resolved by bounded read-only reconciliation — never by blind re-writes.
-3. Idempotence keys on the candidate digest (content revision), not on event
-   identity: a resubmitted batch with the same revision returns the recorded
-   receipt; a failed or unresolved revision is never automatically resent.
-4. Our own open PR is updated in place (new commit on top, no force push);
-   a merged prior PR plus a genuine new delta creates a follow-up PR that
-   references the merged one. Conflicts and base divergence park the batch as
-   ``needs_review`` without overwriting anyone's edits.
+[Timeouts & Locks]
+- Bounded by `Deadline(transaction_seconds, operation_limit, cancel=cancel)` across
+  all Git and GitHub transport operations.
+
+[Side-Effect Policy]
+- Mutates local staging repo (`state_dir/repo`), user fork branch
+  (`mindie-contribute/<domain>/<batch_id>`), and upstream GitHub PRs via `Transport`.
 """
 
 from __future__ import annotations

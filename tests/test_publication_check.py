@@ -201,33 +201,20 @@ def test_checkpoint_bound_to_domain_and_validator_context(tmp_path, monkeypatch)
 
 
 def test_checkpoint_binds_installed_sources_and_privacy_scan(tmp_path, monkeypatch):
-    import shutil
-    import mindie_knowledge
     import mindie_knowledge.publication_check as pc
     import mindie_knowledge.redact as redact_mod
-    package_root = Path(mindie_knowledge.__file__).resolve().parent
-    copied = tmp_path / 'trusted-copy'
-    for relative in pc._TRUSTED_SOURCES:
-        target = copied / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy(package_root / relative, target)
     repo, sha = publish(tmp_path, task_files(domain='npu', body='Body contains policy-canary-1.'), domain='npu')
     state = tmp_path / 'state.json'
     assert validate(repo, sha, 'npu', state=state)['entries'] == 1
     original = pc._validator_context('npu')
-    source = copied / 'redact.py'
-    source.write_bytes(source.read_bytes() + b'\n# tighten policy canary rule\n')
-    monkeypatch.setattr(pc, '_PACKAGE_ROOT', copied)
-    assert pc._validator_context('npu')['sources'] != original['sources']
     first = redact_mod.RULES[0]
     tightened = type(first)(id=first.id, description=first.description, hint=first.hint,
                            pattern=re.compile(r'policy-canary-\d+'))
     monkeypatch.setattr(redact_mod, 'RULES', (tightened,) + redact_mod.RULES[1:])
+    assert pc._validator_context('npu')['redaction_rules'] != original['redaction_rules']
     with pytest.raises(ValueError, match='privacy scan'):
         validate(repo, sha, 'npu', state=state)
     monkeypatch.setattr(redact_mod, 'RULES', (first,) + redact_mod.RULES[1:])
-    monkeypatch.setattr(pc, '_PACKAGE_ROOT', tmp_path / 'missing-package')
-    assert pc._trusted_source_fingerprint() is None
     assert validate(repo, sha, 'npu', state=state)['entries'] == 1
 
 

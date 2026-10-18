@@ -30,14 +30,12 @@ def _present(path):
     try:
         path.lstat()
         return True
-    except FileNotFoundError as missing:
+    except FileNotFoundError:
         for parent in path.parents:
             if parent.exists():
                 if not parent.is_dir():
                     raise NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR), str(parent)) from None
                 return False
-            if parent.is_symlink():
-                raise missing from None
         return False
 
 

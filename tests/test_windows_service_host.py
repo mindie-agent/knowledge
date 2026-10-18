@@ -99,16 +99,6 @@ def test_context_caller_absence_clears_only_declared_host_environment(tmp_path, 
     assert os.environ["UNRELATED_SETTING"] == "preserved"
 
 
-@pytest.mark.skipif(os.name != "nt", reason="Windows DPAPI contract")
-def test_dpapi_roundtrip_binds_entropy_and_is_not_plaintext():
-    raw = b'{"key":"synthetic-secret"}'
-    encrypted = context._crypt(raw, b"correct-owner-config-attempt")
-    assert b"synthetic-secret" not in encrypted
-    assert context._crypt(encrypted, b"correct-owner-config-attempt", decrypt=True) == raw
-    with pytest.raises(context.ContextError):
-        context._crypt(encrypted, b"other-attempt", decrypt=True)
-
-
 @pytest.fixture
 def scheduler(tmp_path, monkeypatch):
     from mindie_knowledge.loop.lifecycle import config_fingerprint

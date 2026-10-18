@@ -1,8 +1,19 @@
-"""One-call LangMem indexing of complete new material, with durable receipts.
+"""[Role] Bounded LangMem incremental block-indexing contract and durable `SummaryLedger` receipt state machine.
 
-Markdown is the body authority. This module never stores source text, rewrites a
-body, invokes a provider directly, or retries a model. The caller owns queue
-transactions and scans returned metadata before applying it to current files.
+[Invariants]
+- Markdown blocks (`<= 16 KB`, `<= 8` blocks/batch, `<= 64 KB` prompt) remain the
+  sole body authority; the model returns only per-block `(title, summary)` and
+  task `navigation` JSON (`mindie-summary-outcome/1`), never rewritten bodies.
+- `SummaryLedger` tracks `prepared -> invoking -> returned / failed / outcome_unknown`;
+  an `outcome_unknown` or `returned` attempt never triggers an automatic model replay.
+
+[Timeouts & Locks]
+- All ledger transitions execute inside the caller's `Store._write_txn()` SQLite
+  transaction (`busy_timeout = 5000ms`).
+
+[Side-Effect Policy]
+- Pure validation, prompt budgeting, and SQLite receipt persistence; external
+  worker subprocesses are invoked by `transcript_capture.summarize_due`.
 """
 from __future__ import annotations
 

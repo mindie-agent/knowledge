@@ -1,9 +1,19 @@
-"""Local transcript redaction. No model, network or ambient scanner config.
+"""[Role] Deterministic local transcript secret & privacy redactor (pinned Gitleaks + regex/HMAC rules).
 
-The installer calls install_scanner once; captures only use its pinned binary.
-Gitleaks findings stay in memory and errors never include its output. Existing
-privacy rules cover identities and paths; Gitleaks supplies maintained secret
-detectors. Neither scanner establishes that proprietary prose is public.
+[Invariants]
+- `redact_increment` carries open multi-line PEM private-key state (`{'private_key': ...}`)
+  across incremental transcript chunks so split keys remain masked until `-----END ...-----`.
+- Unions all detector spans (pinned Gitleaks `8.30.1` + `mindie_knowledge.redact.scan_text`
+  + caller `private_paths` across POSIX/Windows/WSL spellings) before replacing
+  text with HMAC-keyed `<redacted:rule:12-hex>` or `[REDACTED_SECRET]` placeholders.
+
+[Timeouts & Locks]
+- Subprocess execution bounded by `REDACTION_TIMEOUT_SECONDS = 30.0` (or
+  `MINDIE_REDACTION_TIMEOUT_SECONDS`) and cancellable via `cancel` event.
+
+[Side-Effect Policy]
+- `redact()` runs local Gitleaks over stdin with isolated config (`--ignore-gitleaks-allow`);
+  `install_scanner()` downloads/verifies the SHA-256 pinned archive only during setup/update.
 """
 from __future__ import annotations
 

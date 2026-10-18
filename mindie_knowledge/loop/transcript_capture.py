@@ -1,4 +1,24 @@
-"""Authorized public material capture and one shared incremental index queue."""
+"""[Role] Incremental public-transcript capture and single-batch LangMem summary worker driver.
+
+[Invariants]
+- `capture()` deterministically redacts new transcript ranges (`prepare_increment`)
+  and commits immutable 16 KB Markdown blocks + `material_streams` cursor in a
+  single SQLite write transaction with `model_calls=0`.
+- `summarize_due()` claims one pending batch in `SummaryLedger`, invokes the
+  configured summary worker (`bounded_run`), persists the raw outcome immediately
+  via `on_result=save_result`, and redacts returned `(title, summary, navigation)`
+  before applying headers to `MaterialStore`.
+- Any failure after worker spawn without a `not_started` marker records
+  `outcome_unknown` and never automatically replays the paid model call.
+
+[Timeouts & Locks]
+- Settles `SUMMARY_SETTLE_SECONDS = 3` after capture activity; summary subprocess
+  bounded by `MINDIE_SUMMARY_TIMEOUT_SECONDS` (default `120.0s`).
+
+[Side-Effect Policy]
+- Executes local Gitleaks redaction and summary worker subprocesses under
+  cancellable `OperationOwner` scopes.
+"""
 from __future__ import annotations
 
 import json

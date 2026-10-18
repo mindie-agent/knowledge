@@ -1,10 +1,19 @@
-"""Markdown authority with stable material blocks and small atomic pointers.
+"""[Role] Canonical Markdown material store (`mindie-material-task/1`, `mindie-material-block/1`) and dual-channel `current.json` pointer manager.
 
-The only durable body lives in ordinary Markdown files. A manifest binds ordered
-block hashes, their fallible search headers, and current navigation. Candidate
-manifests let the queue database commit a pointer without overwriting the last
-valid body first; ``retain_current`` retires unreferenced candidates afterwards.
-ReMe owns derived chunking, the file graph, and BM25 (see ``reme_index.py``).
+[Invariants]
+- All durable material bodies live in `tasks/<task_id>/index.md` (`mindie-entry/3`
+  header) and immutable 16 KB `blocks/<block_id>.md` files verified by SHA-256.
+- Candidate revisions are staged under `candidates/<revision>/` before SQLite
+  commits; `retain_current` promotes active `draft`/`feed` pointers in `current.json`
+  and retires unreferenced candidates.
+
+[Timeouts & Locks]
+- Mutations acquire `self._mutex` (`threading.RLock`) and cross-process
+  `StartLock(root / ".write.lock", wait=5.0)`.
+
+[Side-Effect Policy]
+- Local atomic file writes (`os.replace`) and derived `ReMeIndex` updates only;
+  post-commit cleanup failures raise `MaterialCleanupError(committed=True)`.
 """
 
 from __future__ import annotations

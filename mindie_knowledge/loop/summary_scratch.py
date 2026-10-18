@@ -10,8 +10,6 @@ import stat
 import tempfile
 import uuid
 
-from mindie_diagnostics.fallback import _private_mkdir
-
 ENVIRONMENT_KEY = "MINDIE_SUMMARY_SCRATCH"
 
 
@@ -23,7 +21,7 @@ class ScratchOwnershipError(ValueError):
 
 def create_root():
     root = Path(tempfile.gettempdir()) / ("mindie-summary-owner-" + uuid.uuid4().hex)
-    _private_mkdir(root)
+    root.mkdir(mode=0o700, parents=True, exist_ok=False)
     return root
 
 

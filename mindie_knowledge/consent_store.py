@@ -1,34 +1,20 @@
-"""Install-level one-time choices: the single persistent consent authority.
+"""[Role] Persistent installation-profile consent authority (`mindie-consent/1`).
 
-One small JSON document (``mindie-consent/1``) per installation profile. Every
-adapter sharing the profile reads the same saved choice; an isolated profile
-has its own file and never inherits another profile's choice.
+[Invariants]
+- `read(path)` is side-effect-free and strictly distinguishes `ok`, `missing`,
+  `unreadable`, and `corrupt`; damaged files never trigger fresh onboarding or
+  silent opt-in/opt-out fallbacks.
+- `record_choice` and `record_reporting` merge independent fields under a
+  cross-process OS file lock without overwriting untouched keys or clearing
+  corrupt state.
 
-This module is the shared implementation used by adapters and the knowledge
-runtime. Runtime installation does not create or replace the saved choice.
+[Timeouts & Locks]
+- Cross-process exclusive lock (`<path>.lock`) with `LOCK_WAIT_SECONDS = 5.0`
+  and `LOCK_POLL_SECONDS = 0.05`; lock files are retained on close to prevent
+  unlink races across concurrent writers.
 
-Semantics:
-
-- ``read`` has zero side effects and never migrates; it distinguishes
-  ``ok``/``missing``/``unreadable``/``corrupt`` strictly. A damaged document
-  is a fault, never a fresh install and never a guessed opt-in or opt-out.
-- ``record_choice``/``record_reporting`` apply explicit user-intent updates
-  under a cross-process OS lock (never only a thread lock): re-read, merge
-  the other field and every untouched key, then a unique temp file, fsync
-  and an atomic replace. A corrupt or unreadable file is never silently
-  cleared by a field update — the update fails and the bytes stay.
-
-Platform note: on Windows a stdlib ``open`` shares read/write but denies
-delete, and MoveFileExW (``os.replace``) refuses a destination with ANY
-open handle — even one opened with FILE_SHARE_DELETE (CPython issue 90161).
-This module therefore does BOTH halves: reads open with FILE_SHARE_DELETE
-(``_open_for_read``), and writes supersede via the NTFS POSIX-semantics
-rename ``SetFileInformationByHandle(FileRenameInfoEx, REPLACE_IF_EXISTS|
-POSIX_SEMANTICS)`` (``_atomic_replace``), which tolerates existing handles
-and keeps old handles valid for reads. On a filesystem/platform without
-that support the write fails honestly with the preserved document and the
-original WinError — no retry wrapper, no fallback that would silently
-change semantics.
+[Side-Effect Policy]
+- Atomic local file replacement via `tempfile.mkstemp` + `os.fsync` + `os.replace`.
 """
 
 from __future__ import annotations

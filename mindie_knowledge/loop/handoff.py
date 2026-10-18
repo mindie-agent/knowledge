@@ -1,6 +1,21 @@
-"""Short Stop handoff into the existing capture table, plus one service wake.
+"""[Role] Fast Stop-hook capture admission and single-flight background service wake (`handoff`).
 
-Stop does not migrate the store, open a transcript, or call a model.
+[Invariants]
+- Stop-hook execution must stay lightweight: it checks `CommunitySettings`,
+  `Admission` lease, and existing `state-v4.sqlite3` schema (`SchemaNotReady` if
+  uninitialized), then inserts a pending row into `captures` without opening
+  transcripts, migrating storage, or calling any LLM.
+- Deduplicates events via `_event_hash(harness, kind, session, key)` and durable
+  `Admission.claim`.
+
+[Timeouts & Locks]
+- Uses `WAKE_PROBE_SECONDS = 2.0` for control-plane RPC liveness probing and
+  non-blocking `StartLock(wake.lock, wait=0)` so concurrent Stop hooks never
+  pile up spawning duplicate service starters.
+
+[Side-Effect Policy]
+- Writes at most one `captures` row and spawns at most one detached background
+  service starter via `service_host`.
 """
 
 from __future__ import annotations
