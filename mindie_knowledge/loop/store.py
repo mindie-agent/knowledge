@@ -455,6 +455,7 @@ class Store:
             if self.db.in_transaction:
                 yield
                 return
+            self.db.assert_authority()
             self.db.execute("BEGIN IMMEDIATE")
             try:
                 yield

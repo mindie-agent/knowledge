@@ -132,14 +132,14 @@ def test_summary_checks_cached_authority_and_preserves_returned_effect(pipeline,
     engine.last_activity = 0
     with store._write_txn():
         store.db.execute('UPDATE transcript_tasks SET summary_due=0')
-    marker = store.root / 'state-v4.sqlite3.owner'
+    db_path = store.root / 'state-v4.sqlite3'
     original_commit, original_run = store.db.commit, transcript_capture.bounded_run
     calls, removed = [], []
     def remove_after_claim_commit():
         original_commit()
         rows = sqlite3.Connection.execute(store.db, "SELECT count(*) FROM material_summary_attempts WHERE status='invoking'").fetchone()[0]
         if failure_point == 'before-invoke' and rows and not removed:
-            marker.unlink()
+            db_path.unlink()
             removed.append(True)
     def run_with_actual_return(command, payload, **kwargs):
         if '--identity' not in command:
@@ -147,7 +147,7 @@ def test_summary_checks_cached_authority_and_preserves_returned_effect(pipeline,
             if failure_point == 'returned':
                 save = kwargs['on_result']
                 def lose_authority(raw):
-                    marker.unlink()
+                    db_path.unlink()
                     return save(raw)
                 kwargs['on_result'] = lose_authority
         return original_run(command, payload, **kwargs)

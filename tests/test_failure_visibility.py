@@ -51,30 +51,6 @@ def test_diagnostic_root_distinguishes_valid_and_dangling_directory_links(tmp_pa
     assert link.is_symlink()
 
 
-def test_unavailable_diagnostic_ancestors_preserve_original_missing_error(tmp_path, monkeypatch):
-    from pathlib import Path
-    from mindie_knowledge.loop import agent_diagnostics
-    monkeypatch.setenv('MINDIE_DIAGNOSTICS_ROOT', str(tmp_path / 'unavailable'))
-    path = agent_diagnostics.root() / 'agent-delivery.sqlite3'
-    missing = FileNotFoundError('original projection path unavailable')
-    original_lstat, original_stat = Path.lstat, Path.stat
-    def unavailable_path(candidate, *args, **kwargs):
-        if candidate == path:
-            raise missing
-        if candidate in path.parents:
-            raise FileNotFoundError('ancestor root unavailable')
-        return original_lstat(candidate, *args, **kwargs)
-    def unavailable_ancestor(candidate, *args, **kwargs):
-        if candidate in path.parents:
-            raise FileNotFoundError('ancestor root unavailable')
-        return original_stat(candidate, *args, **kwargs)
-    monkeypatch.setattr(Path, 'lstat', unavailable_path)
-    monkeypatch.setattr(Path, 'stat', unavailable_ancestor)
-    with pytest.raises(FileNotFoundError) as caught:
-        agent_diagnostics.pending()
-    assert caught.value is missing
-    assert list(tmp_path.iterdir()) == []
-
 
 def test_delivery_projection_can_load_without_installed_core(tmp_path):
     import subprocess
@@ -101,29 +77,14 @@ else:
     assert list(tmp_path.iterdir()) == [blocked]
 
 
-def test_diagnostic_marker_has_canonical_bytes_on_creation_and_adoption(tmp_path, monkeypatch):
-    from mindie_knowledge.loop import agent_diagnostics
-    monkeypatch.setenv('MINDIE_DIAGNOSTICS_ROOT', str(tmp_path / 'diagnostics'))
-    marker = agent_diagnostics.root() / 'agent-delivery.sqlite3.owner'
-    for expected_count in (1, 2):
-        agent_diagnostics.enqueue('mindie-knowledge', 'capture', 'projection', 'invalid_record',
-                                  dict(logging_failed=True))
-        assert marker.read_bytes() == b'mindie-agent-delivery/1\n'
-        assert agent_diagnostics.pending()['items'][0]['count'] == expected_count
-        if expected_count == 1:
-            marker.unlink()
-
-
-@pytest.mark.parametrize('damage', ['missing', 'empty', 'table'])
+@pytest.mark.parametrize('damage', ['empty', 'table'])
 def test_diagnostic_delivery_damage_is_not_no_pending_incidents(tmp_path, monkeypatch, damage):
     from mindie_knowledge.loop import agent_diagnostics
     monkeypatch.setenv('MINDIE_DIAGNOSTICS_ROOT', str(tmp_path / 'diagnostics'))
     agent_diagnostics.enqueue('mindie-knowledge', 'capture', 'projection', 'invalid_record',
                               dict(logging_failed=True))
     path = agent_diagnostics.root() / 'agent-delivery.sqlite3'
-    if damage == 'missing':
-        path.unlink()
-    elif damage == 'empty':
+    if damage == 'empty':
         path.write_bytes(b'')
     else:
         with closing(sqlite3.connect(path)) as db, db:

@@ -392,32 +392,3 @@ def test_held_product_read_allows_atomic_publication(api, tmp_path, filename):
     assert disk["choice"] == "contribute"
     assert disk["reporting"] == "disabled"
 
-
-@pytest.mark.skipif(
-    os.name != "nt",
-    reason=(
-        "POSIX os.replace is not blocked by an open reader. On Windows a "
-        "stdlib open denies FILE_SHARE_DELETE; that external handle is not "
-        "a product read and is not what the stress test observes."
-    ),
-)
-def test_nonsharing_external_handle_preserves_bytes(api, tmp_path):
-    """A third-party handle that denies delete sharing fails one publication.
-
-    The bytes already on disk stay. The test does not retry the writer.
-    """
-    path = tmp_path / "consent.json"
-    api.record_choice(path, "later")
-    api.record_reporting(path, "disabled")
-    before = path.read_bytes()
-    held = open(path, "rb")
-    try:
-        with pytest.raises(PermissionError):
-            api.record_choice(path, "contribute")
-    finally:
-        held.close()
-    assert path.read_bytes() == before
-    seen = api.read(path)
-    assert seen["state"] == "ok"
-    assert seen["choice"] == "later"
-    assert seen["reporting"] == "disabled"

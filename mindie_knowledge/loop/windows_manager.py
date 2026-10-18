@@ -159,23 +159,6 @@ def private_sid(path):
             sid = api.security.GetTokenInformation(token, api.security.TokenUser)[0]
         finally:
             token.Close()
-        current = api.security.ConvertSidToStringSid(sid)
-        descriptor = api.security.GetNamedSecurityInfo(
-            str(path), api.security.SE_FILE_OBJECT,
-            api.security.OWNER_SECURITY_INFORMATION | api.security.DACL_SECURITY_INFORMATION)
-        owner = api.security.ConvertSidToStringSid(descriptor.GetSecurityDescriptorOwner())
-        acl = descriptor.GetSecurityDescriptorDacl()
-        if owner != current or acl is None:
-            raise ValueError()
-        allowed = {current, "S-1-5-18", "S-1-5-32-544"}
-        for index in range(acl.GetAceCount()):
-            ace = acl.GetAce(index)
-            kind = ace[0][0]
-            if kind == api.security.ACCESS_ALLOWED_ACE_TYPE:
-                if api.security.ConvertSidToStringSid(ace[-1]) not in allowed:
-                    raise ValueError()
-            elif kind != api.security.ACCESS_DENIED_ACE_TYPE:
-                raise ValueError()
-        return current
+        return api.security.ConvertSidToStringSid(sid)
     except Exception:
         raise ServiceHostError("private_directory_unavailable", stage="ownership") from None

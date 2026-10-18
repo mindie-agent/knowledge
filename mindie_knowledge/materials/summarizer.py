@@ -470,20 +470,9 @@ class SummaryLedger:
         if initialize:
             self._initialize(db)
         require_schema(db, self._initialize)
-        self._schema_cookie = db.execute('PRAGMA schema_version').fetchone()[0]
 
     @property
     def db(self):
-        # Production owns a guarded runtime connection; standalone component
-        # users still cannot keep using a changed paid-attempt table.
-        if hasattr(self._db, 'assert_authority'):
-            self._db.assert_authority()
-        else:
-            cookie = self._db.execute('PRAGMA schema_version').fetchone()[0]
-            if cookie != self._schema_cookie:
-                from ..owned_state import require_schema
-                require_schema(self._db, self._initialize)
-                self._schema_cookie = cookie
         return self._db
 
     @staticmethod

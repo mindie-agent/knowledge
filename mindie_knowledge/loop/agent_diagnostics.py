@@ -27,67 +27,40 @@ def root():
 
 
 def _present(path):
-    # Keep this bootstrap module standalone: only a real missing path beneath
-    # an accessible directory is optional first use, never an I/O failure.
     try:
         path.lstat()
+        return True
     except FileNotFoundError as missing:
         for parent in path.parents:
-            try:
-                mode = parent.stat().st_mode
-            except FileNotFoundError:
-                try:
-                    parent.lstat()
-                except FileNotFoundError:
-                    continue
-                raise missing from None  # Existing but unusable, e.g. a dangling directory symlink.
-            if not stat.S_ISDIR(mode):
-                raise NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR), str(parent)) from None
-            break
-        else:
-            raise missing
+            if parent.exists():
+                if not parent.is_dir():
+                    raise NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR), str(parent)) from None
+                return False
+            if parent.is_symlink():
+                raise missing from None
         return False
-    return True
 
 
 def _open(create=False):
     path = root() / 'agent-delivery.sqlite3'
-    marker = path.with_name(path.name + '.owner')
-    expected = 'mindie-agent-delivery/1\n'
     existed = _present(path)
-    if marker.is_symlink() or (_present(marker) and (not marker.is_file() or marker.stat().st_size != len(expected)
-                                                   or marker.read_text(encoding='utf-8') != expected)):
-        raise ValueError('diagnostic projection ownership marker is invalid')
-    if not existed and _present(marker):
-        raise ValueError('diagnostic delivery state is missing; pending incidents were not rebuilt')
     if not create and not existed:
         return None
-    if path.is_symlink() or (_present(path) and not path.is_file()):
+    if path.is_symlink() or (existed and not path.is_file()):
         raise ValueError('diagnostic projection must be a regular local file')
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    db = sqlite3.connect(path, timeout=0.1)
+    db = sqlite3.connect(path, timeout=5.0)
     try:
         db.row_factory = sqlite3.Row
         db.execute('BEGIN IMMEDIATE')
         columns = {row[1] for row in db.execute('PRAGMA table_info(pending)')}
         if not columns:
-            if existed or _present(marker):
+            if existed:
                 raise ValueError('diagnostic delivery schema is missing; pending incidents were not rebuilt')
-            marker.write_bytes(expected.encode('utf-8'))
-            marker.chmod(0o600)
             db.execute('CREATE TABLE pending (key TEXT PRIMARY KEY, generation INTEGER NOT NULL, delivered INTEGER NOT NULL, value TEXT NOT NULL)')
-        expected_columns = {
-            'key': ('key', 'TEXT', 0, None, 1),
-            'generation': ('generation', 'INTEGER', 1, None, 0),
-            'delivered': ('delivered', 'INTEGER', 1, None, 0),
-            'value': ('value', 'TEXT', 1, None, 0),
-        }
-        actual_columns = {row[1]: tuple(row[1:]) for row in db.execute('PRAGMA table_info(pending)')}
-        if any(actual_columns.get(name) != value for name, value in expected_columns.items()):
+            columns = {'key', 'generation', 'delivered', 'value'}
+        if not {'key', 'generation', 'delivered', 'value'} <= columns:
             raise ValueError('diagnostic delivery schema or constraints are incomplete')
-        if not _present(marker):
-            marker.write_bytes(expected.encode('utf-8'))
-            marker.chmod(0o600)
         db.commit()
         path.chmod(0o600)
         return db

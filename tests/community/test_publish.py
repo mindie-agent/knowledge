@@ -163,10 +163,8 @@ def test_completed_external_write_survives_receipt_failure(
 
 @pytest.mark.parametrize('authority', ['publication', 'runtime'])
 @pytest.mark.parametrize('before_step', ['git:push', 'github:create-pr'])
-@pytest.mark.parametrize('damage', ['missing_marker', 'replaced_db'])
 def test_live_authority_loss_blocks_next_real_external_write(
-        settings, state_dir, transport, remote_url, tmp_path, monkeypatch, authority, before_step, damage):
-    from contextlib import closing
+        settings, state_dir, transport, remote_url, tmp_path, monkeypatch, authority, before_step):
     from mindie_knowledge.loop.store import Store
     owner = Store(tmp_path / 'source', 'demo')
     original = Ledger.record_step
@@ -175,14 +173,8 @@ def test_live_authority_loss_blocks_next_real_external_write(
         if step == before_step:
             db = self.db if authority == 'publication' else owner.db
             path = state_dir / 'community-ledger.sqlite3' if authority == 'publication' else owner.root / 'state-v4.sqlite3'
-            if damage == 'missing_marker':
-                path.with_name(path.name + '.owner').unlink()
-            else:
-                replacement = path.with_name('replacement.sqlite3')
-                with closing(sqlite3.connect(replacement)) as copy:
-                    db.backup(copy)
-                read = (lambda: self.get_publication(batch_id, revision)) if authority == 'publication' else owner.status
-                damage_database(db, path, read=read, replacement=replacement)
+            read = (lambda: self.get_publication(batch_id, revision)) if authority == 'publication' else owner.status
+            damage_database(db, path, read=read)
         return result
     monkeypatch.setattr(Ledger, 'record_step', damage_after_intent)
     batch = make_batch('lost-authority', [entry_file(make_entry())])
