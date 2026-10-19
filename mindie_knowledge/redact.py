@@ -145,6 +145,18 @@ _UUID = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
 )
 _TOKEN_CANDIDATE = re.compile(r"[A-Za-z0-9+/_=-]{32,}")
+_PINNED_SOURCE_URL = re.compile(
+    r"(?<![\w:/])https://(?:github\.com|gitcode\.com)/"
+    r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/blob/[0-9a-f]{40}/"
+    r"[A-Za-z0-9_./-]+(?:#L[1-9][0-9]*(?:-L[1-9][0-9]*)?)?"
+    r"(?=$|[\s\"'`<>)\],;])"
+)
+
+
+def _mixed_opaque_token(token: str) -> bool:
+    return (len(token) >= 32 and not _HEX.fullmatch(token) and not _UUID.fullmatch(token)
+            and any(c.isupper() for c in token) and any(c.islower() for c in token)
+            and any(c.isdigit() for c in token))
 
 
 def _high_entropy_tokens(text: str) -> Iterator[tuple[int, int]]:
@@ -154,14 +166,21 @@ def _high_entropy_tokens(text: str) -> Iterator[tuple[int, int]]:
     identifiable and are not credentials, so they are excluded; everything
     else that is >= 32 chars and mixes upper, lower and digits is reported.
     """
+    source_urls = [match.span() for match in _PINNED_SOURCE_URL.finditer(text)]
+    source_index = 0
     for m in _TOKEN_CANDIDATE.finditer(text):
         tok = m.group()
-        if _HEX.match(tok) or _UUID.match(tok):
-            continue
-        has_upper = any(c.isupper() for c in tok)
-        has_lower = any(c.islower() for c in tok)
-        has_digit = any(c.isdigit() for c in tok)
-        if has_upper and has_lower and has_digit:
+        while source_index < len(source_urls) and source_urls[source_index][1] <= m.start():
+            source_index += 1
+        if (source_index < len(source_urls) and source_urls[source_index][0] <= m.start()
+                and m.end() <= source_urls[source_index][1]):
+            # A commit and an uppercase filename separated by real URL path
+            # boundaries are not one opaque token. This is tokenization, not a
+            # host allowlist: every segment and every other rule still runs.
+            for segment in re.finditer(r"[^/]+", tok):
+                if _mixed_opaque_token(segment.group()):
+                    yield m.start() + segment.start(), m.start() + segment.end()
+        elif _mixed_opaque_token(tok):
             yield m.span()
 
 

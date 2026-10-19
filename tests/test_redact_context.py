@@ -21,6 +21,25 @@ HEX64_A = "a" * 64
 HEX64_B = "b" * 64
 
 
+class PinnedSourceUrlEntropyTests(unittest.TestCase):
+    def test_reviewed_skill_and_gitcode_sources_keep_path_boundaries(self):
+        urls = (
+            'https://github.com/obra/superpowers/blob/b7a8f76985f1e93e75dd2f2a3b424dc731bd9d37/skills/requesting-code-review/SKILL.md#L8-L22',
+            'https://gitcode.com/Ascend/msprof-analyze/blob/639eb8702c1884813dfab59ddb371f7838caab6d/msprof_analyze/cluster_analyse/operator_mfu.py#L41-L170',
+        )
+        for url in urls:
+            self.assertNotIn('credential-high-entropy', rules_hit(url))
+            self.assertNotIn('credential-high-entropy', rules_hit('[source](' + url + ')'))
+
+    def test_source_url_does_not_hide_secret_segments_parameters_or_userinfo(self):
+        base = 'https://github.com/obra/superpowers/blob/' + 'b7a8f76985f1e93e75dd2f2a3b424dc731bd9d37/'
+        secret = 'SyntheticOnlySecretValue9876543210ABCxyz'
+        for value in (base + secret + '/SKILL.md', base + 'SKILL.md?token=' + secret,
+                      base.replace('https://', 'https://user:password@')):
+            self.assertTrue(any(rule.startswith('credential-') for rule in rules_hit(value)), value)
+        self.assertIn('credential-high-entropy', rules_hit(base.replace('/blob/', '/tree/') + 'SKILL.md'))
+
+
 class MindieRefUsernameAtHostTests(unittest.TestCase):
     def test_complete_tokens_are_not_username_at_host(self):
         tokens = (
