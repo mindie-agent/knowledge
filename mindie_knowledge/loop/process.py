@@ -130,6 +130,13 @@ def _spawn(command, stdin, scratch=None, child_env=None):
 
 def _posix_group_has_writers(pgid, *, timeout):
     """Inspect only process metadata; a zombie cannot write to owned scratch."""
+    if sys.platform == "darwin":
+        from .darwin_process import group_has_writers
+        return group_has_writers(pgid, timeout=timeout)
+    return _ps_group_has_writers(pgid, timeout=timeout)
+
+
+def _ps_group_has_writers(pgid, *, timeout):
     if sys.platform != "darwin" and not sys.platform.startswith("linux"):
         raise RuntimeError("owned process group inspection is unsupported")
     # BSD -g selects a process group; Linux -g selects a numeric session.

@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -28,7 +29,7 @@ pytestmark = pytest.mark.skipif(
 def test_metadata_requires_no_live_writer(monkeypatch, stdout, expected):
     run = Mock(return_value=subprocess.CompletedProcess([], 0, stdout, ""))
     monkeypatch.setattr(process.subprocess, "run", run)
-    assert process._posix_group_has_writers(10, timeout=.5) is expected
+    assert process._ps_group_has_writers(10, timeout=.5) is expected
     assert run.call_args.args[0] == [
         "/bin/ps", "-o", "pid=,pgid=,stat=", "-g", "10",
     ]
@@ -43,14 +44,14 @@ def test_failed_or_malformed_inspection_is_not_absence(monkeypatch, code, stdout
         return_value=subprocess.CompletedProcess([], code, stdout, stderr),
     ))
     with pytest.raises(RuntimeError):
-        process._posix_group_has_writers(10, timeout=.5)
+        process._ps_group_has_writers(10, timeout=.5)
 
 
 def test_supported_ps_empty_selection_is_absence(monkeypatch):
     monkeypatch.setattr(process.subprocess, "run", Mock(
         return_value=subprocess.CompletedProcess([], 1, "", ""),
     ))
-    assert not process._posix_group_has_writers(10, timeout=.5)
+    assert not process._ps_group_has_writers(10, timeout=.5)
 
 
 def test_metadata_query_replaces_bogus_inherited_terminal_dimensions(monkeypatch):
@@ -58,7 +59,7 @@ def test_metadata_query_replaces_bogus_inherited_terminal_dimensions(monkeypatch
     monkeypatch.setenv("LINES", "1")
     run = Mock(return_value=subprocess.CompletedProcess([], 1, "", ""))
     monkeypatch.setattr(process.subprocess, "run", run)
-    assert not process._posix_group_has_writers(10, timeout=.5)
+    assert not process._ps_group_has_writers(10, timeout=.5)
     assert run.call_args.kwargs["env"]["COLUMNS"] == "80"
     assert run.call_args.kwargs["env"]["LINES"] == "24"
     assert os.environ["COLUMNS"] == "131072" and os.environ["LINES"] == "1"
@@ -149,3 +150,33 @@ def test_real_group_transitions_from_writer_to_zombie_to_absent(tmp_path):
             if original_error is None:
                 raise
             original_error.add_note("synthetic keeper cleanup required termination")
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS Seatbelt and libproc")
+def test_real_summary_cleanup_inside_sandbox_without_setuid_ps(tmp_path):
+    profile = tmp_path / "cleanup.sb"
+    profile.write_text('(version 1)\n(allow default)\n'
+                       '(deny process-exec (literal "/bin/ps"))\n')
+    probe = Path(__file__).parent / "fixtures" / "darwin_summary_cleanup.py"
+    result = subprocess.run(
+        ["/usr/bin/sandbox-exec", "-f", str(profile), sys.executable, "-I", str(probe)],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    import json
+    assert json.loads(result.stdout) == dict(
+        status="returned", owned_scratch_removed=True, cleanup={},
+    )
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS Seatbelt and libproc")
+def test_native_metadata_denial_does_not_report_live_group_absent(tmp_path):
+    profile = tmp_path / "denied-metadata.sb"
+    profile.write_text('(version 1)\n(allow default)\n(deny process-info*)\n')
+    probe = Path(__file__).parent / "fixtures" / "darwin_summary_cleanup.py"
+    result = subprocess.run(
+        ["/usr/bin/sandbox-exec", "-f", str(profile), sys.executable, "-I", str(probe),
+         "--inspect-self"], capture_output=True, text=True, timeout=5,
+    )
+    assert result.returncode != 0
+    assert "PermissionError" in result.stderr
