@@ -1198,8 +1198,12 @@ class Store:
                         for key, r in self._query_rows.items()})
                     self._query_version = cache_version
                 rows, allowed = self._query_rows, self._query_allowed
-                found = self.materials.search(query, limit=limit, conditions=conditions, allowed_ids=allowed,
-                                              continuation=continuation)
+                # A graded-only store has no current material to rank. Keep
+                # legacy cursor validation, but do not load its search engine
+                # when SQLite already proves there are no visible entries.
+                found = (self.materials.search(query, limit=limit, conditions=conditions, allowed_ids=allowed,
+                                               continuation=continuation)
+                         if rows or continuation is not None else [])
             except QueryContinuationError:
                 raise
             except (OSError, ValueError, TypeError, KeyError, sqlite3.Error) as exc:

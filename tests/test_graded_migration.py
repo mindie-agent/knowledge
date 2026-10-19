@@ -127,3 +127,37 @@ def test_only_verified_same_feed_format_switch_retires_legacy_membership_without
     assert all(path.exists() for path in old_files)
     with pytest.raises(ReadReferenceError):
         store.explain(previous["ref"])
+
+
+def test_graded_only_query_skips_legacy_engine_until_visible_material_arrives(store, tmp_path, monkeypatch):
+    from mindie_knowledge.materials.provenance import QueryContinuationError
+    searches = []
+    search = store.materials.search
+
+    def observed_search(*args, **kwargs):
+        searches.append(kwargs.get("continuation"))
+        return search(*args, **kwargs)
+
+    monkeypatch.setattr(store.materials, "search", observed_search)
+    rule = unit(conditions={"soc": ["Ascend910B"]})
+    store.graded.install([rule])
+    assert store.query("graph", conditions={"soc": "Ascend910B"})["results"][0]["id"] == rule.id
+    assert searches == []
+
+    with closing(MaterialStore(tmp_path / "arriving-author", store.domain)) as author:
+        blocks = [dict(block_id=hashlib.sha256(str(index).encode()).hexdigest(),
+                       text="Legacy graph observation.", title="Legacy graph", summary="Graph material.",
+                       source_range={"part": index}) for index in range(5)]
+        author.append_batch("a" * 64, blocks, "Legacy graph.", title="Legacy graph", status="complete", promote=True)
+        store.install_feed([author.export_task("a" * 64)], feed_ident="arriving-feed")
+    mixed = store.query("graph", conditions={"soc": "Ascend910B"}, limit=4)
+    assert {row["source"] for row in mixed["results"]} == {"graded", "legacy_material"}
+    cursor = next(row["related_next"] for row in mixed["results"] if row.get("related_next"))
+    assert searches == [None]
+
+    store.install_feed([], feed_ident="arriving-feed")
+    assert store.query("graph", conditions={"soc": "Ascend910B"})["results"][0]["id"] == rule.id
+    assert searches == [None]
+    with pytest.raises(QueryContinuationError):
+        store.query(continuation=cursor, limit=1)
+    assert searches == [None, cursor]
