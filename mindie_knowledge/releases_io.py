@@ -24,6 +24,7 @@ MAX_PAGES = 100
 _COMPATIBILITY_PATHS = {
     "codex": "plugins/mindie-agent/harness-compatibility.json",
     "claude-code": "harness-compatibility.json",
+    "kimi-code": "harness-compatibility.json",
 }
 
 

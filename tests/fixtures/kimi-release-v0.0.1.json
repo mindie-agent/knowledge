@@ -1,0 +1,130 @@
+{
+  "schema": "mindie-plugin-release/1",
+  "version": "0.0.1",
+  "source": {
+    "repository": "mindie-agent/mindie-agent-kimi",
+    "sha": "7ef0ed156eca9a752200d66d2832e2715cc514f2"
+  },
+  "compatibility": {
+    "schema": "mindie-harness-compatibility/1",
+    "harness": "kimi-code",
+    "supported": [
+      {"include_prerelease": false, "minimum": "2.1.1", "maximum": "2.1.1", "maximum_inclusive": true},
+      {"include_prerelease": false, "minimum": "2.2.0", "maximum": "2.2.0", "maximum_inclusive": true}
+    ],
+    "used_interfaces": [
+      "plugin.web-api-install",
+      "hooks.pretool-payload",
+      "hooks.stop-payload",
+      "mcp.stdio-jsonl",
+      "wire.skill-activation",
+      "wire.plugin-command",
+      "plugin.commands",
+      "skill.unified-entry",
+      "session.wire-jsonl",
+      "home.config-layout",
+      "summary.native-prompt-mode"
+    ],
+    "interface_registry": {
+      "plugin.web-api-install": {
+        "code_paths": ["scripts/install_kimi_plugin.py:main", "scripts/updater.py:_install_native", "scripts/updater.py:_readback"],
+        "evidence_refs": ["docs/update.md"],
+        "supported": [
+          {"include_prerelease": false, "minimum": "2.1.1", "maximum": "2.1.1", "maximum_inclusive": true},
+          {"include_prerelease": false, "minimum": "2.2.0", "maximum": "2.2.0", "maximum_inclusive": true}
+        ],
+        "test_ids": ["tests/test_setup_install.py"]
+      },
+      "hooks.pretool-payload": {
+        "code_paths": ["scripts/bridge.py:handle_pretool", "scripts/identity.py:publish_nonce_bind"],
+        "evidence_refs": ["docs/framework-stability.md"],
+        "supported": [
+          {"include_prerelease": false, "minimum": "2.1.1", "maximum": "2.1.1", "maximum_inclusive": true},
+          {"include_prerelease": false, "minimum": "2.2.0", "maximum": "2.2.0", "maximum_inclusive": true}
+        ],
+        "test_ids": ["tests/test_identity.py", "tests/test_runtime_contract.py"]
+      },
+      "hooks.stop-payload": {
+        "code_paths": ["scripts/bridge.py:handle_stop"],
+        "evidence_refs": ["docs/framework-stability.md", "docs/service-continuity.md"],
+        "supported": [
+          {"include_prerelease": false, "minimum": "2.1.1", "maximum": "2.1.1", "maximum_inclusive": true},
+          {"include_prerelease": false, "minimum": "2.2.0", "maximum": "2.2.0", "maximum_inclusive": true}
+        ],
+        "test_ids": ["tests/test_independent_contract.py::ConsentGateTests::test_contribute_stop_persists_and_worker_reads_once"]
+      },
+      "mcp.stdio-jsonl": {
+        "code_paths": ["scripts/mcp_server.py", "scripts/mindie_launch.py:_mcp"],
+        "evidence_refs": ["docs/framework-stability.md"],
+        "supported": [
+          {"include_prerelease": false, "minimum": "2.1.1", "maximum": "2.1.1", "maximum_inclusive": true},
+          {"include_prerelease": false, "minimum": "2.2.0", "maximum": "2.2.0", "maximum_inclusive": true}
+        ],
+        "test_ids": ["tests/test_runtime_contract.py", "tests/native/test_mcp_launch.py"]
+      },
+      "wire.skill-activation": {
+        "code_paths": ["scripts/identity.py:_normalize_activation", "scripts/identity.py:_current_skill_activation"],
+        "evidence_refs": ["docs/framework-stability.md"],
+        "supported": [
+          {"include_prerelease": false, "minimum": "2.1.1", "maximum": "2.1.1", "maximum_inclusive": true},
+          {"include_prerelease": false, "minimum": "2.2.0", "maximum": "2.2.0", "maximum_inclusive": true}
+        ],
+        "test_ids": ["tests/test_identity.py"]
+      },
+      "wire.plugin-command": {
+        "code_paths": ["scripts/identity.py:require_current_plugin_command"],
+        "evidence_refs": ["docs/framework-stability.md"],
+        "supported": [
+          {"include_prerelease": false, "minimum": "2.1.1", "maximum": "2.1.1", "maximum_inclusive": true},
+          {"include_prerelease": false, "minimum": "2.2.0", "maximum": "2.2.0", "maximum_inclusive": true}
+        ],
+        "test_ids": ["tests/test_identity.py", "tests/test_entry.py"]
+      },
+      "plugin.commands": {
+        "code_paths": ["commands/", "scripts/entry.py"],
+        "evidence_refs": ["README.md"],
+        "supported": [
+          {"include_prerelease": false, "minimum": "2.1.1", "maximum": "2.1.1", "maximum_inclusive": true},
+          {"include_prerelease": false, "minimum": "2.2.0", "maximum": "2.2.0", "maximum_inclusive": true}
+        ],
+        "test_ids": ["tests/test_entry.py", "tests/test_setup_install.py"]
+      },
+      "skill.unified-entry": {
+        "code_paths": ["skills/mindie-agent/SKILL.md", "scripts/entry.py:op_init"],
+        "evidence_refs": ["README.md"],
+        "supported": [
+          {"include_prerelease": false, "minimum": "2.1.1", "maximum": "2.1.1", "maximum_inclusive": true},
+          {"include_prerelease": false, "minimum": "2.2.0", "maximum": "2.2.0", "maximum_inclusive": true}
+        ],
+        "test_ids": ["tests/test_entry.py", "tests/test_identity.py"]
+      },
+      "session.wire-jsonl": {
+        "code_paths": ["scripts/transcript.py", "scripts/identity.py:_tail_records"],
+        "evidence_refs": ["docs/service-continuity.md"],
+        "supported": [
+          {"include_prerelease": false, "minimum": "2.1.1", "maximum": "2.1.1", "maximum_inclusive": true},
+          {"include_prerelease": false, "minimum": "2.2.0", "maximum": "2.2.0", "maximum_inclusive": true}
+        ],
+        "test_ids": ["tests/test_independent_contract.py::ConsentGateTests::test_fork_capture_drops_inherited_material"]
+      },
+      "home.config-layout": {
+        "code_paths": ["scripts/organizer.py:_profile", "scripts/organizer.py:prepare_isolated_home"],
+        "evidence_refs": ["docs/organizer-diagnostics.md"],
+        "supported": [
+          {"include_prerelease": false, "minimum": "2.1.1", "maximum": "2.1.1", "maximum_inclusive": true},
+          {"include_prerelease": false, "minimum": "2.2.0", "maximum": "2.2.0", "maximum_inclusive": true}
+        ],
+        "test_ids": ["tests/test_admission_organizer.py"]
+      },
+      "summary.native-prompt-mode": {
+        "code_paths": ["scripts/organizer.py:_invoke_native", "scripts/organizer.py:identity"],
+        "evidence_refs": ["docs/organizer-diagnostics.md"],
+        "supported": [
+          {"include_prerelease": false, "minimum": "2.1.1", "maximum": "2.1.1", "maximum_inclusive": true},
+          {"include_prerelease": false, "minimum": "2.2.0", "maximum": "2.2.0", "maximum_inclusive": true}
+        ],
+        "test_ids": ["tests/test_admission_organizer.py"]
+      }
+    }
+  }
+}

@@ -39,7 +39,6 @@ def main():
             "name": "technical_tokenization", "unit": "us/op",
             "value": elapsed / iterations / 1000, "iterations": iterations,
         }],
-        "workload": {"input_bytes": len(TEXT.encode()), "tokens": len(observed)},
     }
     Path(os.environ["MINDIE_BENCH_RESULT_PATH"]).write_text(
         json.dumps(result, indent=2) + "\n", encoding="utf-8")
