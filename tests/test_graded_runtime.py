@@ -83,6 +83,41 @@ def test_preparation_redacts_selected_content_before_organizer(store):
     assert req["redaction_rules"]
 
 
+def test_nested_json_evidence_redacts_paths_without_corrupting_measurements(store, monkeypatch):
+    from mindie_knowledge.loop import transcript_redaction
+    source = dict(source_ref='/Volumes/data/temp/mindie-003-execution/run1/performance_evidence.json',
+                  grouping_derivation_ref='/Users/private-person/code/mindie-bench/verifier/measure.py',
+                  timing=dict(started_ns=2171894295782027, ended_ns=2171894296069612))
+    selected = inputs()
+    selected[0]['content'] = json.dumps(source, indent=2)
+    calls = []
+    run = transcript_redaction.run_argv
+
+    def observed_run(*args, **kwargs):
+        calls.append(args[0])
+        return run(*args, **kwargs)
+
+    monkeypatch.setattr(transcript_redaction, 'run_argv', observed_run)
+    request = prepare_request(selected, session_digest='e' * 64, task_state='completed',
+        redactor_executable=scanner(), redaction_key=store.redaction_key(),
+        private_paths=('/Volumes/data/temp', '/Users/private-person'))
+    cleaned = json.loads(request['sanitized_inputs'][0]['content'])
+    assert cleaned['timing'] == source['timing']
+    assert 'private-person' not in str(request) and '/Volumes/data/temp' not in str(request)
+    assert len(calls) == 1
+
+
+def test_structured_redaction_masks_embedded_credentials_and_keeps_typed_values(store):
+    from mindie_knowledge.loop.transcript_redaction import redact_tree
+    value = {'note': 'password=synthetic-passphrase', 'machine': 'aarch64',
+             'nested': ['plain text', {'latency': 0.25, 'attempts': 3}]}
+    cleaned, rules = redact_tree(value, executable=scanner(), key=store.redaction_key())
+    assert cleaned['note'] == 'password=[REDACTED_SECRET]'
+    assert cleaned['machine'] == 'aarch64'
+    assert cleaned['nested'] == value['nested'] and rules
+    assert value['note'] == 'password=synthetic-passphrase'
+
+
 def test_native_c6_call_then_local_failure_reuses_saved_result(store, tmp_path, monkeypatch):
     calls = tmp_path / "calls.txt"
     monkeypatch.setenv("MINDIE_GRADED_FIXTURE_CALLS", str(calls))

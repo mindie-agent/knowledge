@@ -84,10 +84,9 @@ def prepare_request(inputs, *, session_digest, task_state, redactor_executable,
         raise ValueError("selected distillation input exceeds 256 KiB; select a smaller evidence scope")
     rules = []
     if selected:
-        from ..loop.transcript_redaction import redact
-        clean, rules = redact(raw, executable=redactor_executable, key=redaction_key,
-                              private_paths=private_paths, cancel=cancel)
-        selected = json.loads(clean)
+        from ..loop.transcript_redaction import redact_tree
+        selected, rules = redact_tree(selected, executable=redactor_executable, key=redaction_key,
+                                      private_paths=private_paths, cancel=cancel)
         for item in selected:
             locator = item["source_locator"]
             if isinstance(locator, dict):

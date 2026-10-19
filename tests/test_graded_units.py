@@ -34,6 +34,12 @@ def test_version_requirements_and_multiple_observed_targets_do_not_expand_rules(
     assert match_conditions(CONDITIONS, {**OBSERVED, "framework": {"torch_npu": "2.4"}}).status == "mismatch"
     assert match_conditions(CONDITIONS, {**OBSERVED, "soc": ["Ascend910B", "Ascend910C"]}).status == "mismatch"
     assert match_conditions(CONDITIONS, {**OBSERVED, "cann": "unreported"}).status == "unknown"
+    # A recorded private host keeps its opaque identity; its leading angle
+    # bracket is not a version comparator and grants no broader host match.
+    recorded = '<redacted:local-path:123456789abc>'
+    assert match_conditions({'hostname': recorded}, {'hostname': recorded}).status == 'matched'
+    assert match_conditions({'hostname': recorded}, {'hostname': '<redacted:local-path:abcdef123456>'}).status == 'mismatch'
+    assert match_conditions({'hostname': recorded}, {}).status == 'unknown'
 
 
 def test_unrecorded_hardware_versions_never_become_applicable_by_echoing_unknown():

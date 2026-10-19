@@ -116,7 +116,8 @@ def match_conditions(required: dict, observed: dict | None) -> Applicability:
                 outcomes.append(Applicability(nested.status, tuple(f"{key}.{r}" for r in nested.reasons)))
             else:
                 outcomes.append(Applicability("unknown", (f"{key}: structured conditions required",)))
-        elif isinstance(expected, str) and expected.startswith(("<", ">", "=", "!", "~")):
+        elif (isinstance(expected, str) and expected.startswith(("<", ">", "=", "!", "~"))
+              and not re.fullmatch(r"<redacted:[a-z0-9-]+:[0-9a-f]{12}>", expected)):
             outcomes.append(_version(expected, observed[key], key))
         else:
             allowed = expected if isinstance(expected, list) else [expected]

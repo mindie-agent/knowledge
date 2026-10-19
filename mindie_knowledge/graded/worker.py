@@ -16,7 +16,7 @@ import time
 from ..loop import summary_budget
 from ..loop.dfx import failure
 from ..loop.process import bounded_run
-from ..loop.transcript_redaction import redact
+from ..loop.transcript_redaction import redact_tree
 from ..materials.summarizer import SummaryLedger, outcome, validate_identity, validate_outcome
 from .distill import (apply_decision, noop_decision, prepare_request, validate_decision,
                       result_view, value_gate, with_worker_identity)
@@ -131,9 +131,8 @@ def run(engine, inputs, *, session_digest, task_state, authorization=None, cance
         for item in pending.get("units", []):
             provenance = item["frontmatter"]["provenance"]
             provenance["source_locator"] = locator_parts(provenance["source_locator"]) or provenance["source_locator"]
-        clean, _ = redact(canonical(pending), executable=engine.redactor_executable,
-                          key=store.redaction_key(), private_paths=private_paths, cancel=cancel)
-        pending = json.loads(clean)
+        pending, _ = redact_tree(pending, executable=engine.redactor_executable,
+                                 key=store.redaction_key(), private_paths=private_paths, cancel=cancel)
         for item in pending.get("units", []):
             provenance = item["frontmatter"]["provenance"]
             locator = provenance["source_locator"]
