@@ -84,6 +84,18 @@ def test_path_only_move_preserves_revision_while_conditions_or_body_change_it():
         GradedUnit.from_text(original.render().replace("compare eager", "skip eager"))
 
 
+def test_frontmatter_cannot_override_claim_conditions_with_duplicate_yaml_keys():
+    original = unit()
+    parsed = GradedUnit.from_text(original.render())
+    assert parsed.metadata == original.metadata and parsed.body == original.body
+    for text in (
+        original.render().replace("conditions:\n", "conditions: {soc: [Ascend910C]}\nconditions:\n"),
+        original.render().replace("conditions:\n", "conditions:\n  soc: [Ascend910C]\n"),
+    ):
+        with pytest.raises(ValueError, match="frontmatter keys must be unique"):
+            GradedUnit.from_text(text)
+
+
 def test_parent_revision_changes_closure_receipt_without_replacing_child_body():
     parent = unit("unit-parent")
     child = unit(parents=[parent.id])
