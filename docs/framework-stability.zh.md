@@ -8,7 +8,7 @@
 
 ## 1. 日常使用的“零打扰”稳定性原则
 
-- **一次配置，长期无感运行**：安装后首次进入原生入口（Claude Code / Kimi 的 `/mindie-agent` 或 Codex 的 `$mindie-agent`）记录一次授权选择，此后跨任务、跨分支、重启与常规升级均自动沿用，无需反复激活。社区贡献授权与故障诊断自动上报拥有各自独立的开关。
+- **一次配置，长期无感运行**：安装后首次进入原生入口（Claude Code / Kimi 的 `/mindie-agent` 或 Codex 的 `$mindie-agent`）将授权选择记录在 `<profile>/.mindie/mindie-consent.json`（`mindie-consent/1`）中，此后跨任务、跨分支、重启与常规升级均自动沿用，无需反复激活。在 MindIE Agent `0.0.2` 宿主安装中，社区知识贡献共享与工具故障诊断自动上报共用这一统一的贡献开关（`mindie-knowledge` 运行时校验 `contribute` 模式与统一的 `choice_revision`，且绝不上传本地工作区文件或未脱敏命令）。
 - **损坏配置绝不假装成首次安装**：当共享配置文件或 `mindie-consent/1` 被外部程序损坏时，系统如实报告配置故障并保留现场，绝不会清空已有数据或重新弹出首次安装引导。
 
 ---
