@@ -90,6 +90,19 @@ class UnknownOutcome(CommunityError):
         super().__init__(detail, status="unknown", retry_at=retry_at)
 
 
+def git_executable():
+    """The resolved git executable for community spawns.
+
+    A missing git stays the same transient ``unavailable`` class as a
+    spawn-time miss, with the resolution remedy carried in the message.
+    """
+    from mindie_knowledge.gitbin import GitUnavailableError, resolve_git
+    try:
+        return resolve_git()
+    except GitUnavailableError as exc:
+        raise TransientError(str(exc)) from exc
+
+
 def canonical(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 

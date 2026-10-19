@@ -1,34 +1,42 @@
-# Windows process ownership
+# Windows Process Tree Ownership
 
-Both organizer execution and community Git/gh subprocesses use
-`mindie_knowledge.windows_process.spawn_owned`. The child is created suspended,
-assigned to a Job with `KILL_ON_JOB_CLOSE`, and resumed through the documented
-Win32 Toolhelp and `ResumeThread` APIs. Cleanup terminates the owned Job even
-when its original process has exited.
+[中文](windows-process-ownership.zh.md) | **English** · [Back to Documentation Center](README.en.md)
 
-Two previous paths violated the same contract. The organizer attached its Job
-after an ordinary spawn, allowing fast descendants to escape before assignment.
-Community subprocesses did not attach a Job at all. A PID-based `taskkill /T`
-cannot recover ownership once the leader has exited. A surviving descendant can
-also keep an inherited pipe open, blocking reader cleanup beyond the deadline.
+Managing subprocess trees on Windows involves two classic pitfalls:
+1. **Fast Descendant Escape**: If a parent spawns a child normally and attaches a Windows Job Object afterward, a fast child can spawn a grandchild before Job assignment completes—allowing the grandchild to escape containment;
+2. **Broken PID Trees & Pipe Hangs After Leader Exit**: Once an intermediate leader process (such as a Python virtual-environment launcher) exits, PID-based `taskkill /T` can no longer locate its surviving grandchildren. Even worse, a surviving grandchild holding an inherited stdout/stderr pipe keeps the parent's pipe reader blocked indefinitely.
 
-The focused Windows regression command is:
+This guide explains how `mindie_knowledge.windows_process.spawn_owned` eliminates both failure modes.
 
-```sh
-python -m pytest -q tests/test_windows_process_ownership.py
+---
+
+## 1. Three-Step Atomic Spawn (`spawn_owned`)
+
+Both summary worker invocations and community Git / `gh` subprocesses on Windows launch through `mindie_knowledge.windows_process.spawn_owned`:
+
+```mermaid
+flowchart LR
+  S1["1. Spawn Suspended (CREATE_SUSPENDED)<br/>Child main thread is frozen at birth;<br/>cannot spawn any descendants yet"] --> S2["2. Assign to KILL_ON_JOB_CLOSE Job<br/>Places suspended child into named Job Object,<br/>sealing the kernel containment boundary"]
+  S2 --> S3["3. Resume Execution (ResumeThread)<br/>Uses Win32 Toolhelp thread snapshot &<br/>ResumeThread to start the child"]
 ```
 
-Its matrix has two callers (organizer and community) and two distinct terminal
-states (normal leader exit with detached output, and a descendant holding the
-output pipes past the deadline). Each case starts real processes, verifies the
-descendant exits, and uses an external watchdog plus an exact opened process
-handle to clean up a failing implementation. It does not mock process launch,
-process liveness or Job assignment.
+- **Zero Escape Window**: Because the child is placed inside a `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` Job Object while still suspended (`CREATE_SUSPENDED`), every child and grandchild it subsequently spawns—across any number of venv redirectors or wrapper scripts—is unconditionally contained within that Job.
+- **Reliable Cleanup After Leader Exit**: During teardown, timeout, or cancellation, `mindie-knowledge` terminates the owned Job handle directly. Even if the original child process already exited, the Windows kernel immediately terminates all remaining descendants in the Job, releasing any inherited stdio pipes so pipe readers never hang.
 
-On the Windows validation host, the four tests failed against main `873136e`
-in 12.45 seconds. They all pass with the candidate, and the ownership plus
-diagnostic failure group has 23 passing tests in 10.33 seconds. These tests
-exercise the Win32 mechanism; POSIX process-group tests remain separate.
+---
 
-References: [Toolhelp thread snapshots](https://learn.microsoft.com/en-us/windows/win32/api/tlhelp32/nf-tlhelp32-createtoolhelp32snapshot),
-[Thread32First](https://learn.microsoft.com/en-us/windows/win32/api/tlhelp32/nf-tlhelp32-thread32first).
+## 2. Live Subprocess Regression Matrix
+
+The focused Windows regression suite exercises real Win32 processes and Job Objects without mocking process creation, liveness, or Job assignment:
+
+```bash
+python3 -m pytest -q tests/test_windows_process_ownership.py
+```
+
+The test matrix covers both callers (**summary worker execution** and **community Git/gh subprocesses**) across two critical terminal scenarios:
+1. The leader process exits normally while leaving a detached grandchild running;
+2. A grandchild holds the inherited output pipes open past the execution deadline.
+
+In every case, `spawn_owned` guarantees that all descendants exit cleanly and pipes close promptly without disturbing the independent background knowledge service.
+
+References: [CreateToolhelp32Snapshot](https://learn.microsoft.com/en-us/windows/win32/api/tlhelp32/nf-tlhelp32-createtoolhelp32snapshot) · [Thread32First](https://learn.microsoft.com/en-us/windows/win32/api/tlhelp32/nf-tlhelp32-thread32first)

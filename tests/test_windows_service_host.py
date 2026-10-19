@@ -136,7 +136,7 @@ def scheduler(tmp_path, monkeypatch):
     def record(path, cfg, root, owner):
         import uuid
         attempt = uuid.uuid4().hex
-        return dict(schema=host.MARKER, sid=sid, label="synthetic-test",
+        return dict(schema=host.MARKER, sid=sid, label=host._label(sid, root),
                     attempt=attempt, config=str(path), fingerprint=config_fingerprint(path, cfg),
                     cwd=str(tmp_path),
                     python=str(tmp_path / "pythonw.exe"),
@@ -322,6 +322,236 @@ def test_retirement_removes_only_exact_idle_task_and_verifies_absence(scheduler)
     host.remove_owned(path, config)
     assert state["task"] is None and state["calls"][-1] == "remove"
     assert not (host._paths(config) / "launch.json").exists()
+
+
+def _supersede(path, config):
+    updated = dict(config, summary_command=["/usr/bin/true", "--identity"])
+    path.write_text(json.dumps(updated))
+    return updated
+
+
+def _finished_receipt(request):
+    host._write(host._result_path(request.root, request.record),
+                dict(attempt=request.record["attempt"], status="finished", exit_code=0))
+
+
+def test_superseded_record_and_task_retire_instead_of_wedging(scheduler, monkeypatch):
+    records = []
+    monkeypatch.setattr("mindie_knowledge.loop.dfx.failure",
+                        lambda *args, **kwargs: records.append((args, kwargs)))
+    path, config, state = scheduler
+    first = host.request_start(path, config)
+    state["task"].update(state="Ready")
+    _finished_receipt(first)
+    updated = _supersede(path, config)
+    second = host.request_start(path, updated)
+    assert second.record["attempt"] != first.record["attempt"]
+    assert second.record["fingerprint"] != first.record["fingerprint"]
+    assert state["calls"] == ["register", "start", "remove", "register", "start"]
+    assert not (first.root / (first.record["attempt"] + ".context")).exists()
+    assert records == [(("knowledge.service",), dict(stage="reconcile",
+                                                    category="stale_launch_record_retired",
+                                                    reportable=False))]
+
+
+def _generation_flip(path, config, root_override=None):
+    """The kimi generation model: a new config FILE PATH each update flip,
+    serving the same domain state root (or a different one, when given)."""
+    flipped_path = path.with_name("generations") / "5da5c0f" / "kimi.engine.json"
+    flipped_path.parent.mkdir(parents=True, exist_ok=True)
+    flipped = dict(config, summary_command=["/usr/bin/true", "--identity"])
+    if root_override is not None:
+        flipped["root"] = str(root_override)
+    flipped_path.write_text(json.dumps(flipped))
+    return flipped_path, flipped
+
+
+def test_generation_flip_record_and_task_retire_and_restart(scheduler):
+    path, config, state = scheduler
+    first = host.request_start(path, config)
+    state["task"].update(state="Ready")
+    _finished_receipt(first)
+    flipped_path, flipped = _generation_flip(path, config)
+    second = host.request_start(flipped_path, flipped)
+    assert second.record["attempt"] != first.record["attempt"]
+    assert second.record["config"] != first.record["config"]
+    assert state["calls"] == ["register", "start", "remove", "register", "start"]
+    assert not (first.root / (first.record["attempt"] + ".context")).exists()
+
+
+def test_record_from_another_ownership_chain_stays_foreign(scheduler):
+    path, config, state = scheduler
+    first = host.request_start(path, config)
+    state["task"].update(state="Ready")
+    _finished_receipt(first)
+    # A record minted for another state root/domain binds another label.
+    stale = host._read(first.root / "launch.json")
+    host._write(first.root / "launch.json", dict(stale, label="MindIE Knowledge " + "0" * 24))
+    flipped_path, flipped = _generation_flip(path, config)
+    with pytest.raises(host.ServiceHostError, match="foreign_launch_record"):
+        host.request_start(flipped_path, flipped)
+    assert state["calls"] == ["register", "start"]
+    assert (first.root / "launch.json").exists()
+
+
+def test_generation_flip_to_another_state_root_is_an_independent_service(scheduler, monkeypatch, tmp_path):
+    path, config, state = scheduler
+    first = host.request_start(path, config)
+    # Real Task Scheduler lookup is keyed by exact label: a different state
+    # root has a different label, so the stale task is not even visible.
+    tasks = {first.record["label"]: state["task"]}
+    monkeypatch.setattr(host, "_task", lambda label: tasks.get(label))
+
+    def fake_register(label, xml, sid, *, replace):
+        state["calls"].append("register")
+        tasks[label] = dict(xml=xml, sid=sid, state="Ready", last_run="before", last_result=0)
+
+    def fake_start(label):
+        state["calls"].append("start")
+        tasks[label].update(state="Running", last_run="after")
+
+    def fake_remove(label):
+        state["calls"].append("remove")
+        tasks.pop(label, None)
+
+    monkeypatch.setattr(manager, "register", fake_register)
+    monkeypatch.setattr(manager, "start", fake_start)
+    monkeypatch.setattr(manager, "remove", fake_remove)
+    flipped_path, flipped = _generation_flip(path, config, root_override=tmp_path / "other-data")
+    second = host.request_start(flipped_path, flipped)
+    assert second.record["label"] != first.record["label"]
+    assert set(tasks) == {first.record["label"], second.record["label"]}
+    assert state["calls"] == ["register", "start", "register", "start"]
+    assert (first.root / "launch.json").exists()
+
+
+def test_live_service_attach_still_requires_the_exact_config_path(scheduler):
+    path, config, state = scheduler
+    host.request_start(path, config)
+    flipped_path, flipped = _generation_flip(path, config)
+    with pytest.raises(host.ServiceHostError, match="foreign_launch_record"):
+        host.request_start(flipped_path, flipped)
+    assert state["calls"] == ["register", "start"]
+
+
+def test_orphaned_task_after_generation_flip_retires_and_reregisters(scheduler):
+    path, config, state = scheduler
+    first = host.request_start(path, config)
+    state["task"].update(state="Ready")
+    _finished_receipt(first)
+    (first.root / "launch.json").unlink()
+    flipped_path, flipped = _generation_flip(path, config)
+    second = host.request_start(flipped_path, flipped)
+    assert second.record["attempt"] != first.record["attempt"]
+    assert state["calls"] == ["register", "start", "remove", "register", "start"]
+
+
+def test_superseded_record_with_live_task_is_never_retired(scheduler):
+    path, config, state = scheduler
+    host.request_start(path, config)
+    updated = _supersede(path, config)
+    with pytest.raises(host.ServiceHostError, match="foreign_launch_record"):
+        host.request_start(path, updated)
+    assert state["calls"] == ["register", "start"]
+    assert (host._paths(updated) / "launch.json").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="exercises the real win32process API")
+def test_pid_dead_uses_the_real_pywin32_process_api():
+    import subprocess
+    import sys
+    assert host._pid_dead(os.getpid()) is False
+    process = subprocess.Popen([sys.executable, "-c", ""])
+    process.wait()
+    assert host._pid_dead(process.pid) is True
+
+
+def test_superseded_record_with_live_pid_is_never_retired(scheduler):
+    path, config, state = scheduler
+    first = host.request_start(path, config)
+    state["task"].update(state="Ready")
+    host._write(host._result_path(first.root, first.record),
+                dict(attempt=first.record["attempt"], status="starting", pid=os.getpid()))
+    updated = _supersede(path, config)
+    with pytest.raises(host.ServiceHostError, match="foreign_launch_record"):
+        host.request_start(path, updated)
+    assert state["calls"] == ["register", "start"]
+
+
+def test_orphaned_task_from_consumed_attempt_retires_and_reregisters(scheduler, monkeypatch):
+    records = []
+    monkeypatch.setattr("mindie_knowledge.loop.dfx.failure",
+                        lambda *args, **kwargs: records.append((args, kwargs)))
+    path, config, state = scheduler
+    first = host.request_start(path, config)
+    state["task"].update(state="Ready")
+    _finished_receipt(first)
+    # The acceptance flow archived the stale record; the task was still wedged.
+    (first.root / "launch.json").unlink()
+    second = host.request_start(path, config)
+    assert second.record["attempt"] != first.record["attempt"]
+    assert state["calls"] == ["register", "start", "remove", "register", "start"]
+    assert records == [(("knowledge.service",), dict(stage="reconcile",
+                                                    category="stale_registered_task_retired",
+                                                    reportable=False))]
+
+
+def test_orphaned_task_with_live_pid_is_never_retired(scheduler):
+    path, config, state = scheduler
+    first = host.request_start(path, config)
+    state["task"].update(state="Ready")
+    host._write(host._result_path(first.root, first.record),
+                dict(attempt=first.record["attempt"], status="starting", pid=os.getpid()))
+    (first.root / "launch.json").unlink()
+    with pytest.raises(host.ServiceHostError, match="foreign_task"):
+        host.request_start(path, config)
+    assert "remove" not in state["calls"]
+
+
+def test_orphaned_task_with_foreign_identity_stays_hard_foreign(scheduler):
+    path, config, state = scheduler
+    first = host.request_start(path, config)
+    state["task"].update(state="Ready")
+    _finished_receipt(first)
+    (first.root / "launch.json").unlink()
+    original = state["task"]["xml"]
+    for tamper in ("sid", "description"):
+        state["task"]["sid"] = "S-1-5-21-999" if tamper == "sid" else first.record["sid"]
+        if tamper == "description":
+            tree = ET.fromstring(original)
+            tree.find("{" + host.NS + "}RegistrationInfo/{" + host.NS + "}Description").text = (
+                host.MARKER + ":/foreign/install/launch.json")
+            state["task"]["xml"] = ET.tostring(tree, encoding="unicode")
+        with pytest.raises(host.ServiceHostError, match="foreign_task"):
+            host.request_start(path, config)
+        assert "remove" not in state["calls"]
+    assert state["calls"] == ["register", "start"]
+
+
+def test_remove_owned_retires_superseded_inert_leftovers(scheduler):
+    path, config, state = scheduler
+    first = host.request_start(path, config)
+    state["task"].update(state="Ready")
+    _finished_receipt(first)
+    updated = _supersede(path, config)
+    host.remove_owned(path, updated)
+    assert state["task"] is None and state["calls"] == ["register", "start", "remove"]
+    assert not (first.root / "launch.json").exists()
+    assert not (first.root / (first.record["attempt"] + ".context")).exists()
+
+
+def test_stop_retires_inert_leftovers_when_endpoint_is_dead(scheduler, capsys):
+    from mindie_knowledge.loop import cli
+    path, config, state = scheduler
+    first = host.request_start(path, config)
+    state["task"].update(state="Ready")
+    _finished_receipt(first)
+    updated = _supersede(path, config)
+    assert cli.main(["stop", "--config", str(path)]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result == dict(status="not-running")
+    assert state["task"] is None and state["calls"] == ["register", "start", "remove"]
+    assert not (first.root / "launch.json").exists()
 
 
 def test_failed_action_returns_safe_actual_stage(scheduler):

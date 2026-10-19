@@ -20,6 +20,7 @@ from mindie_knowledge.materials.store import MaterialCleanupError
 from .locks import StartInProgress, StartLock
 from .store import _backoff_seconds, digest
 from mindie_knowledge.community.common import CommunityError, run_argv
+from mindie_knowledge.gitbin import GitUnavailableError, resolve_git
 from mindie_knowledge.gitread import with_windows_longpaths, _check_cancel
 from mindie_knowledge.publication_contract import read_git_contract
 from mindie_knowledge.filesystem import filesystem_path, git_path
@@ -92,11 +93,11 @@ class Feed:
         maximum = 1024 * 1024
         try:
             completed = run_argv(
-            ["git", "-C", git_path(self.repo), *args],
+            [resolve_git(), "-C", git_path(self.repo), *args],
                 timeout=remaining, max_output=maximum, input_bytes=b"",
                 env=_feed_git_env(), cancel=self._cancel,
             )
-        except CommunityError as exc:
+        except (CommunityError, GitUnavailableError) as exc:
             _check_cancel(self._cancel)
             raise OSError(f"bounded git {args[0]} failed: {exc}") from exc
         if completed.timed_out:
@@ -119,12 +120,12 @@ class Feed:
             url = Path(git_path(filesystem_path(url).resolve())).as_uri()
         try:
             completed = run_argv(
-                ["git", "clone", "--bare", "--quiet", "--depth=1", "--single-branch", "--no-tags",
+                [resolve_git(), "clone", "--bare", "--quiet", "--depth=1", "--single-branch", "--no-tags",
                  "--branch", self.ref, url, git_path(self.repo)],
                 timeout=remaining, max_output=65536, input_bytes=b"",
                 env=_feed_git_env(), cancel=self._cancel,
             )
-        except CommunityError as exc:
+        except (CommunityError, GitUnavailableError) as exc:
             _check_cancel(self._cancel)
             raise OSError(f"bounded git clone failed: {exc}") from exc
         if completed.timed_out:
@@ -200,7 +201,7 @@ class Feed:
 
         listing_path = self.dir / "listing.tmp"
         run_stdout_to_file(
-            ["git", "-C", git_path(self.repo), "ls-tree", "-r", "-z", "--long", commit,
+            [resolve_git(), "-C", git_path(self.repo), "ls-tree", "-r", "-z", "--long", commit,
              "--", self.prefix or "."],
             listing_path,
             timeout=None if deadline is None else max(0, deadline - time.monotonic()),

@@ -222,7 +222,9 @@ def summarize_due(engine):
                         'local index apply failed: ' + type(exc).__name__, time.time() + 30)
                 else:
                     state = 'outcome_unknown' if state in {'invoking', 'outcome_unknown'} else 'failed'
-                    detail = 'configuration: summary worker is not configured' if not engine.summary_command else type(exc).__name__
+                    detail = ('configuration: summary worker is not configured'
+                              if not engine.summary_command and isinstance(exc, ValueError)
+                              else type(exc).__name__)
                     engine.index_queue.finish(batch, state, detail)
         except Exception as receipt_error:
             exc.add_note('summary state could not record this failure: ' + type(receipt_error).__name__)

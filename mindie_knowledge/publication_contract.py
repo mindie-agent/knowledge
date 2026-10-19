@@ -95,7 +95,7 @@ def parse_contract(raw, domain, expected_sha256=None):
 
 def read_git_contract(repo, revision, domain, *, expected_sha256=None, deadline=None, prefix="", env=None, cancel=None):
     """Read one plain Git blob at an exact commit, never a checkout or symlink."""
-    from .community.common import run_argv
+    from .community.common import git_executable, run_argv
     from .gitread import CatFileBatch
 
     if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", revision):
@@ -106,7 +106,7 @@ def read_git_contract(repo, revision, domain, *, expected_sha256=None, deadline=
     remaining = None if deadline is None else deadline - time.monotonic()
     if remaining is not None and remaining <= 0:
         raise TimeoutError("publication contract read exceeded its deadline")
-    result = run_argv(["git", "-C", git_path(repo), "ls-tree", "-z", "--long", revision, "--", path],
+    result = run_argv([git_executable(), "-C", git_path(repo), "ls-tree", "-z", "--long", revision, "--", path],
                       timeout=remaining, max_output=MAX_CONTRACT_BYTES,
                       input_bytes=b"", env=env, cancel=cancel)
     if result.timed_out:

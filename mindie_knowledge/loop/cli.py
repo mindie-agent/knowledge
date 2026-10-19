@@ -585,7 +585,26 @@ def main(argv=None):
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     # stop
-    result = rpc(connect(config), "stop")
+    try:
+        result = rpc(connect(config), "stop")
+    except (OSError, ValueError):
+        # The endpoint is unreachable. Only a provably absent service gets
+        # the not-running result; provably inert manager leftovers are
+        # retired so a later start is not wedged. Cleanup failure stays
+        # visible next to the completed stop, never silently skipped.
+        from .handoff import _probe
+        from .service_host import platform_backend
+        if _probe(config, None, config_path=args.config) != "absent":
+            raise
+        result = dict(status="not-running")
+        backend = platform_backend()
+        if backend is not None:
+            try:
+                backend.remove_owned(args.config, config)
+            except (OSError, ValueError, RuntimeError) as exc:
+                result.update(cleanup_failed=True, cleanup_error=dict(
+                    stage="service_host", error_type=type(exc).__name__,
+                    operation_completed=True))
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 

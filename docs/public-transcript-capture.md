@@ -1,112 +1,61 @@
-# Public transcript material and incremental indexing
+# Public Transcript Capture & Incremental Indexing
 
-`public-transcript` is the only capture pipeline. The adapter provides its own
-`transcript_adapter`, an installed absolute `redactor_executable`, and the
-`summary_command` used for required retrieval metadata. The removed
-`agent_command` and `organize` configuration values fail explicitly. The core
-never guesses a harness format.
+[中文](public-transcript-capture.zh.md) | **English** · [Back to Documentation Center](README.en.md)
 
-The handoff queue stores only the native transcript reference. The parser selects
-authorized visible user and assistant messages with exact source-byte ranges;
-hidden reasoning, system/developer messages, tool traffic and foreign tasks are
-excluded. Gitleaks 8.30.1 plus the deterministic privacy rules run before storage.
-The installer verifies the pinned binary and license; capture never downloads a
-scanner. Private-key redaction state crosses page boundaries. Scanning has no
-default total deadline or report truncation. Shutdown cancellation stops the owned
-scanner process tree, preserves pending work and leaves the source cursor unchanged.
-Explicit authority revocation remains cancelled rather than pending.
-Scanner failure also leaves the cursor unchanged and schedules only local deterministic work.
-The scanner detects rule-defined secrets and identifiers, not proprietary meaning.
+This guide explains how `mindie-knowledge` extracts visible conversation turns from native host transcripts when community sharing is enabled, applies double fail-closed privacy redaction, splits messages into lossless Markdown blocks, and builds retrieval navigation incrementally.
 
-One authorized task owns stable material blocks and a current navigation file.
-Bodies live in ordinary Markdown files under the local `materials/` directory.
-The existing SQLite `state-v4.sqlite3` stores pointers, source cursors, authority,
-queue state and outcome receipts; it does not keep another transcript body.
-A complete new public message is divided into lossless UTF-8 blocks of at most
-16 KiB. Candidate files are prepared before the pointer/cursor transaction;
-current-file promotion and cleanup follow that committed transaction. A cleanup
-failure remains a separate visible fault and cannot claim that the body write
-never happened. Superseded manifests and unreferenced blocks are retired while
-current draft/feed versions remain readable.
+---
 
-Stop capture and explicit selected-history import use this same material writer
-and summary queue. An import validates the consumed prefix before extending its
-cursor and quarantines its package until the selected snapshot is fully admitted.
-Repeating an unchanged import makes no new model call. The fresh format does not
-migrate old organizer bodies, checkpoints or paid recovery work.
+## 1. Capture Pipeline Overview
 
-LangMem 0.0.30 indexes complete new blocks together with short prior navigation.
-It returns exactly one title/summary pair per admitted block and a current task
-navigation summary. It cannot rewrite source material. A batch contains at most
-eight blocks and at most 64 KiB of the rendered user prompt; partitioning retains
-every block, without head/tail selection or a final whole-history model merge.
-Native Harness system tokens are additional and are included in measured usage.
-The Codex worker explicitly uses `gpt-5.6-luna` with `low` effort; the selected
-native CLI route was verified during this implementation's acceptance work.
-There is no runtime model fallback or separate provider credential.
+```mermaid
+flowchart LR
+  Hook["1. Stop Hook Intake<br/>Records native transcript ref"] --> Parse["2. Deterministic Projection<br/>Keeps user & visible assistant text<br/>Strips tool traffic & reasoning"]
+  Parse --> Redact["3. Double Fail-Closed Redaction<br/>Gitleaks 8.30.1 + redact(r3)<br/>Tracks private keys across pages"]
+  Redact --> Split["4. Lossless 16 KiB Blocks<br/>Writes materials/*.md<br/>Commits cursor & pointers"]
+  Split --> Index["5. LangMem Incremental Indexing<br/>Up to 8 blocks / 64 KiB per batch<br/>Commits model output before apply"]
+```
 
-A durable `SummaryLedger` reserves each invocation before launch. The worker
-returns a bound envelope identifying the task, batch, policy and outcome.
-Returned output and known token usage are committed **before** metadata scanning
-or application. A later scanner, authority or local-apply fault reuses that saved
-result and cannot trigger another paid call. A failed or interrupted invocation
-is respectively failed or outcome-unknown; it needs explicit repair/retry.
-Retry keeps the previous attempt and its usage. Missing usage stays unknown,
-never zero. `model_calls` counts native invocation attempts, not independently
-observed provider-internal requests. Token counters are reported; no monetary
-price or dollar cost is inferred from them.
+---
 
-Bounded process output and the strict schema guard one invocation. A healthy
-operation has no default total deadline; owner cancellation and an explicitly
-requested limit remain separate from the persisted invocation outcome.
-Automatic capture and selected-history import have no hourly call or token
-quota. The retired `summary_budget` extension is no longer consulted. Serial
-execution, a single durable claim per batch and explicit retry of failed or
-unknown invocations prevent replay. A known shared worker fault (configuration,
-dependency, model rejection, launch or missing completed output) pauses new
-calls under that exact worker policy. Changing the worker policy, or explicitly
-retrying a failed batch and obtaining a known native result, permits new work;
-an uncertain retry cannot prove recovery. Returned-result local recovery always
-continues without another invocation. Missing worker
-configuration, incomplete indexing and failed/unknown batches block publication.
-They do not turn a saved body or an excerpt into an indexed contribution.
+## 2. Deterministic Public-Message Projection
 
-ReMe's embedded Markdown chunker, file graph and BM25 index search all current
-material blocks, including middle-of-task evidence absent from the short
-navigation. The derived index can be rebuilt from those files. Retrieval and
-consumer sync make no model calls and start no ReMe service or background agent.
+`public-transcript` is the single capture pipeline. Each host plugin supplies its own deterministic `transcript_adapter`:
+- **Reads Only the Bound Session Transcript**: The background worker reads only the exact transcript path forwarded by the Stop Hook—never scanning historical session folders or guessing neighboring files.
+- **Strips Internal Noise**: Only authorized **user inputs**, **visible assistant progress**, and **final answers** are kept. Tool call arguments/results, hidden reasoning traces, system/developer prompt injections, and foreign task history are deterministically excluded.
+- **No Truncation of Long Messages**: Paging bounds memory between records without truncating large messages; a complete public turn is always read whole. Malformed records or unverifiable ownership leave the cursor unchanged and surface an explicit error.
 
-Publication sends the entire canonical package as `tasks/<task-id>/index.md`
-and its exactly referenced `blocks/<block-id>.md` files. A confirmed open PR
-retires staging but keeps the local candidate. Once the same revision is present
-in the public feed, its duplicate draft pointer may be compacted. A later task
-continuation appends to the retained current feed package. Upstream withdrawal
-prevents continuation from resurrecting removed content. Navigation and retrieved
-experience remain fallible reference material, including incomplete work and
-later corrections; neither publication nor retrieval certifies an outcome.
+---
 
-## Lifecycle ownership
+## 3. Double Redaction & Lossless 16 KiB Blocks
 
-`Engine` schedules work and revalidates native authorization. `OperationOwner`
-owns each live capture, index, package preparation and publication separately,
-with its own identity, generation and cancellation token. Revocation cancels old
-contribution operations while retaining already admitted current-generation
-work. A cancelled token is never reused. Reads and reconciliation have independent
-lifetimes; service shutdown cancels all live work. Admission and update freezing
-use the same owner lock, and a failed required idle check releases the freeze
-while reporting the original error.
+Before any text is written to `materials/` or sent to the summary worker, it must pass two local deterministic scanners:
+1. **Pinned Gitleaks (`8.30.1`)**: Verified at installation time (capture never downloads a binary over the network);
+2. **Built-in `mindie_knowledge.redact` (`r3`)**: Redacts credentials, private key blocks (tracking unclosed key boundaries across page slices), internal IPv4/IPv6 addresses, numbered machine identifiers, `<user>@<host>` login targets, personal home paths, and internal ticket IDs.
 
-`IndexQueue` owns queue transitions on the existing Store transaction;
-`SummaryLedger` retains prepared, invoking, returned, failed/unknown and applied
-attempt facts. Applying returned indexes, completing their attempt and settling
-queue readiness commit together. A later increment can be indexed after an
-earlier failure, but the entire package remains unready until every required
-block is indexed. Explicit retry retains earlier usage and reuses successful
-later increments. Neither live operation tokens nor process liveness decide
-durable completion.
+### Why Models Never Rewrite Body Text
+- Sanitized public messages are split along UTF-8 character boundaries into lossless blocks of at most **16 KiB** (`mindie-material-block/1`) under `materials/`.
+- **No model ever generates, shortens, or rewrites block bodies.** Stack traces, environment variables, operator flags, and numerical results remain 100% faithful to the redacted transcript.
 
-`PublicationWorker` owns frozen-package loading, sending, read-only reconciliation
-and result recording. Store revokes unsent batches and unbatched feedback in one
-transaction. Original unknown writes and confirmed remote outcomes survive
-receipt/cleanup faults. Body/cursor commits and public-feed membership continue
-to use the existing Store/MaterialStore transactions and current Markdown files.
+---
+
+## 4. Incremental Navigation Indexing & `SummaryLedger`
+
+To help Agents scan search results quickly, a separate worker invokes **LangMem `0.0.30`** through the host's lightweight native model route to generate one title/summary pair per new block plus an updated task navigation summary:
+
+- **Bounded Batches, Complete Coverage**: Each batch processes at most **8 complete blocks** and **64 KiB** of rendered user prompt. Every block is indexed in order—no middle blocks are sampled away, and there is no whole-history model call at the end.
+- **Commit Output Before Local Apply (Zero Paid Replay)**:
+  The durable `SummaryLedger` tracks `prepared`, `invoking`, `returned`, `complete`, `failed`, and `outcome-unknown` states. **Returned model output and token usage are committed to SQLite before metadata redaction or manifest updates run.**
+  - If a subsequent scanner check, authority check, or local file update fails, recovery **reuses the saved model output** without making another paid model call.
+  - Interrupted or failed model calls (`failed` / `outcome-unknown`) are never automatically retried by the background scheduler; explicit retry preserves prior attempt records and token counters.
+- **Unindexed Material Is Never Exported**: Until every block in a task package is indexed, the package remains unready for export—preventing raw excerpts from masquerading as indexed contributions.
+
+---
+
+## 5. Internal Lifecycle Ownership
+
+Inside `mindie_knowledge/loop/`, each component has a single clear responsibility:
+- **`Engine`**: Schedules work and re-verifies native consent before every read, model call, and outbound write;
+- **`OperationOwner`**: Assigns an independent identity, generation counter, and cancellation token to each live capture, index, staging, and publication operation; revoking consent cancels prior-generation work immediately;
+- **`IndexQueue` & `SummaryLedger`**: Coordinate queue state transitions and model attempt receipts within the existing SQLite transaction;
+- **`PublicationWorker`**: Streams frozen packages one file at a time through hash-bound views, submits or reconciles PRs, and retires staging files once confirmed.

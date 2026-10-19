@@ -111,8 +111,9 @@ def test_owner_cancel_interrupts_silent_cat_file_protocol(tmp_path, monkeypatch)
     import mindie_knowledge.gitread as gitread
     cancel = threading.Event()
     popen = subprocess.Popen
+    from mindie_knowledge.gitbin import resolve_git
     def silent(argv, **kwargs):
-        if argv == ['git', '-C', str(tmp_path), 'cat-file', '--batch']:
+        if argv == [resolve_git(), '-C', str(tmp_path), 'cat-file', '--batch']:
             argv = [sys.executable, '-c', 'import time; time.sleep(60)']
         return popen(argv, **kwargs)
     monkeypatch.setattr(gitread.subprocess, 'Popen', silent)

@@ -351,10 +351,9 @@ def load(path) -> CommunitySettings:
     """Read the settings file once. Never raises; faults close contribution.
 
     The reported ``state`` keeps a missing file, an unreadable one, a damaged
-    one and an explicit saved choice strictly apart. The read goes through
-    the consent store's Windows read path (FILE_SHARE_DELETE); together with
-    the writer's POSIX-semantics rename in the shared atomic writer, a locked
-    write never fails against this gate read."""
+    one and an explicit saved choice strictly apart. The shared reader closes
+    its handle before parsing; Windows writers allow a bounded wait for a
+    concurrent short read to finish."""
     if not path:
         return CommunitySettings(
             None, {}, error="community_config is not configured",

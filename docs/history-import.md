@@ -1,59 +1,44 @@
-# Explicit historical transcript import
+# Explicit Historical Transcript Import
 
-`mindie_knowledge.loop.history_import.import_transcript` is the shared intake
-behind a Harness's explicit history-import entry. The caller selects native
-source files. Startup, Stop capture, synchronization and retrieval never discover
-or import historical sessions automatically.
+[中文](history-import.zh.md) | **English** · [Back to Documentation Center](README.en.md)
 
-The requesting session must already have a current admission token and saved
-contribution consent. Both the requesting scope and each source scope must be
-allowed. The adapter checks this before reading source metadata; the core checks
-again before every parser page and commit. Source sessions receive no new leases.
-The selected file identity and byte length define a fixed snapshot; the activation
-time filter is intentionally omitted for this explicitly selected history.
+By default, `mindie-knowledge` captures only live sessions that run after you opt into community sharing—**it never automatically scans or backfills older session history**.
 
-Each complete parser page goes through the same `prepare_increment` and
-`Store.commit_material_increment` path as live capture: deterministic redaction,
-lossless UTF-8 blocks, stable identities, source cursor, authorization and an index
-queue. The scanner carries only an open private-key boundary across pages; no raw
-secret buffer or transcript copy is retained. Native transcripts remain with the
-Harness. Block bodies are Markdown files; SQLite stores metadata and receipts.
+However, when you finish a valuable troubleshooting session before enabling sharing and want to bring it into the knowledge loop intentionally, host plugins can call `mindie_knowledge.loop.history_import.import_transcript` to perform an **explicit historical import**.
 
-A durable intake marker prevents publication until every page of the selected
-snapshot has been admitted. A malformed record, incomplete EOF, scanner failure,
-source replacement or revoked authority fails visibly. Previously committed pages
-remain local and resumable; they are not misreported as a complete import. A repeat
-validates the consumed raw prefix and imports only its new suffix. An unchanged
-repeat creates no new blocks or model calls. Prefix edits are rejected without
-overwriting prior material. Version 3 databases are not read or migrated.
+---
 
-The shared summary worker receives complete new blocks plus short previous task
-navigation. LangMem produces per-block indexes and updated navigation in one
-bounded native invocation; it never rewrites source bodies. Publication requires
-indexes for all blocks and an admitted complete snapshot. Import receipts report
-local intake, summary status and publication status separately. The receipt's
-`ref` selects current task navigation; `feedback_ref` identifies the observed
-revision. Follow `first_block_ref` and adjacent block references to read material.
-Missing worker
-configuration, failed output validation and uncertain outcomes remain incomplete.
+## 1. Historical Import Pipeline
 
-Returned outputs and usage are recorded before local scanning/application. A
-local apply failure can resume from that saved result without another model call.
-Failed or uncertain calls require an explicit `--retry-summary` request in the
-Codex adapter; retry retains prior usage, and an uncertain call may already have
-been billed. The normal scheduler does not automatically repeat it.
+```mermaid
+flowchart LR
+  Select["1. User Explicitly Selects Transcript"] --> Gate["2. Dual Scope Gate<br/>Verifies requesting session, source scope<br/>& saved mindie-consent/1"]
+  Gate --> Prefix["3. Snapshot & Prefix Check<br/>Binds file identity + byte length<br/>Verifies consumed prefix & imports new suffix"]
+  Prefix --> Pipeline["4. Shared Redaction & Chunking<br/>Gitleaks + redact(r3) scan<br/>16 KiB blocks + snapshot quarantine marker"]
+  Pipeline --> Index["5. Incremental Indexing & Outbox<br/>Unlocks export only after all blocks are indexed"]
+```
 
-After a confirmed feed changes a task, continuation keeps its current remote
-blocks and navigation plus provably unsent local blocks. This requires a local
-append-only extension of the last confirmed sent package; a rewritten old body
-cannot be guessed into independent additions. Prepared send receipts bind the
-observed feed revision before publication, so a later feed update cannot change
-the meaning of a delayed send confirmation. Pending or uncertain sends remain
-frozen. Unfinished index attempts settle through their existing recovery path
-before reorganization; completed per-block indexes are reused without another
-model call. An edited open PR is checked at its actual current head and stays
-`needs_review` without a write when it conflicts; main does not replace that PR's
-base. Withdrawn public tasks cannot be resurrected by a stale draft. The normal
-outbox handles frozen package submission and reconciliation; an import receipt
-does not claim that GitHub publication or merge has happened. Consumers reuse the
-producer's indexes and build their local ReMe index without a model call.
+---
+
+## 2. Safety & Zero-Replay Guarantees
+
+### Dual Scope & Consent Verification
+- The requesting session must hold a valid admission token and an active `mindie-consent/1` contribution choice.
+- **Both the requesting project scope and every imported source session's project scope must be inside the allowed `project_roots`**. The adapter checks this before reading source metadata, and the core re-verifies it before every parser page and commit.
+- Because the user explicitly selected the historical file, its file identity and byte length define a fixed snapshot (omitting the live activation-time filter) without granting a new live lease to the historical session.
+
+### Whole-Snapshot Quarantine Until Complete
+- A durable intake marker keeps the imported package quarantined from outbound publication until **every page of the selected snapshot** has been redacted and admitted.
+- If a malformed record, unexpected EOF, scanner failure, or consent revocation occurs mid-import, the error is reported visibly. **Already committed pages remain safely stored locally for resumption**, and are never misreported as a finished import.
+
+### Prefix Verification & Idempotent Resumption
+- Re-running an import on a previously imported transcript verifies the already consumed raw byte prefix and imports **only the new trailing suffix**.
+- Repeating an unchanged import creates **zero new blocks and makes zero model calls**. If the previously consumed prefix was altered, the import is rejected without overwriting existing material.
+
+---
+
+## 3. Summary Recovery & Remote Continuation
+
+- **Save Output Before Local Apply**: Just like live capture, the shared summary worker commits returned LangMem outputs and token usage to `SummaryLedger` before applying metadata locally. Local apply interruptions recover without another model call; failed or `unknown` model calls require an explicit retry flag (such as `--retry-summary` in the Codex adapter) rather than automatic background replay.
+- **Honest Import Receipts**: The returned receipt reports **local intake status**, **summary indexing status**, and **publication status** separately—never claiming that GitHub PR creation or merge has already occurred.
+- **Safe Remote Continuation**: When extending a task that was already published upstream, continuation preserves the confirmed remote blocks/navigation and appends only provably unsent local blocks. If a maintainer or review bot edited the remote file on an open PR (or withdrew the task upstream), the candidate parks as `needs_review` (or blocks resurrection) instead of overwriting remote edits.

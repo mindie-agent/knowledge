@@ -12,6 +12,8 @@
 - Cross-process exclusive lock (`<path>.lock`) with `LOCK_WAIT_SECONDS = 5.0`
   and `LOCK_POLL_SECONDS = 0.05`; lock files are retained on close to prevent
   unlink races across concurrent writers.
+- Windows sharing violations get at most `RENAME_RETRY_SECONDS = 5.0` to let
+  short readers close; other failures remain immediate and visible.
 
 [Side-Effect Policy]
 - Atomic local file replacement via `tempfile.mkstemp` + `os.fsync` + `os.replace`.
@@ -23,7 +25,6 @@ import json
 import errno
 import os
 import stat
-import struct
 import tempfile
 import time
 from pathlib import Path
@@ -35,6 +36,8 @@ STATES = ("ok", "missing", "unreadable", "corrupt")
 MAX_BYTES = 64 * 1024
 LOCK_WAIT_SECONDS = 5.0
 LOCK_POLL_SECONDS = 0.05
+RENAME_RETRY_SECONDS = 5.0
+_WINERROR_SHARING_VIOLATION = 32
 
 __all__ = [
     "SCHEMA",
@@ -215,6 +218,20 @@ def read(path):
 # -------------------------------------------------------------------- write
 
 
+def _atomic_replace(source, target):
+    """Allow a short Windows reader to close without losing an explicit choice."""
+    deadline = time.monotonic() + RENAME_RETRY_SECONDS
+    while True:
+        try:
+            os.replace(source, target)
+            return
+        except OSError as exc:
+            if (getattr(exc, "winerror", None) != _WINERROR_SHARING_VIOLATION
+                    or time.monotonic() >= deadline):
+                raise
+            time.sleep(min(LOCK_POLL_SECONDS, max(0, deadline - time.monotonic())))
+
+
 def _write_document(path, data):
     """Replace ``path`` atomically: unique temp file, fsync, os.replace."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -229,7 +246,7 @@ def _write_document(path, data):
             stream.flush()
             if os.environ.get("MINDIE_DISABLE_FSYNC") != "1":
                 os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        _atomic_replace(temporary, path)
     finally:
         if temporary.exists():
             temporary.unlink()
