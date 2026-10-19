@@ -1,8 +1,10 @@
-"""Bounded launch bindings for a service outside its calling application's Job.
+"""[Role] Transfer declared caller bindings to a detached service.
 
-Adapters declare paths and optional environment names in the immutable engine
-configuration. Only the current caller's declared values cross the boundary.
-Windows DPAPI protects the short-lived transfer; it is not a credential store.
+[Invariants] Only declared values cross the boundary. Windows DPAPI binds the
+short-lived transfer to the current user and launch identity.
+[Timeouts & Locks] Local DPAPI calls; no subprocesses or additional locks.
+[Side-Effect Policy] Capture encrypts Windows credentials; successful consumption
+removes the one-use file before applying its values.
 """
 from __future__ import annotations
 
@@ -20,7 +22,7 @@ _FORBIDDEN = {
     "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP", "PSMODULEPATH",
     "CODEX_THREAD_ID", "CODEX_TURN_ID", "CODEX_SESSION_ID",
     "MINDIE_MAINTENANCE_GROUP", "MINDIE_MAINTENANCE_OWNER",
-    "MINDIE_SUMMARY_SCRATCH",
+    "MINDIE_SUMMARY_SCRATCH", "MINDIE_SUMMARY_WORKER_DEADLINE",
 }
 _PREFIXES = ("PYTHON", "LD_", "DYLD_", "GIT_CONFIG", "GIT_SSH", "BASH_ENV",
              "NODE_OPTIONS", "NODE_PATH")
@@ -64,7 +66,20 @@ def validate(config):
 
 
 def _crypt(raw, entropy, *, decrypt=False):
-    return raw
+    try:
+        import pywintypes
+        import win32crypt
+    except ImportError:
+        raise ContextError("service_context_crypto_unavailable") from None
+    try:
+        # Current-user DPAPI and launch-bound entropy protect credentials
+        # without changing the user's profile ACLs or allowing UI prompts.
+        if decrypt:
+            return win32crypt.CryptUnprotectData(raw, entropy, None, None, 1)[1]
+        return win32crypt.CryptProtectData(raw, SCHEMA, entropy, None, None, 1)
+    except pywintypes.error:
+        code = "decryption" if decrypt else "encryption"
+        raise ContextError(f"service_context_{code}_failed") from None
 
 
 def capture(config, binding):

@@ -24,6 +24,8 @@ from mindie_knowledge.loop.engine import Engine
 from mindie_knowledge.loop.store import Store
 from mindie_knowledge.loop.transcript_redaction import install_scanner
 
+pytestmark = pytest.mark.live_npu
+
 
 A2_HOST = "173.125.1.2"
 A2_CONTAINER = "mindie-bench-a2-core-20261017"

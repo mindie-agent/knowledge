@@ -148,6 +148,7 @@ def lifecycle_tests_use_explicit_process_backend(request, monkeypatch):
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "benchmark: large payload throughput benchmark")
+    config.addinivalue_line("markers", "live_npu: requires standing A2/A3 SSH access")
     if _FIXTURE_ERRORS:
         pytest.exit("\n".join(_FIXTURE_ERRORS), returncode=2)
 

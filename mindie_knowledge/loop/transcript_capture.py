@@ -13,7 +13,8 @@
 
 [Timeouts & Locks]
 - Settles `SUMMARY_SETTLE_SECONDS = 3` after capture activity; summary subprocess
-  bounded by `MINDIE_SUMMARY_TIMEOUT_SECONDS` (default `120.0s`).
+  bounded by `MINDIE_SUMMARY_TIMEOUT_SECONDS` (default `315.0s`), with a shared
+  absolute child deadline and 5s reserved for its receipt and cleanup.
 
 [Side-Effect Policy]
 - Executes local Gitleaks redaction and summary worker subprocesses under
@@ -22,11 +23,11 @@
 from __future__ import annotations
 
 import json
-import os
 import time
 from pathlib import Path
 
 from .process import bounded_run
+from . import summary_budget
 from .dfx import failure as diagnostic_failure
 from .store import canonical, digest
 from .index_queue import SummaryWorkerPaused
@@ -111,12 +112,13 @@ def summarize_due(engine):
         ledger = SummaryLedger(store.db)
         attempt = engine.index_queue.latest(batch['entry_id'], batch_identity(selected))
         invoke = False
-        summary_timeout = float(os.environ.get('MINDIE_SUMMARY_TIMEOUT_SECONDS', 120.0))
+        summary_timeout = summary_budget.worker_timeout()
         if attempt is None or attempt['status'] == 'prepared' or batch['status'] == 'retry-requested':
             if not engine.summary_command:
                 raise ValueError('configuration: summary worker is not configured')
             identity = validate_identity(json.loads(bounded_run([*engine.summary_command, '--identity'], '{}',
-                                                                timeout=summary_timeout, max_output=8192, cancel=cancel)))
+                                                                timeout=summary_budget.IDENTITY_SECONDS,
+                                                                max_output=8192, cancel=cancel)))
             request = make_request(task_id=batch['entry_id'], body_version=batch_identity(selected), blocks=selected,
                                    prior_navigation=prior_navigation, identity=identity)
             attempt = engine.index_queue.claim(batch, request)
@@ -139,7 +141,9 @@ def summarize_due(engine):
                 store.db.assert_authority()
                 raw = bounded_run(engine.summary_command, canonical(request), timeout=summary_timeout,
                                   max_output=MAX_RESPONSE_BYTES * 3, cancel=cancel,
-                                  cleanup_receipt=cleanup_receipt, on_result=save_result)
+                                  cleanup_receipt=cleanup_receipt, on_result=save_result,
+                                  child_env={summary_budget.DEADLINE_ENV:
+                                             str(time.monotonic() + summary_timeout)})
                 response = json.loads(raw)
                 if ledger.get(attempt['attempt_id'])['status'] == 'invoking':
                     save_result(raw)

@@ -35,6 +35,23 @@ def test_context_projects_only_declared_present_values_and_consumes_once(tmp_pat
     with pytest.raises(context.ContextError):
         context.consume(path, config, binding)
 
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows user DPAPI")
+def test_dpapi_transfer_encrypts_credentials_and_binds_launch(tmp_path, monkeypatch):
+    monkeypatch.setenv("SELECTED_KEY", "synthetic-service-credential")
+    config = dict(service_launch_context=dict(environment=["SELECTED_KEY"]))
+    binding = dict(attempt="first-launch", fingerprint="engine-generation")
+    raw = context.capture(config, binding)
+    assert b"synthetic-service-credential" not in raw
+    path = tmp_path / "launch.context"
+    path.write_bytes(raw)
+    with pytest.raises(context.ContextError, match="decryption_failed"):
+        context.consume(path, config, {**binding, "attempt": "different-launch"})
+    assert path.exists()
+    assert context.consume(path, config, binding) == {
+        "SELECTED_KEY": "synthetic-service-credential",
+    }
+    assert not path.exists()
+
 
 @pytest.mark.parametrize("key", [
     "PATH", "Path", "PYTHONPATH", "PYTHONHOME", "LD_PRELOAD", "DYLD_LIBRARY_PATH",
