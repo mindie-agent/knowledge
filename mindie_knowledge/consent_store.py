@@ -4,9 +4,9 @@
 - `read(path)` is side-effect-free and strictly distinguishes `ok`, `missing`,
   `unreadable`, and `corrupt`; damaged files never trigger fresh onboarding or
   silent opt-in/opt-out fallbacks.
-- `record_choice` and `record_reporting` merge independent fields under a
-  cross-process OS file lock without overwriting untouched keys or clearing
-  corrupt state.
+- `record_choice` is the sole contribution and fault-reporting choice writer.
+  Its revision fences queued publications across disable/re-enable transitions.
+  Legacy reporting metadata is read only and never authorizes publication.
 
 [Timeouts & Locks]
 - Cross-process exclusive lock (`<path>.lock`) with `LOCK_WAIT_SECONDS = 5.0`
@@ -17,6 +17,8 @@
 
 [Side-Effect Policy]
 - Atomic local file replacement via `tempfile.mkstemp` + `os.fsync` + `os.replace`.
+- `activate_reporting` derives the profile policy and explicitly provisions the
+  native reporter within its 75s budget; recording a choice alone starts no worker.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ import os
 import stat
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
 SCHEMA = "mindie-consent/1"
@@ -48,7 +51,7 @@ __all__ = [
     "ConsentError",
     "read",
     "record_choice",
-    "record_reporting",
+    "activate_reporting",
 ]
 
 
@@ -198,6 +201,12 @@ def _validate(data):
     reporting = data.get("reporting")
     if reporting is not None and reporting not in REPORTING:
         return "unknown reporting choice"
+    revision = data.get("choice_revision")
+    if revision is not None and (
+        not isinstance(revision, str) or len(revision) != 32
+        or any(char not in "0123456789abcdef" for char in revision)
+    ):
+        return "invalid contribution revision"
     return None
 
 
@@ -206,7 +215,7 @@ def read(path):
     path = Path(path)
     result = dict(
         state=None, choice=None, reporting=None, choice_at=None,
-        reporting_at=None, path=str(path), error=None,
+        reporting_at=None, choice_revision=None, path=str(path), error=None,
     )
     state, data = _read_raw(path)
     result["state"] = state
@@ -224,6 +233,8 @@ def read(path):
         return result
     result["choice"] = data.get("choice")
     result["reporting"] = data.get("reporting")
+    revision = data.get("choice_revision")
+    result["choice_revision"] = revision
     for key in ("choice_at", "reporting_at"):
         value = data.get(key)
         result[key] = value if type(value) in (int, float) else None
@@ -297,7 +308,7 @@ def _record(path, mutate):
 def record_choice(path, choice):
     """Persist one explicit contribution choice; merge everything else.
 
-    The reporting value and all untouched metadata survive. A missing
+    Untouched legacy metadata survives but has no authorization role. A missing
     file is created (explicit first choice); a corrupt or unreadable one is
     preserved and reported, never silently cleared.
     """
@@ -305,23 +316,48 @@ def record_choice(path, choice):
         raise ValueError("choice must be contribute, read-only, later or disabled")
 
     def mutate(document):
-        if document.get("choice") == choice:
+        if document.get("choice") == choice and document.get("choice_revision"):
             return
-        document.update(schema=SCHEMA, choice=choice, choice_at=time.time())
+        document.update(schema=SCHEMA, choice=choice, choice_at=time.time(),
+                        choice_revision=uuid.uuid4().hex)
 
     return _record(path, mutate)
 
 
-def record_reporting(path, value):
-    """Persist one explicit reporting choice; merge everything else.
+def activate_reporting(path, *, config, roots=None,
+                       repository="mindie-agent/mindie-agent", ensure=True,
+                       unit_dir=None):
+    """Derive fault reporting from the saved unified contribution choice.
 
-    The contribution choice and all untouched metadata survive; the two
-    consents never overwrite each other.
+    Startup never creates consent. Legacy choices require one explicit unified
+    choice, including an unchanged ``contribute``, before uploading diagnostics.
+    Configuration is not worker readiness; failed activation remains visible.
     """
-    if value not in REPORTING:
-        raise ValueError("reporting must be enabled, disabled or later")
+    from mindie_diagnostics.integration import configure_reporting
 
-    def mutate(document):
-        document.update(schema=SCHEMA, reporting=value, reporting_at=time.time())
+    consent = read(path)
+    result = {"consent": consent, "enabled": False,
+              "worker": {"status": "not_started"}}
+    if consent["state"] == "missing":
+        return {**result, "status": "needs_choice"}
+    if consent["state"] != "ok":
+        return {**result, "status": "consent_unavailable"}
+    enabled = consent["choice"] == "contribute" and bool(consent["choice_revision"])
+    configuration = configure_reporting(
+        enabled, consent_config=Path(path).absolute(), config=config,
+        roots=roots, repository=repository,
+    )
+    result.update(configuration=configuration, enabled=enabled)
+    if configuration.get("status") != "configured":
+        return {**result, "status": "configuration_unavailable", "enabled": False}
+    if not consent["choice_revision"]:
+        return {**result, "status": "needs_choice"}
+    if not enabled:
+        return {**result, "status": "disabled"}
+    if not ensure:
+        return {**result, "status": "configured"}
+    from mindie_diagnostics.reporting_commands import ensure as ensure_worker
 
-    return _record(path, mutate)
+    worker = ensure_worker(config, unit_dir=unit_dir)
+    result["worker"] = worker
+    return {**result, "status": "running" if worker.get("status") == "running" else "degraded"}
