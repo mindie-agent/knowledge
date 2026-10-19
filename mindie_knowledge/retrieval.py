@@ -22,7 +22,7 @@ def _aliases(word):
         return ()
     aliases = []
     for part in _PARTS.split(word):
-        if _IDENTIFIER.fullmatch(part):
+        if part.isidentifier() if part.isascii() else _IDENTIFIER.fullmatch(part):
             aliases.append(part)
             aliases.extend(part.split('_'))
     return tuple(dict.fromkeys(part for part in aliases if len(part) > 1 and part != word))
@@ -51,13 +51,15 @@ def tokens(text: str) -> list[str]:
 
 def token_counts(text: str) -> Counter[str]:
     """Expand each distinct lexeme once when a BM25 index needs frequencies."""
-    counts = Counter()
+    counts = {}
     for word, frequency in Counter(_WORDS.findall(text.casefold())).items():
-        if _CJK.fullmatch(word) and len(word) > 1:
+        # _WORDS emits an entire CJK run separately from identifier lexemes.
+        if '\u3400' <= word[0] <= '\u9fff' and len(word) > 1:
             for index in range(len(word) - 1):
-                counts[word[index:index + 2]] += frequency
+                token = word[index:index + 2]
+                counts[token] = counts.get(token, 0) + frequency
         else:
-            counts[word] += frequency
+            counts[word] = counts.get(word, 0) + frequency
             for alias in (_cached_aliases(word) if len(word) <= 256 else _aliases(word)):
-                counts[alias] += frequency
-    return counts
+                counts[alias] = counts.get(alias, 0) + frequency
+    return Counter(counts)
