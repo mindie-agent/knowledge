@@ -15,6 +15,7 @@ import pytest
 from mindie_knowledge.loop import settings as settings_mod
 from mindie_knowledge.loop.cli import capture_hook
 from mindie_knowledge.loop.engine import Engine
+from mindie_knowledge.loop.feed import feed_ident
 from mindie_knowledge.loop.store import Store, canonical, session_key
 from mindie_knowledge.loop.transport import Service
 
@@ -34,6 +35,12 @@ def draft(store, title="ACL graph investigation", content="Compare eager first."
         kind="experience", title=title, summary=summary, content=content,
         owner=PRODUCER, generation=generation,
     )
+
+
+def published_observation(store, settings):
+    doc = draft(store, title="Published graph observation", content="Existing public graph evidence.")
+    install_documents(store, [doc], feed_ident=feed_ident(settings.repository, settings.branch))
+    return doc
 
 
 def _revision_double(files, domain, base_commit, entry_refs):
@@ -356,7 +363,8 @@ def test_outbox_coalesces_and_disable_cancels_unsent(gated, tmp_path):
     current = settings_mod.load(tmp_path / "community.json")
     doc_entry = store.get(store.ref(doc["entry_id"]))
     store.grant("draft", doc["entry_id"], doc_entry["revision"], current.generation)
-    vote = store.record_vote(root_hash=session_key("root-1"), ref=store.ref(doc["entry_id"], doc["revision"]),
+    public = published_observation(store, current)
+    store.record_vote(root_hash=session_key("root-1"), ref=store.ref(public["entry_id"], public["revision"]),
                              rating="up", reason="", publishable=True,
                              generation=current.generation)
     built = build_batch(store, settings=current, revision_fn=_revision_double)
@@ -549,10 +557,11 @@ def test_current_generation_draft_and_vote_publish(gated, tmp_path):
     store, engine, _, _ = gated
     current = settings_mod.load(tmp_path / "community.json")
     doc = draft(store, generation=current.generation)
-    store.record_vote(root_hash=session_key("root-9"), ref=store.ref(doc["entry_id"], doc["revision"]),
+    public = published_observation(store, current)
+    store.record_vote(root_hash=session_key("root-9"), ref=store.ref(public["entry_id"], public["revision"]),
                       rating="up", reason="", publishable=True,
                       generation=current.generation)
-    store.record_vote(root_hash=session_key("root-9"), ref=store.ref(doc["entry_id"], doc["revision"]),
+    store.record_vote(root_hash=session_key("root-9"), ref=store.ref(public["entry_id"], public["revision"]),
                       rating="down", reason="counterexample", publishable=True,
                       generation=current.generation)
     built = build_batch(store, settings=current, revision_fn=_revision_double)
@@ -593,13 +602,14 @@ def test_pending_votes_are_not_sent_after_upstream_withdrawal(gated):
     store, engine, _, _ = gated
     settings = engine._settings()
     doc = draft(store)
-    install_documents(store, [doc], feed_ident='f' * 64)
+    source = feed_ident(settings.repository, settings.branch)
+    install_documents(store, [doc], feed_ident=source)
     ref = store.ref(doc['entry_id'], doc['revision'])
     store.record_vote(ref=ref, rating='down', reason='', root_hash=session_key('consumer'),
                       publishable=True, generation=settings.generation)
     built = build_batch(store, settings=settings)
     pending = store.batch(built[0])
-    store.install_feed([], feed_ident='f' * 64)
+    store.install_feed([], feed_ident=source)
     writes = []
     engine.community = {'submit_batch': lambda *args, **kwargs: writes.append(args)}
     engine._submit(pending)

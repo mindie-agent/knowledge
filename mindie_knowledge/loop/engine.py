@@ -154,6 +154,22 @@ class Engine:
     def _settings(self):
         return settings_mod.load(self.settings_path)
 
+    def apply_distillation(self, request, decision):
+        """Apply an explicit C6 organizer result; never infer completion from Stop."""
+        from ..graded.distill import apply_decision
+        return apply_decision(self.store, request, decision)
+
+    def distill_selected(self, inputs, *, session_digest, task_state, authorization=None, cancel=None):
+        """Explicit verified milestone/completion; ordinary Stop does not select it."""
+        from ..graded.worker import run
+        from .operations import CombinedCancellation
+        generation = authorization.get("generation") if authorization else None
+        with self.operations.scope("index", "distill:" + session_digest, generation) as operation:
+            if operation is None:
+                raise ValueError("service is not admitting distillation work")
+            return run(self, inputs, session_digest=session_digest, task_state=task_state,
+                       authorization=authorization, cancel=CombinedCancellation(cancel, operation.cancel))
+
     def _error(self, detail):
         self.errors = (self.errors + [detail])[-20:]
 
@@ -800,7 +816,7 @@ class Engine:
                         self._submit(row)
                     material = self.store.has_changed_drafts(
                         generation=generation, ready_only=True
-                    ) or self.store.unbatched_votes(generation=generation)
+                    ) or self.store.graded.pending(generation) or self.store.unbatched_votes(generation=generation)
                     if material:
                         idle_for = time.monotonic() - self.last_activity
                         deactivated = (

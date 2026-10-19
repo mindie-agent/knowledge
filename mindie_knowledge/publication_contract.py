@@ -1,8 +1,13 @@
-"""One public data contract shared by producers, validators and consumers.
+"""[Role] One public data contract shared by producers, validators and consumers.
 
-The declaration is untrusted data. It cannot choose code for a client to run.
-Trusted repository CI selects executable validator code from its base commit;
-the product release separately pins the exact declaration bytes it accepts.
+[Invariants] The declaration is untrusted data and cannot choose code to run.
+Its schema selects exactly one data format (contract/1 material packages or
+contract/2 graded Markdown); mismatched formats and unknown schemas fail closed.
+Trusted repository CI selects validator code from its base commit, and the
+product release separately pins the exact declaration bytes it accepts.
+[Timeouts & Locks] Pure parsing; Git reads honor the caller's deadline/cancel.
+[Side-Effect Policy] Validate/read data only; never execute, download or modify
+a candidate tree.
 """
 from __future__ import annotations
 
@@ -15,6 +20,7 @@ from .filesystem import git_path
 CONTRACT_FILE = "publication-contract.json"
 PUBLICATION_CONTRACT_FILE = CONTRACT_FILE
 SCHEMA = "mindie-publication-contract/1"
+GRADED_SCHEMA = "mindie-publication-contract/2"
 REVIEW_CONTRACT = "mindie-content-review/2"
 FORMATS = {
     "package": "mindie-material-package/1",
@@ -23,6 +29,18 @@ FORMATS = {
     "entry": "mindie-entry/3",
     "feedback": "mindie-feedback/1",
 }
+FORMATS_V2 = {
+    "unit": "mindie-graded-unit/1",
+    "feedback": "mindie-graded-feedback/1",
+    "routing": "mindie-routing-manifest/1",
+}
+# The declaration schema selects exactly one data format. There is no
+# implicit fallback: an unknown schema, or a schema paired with another
+# format set, is rejected before a reader sees candidate bytes.
+FORMATS_BY_SCHEMA = {SCHEMA: FORMATS, GRADED_SCHEMA: FORMATS_V2}
+DATA_FORMAT_V1 = "material-package"
+DATA_FORMAT_V2 = "graded"
+DATA_FORMATS = {SCHEMA: DATA_FORMAT_V1, GRADED_SCHEMA: DATA_FORMAT_V2}
 MAX_CONTRACT_BYTES = 16 * 1024
 
 
@@ -41,15 +59,26 @@ def _unique(pairs):
     return result
 
 
+def data_format(value):
+    """Return the one explicitly selected data format, never a fallback."""
+    if not isinstance(value, dict):
+        raise ContractMismatch("publication contract must be an object")
+    try:
+        return DATA_FORMATS[value.get("schema")]
+    except (KeyError, TypeError):
+        raise ContractMismatch("publication contract schema does not select a supported data format") from None
+
+
 def validate_contract(value, domain):
     """Validate a declaration without downloading, executing or modifying it."""
     if not isinstance(value, dict) or set(value) != {"schema", "domain", "formats", "validator", "review"}:
         raise ContractMismatch("publication contract has unsupported fields")
-    if value["schema"] != SCHEMA or value["domain"] != domain:
-        raise ContractMismatch("publication contract schema or domain does not match")
     if not isinstance(domain, str) or not re.fullmatch(r"[a-z][a-z0-9-]{0,63}", domain):
         raise ContractMismatch("publication contract domain is invalid")
-    if value["formats"] != FORMATS:
+    schema = value["schema"]
+    if not isinstance(schema, str) or schema not in FORMATS_BY_SCHEMA or value["domain"] != domain:
+        raise ContractMismatch("publication contract schema or domain does not match")
+    if value["formats"] != FORMATS_BY_SCHEMA[schema]:
         raise ContractMismatch("publication contract formats do not match the installed runtime")
     validator = value["validator"]
     if (not isinstance(validator, dict) or set(validator) != {"repository", "revision"}
@@ -62,9 +91,13 @@ def validate_contract(value, domain):
     return json.loads(json.dumps(value))
 
 
-def make_contract(domain, validator_revision):
+def make_contract(domain, validator_revision, *, schema=SCHEMA):
+    try:
+        formats = FORMATS_BY_SCHEMA[schema]
+    except (KeyError, TypeError):
+        raise ContractMismatch("publication contract schema does not select a supported data format") from None
     return validate_contract({
-        "schema": SCHEMA, "domain": domain, "formats": dict(FORMATS),
+        "schema": schema, "domain": domain, "formats": dict(formats),
         "validator": {"repository": "mindie-agent/knowledge", "revision": validator_revision},
         "review": {"contract": REVIEW_CONTRACT, "check": "publication-head"},
     }, domain)

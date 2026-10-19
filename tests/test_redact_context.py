@@ -146,6 +146,21 @@ class FindingOffsetsAndMaskTests(unittest.TestCase):
 
 
 class PackageVersionIpv4Tests(unittest.TestCase):
+    def test_observed_firmware_version_kept_address_still_masked(self):
+        # Captured by npu-smi during the independent five-stage A2 run.
+        version = "7.7.0.10.220"
+        address = synthetic_ipv4()
+        text = f"Firmware Version: {version}; peer {address}."
+        findings = [f for f in redact.scan_text(text) if f.rule == "ipv4-address"]
+        self.assertEqual([f.value for f in findings], [address])
+        masked, rules = public_redact(
+            text, executable=install_scanner(), key=b"synthetic-redaction-test-key"
+        )
+        self.assertIn(f"Firmware Version: {version};", masked)
+        self.assertNotIn(address, masked)
+        self.assertIn("ipv4-address", rules)
+        self.assertTrue(masked.endswith("."))
+
     def test_package_grammar_versions_survive(self):
         clean = (
             # Public pip-check shape: the four-part token is a version.

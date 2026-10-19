@@ -1,9 +1,13 @@
-"""Explicitly retire one exact service configuration.
+"""[Role] Explicitly retire or restore one exact service configuration.
 
-The receipt lives beside the configuration. It bars already-spawned wake
+[Invariants] The receipt lives beside the configuration. It bars already-spawned wake
 helpers as well as new starters; absence of a listener alone is never an
 admission decision. The startup and admission OS locks make that decision
 atomic with service ownership. No elapsed-time deadline governs useful work.
+[Timeouts & Locks] Caller control budgets bound startup/admission locks and
+owner observation; restoration can use the caller's remaining cleanup budget.
+[Side-Effect Policy] Stops only idle owners and writes exact configuration
+retirement markers. Restoration never invokes model or publication work.
 """
 from __future__ import annotations
 
@@ -174,6 +178,7 @@ def retire_service(config_path, *, control_timeout=None):
     _acquire(start, deadline, "startup_lock")
     try:
         _acquire(admission, deadline, "admission_lock")
+        receipt = None
         try:
             previous = inspect_retirement(config_path, config)
             if previous is not None and previous['status'] == 'retired':
@@ -233,20 +238,29 @@ def retire_service(config_path, *, control_timeout=None):
                             cleanup_error=dict(stage='consumer_ownership', error_type=type(exc).__name__,
                                                errno=exc.errno, operation_completed=True))
             return _completed_retirement(config_path, config, outcome, receipt)
+        except BaseException as exc:
+            if receipt is not None:
+                exc.mindie_retirement = dict(receipt)
+            raise
         finally:
             admission.release()
     finally:
         start.release()
 
 
-def restore_service(config_path, retirement=None):
+def restore_service(config_path, retirement=None, *, control_timeout=None):
     """Explicitly restore one exact, known completed retirement."""
     from .cli import config_at
+    if control_timeout is not None and (
+        type(control_timeout) not in (int, float) or not math.isfinite(control_timeout) or control_timeout < 0
+    ):
+        raise ValueError("control_timeout must be a finite nonnegative number")
+    deadline = None if control_timeout is None else time.monotonic() + control_timeout
     config = config_at(config_path)
     start, admission = _locks(config)
-    start.acquire(wait=None)
+    _acquire(start, deadline, "startup_lock")
     try:
-        admission.acquire(wait=None)
+        _acquire(admission, deadline, "admission_lock")
         try:
             current = inspect_retirement(config_path, config)
             if current is None:

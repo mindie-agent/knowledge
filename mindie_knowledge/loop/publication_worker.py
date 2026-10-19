@@ -1,7 +1,11 @@
-"""Publication stages and receipts; scheduling and authority belong to Engine.
+"""[Role] Execute publication stages; Engine owns scheduling and authority.
 
-A frozen batch owns its original remote intent. Read-only reconciliation never
-creates a new write; a returned result survives receipt or cleanup failures.
+[Invariants] Frozen batches retain their original remote intent. Returned
+remote results survive local receipt or cleanup failures.
+[Timeouts & Locks] Engine operation scopes own cancellation; transports bound
+external calls. Receipt updates use the Store's bounded SQLite transactions.
+[Side-Effect Policy] Only an admitted batch can write remotely. Reconciliation
+reads existing remote state and never creates a new write.
 """
 from .store import Store
 
@@ -58,6 +62,14 @@ class PublicationWorker:
                 batch_row["batch_id"], "disabled",
                 detail="settings generation changed before send",
             )
+            return
+        prepared = self.store.feed_get("prepared-package-bases:" + batch_row["batch_id"]) or {}
+        target = prepared.get("publication_target")
+        from .publication_target import matches_settings
+        if not target or not matches_settings(target, settings):
+            detail = ("pre-upgrade batch has no frozen publication target; retained for explicit review"
+                      if not target else "publication repository or branch changed after this batch was frozen")
+            self.store.mark_batch(batch_row["batch_id"], "needs_review", detail=detail)
             return
         if self.engine.community is None:
             self.store.mark_batch(
@@ -160,7 +172,7 @@ class PublicationWorker:
 
     def _flush(self):
         """Coalesce all pending material into one batch and send it."""
-        from .export import build_batch, ExportQuarantinedError
+        from .export import build_batch, DistillationRequired, ExportQuarantinedError
         from ..materials.publication import CleanupReceiptError
 
         settings = self.engine._settings()
@@ -169,6 +181,10 @@ class PublicationWorker:
         rejection = None
         try:
             built = build_batch(self.store, settings=settings)
+        except DistillationRequired as exc:
+            self.engine._fault('knowledge.publish', 'distillation', 'legacy_drafts_require_c6', exc)
+            self.engine._error(str(exc))
+            raise
         except ExportQuarantinedError as exc:
             rejection = exc
             self.engine._fault('knowledge.publish', 'content-scan', 'publication_content_rejected', exc)
@@ -180,6 +196,7 @@ class PublicationWorker:
             batch_id = exc.batch_id
             self.engine._error("New contribution staged; prior staging cleanup receipt failed: " + str(exc))
         else:
+            self.engine._clear_faults('knowledge.publish', {'distillation'})
             if built is None:
                 return
             batch_id, _revision, _batch, _ids, _votes = built

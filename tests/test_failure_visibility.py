@@ -324,3 +324,24 @@ def test_payload_error_remains_primary_when_failure_recording_also_fails(tmp_pat
         assert caught.value is primary and caught.value.__cause__ is secondary
         assert 'payload failure receipt also failed: OSError' in caught.value.__notes__
         assert store.batch(batch_id) == original
+
+
+def test_pre_upgrade_unbound_batch_never_uses_current_destination(tmp_path):
+    from mindie_knowledge.loop.engine import Engine
+    from conftest import write_settings
+    from test_publication_authority import prepare
+    settings = write_settings(tmp_path / 'sharing.json', consent_choice='contribute', roots=[tmp_path])
+    with closing(Store(tmp_path / 'store', 'test')) as store:
+        _, batch_id = prepare(store, settings, 'Synthetic retained pre-upgrade contribution.')
+        key = 'prepared-package-bases:' + batch_id
+        prepared = store.feed_get(key)
+        prepared.pop('publication_target')
+        store.feed_set(key, prepared)
+        original = store.batch(batch_id)
+        engine = Engine(store, settings_path=settings.path)
+        writes = []
+        engine.community['submit_batch'] = lambda *a, **kw: writes.append(a)
+        engine._submit(original)
+        retained = store.batch(batch_id)
+        assert retained['status'] == 'needs_review' and retained['attempted'] is None
+        assert retained['batch'] == original['batch'] and not writes

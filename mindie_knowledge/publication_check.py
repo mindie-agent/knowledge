@@ -1,20 +1,17 @@
-"""Validate Git publication data using the installed, trusted runtime.
+"""[Role] Validate Git publication data with the installed, trusted runtime.
 
-CI should invoke this with ``python -I -m mindie_knowledge.publication_check``
-from a pinned wheel. Candidate files are read as Git blobs, never imported or
-executed. An empty publication is valid.
-
-There is no whole-publication file-count or total-byte business cap and no
-fixed whole-tree metadata output cap: the tree listing streams to a scratch
-file parsed in bounded chunks, and each blob is validated against the real
-per-file platform envelope as it is read through one bounded persistent
-``git cat-file --batch`` process (at most one body in memory at a time).
-
-One normal call streams the fixed commit and checkpoints verified blobs per
-path, bound to the exact commit and validation context. Interruption preserves
-completed checkpoints for a later invocation. There is no elapsed-time slice
-or stalled-time heuristic: quiet, healthy validation continues. Privacy scans
-always see complete records, including cross-line matches.
+CI invokes this with ``python -I -m mindie_knowledge.publication_check`` from a
+pinned wheel. Candidate bytes are read as Git blobs, never imported or run.
+[Invariants] Contract/1 validates complete task packages and feedback;
+contract/2 parses every graded unit through GradedUnit, checks exact semantic
+paths, stable-ID uniqueness, the complete inheritance graph, persisted revision
+and digest, and validates optional derived routing data against the actual
+units. Without a contract/2 unit tree an old task corpus is never "empty".
+[Timeouts & Locks] One bounded persistent ``git cat-file --batch`` read at a
+time; listing output streams to scratch and validation has no elapsed-time
+slice. Checkpoints bind verified blobs to the exact commit and context.
+[Side-Effect Policy] Read-only candidate inspection plus scratch/checkpoint
+files; never execute candidate content.
 """
 from __future__ import annotations
 import argparse,importlib.metadata,json,os,re,sys,tempfile
@@ -27,7 +24,17 @@ from .loop import documents
 from .loop.documents import MAX_FILE_BYTES
 from .materials.store import BLOCK_SCHEMA, _parse, _parse_manifest, _parse_block, _sha
 from .redact import scan_text
-from .publication_contract import read_git_contract
+from .publication_contract import (
+    DATA_FORMAT_V2, GRADED_SCHEMA, SCHEMA, data_format, read_git_contract,
+)
+from .graded.feed import (
+    ROUTING_MANIFEST_PATH, ROUTING_MANIFEST_SCHEMA,
+    SHARD_TOPOLOGY_PATH, SHARD_TOPOLOGY_SCHEMA, classify_path,
+    is_graded_unit_path, validate_derived,
+)
+from .graded.index import MAX_UNIT_BYTES, RoutingIndex
+from .graded.units import SCHEMA as GRADED_UNIT_SCHEMA
+from .graded.units import GradedUnit, relative_path
 
 def _git_env():
     return with_windows_longpaths({'GIT_TERMINAL_PROMPT':'0','GIT_CONFIG_COUNT':'1',
@@ -35,6 +42,14 @@ def _git_env():
 
 _CHECKPOINT_EVERY=64
 _STATE_NAME='mindie-validator-state.json'
+
+def _graded_feedback_schema():
+    try:
+        from .graded.feedback import SCHEMA_FEEDBACK
+    except ImportError:
+        return 'unavailable'
+    return SCHEMA_FEEDBACK
+
 
 def _validator_context(domain):
     """Fingerprint of the validation context: domain, validator version,
@@ -57,6 +72,10 @@ def _validator_context(domain):
         'entry_schema': documents.SCHEMA,
         'package_schema': 'mindie-material-package/1',
         'feedback_schema': SCHEMA_FEEDBACK,
+        'graded_unit_schema': GRADED_UNIT_SCHEMA,
+        'graded_feedback_schema': _graded_feedback_schema(),
+        'graded_routing_schema': ROUTING_MANIFEST_SCHEMA,
+        'graded_topology_schema': SHARD_TOPOLOGY_SCHEMA,
     }
 
 def _default_state_path(repo):
@@ -82,7 +101,7 @@ def _load_checkpoint(path,revision,context):
     clean={}
     for path,value in verified.items():
         if not isinstance(path,str):continue
-        if (isinstance(value,dict) and value.get('type') in ('task','block','feedback')
+        if (isinstance(value,dict) and value.get('type') in ('task','block','feedback','unit')
               and isinstance(value.get('sha'),str)):
             clean[path]=value
     return clean
@@ -137,6 +156,191 @@ def _validate_task_sets(stats):
         if not all(block['indexed'] for block in header['blocks']):
             raise ValueError(f'tasks/{task_id}: public material indexing is incomplete')
 
+def _unit_from_checkpoint(value, path):
+    if not is_graded_unit_path(path):
+        raise ValueError(f'{path}: unsafe or noncanonical graded unit path')
+    if value.get('path') != path:
+        raise ValueError(f'{path}: checkpoint path differs from the tree path')
+    try:
+        metadata, body = value['metadata'], value['body']
+        unit = GradedUnit.from_parts(metadata, body, path)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f'{path}: checkpointed graded unit is invalid: {exc}') from exc
+    if (unit.metadata.get('content_digest') != metadata.get('content_digest')
+            or unit.content_sha256 != value.get('content_sha256')):
+        raise ValueError(f'{path}: checkpointed graded unit digest differs')
+    expected = f"{unit.metadata['domain_path']}/{unit.id}.md"
+    if path != expected:
+        raise ValueError(f'{path}: unit path must be exactly {expected}')
+    return unit
+
+
+def _unit_from_text(text, path):
+    if not is_graded_unit_path(path):
+        raise ValueError(f'{path}: unsafe or noncanonical graded unit path')
+    unit = GradedUnit.from_text(text, path)
+    expected = f"{unit.metadata['domain_path']}/{unit.id}.md"
+    if path != expected:
+        raise ValueError(f'{path}: unit path must be exactly {expected}')
+    return unit
+
+
+def _json_object(text, path):
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f'{path}: duplicate derived JSON field {key!r}')
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(text, object_pairs_hook=unique)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f'{path}: derived data is not valid JSON: {exc}') from exc
+    if not isinstance(value, dict):
+        raise ValueError(f'{path}: derived data must be an object')
+    return value
+
+
+def _scan_graded_unit(unit, path):
+    """Scan C5 metadata and body; a recognized Git locator is not SSH text."""
+    from .graded.privacy import metadata_findings
+    findings = [*metadata_findings(unit.metadata, path), *scan_text(unit.body, path=path)]
+    if findings:
+        raise ValueError(f'{path}: public data fails the privacy scan')
+
+
+def _scan_graded_json(value, path):
+    """Scan derived JSON while accepting the same C5 Git locators as units."""
+    from .graded.privacy import metadata_findings
+    if metadata_findings(value, path):
+        raise ValueError(f'{path}: public data fails the privacy scan')
+
+
+def _validate_graded_feedback(text, path):
+    # The feedback worker owns this schema and validator; a contract/2 tree
+    # with feedback cannot be called valid while that authority is unavailable.
+    try:
+        from .graded.feedback import validate_feedback as graded_validate_feedback
+    except ImportError as exc:
+        raise ValueError(
+            f'{path}: graded feedback validation is unavailable; '
+            'mindie_knowledge.graded.feedback is required'
+        ) from exc
+    return graded_validate_feedback(text, path)["votes"]
+
+
+def _record_graded(unit, stats):
+    stats['graded_units'].append(unit)
+
+
+def _validate_graded_tree(repo, revision, domain, state_path, context, verified, stats):
+    """Validate a contract/2 snapshot; every unit is parsed and graph-checked.
+
+    The listing streams to a scratch file; verified unit bodies are reused only
+    under the exact same commit and validation context, and the whole unit graph
+    and derived data are still revalidated on every call.
+    """
+    fd, listing_name = tempfile.mkstemp(prefix='mindie-ls-tree-')
+    os.close(fd)
+    listing_file = Path(listing_name)
+    derived = {}
+    try:
+        run_stdout_to_file(
+            [git_executable(), '-C', str(repo), 'ls-tree', '-r', '-z', '--long', revision],
+            listing_file, timeout=None, env=_git_env(),
+        )
+        reader = None
+        pending = 0
+        try:
+            with closing(iter_file_records(listing_file, separator=b'\0')) as records:
+                for raw in records:
+                    if not raw:
+                        continue
+                    head, path = raw.decode('utf-8', 'strict').split('\t', 1)
+                    mode, kind, sha, size = head.split()
+                    content_kind = classify_path(path)
+                    if content_kind in (None, 'metadata'):
+                        continue
+                    if content_kind == 'unit' and not is_graded_unit_path(path):
+                        raise ValueError(f'{path}: unsafe or noncanonical graded unit path')
+                    if path in stats['done_paths']:
+                        continue
+                    if content_kind == 'feedback':
+                        check_path(path)
+                    relative_path(path)
+                    if mode != '100644' or kind != 'blob' or not size.isdigit():
+                        raise ValueError(f'{path}: publication requires a plain data blob')
+                    maximum = MAX_UNIT_BYTES if content_kind == 'unit' else MAX_FILE_BYTES
+                    if int(size) > maximum:
+                        raise ValueError(f'{path}: exceeds the per-file platform envelope')
+                    prior = verified.get(path)
+                    if content_kind == 'unit' and prior is not None and prior.get('sha') == sha:
+                        unit = _unit_from_checkpoint(prior, path)
+                        _record_graded(unit, stats)
+                        stats['count'] += 1
+                        stats['bytes'] += int(size)
+                        stats['done_paths'].add(path)
+                        continue
+                    if reader is None:
+                        reader = CatFileBatch(repo, env=_git_env())
+                    blob = reader.read(sha, deadline=None, max_bytes=maximum)
+                    if blob is None:
+                        # A missing blob is not evidence of deletion; no snapshot
+                        # switch may happen from an incomplete read.
+                        raise OSError(f'{path}: the listed candidate blob is unavailable')
+                    text = blob.decode('utf-8', 'strict')
+                    if '\r' in text or '\x00' in text:
+                        raise ValueError(f'{path}: canonical LF bytes required')
+                    if content_kind == 'unit':
+                        unit = _unit_from_text(text, path)
+                        _scan_graded_unit(unit, path)
+                        _record_graded(unit, stats)
+                        verified[path] = {
+                            'type': 'unit', 'sha': sha, 'path': path,
+                            'metadata': unit.metadata, 'body': unit.body,
+                            'content_sha256': unit.content_sha256,
+                        }
+                    elif content_kind == 'feedback':
+                        if scan_text(text):
+                            raise ValueError(f'{path}: public data fails the privacy scan')
+                        stats['graded_feedback'].extend(_validate_graded_feedback(text, path))
+                        stats['feedback'] += 1
+                    else:
+                        value = _json_object(text, path)
+                        _scan_graded_json(value, path)
+                        derived[path] = value
+                    stats['count'] += 1
+                    stats['bytes'] += int(size)
+                    stats['done_paths'].add(path)
+                    pending += 1
+                    if pending % _CHECKPOINT_EVERY == 0:
+                        _save_checkpoint(state_path, revision, context, verified)
+        finally:
+            if reader is not None:
+                reader.close()
+    finally:
+        pending_error = sys.exc_info()[1]
+        try:
+            listing_file.unlink()
+        except OSError as cleanup_error:
+            if pending_error is None:
+                raise
+            pending_error.add_note('Scratch cleanup also failed: ' + str(cleanup_error))
+    _save_checkpoint(state_path, revision, context, verified)
+    index = RoutingIndex(stats['graded_units'])
+    units = {unit.id: unit for unit in stats['graded_units']}
+    if len(units) != len(stats['graded_units']):
+        raise ValueError('Duplicate canonical unit identity')
+    validate_derived(derived.get(ROUTING_MANIFEST_PATH), derived.get(SHARD_TOPOLOGY_PATH),
+                     units, index)
+    from .graded.feedback import validate_bindings
+    validate_bindings(stats['graded_feedback'], units)
+    stats['graded_index'] = index
+    return stats
+
+
 def _validate_tree(repo,revision,domain,state_path,context,verified,stats):
     """Stream the candidate tree; reuse verified per-path checkpoints.
 
@@ -164,6 +368,10 @@ def _validate_tree(repo,revision,domain,state_path,context,verified,stats):
                     if not path.startswith(('tasks/','feedback/')):
                         if path.startswith(('cases/','topics/','corpus/','generations/')):
                             raise ValueError('Retired knowledge layout is not supported')
+                        if classify_path(path) == 'unit':
+                            raise ValueError(
+                                f'{path}: unsupported content layout for publication-contract/1'
+                            )
                         continue
                     if path in stats['done_paths']:
                         continue  # fully processed in an earlier slice of this call
@@ -218,13 +426,26 @@ def _validate_tree(repo,revision,domain,state_path,context,verified,stats):
     _save_checkpoint(state_path,revision,context,verified)
     return stats
 
-def classify_changes(repo, base_revision, revision):
+def _v2_content_path(path):
+    if path.startswith("tasks/"):
+        return False
+    try:
+        return classify_path(path) in {"unit", "feedback", "derived"}
+    except ValueError:
+        return False
+
+
+def classify_changes(repo, base_revision, revision, *, schema=SCHEMA):
     """Separate ordinary data PRs from development changes at exact commits.
 
-    A valid task tree does not authorize changing workflow, contract or policy.
+    A valid tree does not authorize changing workflow, contract or policy.
     Return a classification; maintainers can review development PRs normally,
-    but the content Bot must not auto-merge them.
+    but the content Bot must not auto-merge them. Contract/2 treats graded
+    units, feedback and validated derived routing data as content; the retired
+    task layout remains development rather than an implicit content upgrade.
     """
+    if schema not in (SCHEMA, GRADED_SCHEMA):
+        raise ValueError("unsupported publication contract schema")
     for name, value in (("base_revision", base_revision), ("revision", revision)):
         if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{40}", value):
             raise ValueError(f"{name} must be an immutable Git commit")
@@ -245,8 +466,12 @@ def classify_changes(repo, base_revision, revision):
                 status = raw.decode("ascii", "strict")
                 path = next(records).decode("utf-8", "strict")
                 count += 1
-                if status == "M" and re.fullmatch(r"tasks/[0-9a-f]{64}/blocks/[0-9a-f]{64}\.md", path):
+                if schema != GRADED_SCHEMA and status == "M" and re.fullmatch(r"tasks/[0-9a-f]{64}/blocks/[0-9a-f]{64}\.md", path):
                     raise ValueError(f"{path}: immutable block changed under the same identity; replace it with a new block")
+                if schema == GRADED_SCHEMA:
+                    if not _v2_content_path(path):
+                        development.append(path)
+                    continue
                 try:
                     check_path(path)
                 except (ValueError, CommunityError):
@@ -265,18 +490,28 @@ def validate(repo,revision,domain,state=None,*,base_revision=None,expected_contr
     contract = read_git_contract(repo, revision, domain,
                                  expected_sha256=expected_contract_sha256,
                                  env=_git_env())
+    selected_format = data_format(contract['contract'])
     context=_validator_context(domain)
     context['publication_contract_sha256'] = contract['sha256']
+    context['contract_schema'] = contract['contract']['schema']
     state_path=state if state is not None else _default_state_path(repo)
     verified=_load_checkpoint(state_path,revision,context)
-    stats={'count':0,'bytes':0,'entries':{},'blocks':{},'feedback':0,'done_paths':set()}
-    stats=_validate_tree(repo,revision,domain,state_path,context,verified,stats)
-    _validate_task_sets(stats)
-    result = {'commit':revision,'entries':len(stats['entries']),
+    if selected_format == DATA_FORMAT_V2:
+        stats={'count':0,'bytes':0,'feedback':0,'done_paths':set(),'graded_units':[],'graded_feedback':[]}
+        stats=_validate_graded_tree(repo,revision,domain,state_path,context,verified,stats)
+        entries=len(stats['graded_units'])
+    else:
+        stats={'count':0,'bytes':0,'entries':{},'blocks':{},'feedback':0,'done_paths':set()}
+        stats=_validate_tree(repo,revision,domain,state_path,context,verified,stats)
+        _validate_task_sets(stats)
+        entries=len(stats['entries'])
+    result = {'commit':revision,'entries':entries,
               'feedback_files':stats['feedback'],'bytes':stats['bytes'],
-              'contract_sha256': contract['sha256'], 'content_only': None}
+              'contract_sha256': contract['sha256'], 'content_only': None,
+              'data_format': selected_format}
     if base_revision is not None:
-        result.update(classify_changes(repo, base_revision, revision))
+        result.update(classify_changes(repo, base_revision, revision,
+                                       schema=contract['contract']['schema']))
     return result
 
 def main(argv=None):

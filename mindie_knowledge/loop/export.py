@@ -1,8 +1,11 @@
-"""Model-free publication of complete, current task Markdown packages.
+"""[Role] Freeze authorized task or graded material into the shared outbox.
 
-The file material store is the only body authority. This module freezes the
-navigation index and all ordered blocks together, then records only file
-identities in the outbox. Existing Git/GitHub publication owns remote writes.
+[Invariants] File stores remain the body authority; the outbox records exact
+file identities. Existing grants bind export eligibility to its generation.
+[Timeouts & Locks] Store transactions retain the shared SQLite lock budget;
+no model, subprocess or network wait is introduced during batch construction.
+[Side-Effect Policy] Write frozen local files and the existing outbox. The
+existing Git/GitHub publisher alone owns external writes.
 """
 from __future__ import annotations
 
@@ -14,12 +17,17 @@ from mindie_knowledge.materials.publication import CleanupReceiptError, freeze_b
 from mindie_knowledge.redact import scan_text
 
 from .store import REPLACEABLE_BATCH, canonical, digest
+from .publication_target import publication_target
 
 MAX_BATCH_VOTES = 500
 
 
 class ExportContentError(ValueError):
     """Unsafe or structurally invalid outbound material; never a transport error."""
+
+
+class DistillationRequired(ValueError):
+    """Retained material drafts need explicit C6 admission for a graded target."""
 
 
 class ExportQuarantinedError(ExportContentError):
@@ -52,7 +60,7 @@ def _vote_payload(votes):
     }
 
 
-def _task_files(store, doc, *, source_revisions=None):
+def _task_files(store, doc, *, source_revisions=None, target=None):
     # Bind the files and the observed feed identity together. A concurrent
     # feed/capture change is visible and retried through existing export state.
     with store._write_txn():
@@ -60,13 +68,13 @@ def _task_files(store, doc, *, source_revisions=None):
         row = store._row(doc["entry_id"])
         if row is None or row["draft_revision"] != doc["revision"]:
             raise BlockingIOError("current task changed before publication preparation")
-        files = _task_files_for_revision(store, doc)
+        files = _task_files_for_revision(store, doc, target=target)
         if source_revisions is not None:
             source_revisions[doc["entry_id"]] = row["published_revision"] if row["feed_active"] else None
         return files
 
 
-def _task_files_for_revision(store, doc):
+def _task_files_for_revision(store, doc, *, target=None):
     package = store.materials.export_task(
         doc["entry_id"], source="draft", revision=doc["revision"], streaming=True,
     )
@@ -75,7 +83,7 @@ def _task_files_for_revision(store, doc):
     if not package["ready"]:
         raise ValueError("current task package still has unfinished material indexes")
     prefix = f"tasks/{package['task_id']}/"
-    previous = {file["path"]: file["sha256"] for file in store.contribution_base_files(doc["entry_id"])
+    previous = {file["path"]: file["sha256"] for file in store.contribution_base_files(doc["entry_id"], target=target)
                 if file.get("sha256") is not None}
     files = []
     for relative in sorted(package['files']):
@@ -101,7 +109,12 @@ def _task_files_for_revision(store, doc):
 
 def build_batch(store, *, settings, revision_fn=None):
     """Freeze one complete package batch, returning its existing engine tuple."""
-    lineage = lineage_of(store.domain, settings.generation)
+    from ..graded.export import build_batch as build_graded_batch
+    graded = build_graded_batch(store, settings=settings, revision_fn=revision_fn)
+    if graded is not None:
+        return graded
+    target = publication_target(store, settings)
+    lineage = lineage_of(store.domain + ":" + target["feed_ident"], settings.generation)
     previous = store.batch(lineage)
     if previous is not None and previous["status"] not in REPLACEABLE_BATCH:
         return None
@@ -112,15 +125,21 @@ def build_batch(store, *, settings, revision_fn=None):
         store.rebase_draft_on_published(entry_id)
     drafts = store.drafts_changed(generation=settings.generation, ready_only=True, include_content=False)
     drafts = [doc for doc in drafts if store.summary_ready(doc)]
-    votes = sorted(store.unbatched_votes(generation=settings.generation),
+    votes = sorted((vote for vote in store.unbatched_votes(generation=settings.generation)
+                    if not vote["entry_id"].startswith("unit-")
+                    and vote["entry_id"] in store.material_feeds().get(target["feed_ident"], {}).get("entries", {})),
                    key=lambda vote: (vote["root_opaque"], vote["entry_id"], vote["revision"]))[:MAX_BATCH_VOTES]
     if not drafts and not votes:
         return None
+    if target["feed_ident"] in store.graded._catalog()["feeds"]:
+        raise DistillationRequired(
+            f"{len(drafts)} local material drafts remain retained; this publication target uses graded units. "
+            "Select their evidence through C6 before publication; no legacy batch was frozen.")
     files, kept, source_revisions, rejections = [], [], {}, []
     total = 0
     for doc in sorted(drafts, key=lambda item: item["entry_id"]):
         try:
-            task_files = _task_files(store, doc, source_revisions=source_revisions)
+            task_files = _task_files(store, doc, source_revisions=source_revisions, target=target)
         except ExportContentError as exc:
             store.quarantine_entry(doc["entry_id"], kind="content-scan", detail=str(exc))
             rejections.append(dict(entry_id=doc["entry_id"], stage="content-scan", detail=str(exc)))
@@ -154,11 +173,7 @@ def build_batch(store, *, settings, revision_fn=None):
             raise ExportQuarantinedError(rejections)
         return None
     try:
-        base_commit = store.feed_get("published-commit")
-        if isinstance(base_commit, dict):
-            base_commit = base_commit.get("commit")
-        if not isinstance(base_commit, str):
-            base_commit = None
+        base_commit = target["source_commit"]
         revision = (revision_fn or batch_revision)(files, store.domain, base_commit, refs)
         batch = dict(schema="mindie-contribution/1", batch_id=lineage, revision=revision,
                      domain=store.domain, base_commit=base_commit, entry_refs=refs, files=files,
@@ -171,7 +186,8 @@ def build_batch(store, *, settings, revision_fn=None):
         store.create_batch(batch_id=lineage, revision=revision, batch=descriptor,
                            entry_ids=entry_ids, vote_keys=vote_keys, generation=settings.generation,
                            source_revisions={ident: source_revisions[ident] for ident in entry_ids},
-                           entry_revisions={doc["entry_id"]: doc["revision"] for doc in kept})
+                           entry_revisions={doc["entry_id"]: doc["revision"] for doc in kept},
+                           publication_target=target)
     except CleanupReceiptError:
         # The replacement is already durable and pending. Its local cleanup
         # error cannot turn it into a failed export or authorize another build.

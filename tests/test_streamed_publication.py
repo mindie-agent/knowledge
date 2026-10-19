@@ -36,7 +36,7 @@ def test_single_long_task_freeze_reload_validate_and_apply_do_not_retain_body_by
         gc.collect()
         tracemalloc.start()
         try:
-            batch_id, _, batch, _, _ = build_batch(store, settings=SimpleNamespace(generation='fixture'))
+            batch_id, _, batch, _, _ = build_batch(store, settings=SimpleNamespace(generation='fixture', repository='fixture/demo', branch='main'))
             loaded = load_batch_payload(store, store.batch(batch_id))
             checked = validate_batch(loaded)
             scan_outbound(checked, 'Public title', 'Public body', 'Public commit')
@@ -60,7 +60,7 @@ def test_single_long_task_freeze_reload_validate_and_apply_do_not_retain_body_by
 def test_frozen_payload_survives_current_generation_removal_and_rejects_late_mutation(tmp_path):
     with closing(Store(tmp_path / 'producer', 'demo')) as store:
         task_id, _ = append(store, 2)
-        batch_id, revision, batch, _, _ = build_batch(store, settings=SimpleNamespace(generation='fixture'))
+        batch_id, revision, batch, _, _ = build_batch(store, settings=SimpleNamespace(generation='fixture', repository='fixture/demo', branch='main'))
         original = next(item for item in batch['files'] if '/blocks/' in item['path'])
         expected = original['content']
         # A candidate refers to frozen files, never the mutable current pointer.

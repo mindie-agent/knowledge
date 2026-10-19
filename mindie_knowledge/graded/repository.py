@@ -1,0 +1,313 @@
+"""[Role] Install C5 units into the existing domain store and resolve references.
+
+[Invariants] SQLite selects one validated graded corpus. Existing task data is
+preserved; a removed unit is unreadable even through an earlier pinned ref.
+[Timeouts & Locks] Uses Store's existing WAL connection and write transaction.
+[Side-Effect Policy] Local content-addressed files and one catalog row only.
+No remote publication, model calls, history scan or new service state machine.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+import re
+
+from ..markdown import _atomic_write_bytes
+from ..materials.references import ReadReferenceError
+from .index import RoutingIndex
+from .units import GradedUnit, canonical
+
+CATALOG_KEY = "graded:current"
+
+
+class GradedRepository:
+    def __init__(self, store):
+        self.store = store
+        self._catalog_raw = None
+        self._index = None
+
+    def _current(self):
+        row = self.store.db.execute("SELECT value FROM state WHERE key=?", (CATALOG_KEY,)).fetchone()
+        return row[0] if row else None
+
+    def available(self):
+        with self.store.lock:
+            return self._current() is not None
+
+    def _catalog(self):
+        raw = self._current()
+        if raw is None:
+            return {"schema": "mindie-graded-catalog/1", "local": [], "feeds": {}, "retired_local": []}
+        value = json.loads(raw)
+        if value.get("schema") != "mindie-graded-catalog/1":
+            raise ValueError("graded catalog schema mismatch")
+        # Earlier local C5 installations are local candidates, never implicit
+        # consent or evidence that any public feed has switched formats.
+        value.setdefault("local", value.get("units", []))
+        value.setdefault("feeds", {})
+        value.setdefault("retired_local", [])
+        return value
+
+    def _descriptor(self, unit, **metadata):
+        raw = unit.render().encode("utf-8")
+        blob = hashlib.sha256(raw).hexdigest()
+        _atomic_write_bytes(self.store.root / "graded" / "blobs" / f"{blob}.md", raw)
+        return {"id": unit.id, "blob": blob, "content_sha256": unit.content_sha256, "revision": unit.revision,
+                "path": unit.path or f"{unit.metadata['domain_path']}/{unit.id}.md", **metadata}
+
+    def _published(self, catalog):
+        result = {}
+        for feed in catalog["feeds"].values():
+            for item in feed["units"]:
+                prior = result.get(item["id"])
+                if prior and (prior["content_sha256"], prior["path"]) != (item["content_sha256"], item["path"]):
+                    raise ValueError("graded feeds disagree on one stable unit")
+                if prior and self._read(prior).revision != self._read(item).revision:
+                    raise ValueError("graded feeds disagree on one stable unit revision")
+                result[item["id"]] = item
+        return result
+
+    def _save(self, catalog):
+        # Public current bytes outrank an unmerged local correction. A newly
+        # distilled ID remains readable locally until it appears in the feed.
+        visible = {item["id"]: item for item in catalog["local"]}
+        visible.update(self._published(catalog))
+        index = RoutingIndex(self._read(item) for item in visible.values())
+        catalog.update(units=list(visible.values()), generation=index.generation)
+        raw = canonical(catalog)
+        self.store.db.execute("INSERT OR REPLACE INTO state VALUES(?,?)", (CATALOG_KEY, raw))
+        self._catalog_raw, self._index = raw, index
+        return index
+
+    def install(self, units, *, source_identity="local-reviewed-units", generation=None, admitted_ids=None):
+        """Install a reviewed local snapshot; publication needs its own grant.
+
+        The optional generation is supplied only by the admitted, redacted C6
+        path. Merely importing Markdown never authorizes outbound publication.
+        """
+        incoming = RoutingIndex(units)
+        with self.store._write_txn():
+            catalog = self._catalog()
+            previous = self._load().units if self.available() else {}
+            old_local = {item["id"]: item for item in catalog["local"]}
+            published = self._published(catalog)
+            selected = set(incoming.units) if admitted_ids is None else set(admitted_ids)
+            if not selected <= set(incoming.units):
+                raise ValueError("graded admission identifies a unit outside the prepared snapshot")
+            local = [] if admitted_ids is None else [item for item in catalog["local"] if item["id"] not in selected]
+            for unit in incoming.units.values():
+                if unit.id not in selected:
+                    continue
+                old = previous.get(unit.id)
+                revision = (old.revision if old.content_sha256 == unit.content_sha256
+                            else max(old.revision + 1, unit.revision)) if old else unit.revision
+                unit = GradedUnit.from_parts({**unit.metadata, "revision": revision}, unit.body, unit.path)
+                public = published.get(unit.id)
+                path = unit.path or f"{unit.metadata['domain_path']}/{unit.id}.md"
+                if public and public["content_sha256"] == unit.content_sha256 and public["path"] == path:
+                    continue
+                old_descriptor = old_local.get(unit.id, {})
+                same = (old_descriptor.get("content_sha256") == unit.content_sha256
+                        and old_descriptor.get("path") == path)
+                meta = {key: old_descriptor[key] for key in ("generation", "base", "batched_blob")
+                        if same and key in old_descriptor}
+                if not same:
+                    meta["base"] = public
+                if generation is not None:
+                    meta["generation"] = generation
+                local.append(self._descriptor(unit, **meta))
+            catalog.update(local=local, source_identity=source_identity)
+            index = self._save(catalog)
+        return {"status": "installed", "units": len(index.units), "generation": index.generation,
+                "build_elapsed_ms": index.build_elapsed_ms, "legacy_data_preserved": True,
+                "publication": "eligible_for_existing_outbox" if generation is not None else "not_requested"}
+
+    def install_feed(self, units, *, feed_ident, source_revision, files=None, feedback=()):
+        """Replace one fully validated feed snapshot without inventing revisions.
+
+        Matching local candidates retire after main contains them. Withdrawn
+        public IDs cannot reappear through an older local candidate. Their
+        content-addressed bytes and prior vote observations remain retained.
+        """
+        index = RoutingIndex(units)
+        from .feedback import validate_bindings, validate_observed_units
+        feedback = list(feedback)
+        validate_bindings(feedback, index.units)
+        with self.store._write_txn():
+            validate_observed_units(self.store, index.units.values())
+            catalog = self._catalog()
+            previous = catalog["feeds"].get(feed_ident, {"units": []})
+            descriptors = []
+            previous_units = {item["id"]: self._read(item) for item in previous["units"]}
+            for unit in index.units.values():
+                old = previous_units.get(unit.id)
+                if old and ((old.content_sha256 == unit.content_sha256 and old.revision != unit.revision)
+                            or (old.content_sha256 != unit.content_sha256 and unit.revision <= old.revision)):
+                    raise ValueError("graded feed update does not preserve or advance its semantic revision")
+                path = unit.path or f"{unit.metadata['domain_path']}/{unit.id}.md"
+                raw_sha = (files or {}).get(path) or hashlib.sha256(unit.render().encode()).hexdigest()
+                descriptors.append(self._descriptor(unit, file_sha256=raw_sha,
+                                                     source_revision=source_revision, feed_ident=feed_ident))
+            catalog["feeds"][feed_ident] = {"units": descriptors, "source_revision": source_revision,
+                                            "feedback": list(feedback), "files": dict(files or {})}
+            self._reconcile_local(catalog, previous["units"])
+            self._save(catalog)
+            retired = self.store.retire_material_feed(feed_ident)
+            if retired:
+                # Only a fully validated replacement of the SAME public source
+                # changes old memberships. Retain old task/vote/file bytes.
+                key = "graded-format-switch:" + feed_ident
+                retained = (self.store.feed_get(key) or {}).get("retained_task_revisions", {})
+                for ident, revision in retired.items():
+                    retained[ident] = sorted(set(retained.get(ident, ())) | {revision})
+                self.store.feed_set(key,
+                                    {"from": "material-package", "to": "graded", "commit": source_revision,
+                                     "retained_task_bytes": True, "retained_task_revisions": retained})
+            self.store.feed_set("published-commit", {"commit": source_revision, "feed": feed_ident,
+                                                     "contract_schema": "mindie-publication-contract/2"})
+        return {"entries": len(descriptors), "units": len(descriptors), "source_revision": source_revision}
+
+    def _reconcile_local(self, catalog, previous):
+        public = self._published(catalog)
+        removed = {item["id"] for item in previous} - set(public)
+        kept = []
+        for item in catalog["local"]:
+            target = public.get(item["id"])
+            matched = target and (target["content_sha256"], target["path"]) == (item["content_sha256"], item["path"])
+            if item["id"] in removed or matched:
+                catalog["retired_local"].append(item)
+            else:
+                kept.append(item)
+        # A withdrawn public parent also removes local candidates whose
+        # premise closure no longer exists. Retain their bytes for review.
+        while True:
+            members = set(public) | {item["id"] for item in kept}
+            dangling = [item for item in kept
+                        if not set(self._read(item).metadata["inherits_from"]) <= members]
+            if not dangling:
+                break
+            catalog["retired_local"].extend(dangling)
+            kept = [item for item in kept if item not in dangling]
+        catalog["local"] = kept
+
+    def retire_feed(self, feed_ident):
+        """Remove a replaced public format; immutable blobs and votes survive."""
+        with self.store._write_txn():
+            catalog = self._catalog()
+            previous = catalog["feeds"].pop(feed_ident, None)
+            if previous is None:
+                return False
+            self._reconcile_local(catalog, previous["units"])
+            self._save(catalog)
+            return True
+
+    def pending(self, generation):
+        with self.store.lock:
+            if not self.available():
+                return []
+            return [item for item in self._catalog()["local"]
+                    if generation is not None and item.get("generation") == generation
+                    and item.get("batched_blob") != item["blob"]]
+
+    def mark_batched(self, descriptors):
+        catalog = self._catalog()
+        frozen = {item["id"]: item["blob"] for item in descriptors}
+        for item in catalog["local"]:
+            if frozen.get(item["id"]) == item["blob"]:
+                item["batched_blob"] = item["blob"]
+        self._save(catalog)
+
+    def public_ids(self):
+        with self.store.lock:
+            return set(self._published(self._catalog()))
+
+    def _feedback(self, unit):
+        from .feedback import outbound_votes, summarize_votes
+        catalog = self._catalog()
+        public = [vote for feed in catalog["feeds"].values()
+                  if any(item["id"] == unit.id for item in feed["units"])
+                  for vote in feed.get("feedback", [])]
+        local = [dict(row) for row in self.store.db.execute("SELECT * FROM votes WHERE entry_id=?", (unit.id,))]
+        return summarize_votes([*public, *outbound_votes(self.store, local)], unit)
+
+    def install_root(self, root):
+        index = RoutingIndex.from_root(root)
+        result = self.install(index.units.values(), source_identity=str(Path(root).resolve()))
+        result["build_elapsed_ms"] = index.build_elapsed_ms
+        return result
+
+    def _read(self, descriptor):
+        blob = descriptor["blob"]
+        if not isinstance(blob, str) or not re.fullmatch(r"[a-f0-9]{64}", blob):
+            raise ValueError("invalid graded blob identity")
+        raw = (self.store.root / "graded" / "blobs" / f"{blob}.md").read_bytes()
+        if hashlib.sha256(raw).hexdigest() != blob:
+            raise ValueError("graded content digest mismatch")
+        unit = GradedUnit.from_text(raw.decode("utf-8"), descriptor["path"])
+        if unit.id != descriptor["id"] or unit.content_sha256 != descriptor["content_sha256"]:
+            raise ValueError("graded catalog and content disagree")
+        return unit
+
+    def _load(self):
+        raw = self._current()
+        if raw is None:
+            raise ValueError("no graded corpus is installed")
+        if raw != self._catalog_raw:
+            catalog = json.loads(raw)
+            if catalog.get("schema") != "mindie-graded-catalog/1":
+                raise ValueError("graded catalog schema mismatch")
+            index = RoutingIndex(self._read(item) for item in catalog["units"])
+            if index.generation != catalog["generation"]:
+                raise ValueError("graded catalog generation mismatch")
+            self._catalog_raw, self._index = raw, index
+        return self._index
+
+    def ref(self, unit_id, revision=None):
+        return f"mindie://{self.store.domain}/units/{unit_id}" + ("@" + revision if revision else "")
+
+    def query(self, query, **kwargs):
+        with self.store.lock:
+            index = self._load()
+            result = index.query(query, **kwargs)
+            for item in result["results"]:
+                item["ref"] = self.ref(item["id"], item["content_sha256"])
+                item["unit_ref"] = self.ref(item["id"])
+                item["feedback_ref"] = item["ref"]
+                item["reference_kind"] = "graded_unit"
+                item["source"] = "graded"
+                from .feedback import observe
+                unit = index.units[item["id"]]
+                observe(self.store, unit)
+                item["feedback"] = self._feedback(unit)
+                for parent in item["inherited_rules"]:
+                    parent["ref"] = self.ref(parent["id"], parent["content_sha256"])
+                    parent["feedback_ref"] = parent["ref"]
+                    observe(self.store, index.units[parent["id"]])
+        return {"domain": self.store.domain, "retrieval": "graded-bm25", "page": "graded_units", **result}
+
+    def explain(self, ref):
+        prefix = f"mindie://{self.store.domain}/units/"
+        if not isinstance(ref, str) or not ref.startswith(prefix):
+            raise ReadReferenceError("outside_domain", "The graded reference is outside the selected domain.")
+        ident, _, revision = ref[len(prefix):].partition("@")
+        with self.store.lock:
+            index = self._load()
+            unit = index.units.get(ident)
+            if unit is None:
+                raise ReadReferenceError("removed_or_superseded", "The graded unit is absent from the current collection.")
+            if revision and revision != unit.content_sha256:
+                raise ReadReferenceError("removed_or_superseded", "The observed graded revision was replaced; no other bytes were substituted.")
+            catalog = json.loads(self._catalog_raw)
+            descriptor = next(item for item in catalog["units"] if item["id"] == ident)
+            unit = self._read(descriptor)
+            from .feedback import observe
+            observe(self.store, unit)
+            return {"kind": "graded_unit", "feedback_ref": self.ref(ident, unit.content_sha256),
+                    "feedback": self._feedback(unit), "domain": self.store.domain, "ref": self.ref(ident, unit.content_sha256),
+                    "unit_ref": self.ref(ident), "id": ident, "content_sha256": unit.content_sha256,
+                    "revision": unit.revision, "content_digest": unit.metadata["content_digest"],
+                    "closure_digest": index.closure_digests[ident],
+                    "frontmatter": unit.metadata, "content": unit.body,
+                    "inherits_from_closure": index.closure[ident],
+                    "note": "Reading a reference does not establish applicability; compare its conditions with observed task facts."}

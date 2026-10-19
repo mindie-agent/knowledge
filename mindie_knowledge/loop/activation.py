@@ -14,6 +14,8 @@
 [Timeouts & Locks]
 - Serializes writes with in-process `self._lock` (`threading.RLock`) and
   `open_database(..., timeout=5.0)` (`timeout=2.0` on reads) in WAL mode.
+- A supplied deactivation timeout covers both the thread lock and database
+  waits; its TimeoutError remains visible to the caller.
 
 [Side-Effect Policy]
 - Local SQLite state (`0700` dir / `0600` file) only; failure counters (`finish`)
@@ -95,18 +97,35 @@ class Admission:
                 initialize=_initialize_admission, initialize_missing=initialize_missing,
                 timeout=timeout,
             )
+        except TimeoutError:
+            raise
         except (OSError, sqlite3.Error, ValueError, StartInProgress) as exc:
             raise AdmissionUnavailable(str(exc)) from exc
 
-    def _write(self, fn, *, initialize_missing=False, missing_error=None):
+    def _write(self, fn, *, initialize_missing=False, missing_error=None, timeout=None):
         """Serialize read+modify while preserving leases and attempt receipts."""
-        with self._lock:
-            db = self._database(initialize_missing=initialize_missing, timeout=5.0)
+        deadline = None if timeout is None else time.monotonic() + timeout
+        acquired = self._lock.acquire() if deadline is None else self._lock.acquire(timeout=max(0, timeout))
+        if not acquired:
+            raise TimeoutError("admission write exceeded its in-process lock budget")
+        try:
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError("admission write exhausted its caller budget")
+            # A caller with several stores owns one outer budget. Opening can
+            # wait on both the initialization lock and SQLite journal setup.
+            db = self._database(initialize_missing=initialize_missing,
+                                timeout=5.0 if remaining is None else remaining / 2)
             if db is None:
                 if missing_error is not None:
                     raise ValueError(missing_error)
                 return False
             try:
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("admission write exhausted its caller budget")
+                    db.execute(f"PRAGMA busy_timeout={int(remaining * 1000)}")
                 self.path.parent.chmod(0o700)
                 self.path.chmod(0o600)
                 db.execute("BEGIN IMMEDIATE")
@@ -117,10 +136,14 @@ class Admission:
                     db.rollback()
                     raise
                 return result
+            except TimeoutError:
+                raise
             except (OSError, sqlite3.Error) as exc:
                 raise AdmissionUnavailable(str(exc)) from exc
             finally:
                 db.close()
+        finally:
+            self._lock.release()
 
     def _rows(self, sql="", args=()):
         """A missing unused store is empty; lost authority is never inactivity."""
@@ -244,7 +267,7 @@ class Admission:
         return self.activate(session, project_root=project_root,
                              not_before=not_before, automatic=True)
 
-    def deactivate(self, session):
+    def deactivate(self, session, *, timeout=None):
         """Disable one task's lease; durable attempt identities are preserved
         so a later fresh activation never replays old work. The row (and its
         failure state) is kept for audit; a fresh activate rotates the token
@@ -259,7 +282,7 @@ class Admission:
             )
             return cursor.rowcount > 0
 
-        return self._write(op)
+        return self._write(op, timeout=timeout)
 
     # ---------------------------------------------------------- lease checks
 
