@@ -23,7 +23,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8,<10"]
+test = ["pytest>=8,<10", "jsonschema>=4,<5"]
 
 [project.scripts]
 mindie-knowledge = "mindie_knowledge.loop.cli:main"

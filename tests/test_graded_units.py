@@ -165,6 +165,30 @@ def test_reproduced_evidence_requires_verified_repeats_and_l1_spec_source():
         validate_decision(spec, req)
 
 
+def test_model_schema_rejects_native_invalid_tier_uses_without_weakening_admission():
+    from jsonschema import Draft202012Validator, ValidationError
+    validator = Draft202012Validator(decision_schema())
+    req = request(outcome="verified", repetitions=3)
+    for tier, category in (("L1", "measurement"), ("L2", "sop"), ("L3", "workflow")):
+        proposed = decision(req, unit(tier=tier, category=category, evidence_strength="reproduced_empirical"))
+        validator.validate(proposed)
+        validate_decision(proposed, req)
+    # These two pairings were returned by the real DSH G3 organizer. The
+    # model-facing schema must reject them just as the C5 parser already does.
+    for tier, category in (("L3", "mutator"), ("L2", "measurement")):
+        proposed = decision(req)
+        proposed["units"][0].update(target_tier=tier, category=category)
+        proposed["units"][0]["frontmatter"].update(tier=tier, category=category)
+        with pytest.raises(ValidationError):
+            validator.validate(proposed)
+        with pytest.raises(ValueError, match="tier/category"):
+            validate_decision(proposed, req)
+    proposed = decision(req)
+    proposed["units"][0]["frontmatter"].update(tier="L1", category="measurement")
+    with pytest.raises(ValidationError):
+        validator.validate(proposed)
+
+
 def test_verified_milestone_can_use_finished_evidence_but_not_an_inflight_sibling():
     req = request()
     pending = {**req["sanitized_inputs"][0], "outcome": "in_flight", "source_locator": "fixture@abcdef1:pending.txt",
