@@ -153,3 +153,20 @@ def test_retry_restores_exact_earlier_retirement_when_binding_was_not_published(
     assert retry['domains'][0]['retirement'] == first['retirement']
     assert restore_changed(retry)['status'] == 'restored'
     assert lifecycle.inspect_retirement(old_path) is None
+
+
+
+def test_native_catalog_cli_uses_utf8_with_a_legacy_stream_locale(tmp_path):
+    import os
+    import subprocess
+    root = tmp_path / "工作𠀀"
+    root.mkdir()
+    adapter, engine, options = initial(root)
+    request = dict(adapter=adapter, engine=engine, domains=[], **options)
+    result = subprocess.run(
+        [sys.executable, "-I", "-m", "mindie_knowledge.loop.domain_catalog"],
+        input=json.dumps(request, ensure_ascii=False).encode("utf-8"), capture_output=True,
+        env={**os.environ, "PYTHONUTF8": "0", "PYTHONIOENCODING": "cp1252"}, timeout=5,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["domain_configs"] == {engine["domain"]: adapter["engine_config"]}

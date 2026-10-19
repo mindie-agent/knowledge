@@ -206,12 +206,14 @@ def retire_changed(previous, candidate, *, timeout=30.0, include_default=False):
 
 
 def main():
-    request = json.load(sys.stdin)
+    request = json.load(sys.stdin.buffer)
     operation = request.pop("operation", "prepare")
     methods = {'prepare': prepare, 'retire': retire_changed, 'restore': restore_changed}
     if operation not in methods:
         raise ValueError("unsupported domain catalog operation")
-    print(json.dumps(methods[operation](**request), ensure_ascii=False))
+    payload = json.dumps(methods[operation](**request), ensure_ascii=False) + "\n"
+    sys.stdout.buffer.write(payload.encode("utf-8"))
+    sys.stdout.buffer.flush()
 
 
 if __name__ == "__main__":
