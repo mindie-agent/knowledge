@@ -12,7 +12,7 @@
 - Cross-process exclusive lock (`<path>.lock`) with `LOCK_WAIT_SECONDS = 5.0`
   and `LOCK_POLL_SECONDS = 0.05`; lock files are retained on close to prevent
   unlink races across concurrent writers.
-- Windows sharing violations get at most `RENAME_RETRY_SECONDS = 5.0` to let
+- Windows access/sharing conflicts get at most `RENAME_RETRY_SECONDS = 5.0` to let
   short readers close; other failures remain immediate and visible.
 
 [Side-Effect Policy]
@@ -37,7 +37,7 @@ MAX_BYTES = 64 * 1024
 LOCK_WAIT_SECONDS = 5.0
 LOCK_POLL_SECONDS = 0.05
 RENAME_RETRY_SECONDS = 5.0
-_WINERROR_SHARING_VIOLATION = 32
+_WINERROR_RENAME_BUSY = {5, 32}
 
 __all__ = [
     "SCHEMA",
@@ -147,7 +147,22 @@ class _UpdateLock:
 
 
 def _read_bytes(path):
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    deadline = None
+    while True:
+        try:
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+            break
+        except PermissionError:
+            if os.name != "nt":
+                raise
+            # Windows CRT reports a concurrent rename as EACCES without its
+            # WinError. A real permission failure remains visible after 5s.
+            if deadline is None:
+                deadline = time.monotonic() + RENAME_RETRY_SECONDS
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(min(LOCK_POLL_SECONDS, remaining))
     with os.fdopen(fd, "rb") as stream:
         if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
             raise OSError(errno.EINVAL, "authority is not a regular file")
@@ -226,7 +241,9 @@ def _atomic_replace(source, target):
             os.replace(source, target)
             return
         except OSError as exc:
-            if (getattr(exc, "winerror", None) != _WINERROR_SHARING_VIOLATION
+            # MoveFileEx (os.replace) can report either access denied or a
+            # sharing violation while another process reads the destination.
+            if (getattr(exc, "winerror", None) not in _WINERROR_RENAME_BUSY
                     or time.monotonic() >= deadline):
                 raise
             time.sleep(min(LOCK_POLL_SECONDS, max(0, deadline - time.monotonic())))

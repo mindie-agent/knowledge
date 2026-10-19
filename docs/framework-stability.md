@@ -30,8 +30,10 @@ This guide summarizes the stability mechanisms built into `mindie-knowledge` for
 Readers copy each complete document and close its handle before parsing.
 Writers serialize updates under the consent or community lock, flush a complete
 temporary file in the same directory, then publish it with `os.replace`.
-On Windows, a concurrent reader can temporarily prevent replacement. Only
-WinError 32 is retried, for at most five seconds; other errors remain immediate.
+On Windows, a concurrent reader can temporarily prevent replacement. WinError 5
+and 32 are retried for at most five seconds; other errors remain immediate.
+Readers likewise allow a bounded wait when Windows reports a denied open during
+replacement.
 A persistent holder produces a visible error while the old document stays
 intact. Writers never truncate the live document or silently discard a choice.
 

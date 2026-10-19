@@ -44,8 +44,9 @@ def _winerror(code, path):
     return exc
 
 
-def test_replace_retries_a_transient_sharing_holder(tmp_path, monkeypatch):
-    """A plain-open reader (no FILE_SHARE_DELETE) fails WinError 32 briefly."""
+@pytest.mark.parametrize("code", [5, 32])
+def test_replace_retries_a_transient_sharing_holder(tmp_path, monkeypatch, code):
+    """Windows MoveFileEx reports both codes for temporary read handles."""
     source = tmp_path / "source"
     target = tmp_path / "target"
     source.write_bytes(b"new document")
@@ -56,7 +57,7 @@ def test_replace_retries_a_transient_sharing_holder(tmp_path, monkeypatch):
     def held_briefly(src, dst):
         calls.append(src)
         if len(calls) < 3:
-            raise _winerror(32, dst)
+            raise _winerror(code, dst)
         replace(src, dst)
 
     monkeypatch.setattr(consent_store.os, "replace", held_briefly)
@@ -66,7 +67,8 @@ def test_replace_retries_a_transient_sharing_holder(tmp_path, monkeypatch):
     assert not source.exists()
 
 
-def test_replace_permanent_holder_reraises_the_original_sharing_error(tmp_path, monkeypatch):
+@pytest.mark.parametrize("code", [5, 32])
+def test_replace_permanent_holder_reraises_the_original_sharing_error(tmp_path, monkeypatch, code):
     source = tmp_path / "source"
     target = tmp_path / "target"
     source.write_bytes(b"new document")
@@ -75,7 +77,7 @@ def test_replace_permanent_holder_reraises_the_original_sharing_error(tmp_path, 
 
     def held_forever(src, dst):
         calls.append(src)
-        raise _winerror(32, dst)
+        raise _winerror(code, dst)
 
     clock = [100.0]
     monkeypatch.setattr(consent_store.os, "replace", held_forever)
@@ -83,7 +85,7 @@ def test_replace_permanent_holder_reraises_the_original_sharing_error(tmp_path, 
     monkeypatch.setattr(consent_store.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
     with pytest.raises(PermissionError) as caught:
         consent_store._atomic_replace(source, target)
-    assert caught.value.winerror == 32
+    assert caught.value.winerror == code
     assert 1 < len(calls) <= 2 + consent_store.RENAME_RETRY_SECONDS / consent_store.LOCK_POLL_SECONDS
     # Neither side is torn: the old document and the staged replacement survive.
     assert target.read_bytes() == b"old document"
@@ -99,11 +101,11 @@ def test_replace_non_sharing_error_is_never_retried(tmp_path, monkeypatch):
 
     def denied(src, dst):
         calls.append(src)
-        raise _winerror(5, dst)
+        raise _winerror(87, dst)
 
     monkeypatch.setattr(consent_store.os, "replace", denied)
     with pytest.raises(PermissionError) as caught:
         consent_store._atomic_replace(source, target)
-    assert caught.value.winerror == 5
+    assert caught.value.winerror == 87
     assert len(calls) == 1
     assert target.read_bytes() == b"old document"
