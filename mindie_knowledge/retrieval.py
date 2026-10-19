@@ -1,11 +1,13 @@
-"""Technical identifier and CJK token boundaries for ReMe BM25.
+"""[Role] Technical identifier and CJK token boundaries for local BM25.
 
-ReMe owns indexing, persistence and ranking; these tokens retain exact
-qualified identifiers and their searchable components. Ranking scores
-measure retrieval relevance, never factual confidence.
+[Invariants] Retain qualified identifiers, versions and searchable components.
+Frequency aggregation must equal individual token expansion; relevance is not
+factual confidence. [Timeouts & Locks] Pure CPU work; no waits or locks.
+[Side-Effect Policy] No I/O; only the bounded identifier-alias cache is shared.
 """
 from __future__ import annotations
 
+from collections import Counter
 import re
 from functools import lru_cache
 
@@ -45,3 +47,17 @@ def tokens(text: str) -> list[str]:
     """Keep exact identifiers and their components searchable, without
     turning software versions into common numeric aliases."""
     return list(_tokens(text))
+
+
+def token_counts(text: str) -> Counter[str]:
+    """Expand each distinct lexeme once when a BM25 index needs frequencies."""
+    counts = Counter()
+    for word, frequency in Counter(_WORDS.findall(text.casefold())).items():
+        if _CJK.fullmatch(word) and len(word) > 1:
+            for index in range(len(word) - 1):
+                counts[word[index:index + 2]] += frequency
+        else:
+            counts[word] += frequency
+            for alias in (_cached_aliases(word) if len(word) <= 256 else _aliases(word)):
+                counts[alias] += frequency
+    return counts

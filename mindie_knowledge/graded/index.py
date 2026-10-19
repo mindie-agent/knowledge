@@ -15,7 +15,7 @@ from pathlib import Path
 import re
 import time
 
-from ..retrieval import tokens
+from ..retrieval import token_counts, tokens
 from .conditions import match_conditions
 from .units import GradedUnit, canonical
 
@@ -108,7 +108,7 @@ class RoutingIndex:
             self.condition_keys[ident] = key
             self.conditions[key] = unit.metadata["conditions"]
             triggers = unit.metadata["triggers"]
-            count = Counter(tokens("\n".join([unit.metadata["title"], *triggers["error_signatures"], *triggers["keywords"], unit.body])))
+            count = token_counts("\n".join([unit.metadata["title"], *triggers["error_signatures"], *triggers["keywords"], unit.body]))
             self.counts[ident] = count
             self.frequencies.update(count.keys())
         self.lengths = {ident: sum(count.values()) for ident, count in self.counts.items()}
