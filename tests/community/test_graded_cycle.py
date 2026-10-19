@@ -215,3 +215,71 @@ def test_graded_path_move_preserves_reference_and_remote_correction_blocks_stale
         assert git(["show-ref"], cwd=remote_url) == heads
         source.sync(force=True)
         assert store.explain(store.graded.ref(moved.id))["content"] == corrected.body
+
+
+def test_reviewed_factor_survives_git_feed_and_group_withdrawal(tmp_path, remote_url):
+    from mindie_knowledge.graded.index import RoutingIndex
+    from mindie_knowledge.graded.maintenance import build_routing_index
+    from mindie_knowledge.graded.reviewed_change import SCHEMA, apply_change
+    from mindie_knowledge.publication_check import validate
+
+    maintainer = seed_graded(tmp_path, remote_url)
+    conditions = {"repository": "fixture/engine", "revision": "a" * 40}
+    original = [unit("unit-" + side, conditions=conditions, title=side + " queue",
+                     body="Shared premise. Inspect " + side + " queue.")
+                for side in ("left", "right")]
+    for value in original:
+        path = maintainer / value.path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(value.render())
+    assert build_routing_index(maintainer)["ok"]
+    commit(maintainer, "Publish synthetic rules before reviewed factoring")
+
+    def authored(changes):
+        return dict(schema=SCHEMA, review_reference="fixture:authored-factor-review",
+                    base_generation=RoutingIndex.from_root(maintainer).generation,
+                    changes=changes)
+
+    def replacement(old, new):
+        return dict(id=new.id, expected_content_sha256=old.content_sha256 if old else None,
+                    path=new.path, content=new.render())
+
+    with closing(Store(tmp_path / "consumer", "npu")) as consumer:
+        source = feed(consumer, remote_url)
+        assert source.sync(force=True)["entries"] == 2
+        observed = consumer.query("left queue", conditions=conditions, limit=1)["results"][0]
+        common = unit("unit-common", conditions=conditions, domain_path="_common",
+                      title="Shared queue premise", body="Shared premise.")
+        revised = [GradedUnit.from_parts({**old.metadata, "revision": 2, "inherits_from": [common.id]},
+                                        "Inspect " + side + " queue.", old.path)
+                   for old, side in zip(original, ("left", "right"))]
+        plan = authored([replacement(None, common),
+                         *[replacement(old, new) for old, new in zip(original, revised)]])
+        assert apply_change(maintainer, plan)["status"] == "applied"
+        commit(maintainer, "Publish explicitly reviewed synthetic factor")
+        head = git(["rev-parse", "HEAD"], cwd=maintainer).strip()
+        assert validate(maintainer, head, "npu", state=str(tmp_path / "check.json"))["entries"] == 3
+        assert source.sync(force=True)["entries"] == 3
+        factored = consumer.query("left queue", conditions=conditions, limit=1)["results"][0]
+        assert factored["id"] == original[0].id and factored["revision"] == 2
+        assert consumer.explain(factored["ref"])["content"] == revised[0].body
+        assert factored["inherited_rules"][0]["content"] == common.body
+        assert consumer.query("left queue", conditions={**conditions, "revision": "b" * 40})["results"] == []
+        with pytest.raises(ReadReferenceError, match="replaced"):
+            consumer.explain(observed["ref"])
+        parent_ref = factored["inherited_rules"][0]["ref"]
+        assert consumer.explain(parent_ref)["content"] == common.body
+
+        def delete(value):
+            return dict(id=value.id, expected_content_sha256=value.content_sha256, content=None)
+
+        with pytest.raises(ValueError, match="missing inherited unit"):
+            apply_change(maintainer, authored([delete(common)]))
+        assert git(["status", "--porcelain"], cwd=maintainer) == ""
+        assert apply_change(maintainer, authored([delete(value) for value in [*revised, common]]))["status"] == "applied"
+        commit(maintainer, "Withdraw complete reviewed synthetic inheritance group")
+        assert source.sync(force=True)["entries"] == 0
+        assert consumer.query("left queue", conditions=conditions)["results"] == []
+        for reference in (factored["ref"], parent_ref):
+            with pytest.raises(ReadReferenceError, match="absent"):
+                consumer.explain(reference)
