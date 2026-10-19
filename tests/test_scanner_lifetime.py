@@ -26,7 +26,7 @@ def test_default_scanner_has_no_deadline_and_uses_complete_filtered_environment(
     assert prepared["blocks"][0]["text"] == "Public technical text.\n\n"
     assert len(observed) == 1
     options = observed[0]
-    assert options["timeout"] is None and options["max_output"] is None
+    assert options["timeout"] == 30.0 and options["max_output"] is None
     assert options["cancel"] is owner and options["inherit_env"] is False
     assert not any(key.startswith("GITLEAKS_") for key in options["env"])
 

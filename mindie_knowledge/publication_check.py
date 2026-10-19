@@ -36,58 +36,24 @@ def _git_env():
 _CHECKPOINT_EVERY=64
 _STATE_NAME='mindie-validator-state.json'
 
-# The trusted validation implementation whose checkpoints may be reused:
-# the installed package's own Python sources (never read from the candidate
-# repository — candidate content must never choose the execution identity).
-_PACKAGE_ROOT = Path(__file__).resolve().parent
-_TRUSTED_SOURCES = (
-    'redact.py',
-    'gitread.py',
-    'publication_check.py',
-    'publication_contract.py',
-    'loop/documents.py',
-    'community/batch.py',
-    'community/common.py',
-    'materials/store.py',
-)
-
-
-def _trusted_source_fingerprint():
-    """sha256 over the installed trusted validator's own Python sources.
-
-    Binds the checkpoint to the actual implementation — a changed finder
-    body, helper, parse or validation function invalidates old checkpoints
-    even when version, profile, rule ids and patterns stay the same. None
-    when any source is unreadable; an unverifiable identity must never claim
-    an old cache is trustworthy."""
-    import hashlib
-
-    digest = hashlib.sha256()
-    for rel in _TRUSTED_SOURCES:
-        try:
-            digest.update((_PACKAGE_ROOT / rel).read_bytes())
-        except OSError:
-            return None
-    return digest.hexdigest()
-
-
 def _validator_context(domain):
-    """Fingerprint of the exact validation context: domain, the installed
-    validator version, the redaction profile, and the actual trusted
-    implementation bytes. A tightened rule under the same id/version — or a
-    changed finder body — invalidates prior checkpoints. Candidate files
-    never supply this identity."""
+    """Fingerprint of the validation context: domain, validator version,
+    redaction profile and active rule patterns, and schema versions."""
+    import hashlib
     from mindie_knowledge import redact as _redact
 
     try:
         version = importlib.metadata.version('mindie-knowledge')
     except Exception:
         version = 'unknown'
+    rules_digest = hashlib.sha256(
+        repr([(r.id, getattr(r.pattern, 'pattern', None)) for r in _redact.RULES]).encode('utf-8')
+    ).hexdigest()
     return {
         'domain': domain,
         'validator': version,
         'redaction_profile': _redact.REDACTION_PROFILE,
-        'sources': _trusted_source_fingerprint(),
+        'redaction_rules': rules_digest,
         'entry_schema': documents.SCHEMA,
         'package_schema': 'mindie-material-package/1',
         'feedback_schema': SCHEMA_FEEDBACK,
@@ -101,9 +67,8 @@ def _default_state_path(repo):
     return Path(tempfile.gettempdir())/f'mindie-validator-{sha256_text(str(repo))}.json'
 
 def _load_checkpoint(path,revision,context):
-    if path is None:return {}
-    if not isinstance(context,dict) or context.get('sources') is None:
-        return {}  # an unverifiable validator identity never trusts a cache
+    if path is None or not isinstance(context,dict):
+        return {}
     try:
         data=json.loads(Path(path).read_text(encoding='utf-8'))
     except (OSError,ValueError):

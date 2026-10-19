@@ -117,15 +117,24 @@ def lock_held(path):
         os.close(fd)
 
 
+_UNSET = object()
+
+
 class StartLock:
-    def __init__(self, path):
+    def __init__(self, path, *, wait=0):
         self.path = filesystem_path(path)
         self.acquired = False
         self._fd = None
+        self.wait = wait
 
-    def acquire(self, *, wait=0):
+    def acquire(self, *, wait=_UNSET):
         if self.acquired:
             return
+        if wait is _UNSET:
+            env_wait = os.environ.get("MINDIE_START_LOCK_WAIT_SECONDS")
+            wait = float(env_wait) if env_wait is not None else self.wait
+        elif wait is not None and wait > 0 and "MINDIE_START_LOCK_WAIT_SECONDS" in os.environ:
+            wait = float(os.environ["MINDIE_START_LOCK_WAIT_SECONDS"])
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
         deadline = None if wait is None else time.monotonic() + wait

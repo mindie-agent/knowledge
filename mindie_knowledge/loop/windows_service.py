@@ -30,9 +30,7 @@ from .service_host import (LIMIT, SAFE_CODES, SAFE_STAGES, ServiceHostError,
 
 
 def _private(root):
-    # Reuse the dependency's already-tested TokenUser SID ACL creation.
-    from mindie_diagnostics.fallback import _private_mkdir
-    _private_mkdir(root, parents=True, exist_ok=True)
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
     return _verify_private(root)
 
 

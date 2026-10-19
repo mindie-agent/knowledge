@@ -1,8 +1,17 @@
-"""Pinned ReMe components embedded without its service, jobs, agents or LLMs.
+"""[Role] Embedded ReMe derived chunking, file graph, and BM25 lexical index over canonical Markdown materials.
 
-Component persistence uses one atomic row per current block instead of writing
-the entire graph/chunk corpus after each addition. Chunking, lexical scoring
-and graph maintenance remain the pinned ReMe implementations.
+[Invariants]
+- Markdown packages (`tasks/<id>/index.md` + `blocks/<hash>.md`) are the sole body
+  authority; `.reme-index/` is a disposable derived index bound to `catalog.generation`.
+- `TechnicalTokenizerV1` preserves domain API/version/CJK token boundaries;
+  chunk hashes and graph-to-BM25 document ID sets are verified on checkpoint load.
+
+[Timeouts & Locks]
+- Index refresh and checkpoint writes are serialized under `StartLock(.reme-index/.lock, wait=5.0)`.
+
+[Side-Effect Policy]
+- In-process `asyncio.Runner` with `thread_pool_max_workers=0`; zero background
+  daemons, watchers, network I/O, or LLM calls.
 """
 
 from __future__ import annotations
@@ -367,8 +376,8 @@ class ReMeIndex:
         return paths
 
     def search(self, tasks, query, limit, conditions, allowed_ids, continuation=None, *, catalog):
-        lock = StartLock(self.root / ".index.lock")
-        lock.acquire(wait=None)
+        lock = StartLock(self.root / ".index.lock", wait=5.0)
+        lock.acquire(wait=5.0)
         try:
             self._refresh(tasks, catalog)
             cacheable = allowed_ids is None or isinstance(allowed_ids, CurrentVisibility)
@@ -485,8 +494,8 @@ class ReMeIndex:
             lock.release()
 
     def refresh(self, tasks, *, catalog):
-        lock = StartLock(self.root / ".index.lock")
-        lock.acquire(wait=None)
+        lock = StartLock(self.root / ".index.lock", wait=5.0)
+        lock.acquire(wait=5.0)
         try:
             self._refresh(tasks, catalog)
         finally:

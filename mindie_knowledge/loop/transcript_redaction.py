@@ -1,9 +1,19 @@
-"""Local transcript redaction. No model, network or ambient scanner config.
+"""[Role] Deterministic local transcript secret & privacy redactor (pinned Gitleaks + regex/HMAC rules).
 
-The installer calls install_scanner once; captures only use its pinned binary.
-Gitleaks findings stay in memory and errors never include its output. Existing
-privacy rules cover identities and paths; Gitleaks supplies maintained secret
-detectors. Neither scanner establishes that proprietary prose is public.
+[Invariants]
+- `redact_increment` carries open multi-line PEM private-key state (`{'private_key': ...}`)
+  across incremental transcript chunks so split keys remain masked until `-----END ...-----`.
+- Unions all detector spans (pinned Gitleaks `8.30.1` + `mindie_knowledge.redact.scan_text`
+  + caller `private_paths` across POSIX/Windows/WSL spellings) before replacing
+  text with HMAC-keyed `<redacted:rule:12-hex>` or `[REDACTED_SECRET]` placeholders.
+
+[Timeouts & Locks]
+- Subprocess execution bounded by `REDACTION_TIMEOUT_SECONDS = 30.0` (or
+  `MINDIE_REDACTION_TIMEOUT_SECONDS`) and cancellable via `cancel` event.
+
+[Side-Effect Policy]
+- `redact()` runs local Gitleaks over stdin with isolated config (`--ignore-gitleaks-allow`);
+  `install_scanner()` downloads/verifies the SHA-256 pinned archive only during setup/update.
 """
 from __future__ import annotations
 
@@ -36,6 +46,9 @@ ARCHIVES = {
 }
 
 
+_EXTRACTED_MEMBERS: dict[tuple[str, str], bytes] = {}
+
+
 def install_scanner(cache=None):
     """Verified release archive; extract only the executable and license.
 
@@ -64,12 +77,16 @@ def install_scanner(cache=None):
         _replace(archive, raw)
     binary = "gitleaks.exe" if system == "Windows" else "gitleaks"
     for member in (binary, "LICENSE"):
-        if ext == "zip":
-            with zipfile.ZipFile(io.BytesIO(raw)) as source:
-                data = source.read(member)
-        else:
-            with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as source:
-                data = source.extractfile(member).read()
+        cache_key = (expected, member)
+        data = _EXTRACTED_MEMBERS.get(cache_key)
+        if data is None:
+            if ext == "zip":
+                with zipfile.ZipFile(io.BytesIO(raw)) as source:
+                    data = source.read(member)
+            else:
+                with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as source:
+                    data = source.extractfile(member).read()
+            _EXTRACTED_MEMBERS[cache_key] = data
         target = base / member
         if not target.exists() or target.read_bytes() != data:
             _replace(target, data)
@@ -136,28 +153,57 @@ def redact_increment(text, *, state=None, executable, key, private_paths=(), can
     return clean, rules, {'private_key': opened} if opened else {}
 
 
-def redact(text, *, executable, key, private_paths=(), cancel=None):
+GITLEAKS_CONFIG = "[extend]\nuseDefault = true\n"
+_CONFIG_DIR: tempfile.TemporaryDirectory | None = None
+
+
+def _scanner_config() -> tuple[Path, Path]:
+    global _CONFIG_DIR
+    if _CONFIG_DIR is not None:
+        temp = Path(_CONFIG_DIR.name)
+        config = temp / "config.toml"
+        try:
+            if temp.is_dir() and config.is_file() and config.read_text(encoding="utf-8") == GITLEAKS_CONFIG:
+                return temp, config
+        except OSError:
+            pass
+    _CONFIG_DIR = tempfile.TemporaryDirectory(prefix="mindie-redaction-")
+    temp = Path(_CONFIG_DIR.name)
+    config = temp / "config.toml"
+    config.write_text(GITLEAKS_CONFIG, encoding="utf-8")
+    return temp, config
+
+
+REDACTION_TIMEOUT_SECONDS = 30.0
+
+
+def _redaction_timeout(timeout=None):
+    if timeout is not None:
+        return float(timeout)
+    raw = os.environ.get("MINDIE_REDACTION_TIMEOUT_SECONDS")
+    return float(raw) if raw is not None else REDACTION_TIMEOUT_SECONDS
+
+
+def redact(text, *, executable, key, private_paths=(), cancel=None, timeout=None):
     _check_cancel(cancel)
     if not executable or not Path(executable).is_absolute():
         raise ValueError("transcript redaction requires an installed scanner")
     # Never honor transcript comments, repository config or environment
     # allowlists that could silently disable credential detection.
-    with tempfile.TemporaryDirectory(prefix="mindie-redaction-") as temp:
-        config = Path(temp) / "config.toml"
-        config.write_text("[extend]\nuseDefault = true\n", encoding="utf-8")
-        try:
-            result = run_argv(
-                [executable, "stdin", "--no-banner", "--no-color", "--log-level", "error",
-                 "--config", str(config), "--ignore-gitleaks-allow", "--report-format", "json",
-                 "--report-path", "-", "--exit-code", "0"],
-                input_bytes=text.encode("utf-8"), max_output=None,
-                cwd=Path(temp), timeout=None, cancel=cancel,
-                env={k: v for k, v in os.environ.items() if not k.startswith("GITLEAKS_")},
-                inherit_env=False,
-            )
-        except (OSError, CommunityError):
-            _check_cancel(cancel)
-            raise ScannerUnavailable("transcript secret scanner unavailable") from None
+    temp, config = _scanner_config()
+    try:
+        result = run_argv(
+            [executable, "stdin", "--no-banner", "--no-color", "--log-level", "error",
+             "--config", str(config), "--ignore-gitleaks-allow", "--report-format", "json",
+             "--report-path", "-", "--exit-code", "0"],
+            input_bytes=text.encode("utf-8"), max_output=None,
+            cwd=temp, timeout=_redaction_timeout(timeout), cancel=cancel,
+            env={k: v for k, v in os.environ.items() if not k.startswith("GITLEAKS_")},
+            inherit_env=False,
+        )
+    except (OSError, CommunityError):
+        _check_cancel(cancel)
+        raise ScannerUnavailable("transcript secret scanner unavailable") from None
     _check_cancel(cancel)
     if result.code != 0 or result.timed_out:
         raise ScannerUnavailable("transcript secret scanner failed")

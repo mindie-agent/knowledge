@@ -1,12 +1,13 @@
-"""Bounded launch bindings for a service outside its calling application's Job.
+"""[Role] Transfer declared caller bindings to a detached service.
 
-Adapters declare paths and optional environment names in the immutable engine
-configuration. Only the current caller's declared values cross the boundary.
-Windows DPAPI protects the short-lived transfer; it is not a credential store.
+[Invariants] Only declared values cross the boundary. Windows DPAPI binds the
+short-lived transfer to the current user and launch identity.
+[Timeouts & Locks] Local DPAPI calls; no subprocesses or additional locks.
+[Side-Effect Policy] Capture encrypts Windows credentials; successful consumption
+removes the one-use file before applying its values.
 """
 from __future__ import annotations
 
-import ctypes
 import json
 import os
 from pathlib import Path
@@ -21,7 +22,7 @@ _FORBIDDEN = {
     "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP", "PSMODULEPATH",
     "CODEX_THREAD_ID", "CODEX_TURN_ID", "CODEX_SESSION_ID",
     "MINDIE_MAINTENANCE_GROUP", "MINDIE_MAINTENANCE_OWNER",
-    "MINDIE_SUMMARY_SCRATCH",
+    "MINDIE_SUMMARY_SCRATCH", "MINDIE_SUMMARY_WORKER_DEADLINE",
 }
 _PREFIXES = ("PYTHON", "LD_", "DYLD_", "GIT_CONFIG", "GIT_SSH", "BASH_ENV",
              "NODE_OPTIONS", "NODE_PATH")
@@ -59,42 +60,26 @@ def validate(config):
     if any(not isinstance(path, str) or "\x00" in path or "\n" in path
            or not Path(path).is_absolute() for path in paths.values()):
         raise ContextError("service_launch_path_invalid")
-    # Windows names are case-insensitive. Explicit upper/lower proxy aliases
-    # may coexist in the declaration, but cannot shadow a path binding.
     if {key.casefold() for key in names} & {key.casefold() for key in paths}:
         raise ContextError("service_launch_context_invalid")
     return dict(paths=paths.copy(), environment=names.copy())
 
 
 def _crypt(raw, entropy, *, decrypt=False):
-    from ctypes import wintypes
-
-    class Blob(ctypes.Structure):
-        _fields_ = [("size", wintypes.DWORD), ("data", ctypes.POINTER(ctypes.c_ubyte))]
-
-    def blob(value):
-        buffer = ctypes.create_string_buffer(value)
-        return buffer, Blob(len(value), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_ubyte)))
-
-    crypt = ctypes.WinDLL("crypt32", use_last_error=True)
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel.LocalFree.argtypes = [ctypes.c_void_p]
-    kernel.LocalFree.restype = ctypes.c_void_p
-    raw_buffer, source = blob(raw)
-    entropy_buffer, extra = blob(entropy)
-    output = Blob()
-    function = crypt.CryptUnprotectData if decrypt else crypt.CryptProtectData
-    function.argtypes = [ctypes.POINTER(Blob), ctypes.c_void_p, ctypes.POINTER(Blob),
-                         ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(Blob)]
-    function.restype = wintypes.BOOL
-    if not function(ctypes.byref(source), None, ctypes.byref(extra),
-                    None, None, 1, ctypes.byref(output)):
-        raise ContextError("service_context_decryption_failed" if decrypt
-                           else "service_context_encryption_failed")
     try:
-        return ctypes.string_at(output.data, output.size)
-    finally:
-        kernel.LocalFree(output.data)
+        import pywintypes
+        import win32crypt
+    except ImportError:
+        raise ContextError("service_context_crypto_unavailable") from None
+    try:
+        # Current-user DPAPI and launch-bound entropy protect credentials
+        # without changing the user's profile ACLs or allowing UI prompts.
+        if decrypt:
+            return win32crypt.CryptUnprotectData(raw, entropy, None, None, 1)[1]
+        return win32crypt.CryptProtectData(raw, SCHEMA, entropy, None, None, 1)
+    except pywintypes.error:
+        code = "decryption" if decrypt else "encryption"
+        raise ContextError(f"service_context_{code}_failed") from None
 
 
 def capture(config, binding):

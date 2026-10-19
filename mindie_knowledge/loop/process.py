@@ -1,4 +1,10 @@
-"""Bound owned process trees and pipe memory without retaining retry work.
+"""[Role] Bound owned process trees and pipe memory without retaining retry work.
+
+[Invariants] A validated result is persisted before cleanup; cleanup failure
+does not turn completed external work into a retry.
+[Timeouts & Locks] Caller timeout bounds execution, followed by bounded process
+and pipe cleanup. Explicit child_env propagates a summary's enclosing deadline.
+[Side-Effect Policy] Spawns and reaps only the owned tree and temporary scratch.
 
 Pipe draining uses daemon reader threads and a bounded queue, which works
 with subprocess pipes on both POSIX and Windows (``selectors`` cannot select
@@ -25,7 +31,7 @@ import threading
 import time
 
 from .dfx import failure
-from . import posix_owner, summary_scratch
+from . import posix_owner, summary_budget, summary_scratch
 
 
 def spawn_service(command, *, from_detached_starter=False):
@@ -90,10 +96,13 @@ def annotated_error(exc, category, started, exit_code=None, stage="run"):
     return exc
 
 
-def _spawn(command, stdin, scratch=None):
+def _spawn(command, stdin, scratch=None, child_env=None):
     env = {**os.environ, "MINDIE_MAINTENANCE_GROUP": "1",
            "MINDIE_MAINTENANCE_OWNER": str(os.getpid())}
     env.pop(summary_scratch.ENVIRONMENT_KEY, None)
+    env.pop(summary_budget.DEADLINE_ENV, None)
+    if child_env is not None:
+        env.update(child_env)
     if scratch is not None:
         env[summary_scratch.ENVIRONMENT_KEY] = summary_scratch.declaration(scratch)
     if os.name == "nt":
@@ -237,7 +246,8 @@ def _reader(stream, tag, chunks, cancel, errors):
             pass
 
 
-def bounded_run(command, payload, *, timeout=None, max_output, cancel=None, cleanup_receipt=None, on_result=None):
+def bounded_run(command, payload, *, timeout=None, max_output, cancel=None,
+                cleanup_receipt=None, on_result=None, child_env=None):
     started = time.monotonic()
     if cancel is not None and cancel.is_set():
         exc = MaintenanceCancelled('maintenance cancelled before start')
@@ -250,7 +260,7 @@ def bounded_run(command, payload, *, timeout=None, max_output, cancel=None, clea
         try:
             if on_result is not None:
                 scratch = summary_scratch.create_root()
-            process = _spawn(command, input_file, scratch)
+            process = _spawn(command, input_file, scratch, child_env)
         except (OSError, posix_owner.LaunchError) as exc:
             if not hasattr(exc, "mindie_execution"):
                 exc.mindie_execution = 'not_started'
@@ -300,6 +310,12 @@ def bounded_run(command, payload, *, timeout=None, max_output, cancel=None, clea
                         "deadline",
                         started,
                     )
+                if not open_streams:
+                    try:
+                        process.wait(timeout=0.05 if remaining is None else min(0.05, remaining))
+                    except subprocess.TimeoutExpired:
+                        pass
+                    continue
                 try:
                     tag, chunk = chunks.get(timeout=0.1 if remaining is None else min(0.1, remaining))
                 except queue.Empty:

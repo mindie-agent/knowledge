@@ -269,3 +269,38 @@ def test_interrupted_first_enable_keeps_its_original_boundary(tmp_path):
         assert path.read_bytes() == saved
     consent_store.record_choice(consent, 'contribute')
     assert settings_mod.load(path).allows_capture()
+
+
+def test_malformed_consent_and_enabled_field_shapes_fail_closed_as_fault(tmp_path):
+    from mindie_knowledge import consent_store
+
+    consent = tmp_path / "consent.json"
+    consent_store.record_choice(consent, "contribute")
+    consent_store.record_reporting(consent, "later")
+    path = tmp_path / "community.json"
+    write_settings(path, enabled=True, roots=[tmp_path], consent_config=str(consent))
+    base_raw = json.loads(path.read_text())
+
+    for field, bad_val in (
+        ("consent_config", None),
+        ("consent_config", ""),
+        ("consent_config", 1),
+        ("consent_config", True),
+        ("consent_config", "mindie-consent.json"),
+        ("enabled", "false"),
+        ("enabled", "true"),
+        ("enabled", 0),
+    ):
+        variant = tmp_path / "variant.json"
+        data = dict(base_raw)
+        data[field] = bad_val
+        variant.write_text(json.dumps(data))
+        loaded = settings_mod.load(variant)
+        assert not loaded.allows_capture(), (field, bad_val)
+        assert loaded.capture_block_kind() == "fault", (field, bad_val)
+
+    consent.write_text(json.dumps({"schema": "mindie-consent/1", "reporting": "later"}) + "\n")
+    loaded = settings_mod.load(path)
+    assert not loaded.allows_capture()
+    assert loaded.capture_block_kind() == "fault"
+

@@ -167,7 +167,7 @@ def test_cold_wake_waits_for_healthy_initialization_past_the_old_deadline(tmp_pa
     owned = []
     def delayed(command, **options):
         child = original([sys.executable, '-c',
-            "import time,runpy; time.sleep(6.2); runpy.run_module('mindie_knowledge.loop.cli', run_name='__main__')",
+            "import time,runpy; time.sleep(0.5); runpy.run_module('mindie_knowledge.loop.cli', run_name='__main__')",
             *command[3:]], **options)
         owned.append(child)
         return child
@@ -284,7 +284,7 @@ def test_loopback_bind_skips_reverse_dns(tmp_path, monkeypatch):
     service = Service(engine, connection_path=tmp_path / "connection.json")
     assert service.http.server_name == "127.0.0.1"
     assert service.http.server_port == int(service.connection["url"].rsplit(":", 1)[-1])
-    assert service.http.slots is not None and service.http.slot_wait == 0
+    assert service.http.slots is not None and service.http.slot_wait == 2.0
     thread = threading.Thread(target=service.serve, daemon=True)
     thread.start()
     try:

@@ -1,11 +1,20 @@
-"""Authorized public transcript capture, incremental indexing and publication.
+"""[Role] Background capture, incremental LangMem indexing, and community publication orchestrator (`Engine`).
 
-Capture stores complete deterministically redacted material. The separate summary
-worker indexes complete new blocks plus prior navigation using the bounded
-LangMem protocol. Its durable ledger owns model outcomes and local result recovery;
-this engine never rewrites a body or automatically replays a paid attempt.
-Authority faults park work, revocation cancels unsent work, and uncertain remote
-writes remain subject to read-only reconciliation.
+[Invariants]
+- Re-verifies shared `CommunitySettings` (`mindie-community-config/1`), profile
+  consent (`mindie-consent/1`), and session `Admission` lease before every capture,
+  summary worker call, and outbound publication.
+- `GateFault` (damaged/unreadable authority) parks queued work with bounded
+  backoff; explicit user revocation (`enabled=False` or non-`contribute` consent)
+  cancels unsent work; `unknown` external effects reconcile read-only without replay.
+
+[Timeouts & Locks]
+- Coordinates three daemon loops (`mindie-capture`, `mindie-outbox`, `mindie-summary`)
+  with cancellable `OperationOwner` scopes and `stop` event signaling.
+
+[Side-Effect Policy]
+- Delegates redaction and summary worker subprocesses via `bounded_run` and
+  outbound Git/GitHub publication via `PublicationWorker`.
 """
 
 from __future__ import annotations

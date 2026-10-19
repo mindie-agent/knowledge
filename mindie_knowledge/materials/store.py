@@ -1,10 +1,19 @@
-"""Markdown authority with stable material blocks and small atomic pointers.
+"""[Role] Canonical Markdown material store (`mindie-material-task/1`, `mindie-material-block/1`) and dual-channel `current.json` pointer manager.
 
-The only durable body lives in ordinary Markdown files. A manifest binds ordered
-block hashes, their fallible search headers, and current navigation. Candidate
-manifests let the queue database commit a pointer without overwriting the last
-valid body first; ``retain_current`` retires unreferenced candidates afterwards.
-ReMe owns derived chunking, the file graph, and BM25 (see ``reme_index.py``).
+[Invariants]
+- All durable material bodies live in `tasks/<task_id>/index.md` (`mindie-entry/3`
+  header) and immutable 16 KB `blocks/<block_id>.md` files verified by SHA-256.
+- Candidate revisions are staged under `candidates/<revision>/` before SQLite
+  commits; `retain_current` promotes active `draft`/`feed` pointers in `current.json`
+  and retires unreferenced candidates.
+
+[Timeouts & Locks]
+- Mutations acquire `self._mutex` (`threading.RLock`) and cross-process
+  `StartLock(root / ".write.lock", wait=5.0)`.
+
+[Side-Effect Policy]
+- Local atomic file writes (`os.replace`) and derived `ReMeIndex` updates only;
+  post-commit cleanup failures raise `MaterialCleanupError(committed=True)`.
 """
 
 from __future__ import annotations
@@ -207,7 +216,7 @@ class MaterialStore:
         self.domain = domain
         self.root.mkdir(parents=True, exist_ok=True)
         self._mutex = threading.RLock()
-        self._write_lock = StartLock(self.root / ".write.lock")
+        self._write_lock = StartLock(self.root / ".write.lock", wait=5.0)
         self._index = None
         self._index_verified = None
         self._index_failure = None
@@ -238,7 +247,8 @@ class MaterialStore:
             with tmp.open("x", encoding="utf-8", newline="") as stream:
                 stream.write(text)
                 stream.flush()
-                os.fsync(stream.fileno())
+                if os.environ.get("MINDIE_DISABLE_FSYNC") != "1":
+                    os.fsync(stream.fileno())
             os.replace(tmp, path)
         except BaseException as exc:
             try:
@@ -255,7 +265,7 @@ class MaterialStore:
         with self._mutex:
             owned = self._write_lock.acquired
             if not owned:
-                self._write_lock.acquire(wait=None)
+                self._write_lock.acquire(wait=5.0)
             try:
                 yield
             finally:
@@ -341,7 +351,7 @@ class MaterialStore:
         _source(source)
         lock = self._lock()
         with self._mutex:
-            lock.acquire(wait=None)
+            lock.acquire(wait=5.0)
             try:
                 selected = revision if revision is not None else self._pointers()[source].get(task_id)
                 prior = self._header(task_id, selected, source) if selected is not None else None
@@ -386,7 +396,7 @@ class MaterialStore:
                   for i, text in enumerate(_split_text(doc["content"]))]
         lock = self._lock()
         with self._mutex:
-            lock.acquire(wait=None)
+            lock.acquire(wait=5.0)
             try:
                 descriptors = [self._write_block(task_id, block) for block in blocks]
                 result = self._write_manifest(doc, descriptors, doc["summary"], "incomplete")
@@ -427,7 +437,7 @@ class MaterialStore:
         navigation_ref = task_ref(self.domain, task_id)
         lock = self._lock()
         with self._mutex:
-            lock.acquire(wait=None)
+            lock.acquire(wait=5.0)
             try:
                 pointers = self.root / "current.json"
                 if pointers.is_symlink():
@@ -476,7 +486,7 @@ class MaterialStore:
         _source(source)
         lock = self._lock()
         with self._mutex:
-            lock.acquire(wait=None)
+            lock.acquire(wait=5.0)
             try:
                 prior = self._header(task_id, revision, source)
                 changes = {item["block_id"]: item for item in indexes}
@@ -515,7 +525,7 @@ class MaterialStore:
         """
         lock = self._lock()
         with self._mutex:
-            lock.acquire(wait=None)
+            lock.acquire(wait=5.0)
             try:
                 draft = self._header(task_id, draft_revision, "draft")
                 public = self._header(task_id, published_revision, "feed")
@@ -559,7 +569,7 @@ class MaterialStore:
         """Atomically promote all metadata-committed tasks, then retire garbage."""
         lock = self._lock()
         with self._mutex, self.validated_headers():
-            lock.acquire(wait=None)
+            lock.acquire(wait=5.0)
             try:
                 if complete:
                     updates = dict(updates)
@@ -667,7 +677,7 @@ class MaterialStore:
         seen = set()
         lock = self._lock()
         with self._mutex:
-            lock.acquire(wait=None)
+            lock.acquire(wait=5.0)
             try:
                 state = self._pointers()
                 old_ids = set(state[source])
@@ -818,7 +828,7 @@ class MaterialStore:
         import shutil
         self.close()
         lock = StartLock(self.root / ".index.lock")
-        lock.acquire(wait=None)
+        lock.acquire(wait=5.0)
         try:
             path = self.root / ".reme-index"
             if path.exists():

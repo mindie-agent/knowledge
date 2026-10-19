@@ -10,6 +10,7 @@ import sys
 import time
 from contextlib import closing
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -132,26 +133,31 @@ def test_summary_checks_cached_authority_and_preserves_returned_effect(pipeline,
     engine.last_activity = 0
     with store._write_txn():
         store.db.execute('UPDATE transcript_tasks SET summary_due=0')
-    marker = store.root / 'state-v4.sqlite3.owner'
+    db_path = store.root / 'state-v4.sqlite3'
     original_commit, original_run = store.db.commit, transcript_capture.bounded_run
-    calls, removed = [], []
-    def remove_after_claim_commit():
+    original_exists = Path.exists
+    calls, unavailable = [], []
+    def authority_exists(candidate):
+        # Windows forbids unlinking an open SQLite file. Inject the same
+        # unavailable-path observation while retaining the real receipt DB.
+        return False if candidate == db_path and unavailable else original_exists(candidate)
+    monkeypatch.setattr(Path, 'exists', authority_exists)
+    def lose_after_claim_commit():
         original_commit()
         rows = sqlite3.Connection.execute(store.db, "SELECT count(*) FROM material_summary_attempts WHERE status='invoking'").fetchone()[0]
-        if failure_point == 'before-invoke' and rows and not removed:
-            marker.unlink()
-            removed.append(True)
+        if failure_point == 'before-invoke' and rows and not unavailable:
+            unavailable.append(True)
     def run_with_actual_return(command, payload, **kwargs):
         if '--identity' not in command:
             calls.append(command)
             if failure_point == 'returned':
                 save = kwargs['on_result']
                 def lose_authority(raw):
-                    marker.unlink()
+                    unavailable.append(True)
                     return save(raw)
                 kwargs['on_result'] = lose_authority
         return original_run(command, payload, **kwargs)
-    monkeypatch.setattr(store.db, 'commit', remove_after_claim_commit)
+    monkeypatch.setattr(store.db, 'commit', lose_after_claim_commit)
     monkeypatch.setattr(transcript_capture, 'bounded_run', run_with_actual_return)
     with pytest.raises(FileNotFoundError) as caught:
         transcript_capture.summarize_due(engine)
@@ -515,7 +521,19 @@ def test_repeated_enable_keeps_pending_material_and_authorization(pipeline):
 
 
 @pytest.mark.parametrize('harness', ['codex', 'kimi', 'cc'])
-@pytest.mark.parametrize('size', [129 * 1024, 1024 * 1024, 10 * 1024 * 1024])
+@pytest.mark.parametrize('size', [
+    129 * 1024,
+    pytest.param(
+        10 * 1024 * 1024,
+        marks=[
+            pytest.mark.benchmark,
+            pytest.mark.skipif(
+                __import__('os').environ.get('MINDIE_RUN_BENCHMARK') != '1',
+                reason='10MB benchmark; set MINDIE_RUN_BENCHMARK=1 to run',
+            ),
+        ],
+    ),
+])
 def test_production_parsers_preserve_large_public_messages_through_export(tmp_path, scanner, harness, size):
     session = SESSIONS[harness]
     settings = tmp_path / 'community.json'

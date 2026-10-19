@@ -1,45 +1,23 @@
-"""Neutral admission store owned by the knowledge core.
+"""[Role] Session-scoped task lease and idempotent event-attempt store (`mindie-admission/1`).
 
-``Admission(path)`` takes an explicit, neutral admission SQLite path from the
-engine configuration (``admission_path``) — never an adapter config path, a
-Codex session database or a runtime-path fingerprint. Each harness uses a
-distinct admission file under its own local domain root (default ``codex`` and
-``kimi`` namespaces); the native session identity is supplied only by that
-adapter, never by a model argument or a newest-session fallback.
+[Invariants]
+- Read-only checks (`check`, `capture_lease`, `active_lease`, `leases`, `scope_root`,
+  `allows_hash`, `resolve`, `inspect`) never create `admission.sqlite3`; only
+  `activate` and `associate` initialize a missing store.
+- A healthy repeat `activate` for the same session and `project_root` preserves
+  the existing token and `activated_at` boundary; a fresh activation (new session,
+  post-revocation, or scope change) rotates the token and boundary.
+- `claim(session, kind, identity)` returns `True` at most once per
+  `(session, kind, identity)` and survives `deactivate` so revoking/reactivating
+  never replays old turns.
 
-Core owns the minimal schema (one lease per native session plus durable
-attempt identities). Construction and all read-only checks
-(``check``/``capture_lease``/``active_lease``/``leases``/``scope_root``/
-``allows_hash``/``resolve``) never create the database; only the first
-``activate``/``associate`` does. A complete existing database can acquire its
-ownership marker without changing grants or receipts. The store holds grants
-and attempt receipts only: no transcript payload or body history. The file
-and its directory get restrictive permissions (0700/0600), like any token or
-config state.
+[Timeouts & Locks]
+- Serializes writes with in-process `self._lock` (`threading.RLock`) and
+  `open_database(..., timeout=5.0)` (`timeout=2.0` on reads) in WAL mode.
 
-Canonical semantics (shared by every adapter):
-
-- A lease is an internal identity binding for one native task, established
-  automatically by the adapter for a verified, authorized native event. It is not a
-  consent prompt: the installation-level shared settings file is the only
-  persistent user choice. A binding lasts until an explicit ``deactivate``
-  or an actual project-scope change. There is no wall-clock expiry, no
-  failure-count pause and no config-byte/runtime-path fingerprint — ordinary
-  failures never revoke a binding and never require a manual
-  revoke/reactivate cycle.
-- A repeated healthy ``activate`` preserves the existing random token and the
-  original ``activated_at`` capture boundary. A fresh activation (new,
-  revoked or changed scope) ROTATES the token and boundary — no deterministic
-  reusable capability survives revocation.
-- ``resolve(activation_token)`` returns the owning VALID lease (or None).
-- ``claim(session, kind, identity, token=None)`` atomically consumes a
-  durable attempt identity and returns bool: True exactly once per
-  ``(session, kind, identity)`` — any repeat is False, even after a failure
-  or crash, and attempts survive ``deactivate`` so revoke/reactivate never
-  replays old work.
-- ``finish(session, activation_token, succeeded)`` records the outcome in
-  the task's consecutive-failure diagnostic counter. The counter is
-  observability only: it never gates activation, capture or claims.
+[Side-Effect Policy]
+- Local SQLite state (`0700` dir / `0600` file) only; failure counters (`finish`)
+  are diagnostic only and never self-brick or revoke an active lease.
 """
 
 from __future__ import annotations
@@ -107,7 +85,7 @@ class Admission:
 
     # ------------------------------------------------------------- internals
 
-    def _database(self, *, initialize_missing=False, timeout=0.1):
+    def _database(self, *, initialize_missing=False, timeout=2.0):
         """Use the shared authority contract; absence is valid only before use."""
         try:
             return open_database(
@@ -320,7 +298,7 @@ class Admission:
             )
         return lease
 
-    def capture_authorization(self, session, token, *, timeout):
+    def capture_authorization(self, session, token, *, timeout=2.0):
         """Read one lease for a Stop handoff.
 
         Returns ``state`` of ``admitted``, ``inactive``, or ``schema``. A
@@ -337,7 +315,7 @@ class Admission:
             or len(token) > 512
         ):
             return {"state": "inactive"}
-        timeout = max(0.05, min(float(timeout), 0.25))
+        timeout = max(0.05, min(float(timeout), 10.0))
         db = self._database(timeout=timeout)
         if db is None:
             return {"state": "inactive"}
@@ -390,7 +368,7 @@ class Admission:
         finally:
             db.close()
 
-    def resolve_capture_lease(self, session, *, timeout):
+    def resolve_capture_lease(self, session, *, timeout=2.0):
         """Read one live lease for an internal Stop that did not pass a token.
 
         The stored token is used only to compute the activation epoch and is
@@ -406,14 +384,14 @@ class Admission:
             or len(session) > 256
         ):
             return {"state": "inactive"}
-        timeout = max(0.05, min(float(timeout), 0.25))
+        timeout = max(0.05, min(float(timeout), 10.0))
         db = self._database(timeout=timeout)
         if db is None:
             return {"state": "inactive"}
         try:
             db.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
             deadline = time.monotonic() + timeout
-            db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+            db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 10000)
             columns = [row[1] for row in db.execute("PRAGMA table_info(leases)")]
             if not columns:
                 raise AdmissionUnavailable("lease schema is missing")

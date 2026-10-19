@@ -35,7 +35,8 @@ def main():
     options = ["--collect-only", "-q"] if args.collect_only else [
         "-v", "--maxfail=1", "--durations=25", "--junitxml=native-knowledge.xml",
     ]
-    return subprocess.call([sys.executable, "-m", "pytest", *selected, *options], cwd=root)
+    return subprocess.call(
+        [sys.executable, "-m", "pytest", *selected, "-m", "not live_npu", *options], cwd=root)
 
 
 if __name__ == "__main__":

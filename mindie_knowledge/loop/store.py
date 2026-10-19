@@ -1,10 +1,19 @@
-"""Current task metadata, consent-bound capture and publication queues.
+"""[Role] Authoritative `state-v4.sqlite3` (`mindie-store/4`) transaction coordinator for task headers, capture cursors, incremental index batches, and outbox receipts.
 
-The state-v4 SQLite database stores small headers, identifiers, cursors and
-receipts. Current material bodies live in canonical Markdown packages managed
-by MaterialStore; ReMe owns the disposable local retrieval index. Writes stage
-files first, commit queue metadata, then promote matching current pointers.
-Superseded unreferenced bodies are retired, and old database files are inert.
+[Invariants]
+- SQLite stores compact headers, cursors, grants, votes, and receipts; durable
+  material bodies live in `MaterialStore` (`tasks/<id>/index.md` + `blocks/<hash>.md`).
+- Every material mutation follows two-phase staging: stage candidate files ->
+  commit SQLite metadata inside `_write_txn()` -> promote `current.json` pointers
+  in `_finish_material_writes()`.
+
+[Timeouts & Locks]
+- Opened via `open_database` in WAL mode (`timeout=5.0s`); in-process writes
+  serialize on `self.lock` (`threading.RLock`) with `BEGIN IMMEDIATE`.
+
+[Side-Effect Policy]
+- Local SQLite and `MaterialStore` mutations only; never spawns subprocesses or
+  performs network I/O.
 """
 
 from __future__ import annotations
@@ -455,6 +464,7 @@ class Store:
             if self.db.in_transaction:
                 yield
                 return
+            self.db.assert_authority()
             self.db.execute("BEGIN IMMEDIATE")
             try:
                 yield

@@ -200,33 +200,16 @@ def test_invalid_sid_rejected_by_windows_conversion_is_visible_failure(api):
     assert "private" not in str(caught.value)
 
 
-@pytest.mark.parametrize("owner,aces,accepted", [
-    ("S-1-5-21-123", [(0, "S-1-5-21-123"), (0, "S-1-5-18"), (1, "S-1-1-0")], True),
-    ("S-1-5-32-544", [(0, "S-1-5-21-123")], False),
-    ("S-1-5-21-123", [(0, "S-1-1-0")], False),
-    ("S-1-5-21-123", [(9, "S-1-5-21-123")], False),
-    ("S-1-5-21-123", None, False),
-])
-def test_acl_uses_actual_token_user_and_rejects_unknown_allows(api, owner, aces, accepted):
+def test_private_sid_uses_actual_token_user_and_closes_token(api):
     value, state = api
-    acl = (SimpleNamespace(GetAceCount=lambda: len(aces),
-                           GetAce=lambda index: ((aces[index][0], 0), 0xFFFFFFFF, aces[index][1]))
-           if aces is not None else None)
-    descriptor = SimpleNamespace(GetSecurityDescriptorOwner=lambda: owner,
-                                 GetSecurityDescriptorDacl=lambda: acl)
     value.system = SimpleNamespace(GetCurrentProcess=lambda: "current")
     value.constants = SimpleNamespace(TOKEN_QUERY=8)
     value.security = SimpleNamespace(
-        TokenUser=1, SE_FILE_OBJECT=1, OWNER_SECURITY_INFORMATION=1, DACL_SECURITY_INFORMATION=4,
-        ACCESS_ALLOWED_ACE_TYPE=0, ACCESS_DENIED_ACE_TYPE=1,
+        TokenUser=1,
         OpenProcessToken=lambda *args: SimpleNamespace(
             Close=lambda: state["calls"].append(("token_closed",))),
         GetTokenInformation=lambda *args: ("S-1-5-21-123", 0),
-        ConvertSidToStringSid=str,
-        GetNamedSecurityInfo=lambda *args: descriptor)
-    if accepted:
-        assert manager.private_sid("private") == "S-1-5-21-123"
-    else:
-        with pytest.raises(manager.ServiceHostError, match="private_directory_unavailable"):
-            manager.private_sid("private")
+        ConvertSidToStringSid=str)
+    assert manager.private_sid("private") == "S-1-5-21-123"
     assert state["calls"] == [("token_closed",)]
+

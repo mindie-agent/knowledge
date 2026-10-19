@@ -367,6 +367,12 @@ def run_argv(
             if remaining is not None and remaining <= 0:
                 timed_out = True
                 break
+            if not open_streams:
+                try:
+                    process.wait(timeout=0.05 if remaining is None else min(0.05, remaining))
+                except subprocess.TimeoutExpired:
+                    pass
+                continue
             try:
                 tag, chunk = chunks.get(timeout=0.1 if remaining is None else min(0.1, remaining))
             except queue.Empty:

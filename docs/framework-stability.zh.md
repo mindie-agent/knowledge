@@ -25,14 +25,14 @@
 
 ---
 
-## 3. Windows 配置文件的并发安全读写（Delete-Sharing + Atomic Rename）
+## 3. Windows 配置文件的并发安全读写
 
-在 Windows 上，如果一个进程正打开某个配置文件进行读取，Python 标准库的 `os.replace` 往往会因为目标文件被占用而抛出权限拒绝异常，或者导致读者读到半截文件。
-
-为了实现与 POSIX 一致的无锁原子更新，`mindie-knowledge` 核心与各插件引导层共享同一套 Windows 原子文件读写实现：
-1. **允许删除共享的读取（Delete-Sharing Reads）**：所有内部读者在打开配置文件时均启用 `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`；
-2. **原生原子重命名替换（Atomic Rename）**：写入方先将新内容完整写入同目录下的临时文件，再通过原生 Win32 重命名语义原子替换目标路径。
-- **效果**：正在读取的旧读者继续读完完整的旧文件内容，新打开路径的读者直接看到完整的新文件内容，双方互不阻塞、绝不会读到半截损坏的 JSON（详见 [Windows `_FILE_RENAME_INFORMATION` 规范](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information)）。
+读取方复制完整文档并关闭句柄后再解析。写入方在授权或社区配置锁内合并更新，
+将完整文档写入同目录临时文件，刷新后用 `os.replace` 原子替换。
+Windows 上的并发读取可能短暂阻止替换，仅对 WinError 5 和 32 重试，最长五秒；
+读取方遇到替换窗口内的权限拒绝也会有限等待，其他错误立即向调用方返回。
+持续占用会报告失败，旧文档保持完整。
+写入方不会截断正在使用的文档，也不会静默丢弃用户选择。
 
 ---
 

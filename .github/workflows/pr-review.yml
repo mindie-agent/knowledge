@@ -28,7 +28,7 @@ jobs:
       - name: Test package
         env:
           MINDIE_FRAMEWORK_SOURCE: tests/fixtures/production-parsers
-        run: python -m pytest -q tests
+        run: python -m pytest -q tests -m "not live_npu"
       - name: Scan packaged public docs and data for accidental private data
         run: >
           python -m mindie_knowledge.redact --check

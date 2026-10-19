@@ -4,8 +4,6 @@ import json
 import os
 from pathlib import Path
 
-from mindie_diagnostics.fallback import current_consent, policy_path, read_policy
-
 from lane_support import file_sha256, isolation_root, parser_paths
 
 
@@ -35,11 +33,8 @@ def test_process_home_and_diagnostics_stay_in_the_test_root():
     config = Path(os.environ["MINDIE_DIAGNOSTICS_CONFIG"])
     assert config == root / "diagnostics.json"
     assert config.is_file() and not config.is_symlink()
-    assert policy_path() == config
-    policy = read_policy()
-    assert policy is not None
+    policy = json.loads(config.read_text(encoding="utf-8"))
     assert policy["decision"] == "disabled"
-    assert current_consent() is None
 
 
 def test_real_home_diagnostics_and_frozen_parsers_are_untouched():

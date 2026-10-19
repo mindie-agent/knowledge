@@ -27,12 +27,15 @@ This guide summarizes the stability mechanisms built into `mindie-knowledge` for
 
 ## 3. Atomic Configuration Reads & Writes on Windows
 
-On Windows, if a reader process holds an open handle to a configuration file without delete-sharing, Python's standard `os.replace` can fail with `PermissionError` or cause readers to observe partial writes.
-
-To provide POSIX-grade atomic configuration updates on Windows, `mindie-knowledge` core and all plugin bootstrap helpers share a unified implementation:
-1. **Delete-Sharing Reads**: Every internal reader opens configuration files with `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`;
-2. **Native Atomic Rename**: Writers flush the complete new document to a temporary file in the same directory and atomically replace the target using native Win32 rename semantics.
-- **Result**: Active readers finish reading the complete old document while new readers immediately see the complete new document—with zero lock contention or partial JSON reads (see [Windows `_FILE_RENAME_INFORMATION` semantics](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information)).
+Readers copy each complete document and close its handle before parsing.
+Writers serialize updates under the consent or community lock, flush a complete
+temporary file in the same directory, then publish it with `os.replace`.
+On Windows, a concurrent reader can temporarily prevent replacement. WinError 5
+and 32 are retried for at most five seconds; other errors remain immediate.
+Readers likewise allow a bounded wait when Windows reports a denied open during
+replacement.
+A persistent holder produces a visible error while the old document stays
+intact. Writers never truncate the live document or silently discard a choice.
 
 ---
 

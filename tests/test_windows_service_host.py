@@ -35,6 +35,23 @@ def test_context_projects_only_declared_present_values_and_consumes_once(tmp_pat
     with pytest.raises(context.ContextError):
         context.consume(path, config, binding)
 
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows user DPAPI")
+def test_dpapi_transfer_encrypts_credentials_and_binds_launch(tmp_path, monkeypatch):
+    monkeypatch.setenv("SELECTED_KEY", "synthetic-service-credential")
+    config = dict(service_launch_context=dict(environment=["SELECTED_KEY"]))
+    binding = dict(attempt="first-launch", fingerprint="engine-generation")
+    raw = context.capture(config, binding)
+    assert b"synthetic-service-credential" not in raw
+    path = tmp_path / "launch.context"
+    path.write_bytes(raw)
+    with pytest.raises(context.ContextError, match="decryption_failed"):
+        context.consume(path, config, {**binding, "attempt": "different-launch"})
+    assert path.exists()
+    assert context.consume(path, config, binding) == {
+        "SELECTED_KEY": "synthetic-service-credential",
+    }
+    assert not path.exists()
+
 
 @pytest.mark.parametrize("key", [
     "PATH", "Path", "PYTHONPATH", "PYTHONHOME", "LD_PRELOAD", "DYLD_LIBRARY_PATH",
@@ -97,16 +114,6 @@ def test_context_caller_absence_clears_only_declared_host_environment(tmp_path, 
     assert os.environ["PRESENT_KEY"] == "current-synthetic-value"
     assert os.environ["SELECTED_HOME"] == str(tmp_path)
     assert os.environ["UNRELATED_SETTING"] == "preserved"
-
-
-@pytest.mark.skipif(os.name != "nt", reason="Windows DPAPI contract")
-def test_dpapi_roundtrip_binds_entropy_and_is_not_plaintext():
-    raw = b'{"key":"synthetic-secret"}'
-    encrypted = context._crypt(raw, b"correct-owner-config-attempt")
-    assert b"synthetic-secret" not in encrypted
-    assert context._crypt(encrypted, b"correct-owner-config-attempt", decrypt=True) == raw
-    with pytest.raises(context.ContextError):
-        context._crypt(encrypted, b"other-attempt", decrypt=True)
 
 
 @pytest.fixture

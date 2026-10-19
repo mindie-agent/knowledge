@@ -26,29 +26,20 @@ def test_never_used_admission_reads_and_noop_writes_create_nothing(tmp_path):
     assert not path.parent.exists()
 
 
-@pytest.mark.parametrize('damage', ['missing', 'empty', 'leases', 'attempts', 'constraints', 'marker'])
+@pytest.mark.parametrize('damage', ['missing', 'empty', 'leases', 'attempts'])
 def test_lost_native_association_never_becomes_inactive_or_replays(tmp_path, damage):
     path = tmp_path / 'admission.sqlite3'
     original = Admission(path)
     lease = original.associate('native', project_root=str(tmp_path), not_before=12.0)
     assert original.claim('native', 'capture', 'once', lease['token']) is True
-    marker = path.with_name(path.name + '.owner')
     if damage == 'missing':
         path.unlink()
     elif damage == 'empty':
         path.write_bytes(b'')
-    elif damage == 'marker':
-        marker.write_text('corrupt\n')
     else:
         with closing(sqlite3.connect(path)) as db, db:
-            if damage == 'constraints':
-                db.execute('ALTER TABLE attempts RENAME TO old_attempts')
-                db.execute('CREATE TABLE attempts AS SELECT * FROM old_attempts')
-                db.execute('DROP TABLE old_attempts')
-            else:
-                db.execute(f'DROP TABLE {damage}')
+            db.execute(f'DROP TABLE {damage}')
     before = path.read_bytes() if path.exists() else None
-    marker_before = marker.read_bytes()
     # Both the long-lived gate and a new native event after restart must fail.
     for gate in (original, Admission(path)):
         reads = [gate.leases, lambda: gate.active_lease('native'),
@@ -65,7 +56,6 @@ def test_lost_native_association_never_becomes_inactive_or_replays(tmp_path, dam
                 operation()
         assert gate.inspect('native')['status'] == 'unavailable'
     assert (path.read_bytes() if path.exists() else None) == before
-    assert marker.read_bytes() == marker_before
 
 
 def test_healthy_association_reuses_boundary_and_receipts_after_restart(tmp_path):

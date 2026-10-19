@@ -138,7 +138,7 @@ def test_notification_without_token_and_locked_admission(tmp_path, monkeypatch):
         held.execute("BEGIN EXCLUSIVE")
         blocked = capture_hook(config, dict(
             event, event_id="22222222-2222-4222-8222-222222222222",
-        ))
+        ), timeout=0.1)
     finally:
         held.rollback()
         held.close()
