@@ -27,7 +27,6 @@ def _world(tmp_path, scanner_exec=None):
     project.mkdir()
     consent, settings = tmp_path / 'consent.json', tmp_path / 'settings.json'
     consent_store.record_choice(consent, 'contribute')
-    consent_store.record_reporting(consent, 'later')
     parsed = write_settings(settings, enabled=True, roots=[project], consent_config=str(consent))
     admission = Admission(make_admission(tmp_path, project_root=project, session='ses-fault'))
     source = transcript_path('codex', tmp_path / 'logs', 'ses-fault')

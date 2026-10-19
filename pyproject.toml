@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mindie-knowledge"
-version = "0.12.1"
+version = "0.12.2"
 description = "Local knowledge and experience loop: bounded capture, optional community sharing, Git-published retrieval"
 readme = "README.md"
 license = "MIT"
@@ -18,7 +18,7 @@ dependencies = [
   "reme-ai[as] @ git+https://github.com/agentscope-ai/ReMe@4c54c2b650038eff2a5d0d77aaa61b3e836f1b18",
   "langmem==0.0.30",
   "pywin32==312; sys_platform == 'win32'",
-  "mindie-diagnostics @ git+https://github.com/mindie-agent/diagnostics@7da7f66d119098e0515f8f37bfd5e7cf8cc32fee",
+  "mindie-diagnostics @ git+https://github.com/mindie-agent/diagnostics@22653fe599f8c0eece2085f301b9bb8dec44734a",
 ]
 
 [project.optional-dependencies]

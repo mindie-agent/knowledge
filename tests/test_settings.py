@@ -39,7 +39,6 @@ def test_missing_choice_reference_is_a_fault_without_rewriting_saved_choice(tmp_
 
     consent = tmp_path / "consent.json"
     consent_store.record_choice(consent, "contribute")
-    consent_store.record_reporting(consent, "disabled")
     saved = consent.read_bytes()
     path = tmp_path / "community.json"
     original = write_settings(path, roots=[tmp_path], consent_config=str(consent))
@@ -276,7 +275,6 @@ def test_malformed_consent_and_enabled_field_shapes_fail_closed_as_fault(tmp_pat
 
     consent = tmp_path / "consent.json"
     consent_store.record_choice(consent, "contribute")
-    consent_store.record_reporting(consent, "later")
     path = tmp_path / "community.json"
     write_settings(path, enabled=True, roots=[tmp_path], consent_config=str(consent))
     base_raw = json.loads(path.read_text())

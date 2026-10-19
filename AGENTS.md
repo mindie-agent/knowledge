@@ -9,7 +9,7 @@
 - **Top-Level Authorities & Retrieval (`mindie_knowledge/`)**:
   - [`owned_state.py`](mindie_knowledge/owned_state.py): Authoritative SQLite opener (`open_database`, WAL mode, `5.0s` busy timeout, schema verification without silent rebuild on damage).
   - [`state_layout.py`](mindie_knowledge/state_layout.py): Domain state directory layout (`state-v4/state-v4.sqlite3`) and release-version migration guard.
-  - [`consent_store.py`](mindie_knowledge/consent_store.py): Profile-level consent authority (`mindie-consent/1`, cross-process `.lock` with `5.0s` wait, atomic `os.replace`).
+  - [`consent_store.py`](mindie_knowledge/consent_store.py): Single profile-level contribution and diagnostics authority (`mindie-consent/1`, `choice_revision`, cross-process `.lock` with `5.0s` wait, atomic `os.replace`). `record_choice` is the only choice writer; `activate_reporting` derives the diagnostics policy and verifies native worker readiness. Legacy choices without a revision require an explicit unified choice and never silently authorize diagnostics upload.
   - [`redact.py`](mindie_knowledge/redact.py): Deterministic regex/structural PII, credential, IP/endpoint, and path scanner (`REDACTION_PROFILE = "mindie-redaction/1"`).
   - [`retrieval.py`](mindie_knowledge/retrieval.py): Technical tokenizer (`TechnicalTokenizerV1` preserving API/version/CJK tokens) and Markdown corpus sync/search helpers.
   - [`publication_check.py`](mindie_knowledge/publication_check.py): Streaming `git ls-tree` + `git cat-file --batch` validator for community PR commits.
