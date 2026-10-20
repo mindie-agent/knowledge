@@ -35,6 +35,32 @@ def publish(tmp_path, files, *, write_timeout=10, domain="vllm-ascend"):
     return repo, git(repo, 'rev-parse', 'HEAD')
 
 
+def publish_fast(tmp_path, files, *, domain="vllm-ascend"):
+    """Commit the same files as true Git blobs without a bulk worktree add."""
+    files = {"publication-contract.json": render_contract(make_contract(domain, "a" * 40)), **files}
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    git(repo, 'init', '-q', '-b', 'main')
+    stream = bytearray()
+    marks = []
+    for mark, (name, text) in enumerate(files.items(), 1):
+        raw = text.encode('utf-8')
+        stream += f'blob\nmark :{mark}\ndata {len(raw)}\n'.encode('ascii')
+        stream += raw + b'\n'
+        marks.append((mark, name))
+    message = b'publication\n'
+    stream += (f'commit refs/heads/main\nmark :{len(marks) + 1}\n'
+               f'committer check <check@example.invalid> 1700000000 +0000\n'
+               f'data {len(message)}\n').encode('ascii')
+    stream += message
+    for mark, name in marks:
+        stream += f'M 100644 :{mark} {name}\n'.encode('utf-8')
+    stream += b'\n'
+    subprocess.run(['git', '-C', str(repo), 'fast-import', '--quiet'],
+                   input=bytes(stream), check=True, timeout=60)
+    return repo, git(repo, 'rev-parse', 'HEAD')
+
+
 def task_files(number=1, *, domain='vllm-ascend', body='Complete public evidence.', kind='experience'):
     entry_id = f'{number:064x}'
     doc = make_entry(entry_id=entry_id, domain=domain, kind=kind,
@@ -115,9 +141,17 @@ def test_pending_block_index_cannot_be_published(tmp_path):
 
 def test_more_than_1024_tasks_validate(tmp_path):
     files = {}
-    for i in range(1027):
-        files.update(task_files(i, body=f'Full evidence in task {i}.'))
-    repo, sha = publish(tmp_path, files, write_timeout=60)
+    with TemporaryDirectory() as root, closing(MaterialStore(root, 'vllm-ascend')) as store:
+        for i in range(1027):
+            entry_id = f'{i:064x}'
+            doc = make_entry(entry_id=entry_id, domain='vllm-ascend', kind='experience',
+                             title=f'Inference task {i}',
+                             summary=f'Case {i}; evidence remains reference material.',
+                             content=f'Full evidence in task {i}.')
+            saved = store.put_document(doc)
+            package = store.export_task(entry_id, revision=saved['revision'])
+            files.update({f'tasks/{entry_id}/{path}': text for path, text in package['files'].items()})
+    repo, sha = publish_fast(tmp_path, files)
     assert validate(repo, sha, 'vllm-ascend')['entries'] == 1027
 
 
