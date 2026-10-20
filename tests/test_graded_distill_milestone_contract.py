@@ -16,6 +16,7 @@ import pytest
 
 from mindie_knowledge.graded import distill
 from mindie_knowledge.loop.engine import Engine
+from mindie_knowledge.loop.transcript_redaction import install_scanner
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -101,10 +102,7 @@ print(canonical(outcome(request, status="returned", result=decision, model_calls
 
 
 def _scanner(tmp_path):
-    path = tmp_path / "fake-gitleaks"
-    path.write_text("#!/bin/sh\ncat >/dev/null\nprintf '[]'\n", encoding="utf-8")
-    path.chmod(0o755)
-    return str(path)
+    return install_scanner()
 
 
 def _verified():

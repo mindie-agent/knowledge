@@ -1,5 +1,14 @@
 """Bounded, read-only local diagnostics; never a source of authorization.
 
+[Role] Read-only diagnostic snapshot of one configured knowledge domain
+(`snapshot()`), including service, store, admission and delivery facts.
+[Invariants] Grants no authorization and mutates no state; missing, locked and
+corrupt stores are reported distinctly, never as empty data.
+[Timeouts & Locks] Read-only SQLite connections use the 5 s WAL `busy_timeout`
+floor; the query progress handler and the loopback status RPC are bounded.
+[Side-Effect Policy] Pure reads plus bounded scratch metadata; no writes to
+authoritative state and no remote calls.
+
 Native callers supply an already established task identity. Operator CLI callers
 may inspect a local identity, but this view grants no access and changes no state.
 """
@@ -24,7 +33,7 @@ from .store import (MISSING_MATERIAL_JOB_DETAIL, SUMMARY_STATUS_SQL, session_key
 from .process import AGENT_ERROR_EXIT_CODES
 
 MAX_JSON = 64 * 1024
-DB_SECONDS = 0.25
+DB_SECONDS = 5.0
 _SAFE_CLASSES = frozenset({
     "RuntimeError", "ValueError", "TypeError", "KeyError", "OSError",
     "PermissionError", "FileNotFoundError", "TimeoutError", "TimeoutExpired",
@@ -175,7 +184,7 @@ def _json(path, limit=MAX_JSON):
 
 
 def _ro(path):
-    db = sqlite3.connect(sqlite_file_uri(path) + "?mode=ro", uri=True, timeout=0.1)
+    db = sqlite3.connect(sqlite_file_uri(path) + "?mode=ro", uri=True, timeout=DB_SECONDS)
     deadline = time.monotonic() + DB_SECONDS
     db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
     db.row_factory = sqlite3.Row
@@ -361,7 +370,7 @@ def _service(config):
                 or url.query or url.fragment or connection.get("domain") != config["domain"]
                 or not isinstance(connection.get("token"), str) or not 1 <= len(connection["token"]) <= 512):
             raise ValueError("invalid existing loopback connection")
-        status = rpc(connection, "status", timeout=0.4)
+        status = rpc(connection, "status", timeout=5.0)
         if not isinstance(status, dict):
             raise ValueError("invalid knowledge service status")
         result = dict(status="running")

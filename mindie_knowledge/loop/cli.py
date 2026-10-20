@@ -611,9 +611,12 @@ def main(argv=None):
         return 0
     if args.operation == "status":
         try:
-            result = rpc(connect(config), "status")
+            result = rpc(connect(config), "status", timeout=5.0)
+        except TimeoutError:
+            result = dict(status="unavailable", stage="probe", error_class="TimeoutError", retryable=True)
         except (OSError, ValueError):
             result = dict(status="not-running")
+        if result.get("status") in {"not-running", "unavailable"}:
             store = _open_existing_store(config)
             if store is not None:
                 try:

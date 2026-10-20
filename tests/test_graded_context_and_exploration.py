@@ -18,7 +18,10 @@ from mindie_knowledge.graded.index import RoutingIndex
 from mindie_knowledge.graded.maintenance import build_index, validate_repository
 from mindie_knowledge.graded.units import GradedUnit
 
-OPERATORS = Path(os.environ.get("MINDIE_OPERATORS_ROOT", "/Volumes/data/code/knowledge-operators"))
+OPERATORS = Path(
+    os.environ.get("MINDIE_OPERATORS_ROOT")
+    or (Path(__file__).resolve().parents[2] / "knowledge-operators")
+)
 NEW_L4 = "unit-triton-constexpr-to-runtime-scalar-specialization-mutator"
 
 

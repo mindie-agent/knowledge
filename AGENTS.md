@@ -71,11 +71,11 @@ Run tests using the repository's isolated Python environment:
 
 ```bash
 # Fast core unit & component contract tests (excludes standing live NPU tests)
-/Volumes/data/code/mindie-release-20261014/codex-interrupt-final-env-20261016/bin/python -m pytest -q -k "not live_npu"
+python -m pytest -q -k "not live_npu"
 
 # Domain retrieval precision/recall & summary quality gate
-/Volumes/data/code/mindie-release-20261014/codex-interrupt-final-env-20261016/bin/python -m pytest -q tests/test_domain_retrieval_and_summary_quality.py
+python -m pytest -q tests/test_domain_retrieval_and_summary_quality.py
 
 # Standing live A2 (173.125.1.2) / A3 (192.168.13.165) NPU knowledge loop integration test
-/Volumes/data/code/mindie-release-20261014/codex-interrupt-final-env-20261016/bin/python -m pytest -q tests/test_live_npu_knowledge_loop.py
+python -m pytest -q tests/test_live_npu_knowledge_loop.py
 ```

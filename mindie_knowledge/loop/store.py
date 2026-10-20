@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
-import inspect
 import json
 import math
 import re
@@ -62,18 +61,6 @@ _STATE_COLUMNS = {
     'material_streams': 'stream_key entry_id source_cursor source_identity redaction_state generation authorization updated'.split(),
     'material_batches': 'batch_id stream_key entry_id block_ids status detail authorization created'.split(),
 }
-
-def _option_kwargs(function, name, value):
-    """Forward a staged option only when the callee accepts it and it is nondefault."""
-    if value in (False, None):
-        return {}
-    try:
-        parameters = inspect.signature(function).parameters
-    except (TypeError, ValueError):
-        return {}
-    accepts = name in parameters or any(
-        parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
-    return {name: value} if accepts else {}
 
 
 def _initialize_state(db):
@@ -754,16 +741,7 @@ class Store:
                       "bottleneck_summary": kwargs.get("bottleneck_summary"),
                       "native_subcontext": kwargs.get("native_subcontext"),
                       "goal": kwargs.get("goal")}
-            try:
-                parameters = inspect.signature(self.graded.explain).parameters
-            except (TypeError, ValueError):
-                parameters = {"ref": None}
-            accepts_any = any(parameter.kind is inspect.Parameter.VAR_KEYWORD
-                              for parameter in parameters.values())
-            if refs is not None and "refs" not in parameters and not accepts_any:
-                raise ValueError("installed graded repository does not support batch explain")
-            call = {key: value for key, value in values.items()
-                    if value is not None and (key in parameters or accepts_any)}
+            call = {key: value for key, value in values.items() if value is not None}
             return self.graded.explain(**call)
         parsed = parse_read_ref(ref, domain=self.domain)
         entry_id = parsed["task_id"]
@@ -1221,14 +1199,14 @@ class Store:
             from ..graded.retrieval import mixed_query
             return mixed_query(self, legacy, query, limit=limit, conditions=conditions,
                                domain_path=domain_path, token_budget=token_budget,
-                               include_unknown=include_unknown, navigation_only=navigation_only,
-                               run_id=run_id, **options,
-                               **_option_kwargs(mixed_query, "include_archived", include_archived))
+                               include_unknown=include_unknown, include_archived=include_archived,
+                               navigation_only=navigation_only,
+                               run_id=run_id, **options)
         return self.graded.query(query, limit=limit, conditions=conditions,
                                  domain_path=domain_path, token_budget=token_budget,
-                                 include_unknown=include_unknown, navigation_only=navigation_only,
-                                 run_id=run_id, **options,
-                                 **_option_kwargs(self.graded.query, "include_archived", include_archived))
+                                 include_unknown=include_unknown, include_archived=include_archived,
+                                 navigation_only=navigation_only,
+                                 run_id=run_id, **options)
 
     def _query_materials(self, query=None, limit=5, conditions=None, continuation=None):
         from ..materials.provenance import QueryContinuationError, query_request

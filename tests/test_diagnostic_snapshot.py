@@ -152,7 +152,8 @@ def test_scoped_records_and_failure_counts_are_diagnostic_only(tmp_path):
     assert diagnostics.snapshot(path)["captures"] == diagnostics.snapshot(path)["contributions"] == []
 
 
-def test_actual_database_lock_is_bounded(tmp_path):
+def test_actual_database_lock_is_bounded(tmp_path, monkeypatch):
+    monkeypatch.setattr(diagnostics, "DB_SECONDS", 0.25)
     path, data = config(tmp_path)
     store = Store(data["root"], "test"); store.close()
     db = sqlite3.connect(tmp_path / "state/test/state-v1/state-v4.sqlite3", isolation_level=None)

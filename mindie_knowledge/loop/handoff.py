@@ -134,30 +134,8 @@ def _store_path(config):
     return state_root(config["root"], config["domain"]) / "state-v4.sqlite3"
 
 
-def _columns(db, table):
-    return {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
-
-
-def _required_schema(db):
-    needed = {
-        "id", "root_session", "session", "turn", "transcript", "summary",
-        "status", "detail", "created", "generation", "boundary", "scope",
-        "activation_epoch", "identity_kind", "event_key",
-    }
-    tables = {row[0] for row in db.execute(
-        "SELECT name FROM sqlite_master WHERE type='table'"
-    )}
-    if not {"captures", "meta", "continuations", "state"} <= tables:
-        raise SchemaNotReady()
-    if not needed <= _columns(db, "captures"):
-        raise SchemaNotReady()
-    if "eligible" not in _columns(db, "continuations"):
-        raise SchemaNotReady()
-
-
 def _accept_row(db, *, namespace, root_hash, session, turn, transcript, summary,
                 generation, boundary, scope, epoch, kind, event_key):
-    _required_schema(db)
     db.execute("BEGIN IMMEDIATE")
     try:
         result = commit_capture(
@@ -168,6 +146,12 @@ def _accept_row(db, *, namespace, root_hash, session, turn, transcript, summary,
         )
         db.commit()
         return result
+    except sqlite3.OperationalError as exc:
+        db.rollback()
+        text = str(exc).lower()
+        if "no such table" in text or "no such column" in text:
+            raise SchemaNotReady() from exc
+        raise
     except Exception:
         db.rollback()
         raise
@@ -477,11 +461,12 @@ def accept_stop(config_path, event, *, timeout=None):
     stop_timeout = (
         float(timeout)
         if timeout is not None
-        else float(os.environ.get("MINDIE_KNOWLEDGE_STOP_TIMEOUT_SECONDS", 5.0))
+        else float(os.environ.get("MINDIE_KNOWLEDGE_STOP_TIMEOUT_SECONDS", 6.0))
     )
+    deadline = time.monotonic() + stop_timeout
     try:
         admission = Admission(admission_path)
-        auth_timeout = min(2.0, stop_timeout)
+        auth_timeout = min(3.0, stop_timeout * 0.5)
         if resolve_lease:
             auth = admission.resolve_capture_lease(session, timeout=auth_timeout)
         else:
@@ -510,8 +495,9 @@ def accept_stop(config_path, event, *, timeout=None):
             recovery=_RECOVERY["store-not-ready"],
         )
     try:
-        db = sqlite3.connect(path, timeout=stop_timeout)
-        db.execute(f"PRAGMA busy_timeout={int(stop_timeout * 1000)}")
+        db_timeout = max(0.05, deadline - time.monotonic())
+        db = sqlite3.connect(path, timeout=db_timeout)
+        db.execute(f"PRAGMA busy_timeout={int(db_timeout * 1000)}")
     except sqlite3.OperationalError as exc:
         text = str(exc).lower()
         if "locked" in text or "busy" in text:
