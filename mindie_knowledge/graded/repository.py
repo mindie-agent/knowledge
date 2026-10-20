@@ -12,6 +12,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import time
 
 from ..markdown import _atomic_write_bytes
 from ..materials.references import ReadReferenceError
@@ -19,6 +20,7 @@ from .index import RoutingIndex
 from .units import GradedUnit, canonical
 
 CATALOG_KEY = "graded:current"
+INDEX_KEY = "graded:index"
 
 
 class GradedRepository:
@@ -75,10 +77,19 @@ class GradedRepository:
         visible.update(self._published(catalog))
         index = RoutingIndex(self._read(item) for item in visible.values())
         catalog.update(units=list(visible.values()), generation=index.generation)
+        self._persist_index(catalog, index)
+        return index
+
+    def _persist_index(self, catalog, index):
+        from .precomputed import dump_index
+        # Both rows belong to the caller's existing write transaction. The
+        # small catalog stays cheap to read on every query and feedback lookup.
+        snapshot = dump_index(index, catalog["units"])
+        catalog["index_sha256"] = hashlib.sha256(snapshot.encode()).hexdigest()
+        self.store.db.execute("INSERT OR REPLACE INTO state VALUES(?,?)", (INDEX_KEY, snapshot))
         raw = canonical(catalog)
         self.store.db.execute("INSERT OR REPLACE INTO state VALUES(?,?)", (CATALOG_KEY, raw))
         self._catalog_raw, self._index = raw, index
-        return index
 
     def install(self, units, *, source_identity="local-reviewed-units", generation=None, admitted_ids=None):
         """Install a reviewed local snapshot; publication needs its own grant.
@@ -237,13 +248,17 @@ class GradedRepository:
         result["build_elapsed_ms"] = index.build_elapsed_ms
         return result
 
-    def _read(self, descriptor):
+    def _read_blob(self, descriptor):
         blob = descriptor["blob"]
         if not isinstance(blob, str) or not re.fullmatch(r"[a-f0-9]{64}", blob):
             raise ValueError("invalid graded blob identity")
         raw = (self.store.root / "graded" / "blobs" / f"{blob}.md").read_bytes()
         if hashlib.sha256(raw).hexdigest() != blob:
             raise ValueError("graded content digest mismatch")
+        return raw
+
+    def _read(self, descriptor):
+        raw = self._read_blob(descriptor)
         unit = GradedUnit.from_text(raw.decode("utf-8"), descriptor["path"])
         if unit.id != descriptor["id"] or unit.content_sha256 != descriptor["content_sha256"]:
             raise ValueError("graded catalog and content disagree")
@@ -254,14 +269,38 @@ class GradedRepository:
         if raw is None:
             raise ValueError("no graded corpus is installed")
         if raw != self._catalog_raw:
-            catalog = json.loads(raw)
-            if catalog.get("schema") != "mindie-graded-catalog/1":
-                raise ValueError("graded catalog schema mismatch")
-            index = RoutingIndex(self._read(item) for item in catalog["units"])
-            if index.generation != catalog["generation"]:
-                raise ValueError("graded catalog generation mismatch")
+            from .precomputed import load_index
+            started = time.perf_counter()
+            raw, catalog, snapshot = self._index_rows()
+            if "index_sha256" not in catalog:
+                # One-time upgrade of the earlier catalog format. Re-read
+                # after obtaining the write lock so a newer feed is never lost.
+                with self.store._write_txn():
+                    raw, catalog, snapshot = self._index_rows()
+                    if "index_sha256" not in catalog:
+                        index = RoutingIndex(self._read(item) for item in catalog["units"])
+                        if index.generation != catalog["generation"]:
+                            raise ValueError("graded catalog generation mismatch")
+                        self._persist_index(catalog, index)
+                        index.build_elapsed_ms = (time.perf_counter() - started) * 1000
+                        return index
+            index = load_index(snapshot, catalog, self._read_blob)
+            index.build_elapsed_ms = (time.perf_counter() - started) * 1000
             self._catalog_raw, self._index = raw, index
         return self._index
+
+    def _index_rows(self):
+        # A single statement sees one SQLite snapshot even if another process
+        # publishes a generation between the earlier hot-path check and here.
+        rows = dict(self.store.db.execute("SELECT key,value FROM state WHERE key IN (?,?)",
+                                          (CATALOG_KEY, INDEX_KEY)))
+        raw = rows.get(CATALOG_KEY)
+        if raw is None:
+            raise ValueError("no graded corpus is installed")
+        catalog = json.loads(raw)
+        if catalog.get("schema") != "mindie-graded-catalog/1":
+            raise ValueError("graded catalog schema mismatch")
+        return raw, catalog, rows.get(INDEX_KEY)
 
     def ref(self, unit_id, revision=None):
         return f"mindie://{self.store.domain}/units/{unit_id}" + ("@" + revision if revision else "")

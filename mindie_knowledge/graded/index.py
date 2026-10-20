@@ -61,7 +61,7 @@ def read_units(root: Path) -> list[GradedUnit]:
 
 
 class RoutingIndex:
-    def __init__(self, units):
+    def __init__(self, units, *, counts=None):
         started = time.perf_counter()
         self.units = {}
         paths = set()
@@ -95,6 +95,8 @@ class RoutingIndex:
 
         for ident in self.units:
             visit(ident)
+        if counts is not None and set(counts) != set(self.units):
+            raise ValueError("precomputed counts do not describe the current units")
         self.closure_digests = {ident: "sha256:" + hashlib.sha256(canonical([
             (member, self.units[member].revision, self.units[member].content_sha256)
             for member in [*ancestors, ident]
@@ -107,8 +109,11 @@ class RoutingIndex:
             key = canonical(unit.metadata["conditions"])
             self.condition_keys[ident] = key
             self.conditions[key] = unit.metadata["conditions"]
-            triggers = unit.metadata["triggers"]
-            count = token_counts("\n".join([unit.metadata["title"], *triggers["error_signatures"], *triggers["keywords"], unit.body]))
+            if counts is None:
+                triggers = unit.metadata["triggers"]
+                count = token_counts("\n".join([unit.metadata["title"], *triggers["error_signatures"], *triggers["keywords"], unit.body]))
+            else:
+                count = Counter(counts[ident])
             self.counts[ident] = count
             self.frequencies.update(count.keys())
         self.lengths = {ident: sum(count.values()) for ident, count in self.counts.items()}
