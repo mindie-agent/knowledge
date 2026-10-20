@@ -31,6 +31,7 @@ A2_HOST = "173.125.1.2"
 A2_CONTAINER = "mindie-bench-a2-core-20261017"
 A3_HOST = "192.168.13.165"
 A3_CONTAINER = "vaws-offload-pd165-20261016"
+_CONNECTED = "MINDIE_NPU_PROBE_CONNECTED"
 
 
 def _ssh_probe(host: str, container: str) -> str:
@@ -42,6 +43,7 @@ def _ssh_probe(host: str, container: str) -> str:
         "-o", "ConnectTimeout=5",
         f"root@{host}",
         (
+            f"printf '{_CONNECTED}\\n' >&2; "
             f"npu-smi info -l && "
             f"docker exec {container} sh -c "
             f"'ls -d /usr/local/Ascend/* 2>/dev/null; uname -m'"
@@ -49,10 +51,20 @@ def _ssh_probe(host: str, container: str) -> str:
     ]
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=15, check=False)
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except subprocess.TimeoutExpired as exc:
+        stderr = exc.stderr or b""
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        if _CONNECTED in stderr:
+            pytest.fail(f"Live NPU host {host} remote command timed out after SSH connected")
+        pytest.skip(f"Live NPU host {host} unreachable within 15s: {exc}")
+    except OSError as exc:
         pytest.skip(f"Live NPU host {host} unreachable within 15s: {exc}")
     if res.returncode != 0:
-        pytest.skip(f"Live NPU host {host} returned {res.returncode}: {res.stderr.strip()}")
+        detail = res.stderr.replace(_CONNECTED, "").strip()
+        if res.returncode == 255 and _CONNECTED not in res.stderr:
+            pytest.skip(f"Live NPU host {host} SSH unavailable: {detail}")
+        pytest.fail(f"Live NPU host {host} remote command returned {res.returncode}: {detail}")
     return res.stdout.strip()
 
 
