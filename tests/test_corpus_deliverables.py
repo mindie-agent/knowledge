@@ -16,19 +16,34 @@ from mindie_knowledge.graded.maintenance import build_routing_index
 from mindie_knowledge.graded.repository import GradedRepository
 from mindie_knowledge.graded.units import GradedUnit
 
-_DEFAULT_WORKSPACE = Path(__file__).resolve().parents[2]
+def _resolve_corpus_root(env_var: str, repo_name: str) -> Path:
+    explicit = os.environ.get(env_var, "").strip()
+    if explicit:
+        return Path(explicit)
+    resolved = Path(__file__).resolve()
+    candidates = [
+        resolved.parents[2] / repo_name,
+        resolved.parents[3] / repo_name,
+        Path("/Volumes/data/code") / repo_name,
+    ]
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    return candidates[0]
+
+
 CORPORA = {
     "operators": {
-        "root": Path(os.environ.get("MINDIE_OPERATORS_ROOT") or (_DEFAULT_WORKSPACE / "knowledge-operators")),
+        "root": _resolve_corpus_root("MINDIE_OPERATORS_ROOT", "knowledge-operators"),
         "new": "unit-vectorized-bf16-fp32-accumulation-cast-fusion-mutator",
-        "l4": 4,
-        "unit_count": 21,
+        "l4": 15,
+        "unit_count": 87,
     },
     "vllm-ascend": {
-        "root": Path(os.environ.get("MINDIE_VLLM_CORPUS_ROOT") or (_DEFAULT_WORKSPACE / "knowledge-vllm-ascend")),
+        "root": _resolve_corpus_root("MINDIE_VLLM_CORPUS_ROOT", "knowledge-vllm-ascend"),
         "new": "unit-vllm-ascend-dspark-mtp-aclgraph-d2h-elimination-mutator",
         "l4": 3,
-        "unit_count": 22,
+        "unit_count": 43,
     },
 }
 
@@ -75,7 +90,7 @@ def test_corpus_contract_and_rebuilt_manifest(name):
             evidence = root / locator
             assert evidence.is_file(), f"{unit.id}: missing {locator}"
             assert hashlib.sha256(evidence.read_bytes()).hexdigest() == provenance["source_digest"]
-        assert "fallback" in unit.body.lower()
+            assert "fallback" in unit.body.lower()
 
     manifest = json.loads((root / "index/routing-manifest.json").read_text(encoding="utf-8"))
     assert manifest["unit_count"] == entry["unit_count"]

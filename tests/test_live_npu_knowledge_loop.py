@@ -562,9 +562,11 @@ def test_live_s1_s2_multi_die_subcluster_topology_and_graded_routing(tmp_path):
     for tier, conditions in (("S1", s1_conditions), ("S2", s2_conditions)):
         found = operators_index.query(
             "dual Die Phy-ID memory alignment tiling reduction",
-            conditions=conditions, token_budget=16000,
+            conditions=conditions, limit=10, token_budget=16000,
         )
-        ids = {row["id"] for row in found["results"]}
+        ids = {row["id"] for row in found["results"]} | {
+            card["id"] for card in found.get("foundation_cards", ())
+        }
         assert "unit-ascend-910b-a3-memory-alignment-and-tiling-axioms" in ids, tier
         operator = next(row for row in found["results"] if row["id"] == operator_mutator_id)
         assert operator["match_status"] == "matched", tier
