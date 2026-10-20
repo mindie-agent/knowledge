@@ -280,6 +280,189 @@ def test_l4_01_applicability_and_fallback_boundary_are_conditions_not_prose():
     assert "Fallback" in mutator.body and "unaligned" in mutator.body
 
 
+def test_s0_to_s3_topology_conditions_scope_multi_die_units():
+    """S0/S1/S2/S3 facts gate same-package, PD-pair and RoCE knowledge."""
+    s1_premise = _l1(
+        "unit-matrix-s1-dual-die-premise",
+        conditions={
+            "npu_model": ["Ascend910_93"],
+            "die_topology": "same_npu_dual_die",
+            "parallel_config": "TP=2",
+            "collective_backend": "hccs",
+        },
+        body="A3 exposes two Dies per NPU package; TP groups keep both Phy-IDs paired.",
+        triggers={"error_signatures": [], "keywords": ["a3-package"]},
+    )
+    s1_mutator = _l4(
+        "unit-matrix-s1-dual-die-idle-mutator",
+        parents=[s1_premise.id],
+        conditions={
+            "npu_model": ["Ascend910_93"],
+            "die_topology": "same_npu_dual_die",
+            "parallel_config": "TP=2",
+            "active_batch": 0,
+            "placement": "intra_node_hccs",
+            "collective_backend": "hccs",
+        },
+        body="Idle same-package dual-Die rank keeps the zeropad workspace: dualdiealpha.",
+    )
+    s2_premise = _l1(
+        "unit-matrix-s2-pd-pair-premise",
+        conditions={
+            "npu_model": ["Ascend910_93"],
+            "die_topology": "same_npu_dual_die",
+            "parallel_config": "TP4xDP2",
+            "die_count": 16,
+            "placement": "disaggregated_pd_pair",
+            "collective_backend": "hccs",
+        },
+        body="A full A3 node can split Prefill and Decode Dies inside one HCCS domain.",
+        triggers={"error_signatures": [], "keywords": ["pd-pair"]},
+    )
+    s2_mutator = _l4(
+        "unit-matrix-s2-pd-pair-mutator",
+        parents=[s2_premise.id],
+        conditions={
+            "npu_model": ["Ascend910_93"],
+            "die_topology": "same_npu_dual_die",
+            "parallel_config": "TP4xDP2",
+            "die_count": 16,
+            "placement": "disaggregated_pd_pair",
+            "collective_backend": "hccs",
+        },
+        body="PD-pair handoff must keep Prefill TTFT and Decode guard: pdpairbeta.",
+    )
+    s3_premise = _l1(
+        "unit-matrix-s3-roce-premise",
+        conditions={
+            "npu_model": ["Ascend910_93"],
+            "parallel_config": "DP4xEP8",
+            "die_count": 32,
+            "node_count": 2,
+            "placement": "multi_node_roce",
+            "collective_backend": "roce",
+        },
+        body="Two A3 nodes join the same DP/EP group through RoCE HCCL interfaces.",
+        triggers={"error_signatures": [], "keywords": ["two-node-roce"]},
+    )
+    s3_mutator = _l4(
+        "unit-matrix-s3-roce-mutator",
+        parents=[s3_premise.id],
+        conditions={
+            "npu_model": ["Ascend910_93"],
+            "parallel_config": "DP4xEP8",
+            "die_count": 32,
+            "node_count": 2,
+            "placement": "multi_node_roce",
+            "collective_backend": "roce",
+        },
+        body="Cross-node RoCE keeps the timeout and slow-link guard: rocegamma.",
+    )
+    index = RoutingIndex([s1_premise, s1_mutator, s2_premise, s2_mutator,
+                          s3_premise, s3_mutator])
+
+    s1 = {"npu_model": "Ascend910_93", "die_topology": "same_npu_dual_die",
+          "parallel_config": "TP=2", "active_batch": 0,
+          "placement": "intra_node_hccs", "collective_backend": "hccs"}
+    s2 = {"npu_model": "Ascend910_93", "die_topology": "same_npu_dual_die",
+          "parallel_config": "TP4xDP2", "die_count": 16,
+          "placement": "disaggregated_pd_pair", "collective_backend": "hccs"}
+    s3 = {"npu_model": "Ascend910_93", "parallel_config": "DP4xEP8",
+          "die_count": 32, "node_count": 2,
+          "placement": "multi_node_roce", "collective_backend": "roce"}
+
+    def sole(term, conditions, **kwargs):
+        result = index.query(term, conditions=conditions, token_budget=8000, **kwargs)
+        assert len(result["results"]) == 1, result
+        return result["results"][0]
+
+    s1_row = sole("dualdiealpha", s1)
+    assert s1_row["id"] == s1_mutator.id and s1_row["ready_to_apply"] is True
+    assert [item["id"] for item in s1_row["inherited_rules"]] == [s1_premise.id]
+    s2_row = sole("pdpairbeta", s2)
+    assert s2_row["id"] == s2_mutator.id and s2_row["ready_to_apply"] is True
+    assert [item["id"] for item in s2_row["inherited_rules"]] == [s2_premise.id]
+    s3_row = sole("rocegamma", s3)
+    assert s3_row["id"] == s3_mutator.id and s3_row["ready_to_apply"] is True
+    assert [item["id"] for item in s3_row["inherited_rules"]] == [s3_premise.id]
+
+    # S0 single-card: neither the same-package premise nor the idle-batch
+    # mutator may be adopted, and S2/S3 remain outside their declared scope.
+    s0 = {"npu_model": "Ascend910B4", "die_topology": "single_die",
+          "parallel_config": "TP=1", "die_count": 1, "active_batch": 8,
+          "placement": "single_card", "collective_backend": "hccs"}
+    assert match_conditions(s1_premise.metadata["conditions"], s0).status == "mismatch"
+    for term in ("dualdiealpha", "pdpairbeta", "rocegamma"):
+        result = index.query(term, conditions=s0, token_budget=8000)
+        assert result["results"] == []
+        assert result["excluded_conditions"]["mismatch"] >= 1
+
+    # Cross-package placement is a real A3 misconfiguration for same-package
+    # knowledge; it is a mismatch, not an unknown fact.
+    cross_package = {**s1, "die_topology": "cross_package"}
+    assert match_conditions(s1_premise.metadata["conditions"], cross_package).status == "mismatch"
+    assessment = match_conditions(s1_mutator.metadata["conditions"], cross_package)
+    assert assessment.status == "mismatch"
+    assert any(reason.startswith("die_topology:") for reason in assessment.reasons)
+    assert index.query("dualdiealpha", conditions=cross_package, token_budget=8000)["results"] == []
+    missing_topology = {key: value for key, value in s1.items() if key != "die_topology"}
+    assert match_conditions(s1_mutator.metadata["conditions"], missing_topology).status == "unknown"
+
+    # active_batch is decisive: >0 is a mismatch, an omitted fact is unknown
+    # and therefore not ready to apply.
+    assert match_conditions(s1_mutator.metadata["conditions"], {**s1, "active_batch": 4}).status == "mismatch"
+    active_result = index.query("dualdiealpha", conditions={**s1, "active_batch": 4},
+                                token_budget=8000)
+    assert s1_mutator.id not in {row["id"] for row in active_result["results"]}
+    assert active_result["excluded_conditions"]["mismatch"] >= 1
+    missing_batch = {key: value for key, value in s1.items() if key != "active_batch"}
+    assert match_conditions(s1_mutator.metadata["conditions"], missing_batch).status == "unknown"
+    unknown = index.query("dualdiealpha", conditions=missing_batch,
+                          include_unknown=True, token_budget=8000)
+    unknown_row = next(row for row in unknown["results"] if row["id"] == s1_mutator.id)
+    assert unknown_row["match_status"] == "condition_unknown"
+    assert unknown_row["ready_to_apply"] is False
+    assert unknown_row["missing_conditions"] == ["active_batch"]
+
+    # S2 knows only the same-node HCCS PD pair; S3 knows only the RoCE pair.
+    assert match_conditions(s2_mutator.metadata["conditions"],
+                            {**s2, "placement": "intra_node_hccs"}).status == "mismatch"
+    assert match_conditions(s2_mutator.metadata["conditions"],
+                            {**s2, "collective_backend": "roce"}).status == "mismatch"
+    assert match_conditions(s3_mutator.metadata["conditions"],
+                            {**s3, "collective_backend": "hccs"}).status == "mismatch"
+
+
+def test_s1_s2_multi_rank_guards_reject_single_rank_throughput_gain():
+    """A local speedup cannot accept a candidate that regresses a guard rank."""
+    s1 = classify_heldout_cases([
+        {"case_id": "s1-tp2-single-rank", "baseline_pass": True, "candidate_pass": True,
+         "baseline_ms": 10.0, "candidate_ms": 5.0},
+        {"case_id": "max_rank_workspace_guard", "guard": True, "baseline_pass": True,
+         "candidate_pass": True, "baseline_ms": 10.0, "candidate_ms": 12.0},
+    ], noise_margin=0.02)
+    assert s1["main_speedup_geomean"] == pytest.approx(2.0)
+    assert s1["guard_speedup_geomean"] == pytest.approx(10 / 12)
+    assert s1["guard_ok"] is False
+    assert s1["complete"] is True
+    assert s1["guards_measured"] is True
+    assert (s1["complete"] and s1["guard_ok"]) is False
+
+    s2 = classify_heldout_cases([
+        {"case_id": "s2-pd-prefill-local", "baseline_pass": True, "candidate_pass": True,
+         "baseline_ms": 10.0, "candidate_ms": 4.0},
+        {"case_id": "pd_decode_tpot_guard", "guard": True, "baseline_pass": True,
+         "candidate_pass": False},
+    ], noise_margin=0.02)
+    assert s2["main_speedup_geomean"] == pytest.approx(2.5)
+    assert s2["buckets"]["opt_regression"] == 1
+    assert s2["guard_ok"] is False
+    assert s2["guards_measured"] is True
+    assert s2["guard_speedup_geomean"] is None
+    assert s2["complete"] is True
+    assert (s2["complete"] and s2["guard_ok"]) is False
+
+
 def test_l4_02_to_l4_04_two_mutator_families_five_buckets_and_guard_protection():
     fastpath = _l4("unit-matrix-l4-fastpath", conditions={"soc": ["Ascend910B"], "dtype": "bfloat16"})
     splitk = _l4("unit-matrix-l4-splitk", conditions={"soc": ["Ascend910_93"], "dtype": "bfloat16"})

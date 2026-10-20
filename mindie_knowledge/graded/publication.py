@@ -32,6 +32,7 @@ import re
 from typing import Any
 
 from ..redact import REDACTION_PROFILE, scan_text
+from .distill import UNIT_BODY_HARD_BUDGET_BYTES
 from .index import RoutingIndex
 from .units import GradedUnit, UNIT_ID, canonical
 
@@ -303,6 +304,28 @@ def _routing_summary(index: RoutingIndex, proposed_ids: list[str]) -> dict:
     }
 
 
+def _anti_bloat_summary(index: RoutingIndex, candidate_units: dict) -> dict:
+    """Measure the proposed corpus against current units without blocking it.
+
+    The 4 KiB target guides rewriting, while the 8 KiB hard budget gates
+    admission in ``distill.validate_decision``. This summary exposes both the
+    active-unit and body-byte movement so a caller can see whether folding
+    negative branches actually compacted the corpus.
+    """
+    before = list(index.units.values())
+    after = list(candidate_units.values())
+    before_bytes = [len(unit.body.encode("utf-8")) for unit in before]
+    after_bytes = [len(unit.body.encode("utf-8")) for unit in after]
+    max_body = max(after_bytes, default=0)
+    return {
+        "active_unit_delta": (sum(unit.status == "active" for unit in after)
+                              - sum(unit.status == "active" for unit in before)),
+        "net_bytes_delta": sum(after_bytes) - sum(before_bytes),
+        "max_unit_body_bytes": max_body,
+        "compacted_within_budget": max_body <= UNIT_BODY_HARD_BUDGET_BYTES,
+    }
+
+
 def _write_entry(operation: str, unit: GradedUnit, path: str,
                  expected_content_sha256: str | None) -> dict:
     content = _unit_text(unit)
@@ -510,6 +533,7 @@ def prepare_decision(decision: dict, index: RoutingIndex, *,
         _fail(f"proposed units do not form a valid routing graph: {message}")
 
     routing = _routing_summary(candidate_index, candidate_ids)
+    anti_bloat = _anti_bloat_summary(index, candidate_units)
     write_count = len(writes)
     review_count = len(reviews)
     unchanged_count = len(unchanged)
@@ -577,6 +601,7 @@ def prepare_decision(decision: dict, index: RoutingIndex, *,
         "limitations": list(LIMITATIONS),
         "evidence_limitations": list(LIMITATIONS),
         "routing": routing,
+        "anti_bloat": anti_bloat,
         "receipt": receipt,
     })
     return proposal

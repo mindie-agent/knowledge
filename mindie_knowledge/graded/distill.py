@@ -16,6 +16,8 @@ from .index import RoutingIndex
 from .conditions import match_conditions
 from .units import GradedUnit, SHA256, TIER_CATEGORIES, UNIT_ID, canonical, locator_parts
 
+UNIT_BODY_SOFT_BUDGET_BYTES = 4096
+UNIT_BODY_HARD_BUDGET_BYTES = 8192
 KINDS = {"experiment_ledger", "run_manifest", "authorized_transcript", "ecosystem_repo", "hardware_spec", "ablation_receipt"}
 OUTCOMES = {"observed", "verified", "compile_failed", "infra_failed", "measurement_invalid", "in_flight"}
 TASK_STATES = {"in_flight", "verified_milestone", "completed"}
@@ -27,7 +29,8 @@ BASE_REQUEST_KEYS = {"schema_version", "session_digest", "task_state", "evidence
 # prepared before related-unit lookup keep their historical digest.
 OPTIONAL_REQUEST_KEYS = {"related_units"}
 DIGEST_KEYS = BASE_REQUEST_KEYS | OPTIONAL_REQUEST_KEYS
-COMPACT_UNIT_FIELDS = ("id", "revision", "tier", "category", "title", "conditions", "triggers", "body_excerpt")
+COMPACT_UNIT_FIELDS = ("id", "revision", "tier", "category", "title", "conditions", "triggers",
+                       "body_excerpt", "body_complete")
 
 
 def _evidence_strengths():
@@ -49,6 +52,8 @@ def _related_units(value):
         for key in ("id", "revision", "tier", "category", "title", "body_excerpt"):
             if key not in item:
                 raise ValueError(f"related_units item requires {key}")
+        if "body_complete" in item and type(item["body_complete"]) is not bool:
+            raise ValueError("related_units body_complete must describe actual body visibility")
         compact.append({key: item[key] for key in COMPACT_UNIT_FIELDS if key in item})
     return compact
 
@@ -198,6 +203,29 @@ def build_prompt(request):
         "If related_units are supplied, compare the new evidence with every listed unit. "
         "Prefer merge_into_existing (or noop when the listed unit already covers the conclusion) over creating a duplicate unit; "
         "state which new condition, mechanism, branch, or counter-evidence justifies any change. "
+        "A related unit's body_excerpt is the full body only when body_complete is true. "
+        "If body_complete is false or absent, do not reconstruct or replace unseen text; "
+        "use propose_semantic_merge_review or noop instead of merge_into_existing. "
+        "Silent background anti-bloat applies to every proposal. Fold multiple negative trials on the same operator "
+        "or subgraph into one compact conditional exclusion table inside the existing L3 unit via merge_into_existing; "
+        "never create a separate unit per failed trial. "
+        "When revising a unit (U@k -> U@k+1), use rewrite-to-compact rather than append-only: rewrite the whole body "
+        "to remove duplication and superseded text, keeping markdown_body within "
+        f"{UNIT_BODY_SOFT_BUDGET_BYTES} UTF-8 bytes as the soft target and never exceeding "
+        f"{UNIT_BODY_HARD_BUDGET_BYTES} UTF-8 bytes as the hard limit. "
+        "Preserve existing supported branches and rare conditions when revising a complete unit. "
+        "For reusable decision experience, keep the known facts, competing explanations, chosen discriminating action, "
+        "expected versus observed result, changed judgment and its limits in the body where recorded. "
+        "Missing reasoning stays missing; do not invent a successful causal story or require every source to fill a template. "
+        "Keep conditional counter-evidence, unresolved alternatives, human corrections and superseded plans with their sources. "
+        "A correction is evidence of a changed instruction or claim, not independent proof of its technical truth. "
+        "Do not revive superseded recommendations or turn a scoped refutation into a permanent ban. "
+        "When relevant, preserve first-divergence alignment, producer/consumer ownership and lifetime, "
+        "initial state and request sequence, observer effects, independent oracle and actual execution-path evidence. "
+        "Instrumentation making a failure disappear, or two paths agreeing through a shared defect, does not prove a fix. "
+        "A branch that was not executed cannot explain an observed improvement. "
+        "Distinguish valid subtarget results, invalid execution, partial findings and inconclusive causality. "
+        "Repeated summaries or commit recaps of the same run are not independent replications. "
         "Put only actual environment and workload applicability premises in conditions. "
         "Plain condition lists mean alternatives. For a measured group of workloads, use "
         "workload: {exact_set: [...]} with each member binding its input_shape and workload_case_sha256; "
@@ -206,7 +234,8 @@ def build_prompt(request):
         "unknown applicability never matches by default and cannot be filled from a different or later environment. "
         "Evidence bookkeeping such as repetitions, observation_scope or not_measured belongs in provenance or the body; "
         "procedure steps and readiness instructions belong in the body, not additional hard matching conditions. "
-        "Never claim that Stop means completion. In-flight tasks yield noop. "
+        "Never claim that Stop means completion. task_state=in_flight yields noop; "
+        "verified_milestone refers to the selected finished finding, not completion of the wider task. "
         "Read infrastructure failures, source code, build glue and shell scripts as first-class evidence. "
         "Extract supported mechanisms and limits; failure labels or filenames alone never justify dropping a source. "
         "Failed evidence may support a scoped observation or hypothesis, never an unverified hardware or repeated-result claim. "
@@ -360,9 +389,12 @@ def validate_decision(decision, request):
     blocked = value_gate(request)
     if blocked:
         raise ValueError(f"distillation value gate requires noop: {blocked}")
+    related = {item["id"]: item for item in request.get("related_units", [])}
     units = []
     for row in rows:
         unit = GradedUnit.from_parts(row["frontmatter"], row["markdown_body"])
+        if len(unit.body.encode("utf-8")) > UNIT_BODY_HARD_BUDGET_BYTES:
+            raise ValueError("graded unit body exceeds 8 KiB anti-bloat budget; compact branches before admission")
         metadata = unit.metadata
         mirrors = {"target_unit_id": "id", "target_tier": "tier", "category": "category",
                    "evidence_strength": "evidence_strength", "domain_path": "domain_path"}
@@ -370,6 +402,10 @@ def validate_decision(decision, request):
             raise ValueError("decision target fields disagree with graded frontmatter")
         if row.get("operation") not in {"create", "merge_into_existing", "propose_semantic_merge_review"}:
             raise ValueError("unsupported unit operation")
+        comparison = related.get(unit.id)
+        if (row["operation"] == "merge_into_existing" and comparison is not None
+                and comparison.get("body_complete") is not True):
+            raise ValueError("merge requires the complete related unit body; use semantic merge review")
         provenance = metadata["provenance"]
         usable = [item for item in inputs if item["outcome"] != "in_flight"]
         bound = [item for item in usable

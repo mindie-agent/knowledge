@@ -8,7 +8,12 @@ import sys
 import pytest
 
 from graded_fixture import OBSERVED, unit as fixture_unit
-from mindie_knowledge.graded.distill import prepare_request, value_gate
+from mindie_knowledge.graded.distill import (
+    UNIT_BODY_HARD_BUDGET_BYTES,
+    prepare_request,
+    validate_decision,
+    value_gate,
+)
 from mindie_knowledge.graded.explore import (
     assess_stagnation,
     build_exploration_context,
@@ -19,8 +24,9 @@ from mindie_knowledge.graded.feedback import (
     record_vote,
     summarize_usage_events,
 )
-from mindie_knowledge.graded.index import response_token_estimate, token_estimate
+from mindie_knowledge.graded.index import RoutingIndex, response_token_estimate, token_estimate
 from mindie_knowledge.graded.maintenance import growth_metrics
+from mindie_knowledge.graded.publication import prepare_decision
 from mindie_knowledge.graded.units import GradedUnit
 from mindie_knowledge.loop.engine import Engine
 from mindie_knowledge.materials.references import ReadReferenceError
@@ -375,3 +381,125 @@ def test_related_units_feed_the_organizer_prompt_without_changing_old_digests(st
     from mindie_knowledge.graded.distill import build_prompt
     prompt = build_prompt(with_related)
     assert "related_units" in prompt and "merge_into_existing" in prompt
+
+
+def test_related_lookup_keeps_late_counterevidence_and_recovery_conditions(store):
+    from mindie_knowledge.graded.worker import _matching_related_units
+
+    # A late correction must survive comparison even after a long procedure.
+    procedure = (
+        "Compare the same logical input and state at each producer/consumer boundary. "
+        "Keep the run reference and distinguish a completed probe from a verified fix.\n"
+    ) * 10
+    correction = (
+        "Correction: the instrumented run passed, but the uninstrumented run still failed. "
+        "The earlier fix claim is withdrawn; the observer effect remains unresolved.\n"
+    )
+    existing = fixture_unit("unit-observer-effect", body=procedure + correction,
+                            tier="L3", category="workflow")
+    store.graded.install([existing])
+    related = _matching_related_units(store, [], [existing.id])
+    assert related[0]["body_complete"] is True
+    assert related[0]["body_excerpt"] == existing.body
+
+
+@pytest.mark.parametrize("legacy_snapshot", [False, True])
+def test_incomplete_related_body_cannot_overwrite_existing_branches(store, legacy_snapshot):
+    from mindie_knowledge.graded.distill import apply_decision
+    from mindie_knowledge.graded.worker import RELATED_BODY_BUDGET_BYTES, _matching_related_units
+
+    branch = "Preserve the initial state, request order, reset semantics and independent oracle.\n"
+    existing = fixture_unit("unit-history-dependent-probe",
+                            body=branch * (RELATED_BODY_BUDGET_BYTES // len(branch) + 1))
+    store.graded.install([existing])
+    related = _matching_related_units(store, [], [existing.id])
+    assert related[0]["body_complete"] is False
+    assert related[0]["body_excerpt"] == ""
+    if legacy_snapshot:
+        related[0].pop("body_complete")
+        related[0]["body_excerpt"] = existing.body[:1200]
+    session = "c" * 64
+    selected = {**evidence(existing, outcome="observed"),
+                "content": "A fresh process passed; the historical request sequence was not tested.",
+                "source_locator": "fixture@abcdef1:history-observation.txt"}
+    request = prepare_request([selected], session_digest=session,
+                              task_state="verified_milestone", redactor_executable=scanner(),
+                              redaction_key=store.redaction_key(), related_units=related)
+    replacement = proposal(session, existing, operation="merge_into_existing",
+                           body="Only retry from a fresh process.\n")
+    replacement["units"][0]["frontmatter"]["provenance"].update(
+        source_locator=selected["source_locator"],
+        source_digest=request["sanitized_inputs"][0]["source_digest"])
+    with pytest.raises(ValueError, match="complete related unit"):
+        apply_decision(store, request, replacement)
+    assert store.explain(ref(existing))["content"] == existing.body
+
+    # The existing review route can retain a candidate without overwriting it.
+    replacement["units"][0]["operation"] = "propose_semantic_merge_review"
+    review = apply_decision(store, request, replacement)
+    assert review["status"] == "review_or_unchanged"
+    assert store.explain(ref(existing))["content"] == existing.body
+
+
+def test_negative_branch_folding_keeps_one_compacted_l3_unit():
+    existing = fixture_unit(
+        "unit-k3-a5-pipeline-fusion", tier="L3", category="workflow",
+        title="K3/A5 pipeline fusion triage",
+        body=(
+            "## Negative pipeline attempts\n\n"
+            "PV2 on the K3 A5 decode path: the isolated PV2 schedule removed the staging copy, "
+            "but the paired full-pipeline run regressed because the producer still materialized "
+            "the attention result to GM and the consumer reloaded it; the branch was rejected.\n\n"
+            "Score2 on the K3 A5 decode path: the score tile change reduced local cycles, yet the "
+            "same GM round-trip remained and the critical path did not move; the branch was rejected.\n\n"
+            "vmula on the K3 A5 decode path: the vector multiply-add helper was folded, but a "
+            "collective barrier split the fused region and the extra synchronization erased the "
+            "gain; the branch was rejected.\n"
+        ),
+    )
+    compact = (
+        "## Verified exclusion branches\n\n"
+        "| Branch | Conditions | Physical reason | Paired data |\n"
+        "| --- | --- | --- | --- |\n"
+        "| PV2 | K3/A5 decode, batch 1 | Producer and consumer still round-trip through GM | "
+        "Local cycles fell while the paired run regressed |\n"
+        "| Score2 | K3/A5 decode, batch 1 | Shorter score tile leaves the fused region unchanged | "
+        "Critical path and GM traffic stayed flat |\n"
+        "| vmula | K3/A5 decode, batch 1 | A collective barrier splits the fused region | "
+        "Added synchronization erased the local gain |\n"
+    )
+    metadata = {key: value for key, value in existing.metadata.items() if key != "revision"}
+    decision = {
+        "schema_version": "mindie-distill-decision/1", "session_digest": "d" * 64,
+        "evidence_inputs": ["authorized_transcript"],
+        "action": "propose_graded_units", "drop_reason": None,
+        "units": [{"target_unit_id": existing.id, "target_tier": metadata["tier"],
+                   "category": metadata["category"],
+                   "evidence_strength": metadata["evidence_strength"],
+                   "domain_path": metadata["domain_path"],
+                   "operation": "merge_into_existing", "frontmatter": deepcopy(metadata),
+                   "markdown_body": compact}],
+    }
+
+    plan = prepare_decision(decision, RoutingIndex([existing]))
+
+    assert plan.status == "proposed"
+    assert len(plan.writes) == 1 and plan.writes[0]["unit_id"] == existing.id
+    assert all(name in plan.writes[0]["markdown_body"] for name in ("PV2", "Score2", "vmula"))
+    assert plan.anti_bloat["active_unit_delta"] == 0
+    assert plan.anti_bloat["net_bytes_delta"] < 0
+    assert plan.anti_bloat["max_unit_body_bytes"] == len(
+        plan.writes[0]["markdown_body"].encode("utf-8"))
+    assert plan.anti_bloat["compacted_within_budget"] is True
+
+
+def test_bloated_unit_body_is_rejected_before_admission(store):
+    item = fixture_unit()
+    session = "e" * 64
+    request = prepare_request([evidence(item)], session_digest=session,
+                              task_state="verified_milestone", redactor_executable=scanner(),
+                              redaction_key=store.redaction_key())
+    bloated = proposal(session, item, body="x" * (UNIT_BODY_HARD_BUDGET_BYTES + 1))
+
+    with pytest.raises(ValueError, match="8 KiB anti-bloat budget"):
+        validate_decision(bloated, request)
