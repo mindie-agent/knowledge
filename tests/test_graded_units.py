@@ -172,6 +172,27 @@ def test_matched_child_injects_full_l1_foundation_body_and_revision():
     assert rule["applicability"]["status"] == "matched"
 
 
+def test_long_workflow_reserves_budget_for_its_foundation_before_excerpt():
+    premise = foundation(body="Use fp32 accumulation before casting to the output dtype.")
+    child = unit("unit-long-workflow", parents=[premise.id],
+                 body="Tune graph capture. " * 100, tier="L3", category="workflow")
+    result = RoutingIndex([premise, child]).query(
+        "graph", conditions=OBSERVED, limit=1, token_budget=32,
+    )
+    row = result["results"][0]
+    assert row["id"] == child.id
+    assert row["inherited_rules"][0]["content"] == premise.body
+    assert row["excerpt_truncated"]
+    assert result["body_token_estimate"] <= 32
+
+
+def test_foundation_is_omitted_as_a_whole_when_its_premise_cannot_fit():
+    premise = foundation(body="Only apply when dtype is bf16 and the reduction dimension is contiguous.")
+    result = RoutingIndex([premise]).query("unrelatedquerytoken", conditions=OBSERVED, token_budget=4)
+    assert result["results"] == []
+    assert result["excluded_budget"] == [premise.id]
+
+
 def test_in_flight_is_incomplete_but_failures_can_support_scoped_observations():
     req = request(state="in_flight")
     assert validate_decision(noop_decision(req), req)["action"] == "noop"
