@@ -174,7 +174,10 @@ def evaluate_exploration_candidate(*, run_id: str, candidate_id: str,
                                    noise_margin: float = 0.01,
                                    ablation_retained: bool | None = None,
                                    target_tier: str = "L4",
-                                   failure_reason: str = "") -> dict[str, Any]:
+                                   failure_reason: str = "",
+                                   goal_type: str = "speedup",
+                                   goal_met: bool | None = None,
+                                   diagnostic_gain: bool = False) -> dict[str, Any]:
     """Judge evidence, goal, and reuse independently; never refute a valid subtarget gain."""
     run_id = _text(run_id, "run_id")
     candidate_id = _text(candidate_id, "candidate_id")
@@ -182,6 +185,12 @@ def evaluate_exploration_candidate(*, run_id: str, candidate_id: str,
     current = _mapping(conditions, "conditions")
     if target_tier not in TIERS:
         raise ValueError(f"target_tier must be one of {sorted(TIERS)}")
+    if goal_type not in {"speedup", "correctness", "diagnose"}:
+        raise ValueError("goal_type must be one of ['correctness', 'diagnose', 'speedup']")
+    if goal_met is not None and type(goal_met) is not bool:
+        raise ValueError("goal_met must be a boolean or None")
+    if type(diagnostic_gain) is not bool:
+        raise ValueError("diagnostic_gain must be a boolean")
     for name, value in (("compile_ok", compile_ok), ("oracle_passed", oracle_passed),
                         ("measurement_passed", measurement_passed)):
         if type(value) is not bool:
@@ -208,17 +217,27 @@ def evaluate_exploration_candidate(*, run_id: str, candidate_id: str,
         validity, reusability = "valid", None
     if validity != "valid":
         attainment = "not_applicable"
-    elif ratio is None:
-        attainment = "not_applicable"
-    elif ratio >= minimum:
-        attainment = "attained"
+    elif goal_met is not None:
+        attainment = "attained" if goal_met else "not_attained"
+    elif goal_type == "speedup":
+        if ratio is None:
+            attainment = "not_applicable"
+        elif ratio >= minimum:
+            attainment = "attained"
+        else:
+            attainment = "not_attained"
+    elif goal_type == "correctness":
+        attainment = "attained" if oracle_passed else "not_applicable"
     else:
-        attainment = "not_attained"
+        attainment = "attained" if diagnostic_gain else "not_attained"
 
     if validity == "valid" and reusability is None:
-        if attainment == "attained":
+        if attainment == "attained" and goal_type == "speedup":
             reusability = ("reusable_mutator" if ablation_retained is True
                            else "reusable_negative_boundary" if ablation_retained is False
+                           else "reusable_observation")
+        elif attainment == "attained":
+            reusability = ("reusable_mutator" if ablation_retained is True
                            else "reusable_observation")
         elif ratio is None:
             reusability = ("reusable_negative_boundary" if ablation_retained is False
@@ -246,7 +265,7 @@ def evaluate_exploration_candidate(*, run_id: str, candidate_id: str,
         verdict = "unconfirmed"
 
     if reusability == "reusable_negative_boundary":
-        return_tier = "L1" if target_tier == "L4" else target_tier
+        return_tier = "L2" if target_tier == "L4" else target_tier
         conditional_avoid = [{"conditions": current, "avoid": mutation_summary,
                               "reason": failure_reason or verdict}]
     elif reusability == "reusable_observation":
@@ -265,6 +284,7 @@ def evaluate_exploration_candidate(*, run_id: str, candidate_id: str,
         "return_tier": return_tier, "conditional_avoid": conditional_avoid,
         "speedup_ratio": ratio, "min_speedup_ratio": minimum, "noise_margin": noise,
         "ablation_retained": ablation_retained, "target_tier": target_tier,
+        "goal_type": goal_type, "goal_met": goal_met, "diagnostic_gain": diagnostic_gain,
         "reason": failure_reason or (
             "valid gain is below the stated target but remains reusable evidence"
             if verdict == "subtarget_valid" else verdict),

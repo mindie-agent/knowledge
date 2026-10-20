@@ -331,6 +331,8 @@ class Service:
                 token_budget=args.get("token_budget", 800),
                 include_unknown=args.get("include_unknown", False),
                 include_archived=args.get("include_archived", False),
+                navigation_only=args.get("navigation_only", False),
+                run_id=args.get("run_id"),
             )
             stale = [source for source in sources if source["status"] == "stale"]
             if stale:
@@ -355,7 +357,7 @@ class Service:
                                                cancel=cancel, related_refs=args.get("related_refs"),
                                                proposal=args.get("proposal"))
         if method == "explain":
-            allowed = {"ref", "refs", "conditions", "known_refs", "token_budget"}
+            allowed = {"ref", "refs", "conditions", "known_refs", "token_budget", "run_id"}
             if not set(args) <= allowed or (args.get("ref") is None and args.get("refs") is None):
                 raise ValueError("explain accepts only ref or refs plus optional conditions/known_refs/token_budget")
             return self.store.explain(**args)
@@ -376,6 +378,7 @@ class Service:
                 generation=settings.generation if publishable else None,
                 event_type=args.get("event_type"), run_id=args.get("run_id", ""),
                 outcome=args.get("outcome"), step_id=args.get("step_id", ""),
+                evidence_source=args.get("evidence_source", "agent_declared"),
             )
             if vote.get("publishable"):
                 self.engine.last_activity = time.monotonic()

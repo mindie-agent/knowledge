@@ -736,7 +736,7 @@ class Store:
         navigation. No full-document assembly, historical package or old
         offset-based reading path is reachable through this interface.
         """
-        supported = {"refs", "conditions", "known_refs", "token_budget"}
+        supported = {"refs", "conditions", "known_refs", "token_budget", "run_id"}
         unknown = set(kwargs) - supported
         if unknown:
             raise TypeError(f"explain() got an unexpected keyword argument {sorted(unknown)[0]!r}")
@@ -746,7 +746,8 @@ class Store:
         if refs is not None or (isinstance(ref, str) and "/units/" in ref):
             values = {"ref": ref, "refs": refs, "conditions": kwargs.get("conditions"),
                       "known_refs": kwargs.get("known_refs"),
-                      "token_budget": kwargs.get("token_budget")}
+                      "token_budget": kwargs.get("token_budget"),
+                      "run_id": kwargs.get("run_id")}
             try:
                 parameters = inspect.signature(self.graded.explain).parameters
             except (TypeError, ValueError):
@@ -1198,7 +1199,7 @@ class Store:
 
     def query(self, query=None, limit=5, conditions=None, continuation=None,
               domain_path=None, token_budget=800, include_unknown=False,
-              include_archived=False):
+              include_archived=False, navigation_only=False, run_id=None):
         if continuation is not None or not self.graded.available():
             return self._query_materials(query, limit, conditions, continuation)
         legacy = self._query_materials(query, limit, conditions)
@@ -1206,11 +1207,13 @@ class Store:
             from ..graded.retrieval import mixed_query
             return mixed_query(self, legacy, query, limit=limit, conditions=conditions,
                                domain_path=domain_path, token_budget=token_budget,
-                               include_unknown=include_unknown,
+                               include_unknown=include_unknown, navigation_only=navigation_only,
+                               run_id=run_id,
                                **_option_kwargs(mixed_query, "include_archived", include_archived))
         return self.graded.query(query, limit=limit, conditions=conditions,
                                  domain_path=domain_path, token_budget=token_budget,
-                                 include_unknown=include_unknown,
+                                 include_unknown=include_unknown, navigation_only=navigation_only,
+                                 run_id=run_id,
                                  **_option_kwargs(self.graded.query, "include_archived", include_archived))
 
     def _query_materials(self, query=None, limit=5, conditions=None, continuation=None):
@@ -1433,7 +1436,7 @@ class Store:
 
     def record_vote(self, *, root_hash, ref, rating=None, reason="", publishable=False,
                     generation=None, event_type=None, run_id="", outcome=None,
-                    step_id=""):
+                    step_id="", evidence_source="agent_declared"):
         """One current vote per opaque root and entry; a new vote on the same
         entry replaces it (including its revision and reason). A publishable
         vote's free-text reason is privacy-scanned at admission, so a single
@@ -1445,7 +1448,7 @@ class Store:
             return record_vote(self, root_hash=root_hash, ref=ref, rating=rating, reason=reason,
                                publishable=publishable, generation=generation,
                                event_type=event_type, run_id=run_id, outcome=outcome,
-                               step_id=step_id)
+                               step_id=step_id, evidence_source=evidence_source)
         if event_type is not None or run_id or outcome is not None or step_id:
             raise ValueError("usage events require a graded unit reference")
         if rating not in RATINGS:
