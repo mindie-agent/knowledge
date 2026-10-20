@@ -11,6 +11,8 @@ from __future__ import annotations
 from contextlib import closing
 from datetime import datetime, timezone
 import json
+import os
+import shlex
 import subprocess
 import time
 
@@ -34,7 +36,21 @@ A3_CONTAINER = "vaws-offload-pd165-20261016"
 _CONNECTED = "MINDIE_NPU_PROBE_CONNECTED"
 
 
+def _live_targets() -> dict[str, tuple[str, str]]:
+    return {
+        "a2": (
+            os.environ.get("MINDIE_LIVE_A2_HOST", "").strip() or A2_HOST,
+            os.environ.get("MINDIE_LIVE_A2_CONTAINER", "").strip() or A2_CONTAINER,
+        ),
+        "a3": (
+            os.environ.get("MINDIE_LIVE_A3_HOST", "").strip() or A3_HOST,
+            os.environ.get("MINDIE_LIVE_A3_CONTAINER", "").strip() or A3_CONTAINER,
+        ),
+    }
+
+
 def _ssh_probe(host: str, container: str) -> str:
+    quoted_container = shlex.quote(container)
     cmd = [
         "ssh",
         "-n",
@@ -45,7 +61,7 @@ def _ssh_probe(host: str, container: str) -> str:
         (
             f"printf '{_CONNECTED}\\n' >&2; "
             f"npu-smi info -l && "
-            f"docker exec {container} sh -c "
+            f"docker exec {quoted_container} sh -c "
             f"'ls -d /usr/local/Ascend/* 2>/dev/null; uname -m'"
         ),
     ]
@@ -84,8 +100,11 @@ def _append_turn(path, role: str, text: str) -> None:
 
 
 def test_live_a2_and_a3_npu_capture_redaction_store_and_reme_recall(tmp_path):
-    a2_output = _ssh_probe(A2_HOST, A2_CONTAINER)
-    a3_output = _ssh_probe(A3_HOST, A3_CONTAINER)
+    targets = _live_targets()
+    a2_host, a2_container = targets["a2"]
+    a3_host, a3_container = targets["a3"]
+    a2_output = _ssh_probe(a2_host, a2_container)
+    a3_output = _ssh_probe(a3_host, a3_container)
 
     assert "Total Count" in a2_output and "Chip Count" in a2_output
     assert "Total Count" in a3_output and "Chip Count" in a3_output
@@ -103,15 +122,15 @@ def test_live_a2_and_a3_npu_capture_redaction_store_and_reme_recall(tmp_path):
 
     private_host_dir = "/home/ascend_engineer/private_bench_workspace"
     user_prompt = (
-        f"Investigating NPU 显存分配 failure on A2 node {A2_HOST} ({A2_CONTAINER}) "
-        f"and A3 node {A3_HOST} ({A3_CONTAINER}) mounted from {private_host_dir}/logs.\n"
+        f"Investigating NPU 显存分配 failure on A2 node {a2_host} ({a2_container}) "
+        f"and A3 node {a3_host} ({a3_container}) mounted from {private_host_dir}/logs.\n"
         f"A2 probe:\n{a2_output}\n"
         f"A3 probe:\n{a3_output}\n"
     )
     assistant_reply = (
         f"Observed ACL_ERROR_RT_MEMORY_ALLOCATION during GroupedMatmulSwiglu and "
-        f"torch_npu.npu_rms_norm dispatch on {A2_HOST} (8x1 Ascend910B4) and "
-        f"{A3_HOST} (8x2 Ascend910C dual-die) under cann-9.1.0 at {private_host_dir}/run.py. "
+        f"torch_npu.npu_rms_norm dispatch on {a2_host} (8x1 Ascend910B4) and "
+        f"{a3_host} (8x2 Ascend910C dual-die) under cann-9.1.0 at {private_host_dir}/run.py. "
         f"Setting PYTORCH_NPU_ALLOC_CONF=expandable_segments:True resolved the 显存分配 fragmentation."
     )
     _append_turn(transcript, "user", user_prompt)
@@ -142,8 +161,8 @@ def test_live_a2_and_a3_npu_capture_redaction_store_and_reme_recall(tmp_path):
         full_body = package_body(exported)
 
         # 1. Deterministic redaction of live cluster IPs and private user paths
-        assert A2_HOST not in full_body
-        assert A3_HOST not in full_body
+        assert a2_host not in full_body
+        assert a3_host not in full_body
         assert private_host_dir not in full_body
         assert "ascend_engineer" not in full_body
         assert "<redacted:ipv4-address:" in full_body
@@ -151,6 +170,8 @@ def test_live_a2_and_a3_npu_capture_redaction_store_and_reme_recall(tmp_path):
 
         # 2. Real NPU hardware topology & technical identifiers survive intact
         for preserved in (
+            a2_container,
+            a3_container,
             "ACL_ERROR_RT_MEMORY_ALLOCATION",
             "GroupedMatmulSwiglu",
             "torch_npu.npu_rms_norm",
