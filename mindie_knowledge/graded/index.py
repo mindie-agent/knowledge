@@ -196,31 +196,50 @@ class RoutingIndex:
         selected = ranked[:limit]
         left = token_budget
         results = []
+        excluded_budget = []
         for position, (score, ident, route) in enumerate(selected):
             if left < 1:
                 break
             unit = self.units[ident]
-            share = max(1, left // (len(selected) - position))
-            content, used, truncated = _excerpt(unit.body, share)
-            left -= used
+            if unit.metadata["tier"] == "L1" and token_estimate(unit.body) > left:
+                excluded_budget.append(ident)
+                continue
             inherited, omitted = [], []
-            for parent_id in self.closure[ident]:
+
+            def include_parent(parent_id, inherited, omitted, *, reserve_tokens=0):
+                nonlocal left
                 parent = self.units[parent_id]
                 status = applicability[parent_id]
                 if status.status != "matched":
                     omitted.append({"id": parent_id, **status.to_dict()})
-                    continue
+                    return
                 # An inherited rule is injected only as a complete condition-bound
                 # rule. A budget miss is visible, never silent truncation of a premise.
                 cost = token_estimate(parent.body)
-                if cost > left:
+                if cost > left - reserve_tokens:
                     omitted.append({"id": parent_id, "status": "budget_excluded"})
-                    continue
+                    return
                 left -= cost
                 inherited.append({"id": parent_id, "revision": parent.revision,
                                   "content": parent.body, "conditions": parent.metadata["conditions"],
                                   "tier": parent.metadata["tier"], "evidence_strength": parent.metadata["evidence_strength"],
                                   "provenance": parent.metadata["provenance"], "applicability": status.to_dict()})
+
+            # A long workflow excerpt must not displace the hardware or numerical
+            # premises on which that workflow depends.
+            reserve = token_estimate(unit.body) if unit.metadata["tier"] == "L1" else 1
+            for parent_id in self.closure[ident]:
+                if self.units[parent_id].metadata["tier"] == "L1":
+                    include_parent(parent_id, inherited, omitted, reserve_tokens=reserve)
+            if unit.metadata["tier"] == "L1":
+                content, used, truncated = unit.body, token_estimate(unit.body), False
+            else:
+                share = max(1, left // (len(selected) - position))
+                content, used, truncated = _excerpt(unit.body, share)
+            left -= used
+            for parent_id in self.closure[ident]:
+                if self.units[parent_id].metadata["tier"] != "L1":
+                    include_parent(parent_id, inherited, omitted)
             results.append({"id": ident, "title": unit.metadata["title"],
                             "revision": unit.revision,
                             "match_status": {"matched": "matched", "mismatch": "mismatched", "unknown": "condition_unknown"}[applicability[ident].status],
@@ -236,5 +255,6 @@ class RoutingIndex:
         return {"results": results, "generation": self.generation, "unit_count": len(self.units),
                 "body_token_estimate": token_budget - left, "token_budget": token_budget,
                 "budget_scope": "body excerpts and inherited rules; metadata excluded",
+                "excluded_budget": excluded_budget,
                 "excluded_conditions": dict(rejected), "query_elapsed_ms": (time.perf_counter() - started) * 1000,
                 "note": "Conditions must be established. Unknown conditions are not evidence of applicability; retrieval scores are not confidence."}
