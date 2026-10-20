@@ -1,7 +1,8 @@
 """[Role] Authenticated loopback service with one process/root per domain.
 
 [Invariants] Requests require a per-process bearer token and native operation
-identity. Domain routing cannot grant capture or contribution consent.
+identity. Loopback RPC never uses an enterprise proxy. Domain routing cannot
+grant capture or contribution consent.
 [Timeouts & Locks] Body size, workers and stalled reads are bounded. Engine
 operation scopes and the Store own cancellation and transaction locks.
 [Side-Effect Policy] Distribution uses admitted outbox batches; retrieval uses
@@ -60,7 +61,7 @@ def rpc(connection, method, arguments=None, *, timeout=None):
         def redirect_request(self, *args, **kwargs):
             return None
 
-    with urllib.request.build_opener(NoRedirect).open(
+    with urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect).open(
         request, timeout=timeout
     ) as response:
         raw = response.read(MAX_BODY + 1)

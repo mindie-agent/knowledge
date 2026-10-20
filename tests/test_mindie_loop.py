@@ -436,7 +436,7 @@ def test_hook_short_circuits_when_sharing_off(tmp_path):
     assert not (tmp_path / "root").exists()
 
 
-def test_transport_loopback_and_identity(tmp_path):
+def test_transport_loopback_and_identity(tmp_path, monkeypatch):
     project = tmp_path / "proj"
     project.mkdir()
     settings_path = tmp_path / "community.json"
@@ -480,6 +480,10 @@ def test_transport_loopback_and_identity(tmp_path):
         assert store.db.execute("SELECT count(*) FROM material_batches").fetchone()[0] == 0  # no model attempt
         from mindie_knowledge.loop.transport import rpc
 
+        for name in ("HTTP_PROXY", "http_proxy"):
+            monkeypatch.setenv(name, "http://127.0.0.1:1")
+        for name in ("NO_PROXY", "no_proxy"):
+            monkeypatch.setenv(name, "")
         assert rpc(service.connection, "status", timeout=5)["domain"] == "test"
     finally:
         service.http.shutdown()

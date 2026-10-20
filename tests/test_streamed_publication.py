@@ -1,8 +1,11 @@
 """Long-task publication keeps bodies on disk and rechecks exact frozen bytes."""
 from contextlib import closing
 import gc
+import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 import time
 import tracemalloc
 from types import SimpleNamespace
@@ -31,6 +34,24 @@ def append(store, count):
 
 
 def test_single_long_task_freeze_reload_validate_and_apply_do_not_retain_body_bytes(tmp_path, record_property):
+    # pathlib interns path components process-wide. A fresh interpreter keeps
+    # prior tests' intern-table growth out of this publication memory budget.
+    completed = subprocess.run(
+        [sys.executable, __file__, str(tmp_path)],
+        capture_output=True, text=True, encoding="utf-8", timeout=180,
+    )
+    assert completed.returncode == 0, completed.stderr
+    metrics = json.loads(completed.stdout)
+    body_bytes, retained, peak = (
+        metrics["body_bytes"], metrics["retained_python_bytes"], metrics["peak_python_bytes"]
+    )
+    assert retained < body_bytes // 2, (retained, peak, body_bytes)
+    assert peak < body_bytes * 2, (retained, peak, body_bytes)
+    for name, value in metrics.items():
+        record_property(name, value)
+
+
+def publication_memory_probe(tmp_path):
     with closing(Store(tmp_path / 'producer', 'demo')) as store:
         task_id, body_bytes = append(store, 1024)
         gc.collect()
@@ -46,15 +67,12 @@ def test_single_long_task_freeze_reload_validate_and_apply_do_not_retain_body_by
             retained, peak = tracemalloc.get_traced_memory()
         finally:
             tracemalloc.stop()
-        assert retained < body_bytes // 2, (retained, peak, body_bytes)
-        assert peak < body_bytes * 2, (retained, peak, body_bytes)
-        for name, value in [('body_bytes', body_bytes), ('retained_python_bytes', retained), ('peak_python_bytes', peak)]:
-            record_property(name, value)
         assert len(checked['files']) == 1025
         assert all(isinstance(item, FileText) for item in batch['files'])
         assert len(list((destination / 'tasks' / task_id / 'blocks').glob('*.md'))) == 1024
         assert len(render_pr_body(checked)) < 16000
         assert 'additional files' in render_pr_body(checked)
+        return dict(body_bytes=body_bytes, retained_python_bytes=retained, peak_python_bytes=peak)
 
 
 def test_frozen_payload_survives_current_generation_removal_and_rejects_late_mutation(tmp_path):
@@ -83,3 +101,7 @@ def test_nonregular_frozen_source_fails_before_opening_a_pipe(tmp_path):
     with pytest.raises(ValueError, match='regular file'):
         source['content']
     assert time.monotonic() - started < 1
+
+
+if __name__ == "__main__":
+    print(json.dumps(publication_memory_probe(Path(sys.argv[1]))))
