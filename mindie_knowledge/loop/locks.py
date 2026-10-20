@@ -1,13 +1,23 @@
-"""Single-active-starter lock anchored on one persistent file.
+"""[Role] Single-active-starter OS file lock with a persistent diagnostic record.
 
-The lock itself is OS-managed (``fcntl.flock`` on POSIX, ``LockFileEx``
-on Windows) and the OS releases it when the holder exits or crashes, so a
-live holder stays exclusive for *any* duration and there is no stale
-metadata to heuristically reclaim. The file is deliberately never unlinked:
-an old owner's ``release`` only closes its own descriptor and cannot delete
-a later acquisition. The JSON payload is diagnostic only — liveness is never
-inferred from it, so a half-written payload during another process's
-create→write window just yields a conservative ``busy``.
+[Invariants]
+- The lock is OS-managed (``fcntl.flock`` on POSIX, ``LockFileEx`` on Windows)
+  and released by the OS when the holder exits or crashes; the file is never
+  unlinked, so an old owner cannot delete a later acquisition.
+- The JSON record is diagnostic metadata, never liveness evidence. On the
+  database init lock its presence is authority evidence only after the DB was
+  created and validated; a created-but-unlocked or pre-DB file is not evidence.
+- ``acquire(write_record=False)`` observes without adding history, and
+  ``persist_record()`` is the strict write for callers that use the record as
+  authority evidence.
+
+[Timeouts & Locks]
+- Bounded waits use ``wait`` seconds or ``MINDIE_START_LOCK_WAIT_SECONDS``;
+  zero is one non-blocking attempt. The record is read or written only while
+  the OS lock is held.
+
+[Side-Effect Policy]
+- Local file descriptors and bytes only; no network, subprocess, or globals.
 """
 
 from __future__ import annotations
@@ -126,8 +136,12 @@ class StartLock:
         self.acquired = False
         self._fd = None
         self.wait = wait
+        # True only when this acquisition observed a record written by an
+        # earlier acquisition, before replacing it under the held OS lock.
+        self.prior_record = False
 
-    def acquire(self, *, wait=_UNSET):
+    def acquire(self, *, wait=_UNSET, write_record=True):
+        """Take the OS lock; ``write_record=False`` observes without adding evidence."""
         if self.acquired:
             return
         if wait is _UNSET:
@@ -161,21 +175,56 @@ class StartLock:
                 "another service start is in progress "
                 f"(pid {holder.get('pid', '?')} since {holder.get('at', '?')})"
             ) from None
-        payload = json.dumps(
+        try:
+            # A record is written only while this lock is held. Read the
+            # previous one under the lock, before replacing it, so callers
+            # can distinguish "an earlier acquisition ran" from "a sibling
+            # created the file and has not reached flock yet".
+            os.lseek(fd, 0, os.SEEK_SET)
+            self.prior_record = bool(os.read(fd, 4096))
+        except OSError:
+            os.close(fd)
+            raise
+        if write_record:
+            self._write_record(fd, strict=False)
+        self._fd = fd
+        self.acquired = True
+
+    @staticmethod
+    def _record_payload():
+        return json.dumps(
             {
                 "pid": os.getpid(),
                 "host": os.uname().nodename if hasattr(os, "uname") else "",
                 "at": time.time(),
             }
-        )
+        ).encode("utf-8")
+
+    @staticmethod
+    def _write_record(fd, *, strict):
+        """Replace the record without emptying it first; strict failures raise."""
+        encoded = StartLock._record_payload()
         try:
-            os.ftruncate(fd, 0)
             os.lseek(fd, 0, os.SEEK_SET)
-            os.write(fd, payload.encode("utf-8"))
+            written = 0
+            while written < len(encoded):
+                count = os.write(fd, encoded[written:])
+                if count <= 0:
+                    raise OSError(errno.EIO, "short write")
+                written += count
+            os.ftruncate(fd, len(encoded))
+            if strict:
+                os.fsync(fd)
         except OSError:
-            pass  # diagnostic only; the OS lock is what excludes
-        self._fd = fd
-        self.acquired = True
+            if strict:
+                raise
+            # Diagnostic-only callers keep the OS lock as what excludes.
+
+    def persist_record(self):
+        """Record a held lock as authority evidence; failure is never swallowed."""
+        if not self.acquired or self._fd is None:
+            raise RuntimeError("start lock must be held before its record is persisted")
+        self._write_record(self._fd, strict=True)
 
     def release(self):
         if not self.acquired:

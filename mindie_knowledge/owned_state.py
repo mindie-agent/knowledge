@@ -4,8 +4,18 @@
 - An existing database is never silently recreated or truncated on corruption;
   missing tables, missing columns, 0-byte files, or leftover WAL/SHM/journal
   files without the main database raise ValueError immediately.
+- A created-but-not-yet-locked `.init.lock` is not authority evidence. The
+  initializer record is persisted only after the database exists and its
+  initialization/commit/validation succeeded, and only when the validated DB
+  has no durable record: a fresh initialization, a legacy DB without a record,
+  or repair after a failed record write. Existing records are not rewritten
+  or fsynced on every open; their PID/time fields are diagnostic, not liveness.
+- Once a database file exists, 0-byte or schema damage remains fail-closed even
+  when no record was persisted; it is never reclassified as first use.
+- The first init record is authority evidence: after a validated open, failure
+  to persist it is raised rather than swallowed as diagnostic-only noise.
 - Read-only probes (`initialize_missing=False`) never create directories, lock
-  files, or empty SQLite files when the database has never been initialized.
+  files, records, or empty SQLite files when the database has never been used.
 
 [Timeouts & Locks]
 - Cross-process initialization is serialized by `StartLock(<db>.init.lock)` with
@@ -73,16 +83,20 @@ def open_database(path, *, schema, required, initialize, residue=(), validate=No
     if (not initialize_missing and not _present(path) and not _present(lock_path)
             and not any(_present(p) for p in leftovers)):
         return None
-    had_lock = _present(lock_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     lock = StartLock(lock_path)
-    lock.acquire(wait=timeout)
+    # No record before the database exists: only a validated DB earns durable
+    # authority evidence. Generic StartLock callers keep their own diagnostics.
+    lock.acquire(wait=timeout, write_record=False)
     db = None
     try:
         if path.is_symlink():
             raise ValueError('authoritative state must be a regular local file')
         fresh = not path.exists()
-        if fresh and (had_lock or any(p.exists() or p.is_symlink() for p in leftovers)):
+        # `fresh` means the path is absent, so only prior evidence/residue can
+        # distinguish first use from lost authority. Once a file exists, 0-byte
+        # or schema damage stays fail-closed even without a persisted record.
+        if fresh and (lock.prior_record or any(p.exists() or p.is_symlink() for p in leftovers)):
             raise ValueError('authoritative state database is missing; existing material and receipts were preserved')
         if fresh and not initialize_missing:
             return None
@@ -102,6 +116,12 @@ def open_database(path, *, schema, required, initialize, residue=(), validate=No
         db.execute('PRAGMA journal_mode=WAL')
         if os.environ.get('MINDIE_DISABLE_FSYNC') == '1':
             db.execute('PRAGMA synchronous=OFF')
+        if initialize_missing and not lock.prior_record:
+            # A validated DB without a durable record is the only case that
+            # needs the authority write: fresh initialization, a legacy DB, or
+            # repair after a failed record write. Existing records are not
+            # refreshed; PID/time are diagnostic, not liveness.
+            lock.persist_record()
         return db
     except BaseException:
         if db is not None:
