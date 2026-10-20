@@ -1,5 +1,6 @@
 """Stop handoff, partial reads, and apply checkpoint. Not native acceptance."""
 
+from contextlib import closing
 import json
 import sqlite3
 import time
@@ -172,6 +173,39 @@ def test_public_transcript_handoff_never_stores_raw_native_answer(tmp_path):
         assert missing['stage'] == 'rejected' and missing['capture_id'] is None
     finally:
         store.close()
+
+
+def test_omitted_capture_mode_keeps_native_answer_out_of_sqlite(tmp_path):
+    """Omitting the supported default must preserve the transcript-only boundary."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    config, admission = _ready(tmp_path, project)
+    value = json.loads(config.read_text())
+    del value["capture_mode"]
+    config.write_text(json.dumps(value))
+    canary = "AUDIT_CANARY_RAW_NATIVE_ANSWER"  # Synthetic, never a real secret.
+    result = capture_hook(config, _event(admission, last_assistant_message=canary))
+    assert result["capture_id"], result
+    with closing(Store(tmp_path / "root", "test")) as store:
+        row = store.capture_row(result["capture_id"])
+        assert row["summary"] == ""
+        assert row["transcript"] == _event(admission)["transcript_path"]
+        assert result["summary_dropped"] is True
+
+
+def test_omitted_capture_mode_rejects_answer_without_transcript(tmp_path):
+    project = tmp_path / "proj"
+    project.mkdir()
+    config, admission = _ready(tmp_path, project)
+    value = json.loads(config.read_text())
+    del value["capture_mode"]
+    config.write_text(json.dumps(value))
+    result = capture_hook(config, _event(admission, transcript_path=None))
+    assert result["stage"] == "rejected"
+    assert result["reason"] == "no-capturable-material"
+    assert result["capture_id"] is None
+    with closing(Store(tmp_path / "root", "test")) as store:
+        assert store.status()["captures"] == []
 
 
 def test_reactivated_epoch_cancels_the_queued_turn(tmp_path):

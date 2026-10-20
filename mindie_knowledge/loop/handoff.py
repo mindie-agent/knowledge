@@ -40,7 +40,6 @@ from .store import (
     session_key,
 )
 
-SUMMARY_LIMIT = 32768
 WAKE_PROBE_SECONDS = 2.0  # Control-plane observation; never a business deadline.
 
 
@@ -457,24 +456,14 @@ def accept_stop(config_path, event, *, timeout=None):
         summary = ""
         if transcript is None:
             return _result(stage="rejected", reason="no-capturable-material", summary_dropped=False)
-    elif config.get("capture_mode") == "public-transcript":
+    else:
         if transcript is None:
             return _result(stage="rejected", reason="no-capturable-material")
-        # Selection/redaction happens in the worker. The handoff stores only
+        # config_at permits only public-transcript, including the omitted
+        # default. Selection/redaction belongs to the worker; persist only
         # the native source reference, never another raw copy of its answer.
         summary = ""
         dropped = bool(raw_summary)
-    else:
-        summary = raw_summary if isinstance(raw_summary, str) else ""
-        if len(summary) > SUMMARY_LIMIT:
-            if transcript is None:
-                return _result(stage="rejected", reason="no-capturable-material")
-            summary = ""
-            dropped = True
-        else:
-            summary = summary.strip()
-        if not summary and transcript is None:
-            return _result(stage="rejected", reason="no-capturable-material", summary_dropped=dropped)
     turn = key if kind == "turn" else ""
     event_key = key if kind == "notification" else None
     event_id = hashed
