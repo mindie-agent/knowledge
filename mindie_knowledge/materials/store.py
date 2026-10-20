@@ -26,7 +26,6 @@ import os
 import re
 import sqlite3
 import threading
-from pathlib import Path
 from uuid import uuid4
 
 import yaml
@@ -565,8 +564,9 @@ class MaterialStore:
         revisions = revisions if revisions is not None else kwargs
         return self.retain_snapshot({entry_id: revisions})
 
-    def retain_snapshot(self, updates, *, complete=False):
+    def retain_snapshot(self, updates, *, complete=False, retained=None):
         """Atomically promote all metadata-committed tasks, then retire garbage."""
+        retained = retained or {}
         lock = self._lock()
         with self._mutex, self.validated_headers():
             lock.acquire(wait=5.0)
@@ -574,7 +574,7 @@ class MaterialStore:
                 if complete:
                     updates = dict(updates)
                     state = self._pointers()
-                    managed = set(state["draft"]) | set(state["feed"])
+                    managed = set(state["draft"]) | set(state["feed"]) | set(retained)
                     tasks_root = self.root / "tasks"
                     if tasks_root.is_symlink():
                         raise ValueError("managed material directory cannot be a symlink")
@@ -588,6 +588,8 @@ class MaterialStore:
                         _source(source)
                         if revision:
                             self._header(entry_id, revision, source)
+                    for revision in retained.get(entry_id, ()):
+                        self._header(entry_id, revision)
                 state = self._pointers()
                 for entry_id, revisions in updates.items():
                     for source in _SOURCE:
@@ -598,19 +600,20 @@ class MaterialStore:
                 self._save_pointers(state, set(updates))
                 try:
                     for entry_id, revisions in updates.items():
-                        self._prune_task(entry_id, set(revisions.values()) - {None, ""})
+                        self._prune_task(entry_id, (set(revisions.values()) - {None, ""})
+                                         | set(retained.get(entry_id, ())))
                 except Exception as exc:
                     raise MaterialCleanupError("material pointers committed; cleanup of unused files failed") from exc
             finally:
                 lock.release()
 
-    def recover_snapshot(self, snapshot):
+    def recover_snapshot(self, snapshot, *, retained=None):
         """Recover candidates against the complete committed metadata snapshot.
 
         The caller holds its metadata transaction lock. Only generated task
         directories are examined; native history and previous stores are inert.
         """
-        return self.retain_snapshot(snapshot, complete=True)
+        return self.retain_snapshot(snapshot, complete=True, retained=retained)
 
     def _prune_task(self, task_id, revisions):
         keep_blocks = set()

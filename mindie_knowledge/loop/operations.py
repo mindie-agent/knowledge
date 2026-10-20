@@ -1,9 +1,11 @@
-"""Service-owned live operations; durable business stages stay in SQLite.
+"""[Role] Service-owned live operations; durable business stages stay in SQLite.
 
-Each admitted operation owns an irreversible cancellation token. Revocation
+[Invariants] Each admitted operation owns an irreversible cancellation token. Revocation
 targets contribution work by authorization generation; reads and reconciliation
 are independent. The same lock admits work and freezes an idle service, so an
 updater cannot switch generations while a new operation is being admitted.
+[Timeouts & Locks] One in-memory lock; no subprocesses or timed waits.
+[Side-Effect Policy] Cancels owned in-process work; no durable state or remote writes.
 """
 from __future__ import annotations
 
@@ -13,6 +15,16 @@ import threading
 
 
 CONTRIBUTION = frozenset({"capture", "index", "package", "publish"})
+
+
+class CombinedCancellation:
+    """Observe caller cancellation and service authority revocation together."""
+
+    def __init__(self, *events):
+        self.events = tuple(event for event in events if event is not None)
+
+    def is_set(self):
+        return any(event.is_set() for event in self.events)
 
 
 @dataclass(eq=False)

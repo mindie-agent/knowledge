@@ -1,4 +1,9 @@
-"""MindIE domain service CLI.
+"""[Role] MindIE domain service CLI.
+
+[Invariants] Native adapters bind session identity; Stop never means completed.
+[Timeouts & Locks] C6 RPC budgets both scanners, identity, worker and cleanup.
+[Side-Effect Policy] C6 reads explicit stdin evidence and requires a live lease;
+it calls the configured native worker and installs local units, never publishes.
 
 Bounded local commands: ``serve``, ``hook``, ``status``, ``stop``, ``sync``
 (model-free knowledge update, works with sharing off), ``sharing-status``
@@ -249,6 +254,23 @@ def capture_hook(config_path, event, *, timeout=None):
     return accept_stop(config_path, event, timeout=timeout)
 
 
+def distill_selected(config_path, payload):
+    """Current paired sources only; forwards the existing native lease unchanged.
+
+    This opt-in command is independent of Stop. It never discovers transcripts,
+    grants contribution consent, or upgrades an installed plugin's runtime pin.
+    """
+    from . import summary_budget
+    required = {"inputs", "task_state", "_session_id", "_activation"}
+    if not isinstance(payload, dict) or set(payload) != required:
+        raise ValueError("distill stdin requires inputs, task_state, _session_id and _activation")
+    config = config_at(config_path)
+    connection = connect(config, config_path=config_path)
+    # Two scanners surround the native worker; SQLite receipt writes have
+    # their existing 5s busy timeout. No automatic replay after an RPC timeout.
+    return rpc(connection, "distill", payload, timeout=summary_budget.distill_rpc_timeout())
+
+
 def contribution_recovery(config, operation, batch_id):
     """Deterministic, model-free recovery for one existing contribution.
 
@@ -335,6 +357,12 @@ def contribution_recovery(config, operation, batch_id):
                     "contribution-reconcile, never replayed"
                 )
             from ..materials.publication import load_batch_payload
+            from .publication_target import matches_settings
+
+            prepared = store.feed_get("prepared-package-bases:" + batch_id) or {}
+            target = prepared.get("publication_target")
+            if not target or not matches_settings(target, settings):
+                raise ValueError("retry requires the original frozen publication target; retained batch needs review")
 
             batch = load_batch_payload(store, row)
             batch["explicit_retry"] = True
@@ -376,7 +404,7 @@ def _feeds(config, store):
     feeds = [Feed(store, item) for item in config.get("feeds", [])]
     settings = settings_mod.from_engine_config(config)
     if settings.repository and not any(
-        f.repository == settings.repository and f.ref == settings.branch for f in feeds
+        f.repository == settings.repository and f.ref == settings.branch and not f.prefix for f in feeds
     ):
         feeds.append(
             Feed(
@@ -479,6 +507,7 @@ def main(argv=None):
             "diagnostic-status",
             "stop",
             "sync",
+            "distill",
             "sharing-status",
             "contribution-inspect",
             "contribution-reconcile",
@@ -518,6 +547,14 @@ def main(argv=None):
 
         print(json.dumps(snapshot(args.config, session=args.session), ensure_ascii=False, indent=2))
         return 0
+    if args.operation == "distill":
+        from .transport import MAX_BODY
+        raw = sys.stdin.buffer.read(MAX_BODY + 1)
+        if len(raw) > MAX_BODY:
+            raise ValueError("selected evidence RPC exceeds the 2 MiB transport limit")
+        result = distill_selected(args.config, json.loads(raw))
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if result.get("status") in {"noop", "applied", "review_or_unchanged"} else 2
     config = config_at(args.config)
     if args.operation == "serve":
         return _serve(args.config, config)

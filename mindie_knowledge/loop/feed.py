@@ -1,9 +1,16 @@
-"""Model-free Git synchronization of complete current task file packages.
+"""[Role] Model-free Git synchronization of complete current publication snapshots.
 
-Candidate bytes are ordinary temporary files, bound to one immutable commit.
-All packages validate before the material store switches its current snapshot.
-SQLite keeps progress and receipts only. Superseded references expire; neither
-sync nor index installation calls a model or republishes consumer material.
+[Invariants] Candidate bytes are ordinary temporary files bound to one immutable
+commit. Contract/1 installs complete task packages through Store.install_feed;
+contract/2 parses ordinary graded Markdown through GradedUnit and installs only
+through GradedRepository.install_feed. The contract schema selects the format,
+never a silent fallback. Incomplete reads never imply deletion; an actual
+removal from a fully validated snapshot withdraws the unit.
+[Timeouts & Locks] One sync lock per feed; Git work honors the caller's explicit
+deadline/cancel and no internal elapsed-time deadline. Candidate attempts use
+persisted bounded backoff.
+[Side-Effect Policy] Local Git cache, staging files, SQLite receipts and the
+selected store snapshot only. No model, network write or remote publication.
 """
 
 from __future__ import annotations
@@ -22,7 +29,9 @@ from .store import _backoff_seconds, digest
 from mindie_knowledge.community.common import CommunityError, run_argv
 from mindie_knowledge.gitbin import GitUnavailableError, resolve_git
 from mindie_knowledge.gitread import with_windows_longpaths, _check_cancel
-from mindie_knowledge.publication_contract import read_git_contract
+from mindie_knowledge.publication_contract import (
+    DATA_FORMAT_V2, data_format, read_git_contract,
+)
 from mindie_knowledge.filesystem import filesystem_path, git_path
 from mindie_knowledge.git_layout import feed_repository_path, validate_git_directory
 
@@ -69,12 +78,6 @@ class Feed:
         ):
             raise ValueError("feed requires a GitHub owner/repository and ref")
         self.repository, self.ref = repository, ref
-        self.contract_sha256 = config.get("contract_sha256")
-        if self.contract_sha256 is not None and (
-            not isinstance(self.contract_sha256, str)
-            or not re.fullmatch(r"[0-9a-f]{64}", self.contract_sha256)
-        ):
-            raise ValueError("feed contract_sha256 must be a complete SHA256 digest")
         self.prefix = (config.get("prefix") or "").strip("/")
         self.url = config.get("url") or f"https://github.com/{repository}.git"
         self.ident = feed_ident(repository, ref, self.prefix)
@@ -166,10 +169,8 @@ class Feed:
         receipt = self.store.feed_get("feed:" + self.ident) or {}
         candidate = self._candidate()
         commit = receipt.get("commit")
-        contract = receipt.get("contract_sha256")
         installed = (isinstance(commit, str)
-                     and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit)
-                     and isinstance(contract, str) and re.fullmatch(r"[0-9a-f]{64}", contract))
+                     and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit))
         sync_status = receipt.get("status", "not-synced")
         if sync_status not in {"synced", "unchanged", "unavailable", "invalid", "deferred"}:
             sync_status = "unknown"
@@ -319,6 +320,27 @@ class Feed:
                 reader.close()
         return staged
 
+    def _sync_graded(self, commit, deadline, cancel):
+        """Validate one contract/2 tree and use the shared graded consumer API."""
+        from mindie_knowledge.graded.feed import install_snapshot, load_snapshot
+
+        # Candidate membership comes only from this commit's tree listing.
+        # Persist the checked bytes across commits: load_snapshot compares each
+        # cached file with the listed Git object and validates the complete
+        # graph again before install. Scratch cleanup must not erase this cache.
+        snapshot = load_snapshot(
+            self.repo, commit, prefix=self.prefix, staging=self.dir / "graded-cache",
+            env=_feed_git_env(), deadline=deadline, cancel=cancel,
+        )
+        try:
+            installed = install_snapshot(
+                self.store, snapshot, feed_ident=self.ident, source_revision=commit,
+            )
+        except MaterialCleanupError as exc:
+            exc.entries = len(snapshot.units)
+            raise
+        return installed, len(snapshot.units)
+
     def _packages(self, commit, entries):
         from mindie_knowledge.materials.file_source import FileContents
 
@@ -431,8 +453,7 @@ class Feed:
                 ))
                 return self.store.feed_get(receipt_key)
             self.store.feed_set(discovery_key, {"failures": 0, "commit": commit})
-            if (receipt.get("commit") == commit and receipt.get("contract_sha256")
-                    and receipt.get("contract_requirement") == self.contract_sha256 and not force):
+            if receipt.get("commit") == commit and not force:
                 cleaned = dict(receipt)
                 cleaned.pop("detail", None)
                 cleaned.pop("retained_commit", None)
@@ -442,10 +463,8 @@ class Feed:
                 self.store.feed_set(receipt_key, cleaned)
                 return cleaned
             candidate = self._candidate()
-            if (candidate.get("commit") != commit
-                    or candidate.get("contract_requirement", "") != self.contract_sha256):
-                candidate = {"commit": commit, "attempts": 0, "status": "new",
-                             "contract_requirement": self.contract_sha256}
+            if candidate.get("commit") != commit:
+                candidate = {"commit": commit, "attempts": 0, "status": "new"}
             if candidate.get("status") == "invalid":
                 result = dict(status="invalid", repository=self.repository,
                               commit=commit, detail=candidate.get("detail", ""),
@@ -470,20 +489,25 @@ class Feed:
             try:
                 contract = read_git_contract(
                     self.repo, commit, self.store.domain, prefix=self.prefix,
-                    expected_sha256=self.contract_sha256, deadline=deadline, env=_feed_git_env(), cancel=cancel,
+                    deadline=deadline, env=_feed_git_env(), cancel=cancel,
                 )
-                listing = self._validate_listing(commit, deadline)
-                staged = self._stage_tree_docs(commit, listing, deadline)
-                # The candidate switched atomically only when every blob of
-                # the exact commit was verified and staged; the switch itself
-                # is a short local transaction with no Git IO inside.
-                packages = self._packages(commit, listing)
-                installed = self.store.install_feed(packages, feed_ident=self.ident, source_revision=commit)
+                selected_format = data_format(contract["contract"])
+                installed_entries = None
+                if selected_format == DATA_FORMAT_V2:
+                    installed, installed_entries = self._sync_graded(commit, deadline, cancel)
+                else:
+                    listing = self._validate_listing(commit, deadline)
+                    self._stage_tree_docs(commit, listing, deadline)
+                    # The candidate switched atomically only when every blob of
+                    # the exact commit was verified and staged; the switch itself
+                    # is a short local transaction with no Git IO inside.
+                    packages = self._packages(commit, listing)
+                    installed_entries = len({path.split('/')[1] for path, _, _ in listing})
+                    installed = self.store.install_feed(packages, feed_ident=self.ident, source_revision=commit)
             except MaterialCleanupError as exc:
                 # The new pointers and metadata are already committed. Preserve
                 # this outcome separately from retiring superseded local files.
-                installed = dict(entries=len({path.split('/')[1] for path, _, _ in listing}),
-                                 cleanup_error=str(exc)[:300])
+                installed = dict(entries=getattr(exc, 'entries', installed_entries or 0), cleanup_error=str(exc)[:300])
             except ValueError as exc:
                 if getattr(exc, "metadata_committed", False):
                     return self._partial_promotion(commit, self.repository, exc)
@@ -529,15 +553,14 @@ class Feed:
                 status="synced", repository=self.repository, ref=self.ref,
                 prefix=self.prefix, commit=commit, entries=installed["entries"],
                 attempts=candidate["attempts"], checked=time.time(),
-                contract_sha256=contract["sha256"], contract_requirement=self.contract_sha256,
+                contract_sha256=contract["sha256"], contract_schema=contract["contract"]["schema"],
             )
             if installed.get("cleanup_error"):
                 receipt["material_cleanup_error"] = installed["cleanup_error"]
             self._cleanup_receipt(receipt)
             try:
                 self.store.feed_set(receipt_key, receipt)
-                self._save_candidate({"commit": commit, "attempts": 0, "status": "ok",
-                                      "contract_requirement": self.contract_sha256})
+                self._save_candidate({"commit": commit, "attempts": 0, "status": "ok"})
             except Exception as exc:
                 # The file snapshot is already installed. Report its known
                 # outcome even when saving the secondary sync receipt fails.

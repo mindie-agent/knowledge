@@ -17,7 +17,12 @@ def git(repo, *args, timeout=10):
     return subprocess.check_output(['git', '-C', str(repo), *args], text=True, timeout=timeout).strip()
 
 
-def publish(tmp_path, files, *, write_timeout=10, domain="vllm-ascend"):
+def publish(tmp_path, files, *, domain="vllm-ascend", materialize=True):
+    """Create a real root commit from exact UTF-8 blobs via one fast-import.
+
+    ``materialize=True`` also loads the commit into the index/worktree for the
+    few tests that genuinely edit paths or update-index and commit again.
+    """
     files = {"publication-contract.json": render_contract(make_contract(domain, "a" * 40)), **files}
     repo = tmp_path / 'repo'
     repo.mkdir()
@@ -26,13 +31,28 @@ def publish(tmp_path, files, *, write_timeout=10, domain="vllm-ascend"):
     git(repo, 'config', 'user.email', 'check@example.invalid')
     git(repo, 'config', 'core.autocrlf', 'false')
     git(repo, 'config', 'core.eol', 'lf')
-    for name, text in files.items():
-        path = repo / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding='utf-8', newline='\n')
-    git(repo, 'add', '.', timeout=write_timeout)
-    git(repo, 'commit', '-qm', 'publication', timeout=write_timeout)
-    return repo, git(repo, 'rev-parse', 'HEAD')
+    stream = bytearray()
+    marks = []
+    for mark, (name, text) in enumerate(files.items(), 1):
+        raw = text.encode('utf-8')
+        stream += f'blob\nmark :{mark}\ndata {len(raw)}\n'.encode('ascii')
+        stream += raw + b'\n'
+        marks.append((mark, name))
+    message = b'publication\n'
+    stream += (f'commit refs/heads/main\nmark :{len(marks) + 1}\n'
+               f'committer check <check@example.invalid> 1700000000 +0000\n'
+               f'data {len(message)}\n').encode('ascii')
+    stream += message
+    for mark, name in marks:
+        stream += f'M 100644 :{mark} {name}\n'.encode('utf-8')
+    stream += b'\n'
+    subprocess.run(['git', '-C', str(repo), 'fast-import', '--quiet'],
+                   input=bytes(stream), check=True, timeout=60)
+    sha = git(repo, 'rev-parse', 'HEAD')
+    if materialize:
+        git(repo, 'read-tree', 'HEAD')
+        git(repo, 'checkout-index', '-a', '-f')
+    return repo, sha
 
 
 def task_files(number=1, *, domain='vllm-ascend', body='Complete public evidence.', kind='experience'):
@@ -54,7 +74,7 @@ def test_empty_repository_metadata_is_valid(tmp_path):
 
 def test_plain_canonical_task_data_only(tmp_path):
     files = task_files()
-    repo, sha = publish(tmp_path, files)
+    repo, sha = publish(tmp_path, files, materialize=True)
     assert validate(repo, sha, 'vllm-ascend')['entries'] == 1
     path = next(path for path in files if '/blocks/' in path)
     git(repo, 'update-index', '--chmod=+x', path)
@@ -115,9 +135,17 @@ def test_pending_block_index_cannot_be_published(tmp_path):
 
 def test_more_than_1024_tasks_validate(tmp_path):
     files = {}
-    for i in range(1027):
-        files.update(task_files(i, body=f'Full evidence in task {i}.'))
-    repo, sha = publish(tmp_path, files, write_timeout=60)
+    with TemporaryDirectory() as root, closing(MaterialStore(root, 'vllm-ascend')) as store:
+        for i in range(1027):
+            entry_id = f'{i:064x}'
+            doc = make_entry(entry_id=entry_id, domain='vllm-ascend', kind='experience',
+                             title=f'Inference task {i}',
+                             summary=f'Case {i}; evidence remains reference material.',
+                             content=f'Full evidence in task {i}.')
+            saved = store.put_document(doc)
+            package = store.export_task(entry_id, revision=saved['revision'])
+            files.update({f'tasks/{entry_id}/{path}': text for path, text in package['files'].items()})
+    repo, sha = publish(tmp_path, files, materialize=False)
     assert validate(repo, sha, 'vllm-ascend')['entries'] == 1027
 
 
@@ -127,7 +155,7 @@ def test_checkpoint_resume_skips_reverified_blobs(tmp_path, monkeypatch):
     files = {}
     for i in range(70):
         files.update(task_files(i, body=f'Evidence {i}.'))
-    repo, sha = publish(tmp_path, files)
+    repo, sha = publish(tmp_path, files, materialize=True)
     state = tmp_path / 'validator-state.json'
     monkeypatch.setattr(pc, '_CHECKPOINT_EVERY', 16)
     real_read, reads, armed = gitread.CatFileBatch.read, [], [True]

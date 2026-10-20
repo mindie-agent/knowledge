@@ -184,7 +184,7 @@ def _redaction_timeout(timeout=None):
     return float(raw) if raw is not None else REDACTION_TIMEOUT_SECONDS
 
 
-def redact(text, *, executable, key, private_paths=(), cancel=None, timeout=None):
+def _redaction_spans(text, *, executable, private_paths=(), cancel=None, timeout=None):
     _check_cancel(cancel)
     if not executable or not Path(executable).is_absolute():
         raise ValueError("transcript redaction requires an installed scanner")
@@ -265,10 +265,13 @@ def redact(text, *, executable, key, private_paths=(), cancel=None, timeout=None
             merged[-1] = (old[0], max(old[1], end), old[2])
         else:
             merged.append((start, end, rule))
-    rules = sorted({rule for _, _, rule in merged})
+    return merged
+
+
+def _replace_spans(text, spans, key):
     pieces = []
     cursor = 0
-    for start, end, rule in merged:
+    for start, end, rule in spans:
         token = hmac.new(key, text[start:end].encode(), hashlib.sha256).hexdigest()[:12]
         # A fixed closed token cannot itself be mistaken for a credential
         # assignment by the final outbound scan. It contains no user input.
@@ -276,7 +279,83 @@ def redact(text, *, executable, key, private_paths=(), cancel=None, timeout=None
         pieces.extend((text[cursor:start], placeholder))
         cursor = end
     pieces.append(text[cursor:])
-    return ''.join(pieces), rules
+    return ''.join(pieces)
+
+
+def redact(text, *, executable, key, private_paths=(), cancel=None, timeout=None):
+    spans = _redaction_spans(text, executable=executable, private_paths=private_paths,
+                            cancel=cancel, timeout=timeout)
+    return _replace_spans(text, spans, key), sorted({rule for _, _, rule in spans})
+
+
+def redact_tree(value, *, executable, key, private_paths=(), cancel=None, timeout=None):
+    """Scan JSON values once without treating serialization escapes as content.
+
+    Keys and unescaped string values retain their JSON assignment context in
+    the scanner input. Findings are projected back onto each original string; JSON
+    delimiters and typed numeric measurements are never rewritten as text.
+    """
+    parts, strings, position = [], [], 0
+
+    def append(text, *, leaf=False):
+        nonlocal position
+        if leaf:
+            strings.append((position, position + len(text), text))
+        parts.append(text)
+        position += len(text)
+
+    def collect(item):
+        if isinstance(item, dict):
+            append('{\n')
+            for name, member in item.items():
+                append('"')
+                append(name, leaf=True)
+                append('\": ')
+                collect(member)
+                append(',\n')
+            append('}')
+        elif isinstance(item, list):
+            append('[\n')
+            for member in item:
+                collect(member)
+                append(',\n')
+            append(']')
+        elif isinstance(item, str):
+            append('"')
+            append(item, leaf=True)
+            append('"')
+        else:
+            append(json.dumps(item))
+
+    collect(value)
+    spans = _redaction_spans(''.join(parts), executable=executable,
+                            private_paths=private_paths, cancel=cancel, timeout=timeout)
+    cleaned, cursor = [], 0
+    for start, end, original in strings:
+        while cursor < len(spans) and spans[cursor][1] <= start:
+            cursor += 1
+        selected, index = [], cursor
+        while index < len(spans) and spans[index][0] < end:
+            left, right, rule = spans[index]
+            selected.append((max(left, start) - start, min(right, end) - start, rule))
+            index += 1
+        cleaned.append(_replace_spans(original, selected, key))
+    values = iter(cleaned)
+
+    def rebuild(item):
+        if isinstance(item, dict):
+            result = {}
+            for _, member in item.items():
+                name = next(values)
+                if name in result:
+                    raise ValueError('redaction produced duplicate object keys')
+                result[name] = rebuild(member)
+            return result
+        if isinstance(item, list):
+            return [rebuild(member) for member in item]
+        return next(values) if isinstance(item, str) else item
+
+    return rebuild(value), sorted({rule for _, _, rule in spans})
 
 
 if __name__ == "__main__":

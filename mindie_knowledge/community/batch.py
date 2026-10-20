@@ -1,9 +1,11 @@
-"""Strict validation of ``mindie-contribution/1`` batches and feedback files.
+"""[Role] Validate frozen contribution batches before publication.
 
-Core stages already-scanned outbound bytes; this module re-checks everything
-at the trust boundary before any Git mutation: schema, path allowlist, per-file
-sha256, the batch revision digest, vote shape, and the deterministic PR/commit
-text templates (zero model involvement).
+[Invariants] Each batch uses one explicit task or graded data format. Paths,
+exact file hashes, revision references, feedback and publication text are
+validated together; no model repairs or rewrites an admitted payload.
+[Timeouts & Locks] Local bounded payload reads only; no subprocess or database
+transaction. The publisher owns operation deadlines and remote state.
+[Side-Effect Policy] Read and validate frozen files; no Git or network write.
 """
 
 from __future__ import annotations
@@ -43,6 +45,9 @@ def check_path(path: Any) -> str:
     if pure.is_absolute() or str(path) != str(pure):
         raise CommunityError(f"file path {path!r} is not a clean relative POSIX path")
     parts = pure.parts
+    from ..graded.contribution import DERIVED_PATHS, is_unit_path
+    if path in DERIVED_PATHS or is_unit_path(path):
+        return path
     if re.fullmatch(r"tasks/[0-9a-f]{64}/(?:index\.md|blocks/[A-Za-z0-9_-]{1,128}\.md)", path):
         return path
     if len(parts) != 2 or parts[0] not in ALLOWED_PREFIXES:
@@ -204,7 +209,8 @@ def validate_batch(batch: Any) -> dict[str, Any]:
         if "delete" in item and item["delete"] is not True:
             raise CommunityError(f"{path}: delete must be true when present")
         if item.get("delete") is True:
-            if not path.startswith("tasks/") or path.endswith("/index.md"):
+            from ..graded.contribution import is_unit_path
+            if not is_unit_path(path) and (not path.startswith("tasks/") or path.endswith("/index.md")):
                 raise CommunityError("only superseded task block files can be deleted by a contribution")
             if content is not None or item.get("sha256") is not None:
                 raise CommunityError(f"{path}: a deletion cannot contain replacement bytes")
@@ -232,7 +238,8 @@ def validate_batch(batch: Any) -> dict[str, Any]:
         if base_sha is not None and (not isinstance(base_sha, str) or len(base_sha) != 64):
             raise CommunityError(f"{path}: base_sha256 must be null or a sha256 digest")
         if path.startswith("feedback/"):
-            validate_feedback(content, path)
+            from ..graded.contribution import feedback_api
+            feedback_api(content).validate_feedback(content, path)
         checked_files.append(item.with_metadata(path=path, base_sha256=base_sha)
                              if isinstance(item, FileText) else
                              dict(path=path, content=content, sha256=sha, base_sha256=base_sha))
@@ -267,7 +274,9 @@ def validate_batch(batch: Any) -> dict[str, Any]:
                 raise CommunityError("task package requires its exact revision reference")
             if package.get("task_id") != task_id:
                 raise CommunityError("task package identity differs from its public path")
-    has_entries = any(f["path"].startswith(("tasks/",)) for f in checked_files)
+    from ..graded.contribution import validate_files
+    data_format, units = validate_files(checked_files, entry_refs, domain)
+    has_entries = bool(task_revisions or units)
     return {
         "batch_id": batch_id,
         "revision": revision,
@@ -278,6 +287,8 @@ def validate_batch(batch: Any) -> dict[str, Any]:
         "summary": summary,
         "votes_only": not has_entries,
         "task_revisions": task_revisions,
+        "unit_revisions": {ident: unit.content_sha256 for ident, unit in units.items()},
+        "data_format": data_format,
         "explicit_retry": batch.get("explicit_retry") is True,
     }
 
@@ -293,7 +304,14 @@ def scan_outbound(batch: Mapping[str, Any], pr_title: str, pr_body: str, commit_
     for item in batch["files"]:
         if item.get("delete") is True:
             continue
-        findings.extend(scan_text(item["content"], allow, path=item["path"])[:5])
+        from ..graded.contribution import DERIVED_PATHS, is_unit_path, scan_unit
+        if is_unit_path(item["path"]):
+            scan_unit(item["content"], item["path"])
+        elif item["path"] in DERIVED_PATHS:
+            from ..graded.privacy import metadata_findings
+            findings.extend(metadata_findings(json.loads(item["content"]), item["path"])[:5])
+        else:
+            findings.extend(scan_text(item["content"], allow, path=item["path"])[:5])
         if findings:
             break  # A known unsafe file blocks the entire write immediately.
     for label, text in (("pr-title", pr_title), ("pr-body", pr_body), ("commit-message", commit_message)):

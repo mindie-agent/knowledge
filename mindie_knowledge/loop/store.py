@@ -446,7 +446,7 @@ class Store:
             current = self.materials._pointers()
             if (set(current['draft']) | set(current['feed'])) - set(snapshot):
                 raise ValueError('committed material has no runtime metadata; existing files were preserved')
-            self.materials.recover_snapshot(snapshot)
+            self.materials.recover_snapshot(snapshot, retained=self.retained_material_revisions())
             self.db.executemany("INSERT OR IGNORE INTO known_revisions VALUES(?,?)",
                                 [(entry_id, revision) for entry_id, revisions in snapshot.items()
                                  for revision in set(revisions.values())])
@@ -456,6 +456,13 @@ class Store:
             self.materials.close()
             raise
         self.db.commit()
+
+    @property
+    def graded(self):
+        from ..graded.repository import GradedRepository
+        if not hasattr(self, "_graded_repository"):
+            self._graded_repository = GradedRepository(self)
+        return self._graded_repository
 
     @contextlib.contextmanager
     def _write_txn(self):
@@ -508,7 +515,7 @@ class Store:
                     if row['feed_active'] and row['published_revision']:
                         revisions['feed'] = row['published_revision']
                 snapshot[entry_id] = revisions
-            self.materials.retain_snapshot(snapshot)
+            self.materials.retain_snapshot(snapshot, retained=self.retained_material_revisions())
         except Exception as exc:
             self.db.rollback()
             if getattr(exc, 'committed', False):
@@ -686,6 +693,18 @@ class Store:
 
     def is_withdrawn(self, ref):
         """Publication checks current withdrawal state, not a past draft body."""
+        if isinstance(ref, str) and "/units/" in ref:
+            from ..graded.feedback import parse_feedback_ref
+            observed = parse_feedback_ref(ref, self.domain)
+            with self.lock:
+                catalog = self.graded._catalog()
+                ident = observed["unit_id"]
+                if ident in {item["id"] for item in catalog.get("units", [])}:
+                    return False
+                if ident in {item["id"] for item in catalog["retired_local"]} or self.db.execute(
+                        "SELECT 1 FROM known_revisions WHERE entry_id=? LIMIT 1", (ident,)).fetchone():
+                    return True
+                raise ValueError("unknown graded reference in this domain")
         with self.lock:
             entry_id, _ = self._parse_ref(ref.split("@", 1)[0])
             row = self.db.execute(
@@ -703,6 +722,8 @@ class Store:
         navigation. No full-document assembly, historical package or old
         offset-based reading path is reachable through this interface.
         """
+        if isinstance(ref, str) and "/units/" in ref:
+            return self.graded.explain(ref)
         parsed = parse_read_ref(ref, domain=self.domain)
         entry_id = parsed["task_id"]
         navigation_ref = task_ref(self.domain, entry_id)
@@ -1141,7 +1162,21 @@ class Store:
 
     # ---------------------------------------------------------------- search
 
-    def query(self, query=None, limit=5, conditions=None, continuation=None):
+    def query(self, query=None, limit=5, conditions=None, continuation=None,
+              domain_path=None, token_budget=800, include_unknown=False):
+        if continuation is not None or not self.graded.available():
+            return self._query_materials(query, limit, conditions, continuation)
+        legacy = self._query_materials(query, limit, conditions)
+        if legacy["results"]:
+            from ..graded.retrieval import mixed_query
+            return mixed_query(self, legacy, query, limit=limit, conditions=conditions,
+                               domain_path=domain_path, token_budget=token_budget,
+                               include_unknown=include_unknown)
+        return self.graded.query(query, limit=limit, conditions=conditions,
+                                 domain_path=domain_path, token_budget=token_budget,
+                                 include_unknown=include_unknown)
+
+    def _query_materials(self, query=None, limit=5, conditions=None, continuation=None):
         from ..materials.provenance import QueryContinuationError, query_request
         from ..materials.catalog import CurrentVisibility
         query_request(query, limit, conditions, continuation)
@@ -1163,8 +1198,12 @@ class Store:
                         for key, r in self._query_rows.items()})
                     self._query_version = cache_version
                 rows, allowed = self._query_rows, self._query_allowed
-                found = self.materials.search(query, limit=limit, conditions=conditions, allowed_ids=allowed,
-                                              continuation=continuation)
+                # A graded-only store has no current material to rank. Keep
+                # legacy cursor validation, but do not load its search engine
+                # when SQLite already proves there are no visible entries.
+                found = (self.materials.search(query, limit=limit, conditions=conditions, allowed_ids=allowed,
+                                               continuation=continuation)
+                         if rows or continuation is not None else [])
             except QueryContinuationError:
                 raise
             except (OSError, ValueError, TypeError, KeyError, sqlite3.Error) as exc:
@@ -1203,6 +1242,44 @@ class Store:
                 (key, canonical(value)),
             )
 
+    def material_feeds(self):
+        """Per-source membership; old stores have one evidenced active source."""
+        recorded = self.feed_get("material-feeds")
+        if recorded is not None:
+            return recorded["feeds"]
+        previous = self.feed_get("published-commit") or {}
+        if not previous.get("feed") or previous.get("contract_schema") == "mindie-publication-contract/2":
+            return {}
+        with self.lock:
+            entries = {row["entry_id"]: row["published_revision"] for row in self.db.execute(
+                "SELECT entry_id,published_revision FROM entries WHERE feed_active=1")}
+        return {previous["feed"]: dict(entries=entries, source_revision=previous.get("commit"))}
+
+    def retire_material_feed(self, feed_ident):
+        """Withdraw exactly one old-format source after its verified switch."""
+        feeds = self.material_feeds()
+        previous = feeds.pop(feed_ident, None)
+        # Materialize a legacy store's one-source receipt before another format
+        # replaces the compatibility published-commit pointer.
+        self.feed_set("material-feeds", {"feeds": feeds})
+        if previous is None:
+            return {}
+        retained = {ident for source in feeds.values() for ident in source["entries"]}
+        for ident in set(previous["entries"]) - retained:
+            self.db.execute("UPDATE entries SET feed_active=0 WHERE entry_id=?", (ident,))
+            self._mark_material_changed(ident)
+        self._query_version = None
+        return previous["entries"]
+
+    def retained_material_revisions(self):
+        """Format-switch evidence retains exact bytes without public pointers."""
+        retained = {}
+        for row in self.db.execute("SELECT value FROM feed_state WHERE key LIKE 'graded-format-switch:%'"):
+            receipt = _stored_json(row[0], dict, "format switch")
+            for ident, revisions in receipt.get("retained_task_revisions", {}).items():
+                retained.setdefault(ident, set()).update(revisions)
+        return retained
+
     def install_feed(self, packages, *, feed_ident, source_revision=None):
         """Install one whole Git snapshot into the current file material store.
 
@@ -1224,7 +1301,21 @@ class Store:
                 packages, source="feed", source_revision=source_revision,
                 promote=False, on_validated=accept_metadata,
             )
-            self.db.execute("UPDATE entries SET feed_active=0 WHERE feed_active=1")
+            feeds = self.material_feeds()
+            incoming = {doc["entry_id"]: doc["revision"] for doc in headers}
+            for identity, source in feeds.items():
+                if identity != feed_ident and any(ident in incoming and incoming[ident] != revision
+                                                 for ident, revision in source["entries"].items()):
+                    raise ValueError("material feeds disagree on one stable task revision")
+            # One immutable source snapshot has one selected format. Withdraw
+            # its graded authority before publishing the material replacement.
+            self.graded.retire_feed(feed_ident)
+            previous = feeds.get(feed_ident, {"entries": {}})
+            feeds[feed_ident] = dict(entries=incoming, source_revision=source_revision)
+            retained = {ident for source in feeds.values() for ident in source["entries"]}
+            for ident in set(previous["entries"]) - retained:
+                self.db.execute("UPDATE entries SET feed_active=0 WHERE entry_id=?", (ident,))
+            self.feed_set("material-feeds", {"feeds": feeds})
             for doc in headers:
                 row = self._row(doc["entry_id"])
                 self._record_material_revision(doc, "feed", now)
@@ -1243,8 +1334,8 @@ class Store:
                          now, canonical(doc["conditions"]), doc["entry_id"]))
             # Upstream withdrawal removes public visibility and its file pointer;
             # a superseded local draft never silently reappears in consumer search.
-            self._mark_all_material_changed()
-            self._prune_body_history()
+            for ident in set(previous["entries"]) | set(incoming):
+                self._prune_body_history(ident)
             if source_revision is not None:
                 self.db.execute("INSERT OR REPLACE INTO feed_state VALUES(?,?)",
                                 ("published-commit", canonical(dict(commit=source_revision, feed=feed_ident))))
@@ -1310,6 +1401,10 @@ class Store:
         vote's free-text reason is privacy-scanned at admission, so a single
         unsafe reason can never block unrelated material at batch time; local
         (non-publishable) votes are never scanned and never leave the store."""
+        if isinstance(ref, str) and "/units/" in ref:
+            from ..graded.feedback import record_vote
+            return record_vote(self, root_hash=root_hash, ref=ref, rating=rating, reason=reason,
+                               publishable=publishable, generation=generation)
         if rating not in RATINGS:
             raise ValueError("rating must be up or down")
         if not isinstance(reason, str) or len(reason) > MAX_VOTE_REASON:
@@ -1351,6 +1446,11 @@ class Store:
             )
 
     def unbatched_votes(self, *, generation=None):
+        rows = self._unbatched_votes(generation=generation)
+        public = self.graded.public_ids() if self.graded.available() else set()
+        return [row for row in rows if not row["entry_id"].startswith("unit-") or row["entry_id"] in public]
+
+    def _unbatched_votes(self, *, generation=None):
         """Publishable unbatched votes. With ``generation`` (the outbound
         path), only votes explicitly granted to that sharing generation.
         Votes on an entry the feed no longer carries — or whose material was
@@ -1497,7 +1597,7 @@ class Store:
             )
 
     def create_batch(self, *, batch_id, revision, batch, entry_ids, vote_keys,
-                     generation=None, source_revisions=None, entry_revisions=None):
+                     generation=None, source_revisions=None, entry_revisions=None, publication_target=None):
         """Record one built batch as pending and bind its material.
 
         Material bound to a batch is never silently re-batched: only a newer
@@ -1540,7 +1640,7 @@ class Store:
                     raise ValueError("prepared feed identities differ from task package identities")
                 self.feed_set("prepared-package-bases:" + batch_id,
                               dict(batch_revision=revision, source_revisions=source_revisions,
-                                   entry_revisions=entry_revisions))
+                                   entry_revisions=entry_revisions, publication_target=publication_target))
             for entry_id in entry_ids:
                 row = self._row(entry_id)
                 if row is not None:
@@ -1869,6 +1969,9 @@ class Store:
         row = dict(row)
         if not isinstance(row.get("head_sha"), str) or not row["head_sha"]:
             raise ValueError("confirmed contribution has no remote head identity")
+        if any("/units/" in ref for ref in batch.get("entry_refs", [])):
+            from ..graded.export import record_sent_receipts
+            return record_sent_receipts(self, row, batch, actual_files)
         candidate = {item["path"]: item for item in batch.get("files", [])}
         actual = {item["path"]: item for item in actual_files or []}
         prepared = self.feed_get("prepared-package-bases:" + row["batch_id"])
@@ -1906,7 +2009,8 @@ class Store:
             # Task packages do not merge observation text during publication:
             # every accepted file is either byte-identical or an exact-base update.
             receipt = dict(revision=revision, files=files, head_sha=row["head_sha"],
-                           batch_id=row["batch_id"], batch_revision=row["revision"])
+                           batch_id=row["batch_id"], batch_revision=row["revision"],
+                           publication_target=(prepared or {}).get("publication_target"))
             if entry_id in sources:
                 receipt["source_published_revision"] = sources[entry_id]
             self.db.execute("INSERT OR REPLACE INTO feed_state VALUES(?,?)",
@@ -1915,7 +2019,8 @@ class Store:
                 "INSERT OR REPLACE INTO sent_receipts(entry_id,generation,sent_revision,path,sha256,"
                 "head_sha,repository,pr_url,batch_id,updated,markers,batch_revision) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (entry_id, row.get("generation"), revision, index_path, index["sha256"],
-                 row["head_sha"], None, row.get("pr_url"), row["batch_id"], now, None, row["revision"]),
+                 row["head_sha"], ((prepared or {}).get("publication_target") or {}).get("repository"),
+                 row.get("pr_url"), row["batch_id"], now, None, row["revision"]),
             )
 
     def sent_receipt(self, entry_id):
@@ -2017,9 +2122,22 @@ class Store:
             current = self._row(entry_id)
             return self.materials.read_task(entry_id, current["draft_revision"], "draft")["entry"] if current["draft_revision"] else None
 
-    def contribution_base_files(self, entry_id):
+    def contribution_base_files(self, entry_id, *, target=None):
         """Exact confirmed base used by the current append-only candidate."""
         with self.lock:
+            if target:
+                feeds = self.material_feeds()
+                members = feeds.get(target["feed_ident"], {}).get("entries", {})
+                if entry_id not in members and any(entry_id in source["entries"] for source in feeds.values()):
+                    raise ValueError("task correction belongs to a different publication repository")
+                receipt = self.feed_get("sent-package:" + entry_id) or {}
+                sent_target = receipt.get("publication_target")
+                if not sent_target or sent_target["feed_ident"] != target["feed_ident"]:
+                    if entry_id not in members:
+                        return []
+                    package = self.materials.export_task(entry_id, source="feed", revision=members[entry_id])
+                    return [dict(path=f"tasks/{entry_id}/{path}", sha256=hashlib.sha256(content.encode()).hexdigest())
+                            for path, content in package["files"].items()]
             base = self.feed_get("continuation-base:" + entry_id)
             sent = self.sent_receipt(entry_id)
             if base and sent and base["sent_head_sha"] == sent["head_sha"]:

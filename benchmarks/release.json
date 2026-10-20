@@ -4,6 +4,14 @@
   "publishable": true,
   "cases": [
     {
+      "id": "graded-feed-lifecycle",
+      "kind": "functional",
+      "required": true,
+      "repetitions": 1,
+      "timeout_seconds": 20,
+      "command": ["{python}", "benchmarks/graded_lifecycle.py"]
+    },
+    {
       "id": "technical-tokenization",
       "kind": "microbenchmark",
       "required": true,

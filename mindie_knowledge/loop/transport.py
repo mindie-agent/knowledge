@@ -1,10 +1,11 @@
-"""Authenticated loopback service; one process and storage root per domain.
+"""[Role] Authenticated loopback service with one process/root per domain.
 
-Loopback only: the service binds 127.0.0.1, requires a per-process bearer
-token, refuses Origin-headed browser requests, bounds body size, worker
-count and stalled reads. There is no remote upstream, authority, contribute
-or raw-outcome route — distribution happens through the outbox and the
-community package, retrieval through the model-free Git feed sync.
+[Invariants] Requests require a per-process bearer token and native operation
+identity. Domain routing cannot grant capture or contribution consent.
+[Timeouts & Locks] Body size, workers and stalled reads are bounded. Engine
+operation scopes and the Store own cancellation and transaction locks.
+[Side-Effect Policy] Distribution uses admitted outbox batches; retrieval uses
+the model-free Git feed. No raw upstream or unauthenticated write route exists.
 """
 
 from __future__ import annotations
@@ -282,7 +283,7 @@ class Service:
             threading.Thread(target=self.close, daemon=True).start()
             return dict(status="stopping")
         work = method in {
-            "query", "explain", "feedback", "capture", "sync",
+            "query", "explain", "feedback", "capture", "sync", "distill",
         }
         operation = self.engine.operations.begin("capability", method) if work else None
         if work and operation is None:
@@ -301,10 +302,14 @@ class Service:
         return result
 
     def _dispatch(self, method, args, *, cancel=None):
+        args = dict(args)
+        domain = args.pop("domain", self.store.domain)
+        if domain != self.store.domain:
+            raise ValueError("domain differs from the selected knowledge service")
         lease = None
         session = None
-        if method in {"feedback", "capture"}:
-            args, session, lease = self._identify(args, capture=method == "capture")
+        if method in {"feedback", "capture", "distill"}:
+            args, session, lease = self._identify(args, capture=method in {"capture", "distill"})
         elif method in {'query', 'explain'}:
             # Host identity is verified without creating or consulting a
             # capture lease for ordinary public knowledge reads.
@@ -322,6 +327,9 @@ class Service:
                 args.get("query"), limit=args.get("limit", 5),
                 conditions=args.get("conditions"),
                 continuation=args.get("continuation"),
+                domain_path=args.get("domain_path"),
+                token_budget=args.get("token_budget", 800),
+                include_unknown=args.get("include_unknown", False),
             )
             stale = [source for source in sources if source["status"] == "stale"]
             if stale:
@@ -330,6 +338,19 @@ class Service:
                                     "a configured feed refresh failed or is incomplete. "
                                     "No match does not establish absence from the current source.").strip())
             return result
+        if method == "distill":
+            from .activation import activation_epoch
+            if set(args) != {"inputs", "task_state"}:
+                raise ValueError("distill accepts explicit inputs and task_state")
+            settings = self.engine._settings()
+            scope = self.admission.scope_root(session)
+            if not settings.allows_capture() or not scope or not settings.in_scope(scope):
+                raise ValueError("selected evidence is outside current contribution authorization")
+            authorization = dict(session=session, generation=settings.generation, scope=scope,
+                                 activation_epoch=activation_epoch(lease["token"]))
+            return self.engine.distill_selected(args["inputs"], session_digest=session_key(session),
+                                               task_state=args["task_state"], authorization=authorization,
+                                               cancel=cancel)
         if method == "explain":
             if set(args) != {"ref"}:
                 raise ValueError("explain accepts only ref; whole-document offset/limit reading is unavailable")

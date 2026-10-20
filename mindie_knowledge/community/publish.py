@@ -20,8 +20,6 @@
 
 from __future__ import annotations
 
-import json
-import time
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -29,14 +27,11 @@ from . import gitops
 from .batch import (
     check_path,
     contribution_branch,
-    merge_votes,
     render_commit_message,
-    render_feedback,
     render_pr_body,
     render_pr_title,
     scan_outbound,
     validate_batch,
-    validate_feedback,
 )
 from .common import (
     CommunityError,
@@ -49,7 +44,7 @@ from .common import (
 from .ledger import Ledger
 from .settings import live_gate, sharing_enabled
 from .transport import Transport, transport_from_settings
-from mindie_knowledge.publication_contract import ContractMismatch, read_git_contract
+from mindie_knowledge.publication_contract import ContractMismatch, data_format, read_git_contract
 
 RECEIPT_STATUSES = (
     "submitted",
@@ -357,9 +352,10 @@ def _publication_base(checked, settings, state_dir, deadline, *, repository, wri
         )
     contract = read_git_contract(
         work_dir, base_tip, checked["domain"],
-        expected_sha256=settings.get("publication_contract_sha256"),
         deadline=deadline.limit, env=genv, cancel=deadline.cancel,
     )
+    if data_format(contract["contract"]) != checked["data_format"]:
+        raise ContractMismatch("contribution data format differs from the selected publication contract")
     return dict(work_dir=work_dir, genv=genv, base_tip=base_tip,
                 read_url=read_url, base_branch=base_branch, contract=contract)
 
@@ -417,13 +413,16 @@ def _publish(checked, settings, state_dir, ledger, deadline, transport, *,
     selected_commit = gitops._git(["rev-parse", checkout_ref], deadline, cwd=work_dir, env=genv).strip()
     try:
         read_git_contract(work_dir, selected_commit, checked["domain"],
-                          expected_sha256=prepared["contract"]["sha256"],
                           deadline=deadline.limit, env=genv, cancel=deadline.cancel)
     except ContractMismatch as exc:
         raise CommunityError(f"contribution head contract differs from its upstream base: {exc}",
                              status="needs_review") from exc
     except (OSError, TimeoutError) as exc:
         raise TransientError(f"cannot verify the contribution head contract: {exc}") from exc
+
+    if checked["data_format"] == "graded":
+        from ..graded.publisher import validate_projection
+        validate_projection(checked, work_dir, selected_commit, deadline, genv)
 
     # Inspect Git objects before asking the host to materialize them. A path
     # or mode conflict must stay needs_review even when checkout cannot create
@@ -547,8 +546,12 @@ def _actual_entry_files(checked, work_dir):
         text = gitops.read_tree_file(work_dir, path)
         if text is None or sha256_text(text) != item["sha256"]:
             raise CommunityError(f"committed task file differs from its validated package: {path}")
-        task_id = path.split("/")[1]
-        revision = checked["task_revisions"][task_id]
+        if checked["data_format"] == "graded":
+            from ..graded.contribution import DERIVED_PATHS, parse_unit
+            revision = sha256_text(text) if path in DERIVED_PATHS else parse_unit(text, path).content_sha256
+        else:
+            task_id = path.split("/")[1]
+            revision = checked["task_revisions"][task_id]
         actual.append({
             "path": path,
             "sha256": sha256_text(text),
@@ -636,9 +639,11 @@ def _prepare_files(checked, work_dir, *, own_branch_resume=False, resumed_files=
             continue
         if path.startswith("feedback/"):
             current = gitops.read_tree_file(work_dir, path)
-            existing = validate_feedback(current, path)["votes"] if current else []
-            new = validate_feedback(item["content"], path)["votes"]
-            merged = render_feedback(merge_votes(existing, new))
+            from ..graded.contribution import feedback_api
+            api = feedback_api(item["content"])
+            existing = api.validate_feedback(current, path)["votes"] if current else []
+            new = api.validate_feedback(item["content"], path)["votes"]
+            merged = api.render_feedback(api.merge_votes(existing, new))
             if sha256_text(merged) != current_sha:
                 out.append({**item, "content": merged, "sha256": sha256_text(merged)})
             continue

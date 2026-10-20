@@ -1,11 +1,13 @@
-"""Technical identifier and CJK token boundaries for ReMe BM25.
+"""[Role] Technical identifier and CJK token boundaries for local BM25.
 
-ReMe owns indexing, persistence and ranking; these tokens retain exact
-qualified identifiers and their searchable components. Ranking scores
-measure retrieval relevance, never factual confidence.
+[Invariants] Retain qualified identifiers, versions and searchable components.
+Frequency aggregation must equal individual token expansion; relevance is not
+factual confidence. [Timeouts & Locks] Pure CPU work; no waits or locks.
+[Side-Effect Policy] No I/O; only the bounded identifier-alias cache is shared.
 """
 from __future__ import annotations
 
+from collections import Counter
 import re
 from functools import lru_cache
 
@@ -20,7 +22,7 @@ def _aliases(word):
         return ()
     aliases = []
     for part in _PARTS.split(word):
-        if _IDENTIFIER.fullmatch(part):
+        if part.isidentifier() if part.isascii() else _IDENTIFIER.fullmatch(part):
             aliases.append(part)
             aliases.extend(part.split('_'))
     return tuple(dict.fromkeys(part for part in aliases if len(part) > 1 and part != word))
@@ -45,3 +47,19 @@ def tokens(text: str) -> list[str]:
     """Keep exact identifiers and their components searchable, without
     turning software versions into common numeric aliases."""
     return list(_tokens(text))
+
+
+def token_counts(text: str) -> Counter[str]:
+    """Expand each distinct lexeme once when a BM25 index needs frequencies."""
+    counts = {}
+    for word, frequency in Counter(_WORDS.findall(text.casefold())).items():
+        # _WORDS emits an entire CJK run separately from identifier lexemes.
+        if '\u3400' <= word[0] <= '\u9fff' and len(word) > 1:
+            for index in range(len(word) - 1):
+                token = word[index:index + 2]
+                counts[token] = counts.get(token, 0) + frequency
+        else:
+            counts[word] = counts.get(word, 0) + frequency
+            for alias in (_cached_aliases(word) if len(word) <= 256 else _aliases(word)):
+                counts[alias] = counts.get(alias, 0) + frequency
+    return Counter(counts)

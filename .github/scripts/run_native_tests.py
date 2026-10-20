@@ -33,7 +33,7 @@ def main():
     print(f"Native tests: shard {args.shard + 1}/{args.shards}, "
           f"{len(selected)}/{len(files)} modules", flush=True)
     options = ["--collect-only", "-q"] if args.collect_only else [
-        "-v", "--maxfail=1", "--durations=25", "--junitxml=native-knowledge.xml",
+        "-v", "--durations=25", "--junitxml=native-knowledge.xml",
     ]
     return subprocess.call(
         [sys.executable, "-m", "pytest", *selected, "-m", "not live_npu", *options], cwd=root)

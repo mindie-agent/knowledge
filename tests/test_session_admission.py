@@ -198,3 +198,245 @@ def test_concurrent_processes_share_one_activation_token(tmp_path):
         tokens.append(json.loads(out)["token"])
     assert tokens[0] == tokens[1]
     assert len(tokens[0]) == 64
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor barrier")
+@pytest.mark.parametrize("observer", ["writer", "reader"])
+def test_first_open_does_not_treat_a_created_lock_as_lost_authority(tmp_path, observer):
+    """A created-but-not-yet-locked .init.lock is not authority loss.
+
+    A opens/creates the real init lock, then pauses on an OS pipe at the exact
+    open-to-flock interval. B therefore observes the lock file as pre-existing
+    and acquires the kernel lock first while no database exists. B's real
+    post-flock barrier proves it owned the kernel lock; a second initializer
+    must create the store and share its token, while a read-only probe must
+    report an unused store, leave the DB absent, and write no history.
+    """
+    import json
+    import select
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    path = tmp_path / "admission.sqlite3"
+    lock_path = path.with_name(path.name + ".init.lock")
+    core_root = Path(__file__).resolve().parents[1]
+    starter = tmp_path / "starter.py"
+    starter.write_text(
+        "import json,os,sys\n"
+        f"sys.path.insert(0, {str(core_root)!r})\n"
+        "import mindie_knowledge.loop.locks as locks\n"
+        "from mindie_knowledge.loop.activation import Admission\n"
+        "real = locks._lock_file_nb\n"
+        "def between_open_and_flock(fd):\n"
+        "    os.write(int(sys.argv[2]), b'r')\n"
+        "    os.close(int(sys.argv[2]))\n"
+        "    if os.read(int(sys.argv[3]), 1) != b'g':\n"
+        "        raise SystemExit('barrier gate closed')\n"
+        "    os.close(int(sys.argv[3]))\n"
+        "    real(fd)\n"
+        "locks._lock_file_nb = between_open_and_flock\n"
+        "print(json.dumps(Admission(sys.argv[1]).activate("
+        "'shared', project_root=sys.argv[4])))\n"
+    )
+    second = tmp_path / "second.py"
+    second.write_text(
+        "import json,os,sys\n"
+        f"sys.path.insert(0, {str(core_root)!r})\n"
+        "import mindie_knowledge.loop.locks as locks\n"
+        "from mindie_knowledge.loop.activation import Admission\n"
+        "real = locks.StartLock.acquire\n"
+        "def after_acquire(self, **kw):\n"
+        "    real(self, **kw)\n"
+        "    if self.path.name.endswith('.init.lock'):\n"
+        "        os.write(int(sys.argv[3]), b'f')\n"
+        "        os.read(int(sys.argv[4]), 1)\n"
+        "locks.StartLock.acquire = after_acquire\n"
+        "gate = Admission(sys.argv[1])\n"
+        + ("result = gate.activate('shared', project_root=sys.argv[2])\n"
+           if observer == "writer" else
+           "result = gate.active_lease('shared')\n")
+        + "print(json.dumps(result))\n"
+    )
+    ready_read, ready_write = os.pipe()
+    gate_read, gate_write = os.pipe()
+    b_ready_r, b_ready_w = os.pipe()
+    b_gate_r, b_gate_w = os.pipe()
+    first = second_proc = None
+    try:
+        first = subprocess.Popen(
+            [sys.executable, str(starter), str(path), str(ready_write),
+             str(gate_read), str(project)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            pass_fds=(ready_write, gate_read),
+        )
+        os.close(ready_write)
+        ready_write = None
+        os.close(gate_read)
+        gate_read = None
+        readable, _, _ = select.select([ready_read], [], [], 20)
+        assert readable, "starter never reached the open-to-flock interval"
+        assert os.read(ready_read, 1) == b"r"
+        second_proc = subprocess.Popen(
+            [sys.executable, str(second), str(path), str(project),
+             str(b_ready_w), str(b_gate_r)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            pass_fds=(b_ready_w, b_gate_r),
+        )
+        os.close(b_ready_w)
+        b_ready_w = None
+        os.close(b_gate_r)
+        b_gate_r = None
+        readable, _, _ = select.select([b_ready_r], [], [], 20)
+        assert readable, "observer never reached its post-flock barrier"
+        assert os.read(b_ready_r, 1) == b"f"
+        from mindie_knowledge.loop.locks import lock_held
+        assert lock_held(lock_path) is True
+        assert not path.exists()
+        assert lock_path.stat().st_size == 0  # no pre-DB record for either
+        os.write(b_gate_w, b"g")
+        os.close(b_gate_w)
+        b_gate_w = None
+        out_b, err_b = second_proc.communicate(timeout=20)
+        assert second_proc.returncode == 0, err_b
+        if observer == "reader":
+            assert json.loads(out_b) is None
+            assert not path.exists()
+            assert lock_path.stat().st_size == 0
+        else:
+            assert path.exists()
+            assert lock_path.stat().st_size > 0
+        os.write(gate_write, b"g")
+        os.close(gate_write)
+        gate_write = None
+        out_a, err_a = first.communicate(timeout=20)
+        assert first.returncode == 0, err_a
+        token_a = json.loads(out_a)["token"]
+        assert len(token_a) == 64
+        if observer == "writer":
+            assert token_a == json.loads(out_b)["token"]
+        else:
+            assert Admission(path).active_lease("shared")["token"] == token_a
+    finally:
+        for process in (first, second_proc):
+            if process is not None and process.poll() is None:
+                process.kill()
+            if process is not None:
+                process.communicate(timeout=10)
+        for descriptor in (ready_read, ready_write, gate_read, gate_write,
+                           b_ready_r, b_ready_w, b_gate_r, b_gate_w):
+            if descriptor is not None:
+                os.close(descriptor)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX pipe/SIGKILL barrier")
+def test_pre_db_process_failure_leaves_never_used_store_retryable(tmp_path):
+    """A crash after real flock but before DB creation must not persist evidence.
+
+    The child is paused after the real kernel lock is acquired and before
+    sqlite3.connect. The parent verifies real lock ownership with lock_held,
+    SIGKILLs the child while no DB exists, and requires the next genuine
+    activation to succeed. It then deletes the initialized DB and requires the
+    preserved missing-authority failure.
+    """
+    import json
+    import select
+    import signal
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    path = tmp_path / "admission.sqlite3"
+    lock_path = path.with_name(path.name + ".init.lock")
+    core_root = Path(__file__).resolve().parents[1]
+    crash = tmp_path / "pre_db_crash.py"
+    crash.write_text(
+        "import os,sys\n"
+        f"sys.path.insert(0, {str(core_root)!r})\n"
+        "import mindie_knowledge.loop.locks as locks\n"
+        "from mindie_knowledge.loop.activation import Admission\n"
+        "real = locks.StartLock.acquire\n"
+        "def after_acquire(self, **kw):\n"
+        "    real(self, **kw)\n"
+        "    os.write(int(sys.argv[2]), b'a')\n"
+        "    os.close(int(sys.argv[2]))\n"
+        "    os.read(int(sys.argv[3]), 1)\n"
+        "    raise SystemExit('parent did not kill')\n"
+        "locks.StartLock.acquire = after_acquire\n"
+        "Admission(sys.argv[1]).activate('shared', project_root=sys.argv[4])\n"
+    )
+    ready_read, ready_write = os.pipe()
+    gate_read, gate_write = os.pipe()
+    child = None
+    try:
+        child = subprocess.Popen(
+            [sys.executable, str(crash), str(path), str(ready_write),
+             str(gate_read), str(project)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            pass_fds=(ready_write, gate_read),
+        )
+        os.close(ready_write)
+        ready_write = None
+        os.close(gate_read)
+        gate_read = None
+        readable, _, _ = select.select([ready_read], [], [], 20)
+        assert readable, "child never reached the post-flock barrier"
+        assert os.read(ready_read, 1) == b"a"
+        from mindie_knowledge.loop.locks import lock_held
+        assert lock_held(lock_path) is True
+        assert not path.exists()
+        assert lock_path.stat().st_size == 0
+        child.kill()
+        _, err = child.communicate(timeout=20)
+        assert child.returncode == -signal.SIGKILL, err
+        assert not path.exists()
+        assert lock_path.stat().st_size == 0
+
+        lease = Admission(path).activate("shared", project_root=str(project))
+        assert len(lease["token"]) == 64
+        assert path.exists()
+        assert lock_path.stat().st_size > 0
+
+        path.unlink()
+        with pytest.raises(AdmissionUnavailable, match="missing"):
+            Admission(path).activate("shared", project_root=str(project))
+        with pytest.raises(AdmissionUnavailable, match="missing"):
+            Admission(path).leases()
+        assert not path.exists()
+    finally:
+        if child is not None and child.poll() is None:
+            child.kill()
+        if child is not None:
+            child.communicate(timeout=10)
+        for descriptor in (ready_read, ready_write, gate_read, gate_write):
+            if descriptor is not None:
+                os.close(descriptor)
+
+
+def test_authority_record_write_failure_is_visible_and_repairable(tmp_path, monkeypatch):
+    """The record is authority evidence: its write failure is not swallowed."""
+    from mindie_knowledge.loop.locks import StartLock
+
+    path = tmp_path / "admission.sqlite3"
+    lock_path = path.with_name(path.name + ".init.lock")
+    project = tmp_path / "project"
+    project.mkdir()
+
+    def fail(_lock):
+        raise OSError("synthetic authority record failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(StartLock, "persist_record", fail)
+        with pytest.raises(AdmissionUnavailable, match="authority record failure"):
+            Admission(path).activate("shared", project_root=str(project))
+
+    assert path.is_file()  # the validated database was created, not deleted
+    assert lock_path.stat().st_size == 0  # no record was silently claimed
+    repaired = Admission(path).activate("shared", project_root=str(project))
+    assert len(repaired["token"]) == 64
+    assert lock_path.stat().st_size > 0
+    assert Admission(path).active_lease("shared")["token"] == repaired["token"]

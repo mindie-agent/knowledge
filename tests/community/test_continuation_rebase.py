@@ -19,7 +19,7 @@ from mindie_knowledge.materials import MaterialStore
 from mindie_knowledge.materials.publication import load_batch_payload
 from material_worker_fixture import package_body
 from package_fixture import write_package
-from .conftest import git
+from .conftest import REPO, git
 
 TASK = "b" * 64
 
@@ -37,7 +37,7 @@ def append_parts(store, *texts, navigation="Current synthetic observations."):
 
 
 def build(store):
-    return build_batch(store, settings=SimpleNamespace(generation="g1"))
+    return build_batch(store, settings=SimpleNamespace(generation="g1", repository=REPO, branch="main"))
 
 
 def mark(store, batch_id, receipt):

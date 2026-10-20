@@ -526,39 +526,3 @@ def test_deleted_entry_is_not_restored_by_a_pending_correction(settings, state_d
     result = submit_batch(batch, settings, state_dir, transport=transport)
     assert result['status'] == 'needs_review' and 'deleted' in result['detail']
     assert git(['ls-remote', remote_url, 'refs/heads/mindie-contrib/npu/batch-delete']).split()[0] == before
-
-
-def test_contract_mismatch_before_intent_or_remote_write_and_same_payload_recovers(
-    settings, state_dir, transport, remote_url, tmp_path,
-):
-    from mindie_knowledge.publication_contract import make_contract, render_contract
-    from mindie_knowledge.community.common import sha256_text
-    wanted = render_contract(make_contract('npu', 'b' * 40))
-    settings['publication_contract_sha256'] = sha256_text(wanted)
-    config = tmp_path / 'community.json'
-    data = json.loads(config.read_text())
-    data['publication_contract_sha256'] = settings['publication_contract_sha256']
-    config.write_text(json.dumps(data))
-    batch = make_batch('contract-recovery', [entry_file(make_entry())])
-    before = git(['ls-remote', remote_url])
-    receipt = submit_batch(batch, settings, state_dir, transport=transport)
-    assert receipt['status'] == 'unavailable' and receipt['error_code'] == 'contract_mismatch'
-    assert receipt['failed_stage'] == 'publication-contract'
-    assert receipt['external_write_attempted'] is False
-    ledger = Ledger(state_dir)
-    try:
-        assert ledger.get_publication(batch['batch_id'], batch['revision']) is None
-    finally:
-        ledger.close()
-    assert git(['ls-remote', remote_url]) == before
-    assert transport.list_open_pull_requests(settings['repository'], deadline=_deadline()) == []
-    work = tmp_path / 'repair-contract'
-    git(['clone', remote_url, str(work)])
-    (work / 'publication-contract.json').write_bytes(wanted.encode('utf-8'))
-    git(['add', '.'], cwd=work)
-    git(['-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid',
-         'commit', '-m', 'reviewed deployment combination'], cwd=work)
-    git(['push', 'origin', 'main'], cwd=work)
-    # Identical frozen payload, no explicit retry or new batch identity needed.
-    receipt = submit_batch(batch, settings, state_dir, transport=transport)
-    assert receipt['status'] == 'submitted', receipt

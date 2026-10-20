@@ -10,13 +10,11 @@ from mindie_knowledge.publication_check import validate
 from test_publication_check import git, publish, task_files
 
 
-def test_contract_digest_binds_bytes_and_validator_identity(tmp_path):
+def test_contract_validation_uses_current_declaration_not_a_byte_pin(tmp_path):
     raw = render_contract(make_contract('vllm-ascend', 'a' * 40))
     digest = hashlib.sha256(raw.encode()).hexdigest()
     repo, sha = publish(tmp_path, {'publication-contract.json': raw})
-    assert read_git_contract(repo, sha, 'vllm-ascend', expected_sha256=digest)['sha256'] == digest
-    with pytest.raises(ContractMismatch, match='selected product'):
-        read_git_contract(repo, sha, 'vllm-ascend', expected_sha256='b' * 64)
+    assert read_git_contract(repo, sha, 'vllm-ascend')['sha256'] == digest
     with pytest.raises(ContractMismatch, match='domain'):
         read_git_contract(repo, sha, 'npu')
     with pytest.raises(ContractMismatch, match='immutable'):
@@ -27,6 +25,14 @@ def test_contract_digest_binds_bytes_and_validator_identity(tmp_path):
     declaration['validator']['revision'] = 'main'
     with pytest.raises(ContractMismatch, match='exact reviewed'):
         parse_contract(json.dumps(declaration), 'vllm-ascend')
+
+    changed = render_contract(make_contract('vllm-ascend', 'b' * 40))
+    path = repo / 'publication-contract.json'
+    path.write_bytes(changed.encode('utf-8'))
+    git(repo, 'add', '.')
+    git(repo, 'commit', '-qm', 'new valid declaration')
+    updated = git(repo, 'rev-parse', 'HEAD')
+    assert read_git_contract(repo, updated, 'vllm-ascend')['contract']['validator']['revision'] == 'b' * 40
 
 
 @pytest.mark.parametrize('change', ['missing', 'executable', 'symlink', 'schema'])
@@ -70,7 +76,7 @@ def test_review_path_distinguishes_valid_development_from_content(tmp_path):
     assert checked['development_paths'] == ['AGENTS.md']
 
 
-def test_feed_contract_change_preserves_current_and_new_requirement_recovers(tmp_path):
+def test_feed_contract_change_at_new_commit_updates_without_a_pinned_digest(tmp_path):
     from test_mindie_feed import init_repo, commit_docs, entry_doc
     from mindie_knowledge.loop.feed import Feed
     from mindie_knowledge.loop.store import Store
@@ -79,21 +85,14 @@ def test_feed_contract_change_preserves_current_and_new_requirement_recovers(tmp
     store = Store(tmp_path / 'store', 'vllm-ascend')
     try:
         config = dict(repository='org/knowledge', ref='main', domain='vllm-ascend', url=str(repo))
-        original = render_contract(make_contract('vllm-ascend', 'a' * 40))
-        old_hash = hashlib.sha256(original.encode()).hexdigest()
         first = commit_docs(run, repo, [entry_doc('1' * 64, 'Original evidence')])
-        feed = Feed(store, {**config, 'contract_sha256': old_hash})
+        feed = Feed(store, config)
         assert feed.sync()['status'] == 'synced'
         changed = render_contract(make_contract('vllm-ascend', 'b' * 40))
         (repo / 'publication-contract.json').write_bytes(changed.encode('utf-8'))
         second = commit_docs(run, repo, [entry_doc('1' * 64, 'Later evidence')])
-        for force in (False, True):
-            receipt = feed.sync(force=force)
-            assert receipt['status'] == 'invalid' and receipt['error_code'] == 'contract_mismatch'
-            assert receipt['retained_commit'] == first and receipt['commit'] == second
-        assert store.query('Original evidence')['results']
-        updated = Feed(store, {**config, 'contract_sha256': hashlib.sha256(changed.encode()).hexdigest()})
-        assert updated.sync()['status'] == 'synced'
+        receipt = feed.sync()
+        assert receipt['status'] == 'synced' and receipt['commit'] == second
         assert store.query('Later evidence')['results']
     finally:
         store.close()

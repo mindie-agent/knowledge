@@ -292,6 +292,9 @@ def make_request(*, task_id, body_version, blocks, prior_navigation, identity):
 
 
 def validate_request(value):
+    if isinstance(value, dict) and value.get("schema_version") == "mindie-distill-request/1":
+        from ..graded.distill import validate_request as validate_distill_request
+        return validate_distill_request(value)
     if not isinstance(value, dict) or set(value) != {
         "schema", "task_id", "body_version", "batch_id", "blocks", "prior_navigation", "policy_identity", "input_digest"
     } or value.get("schema") != REQUEST_SCHEMA:
@@ -435,9 +438,17 @@ def outcome(request, *, status, result=None, raw_result=None, usage=None,
     if raw_result is not None and (not isinstance(raw_result, str) or len(raw_result.encode("utf-8")) > MAX_RESPONSE_BYTES):
         raise SummaryResultError("invalid pending output receipt")
     if status == "returned":
-        if model_calls != 1:
+        graded = request.get("body_version", "").startswith("distill:")
+        if model_calls != 1 and not (graded and model_calls == 0 and isinstance(result, dict) and result.get("action") == "noop"):
             raise SummaryResultError("returned batch must account for one invocation")
-        result = validate_result(result, [block["block_id"] for block in request["blocks"]])
+        if graded:
+            if not isinstance(result, dict) or result.get("schema_version") != "mindie-distill-decision/1":
+                raise SummaryResultError("returned C6 decision has the wrong schema")
+            if "sanitized_inputs" in request:
+                from ..graded.distill import validate_decision
+                result = validate_decision(result, request)
+        else:
+            result = validate_result(result, [block["block_id"] for block in request["blocks"]])
     elif result is not None:
         raise SummaryResultError("failure cannot contain successful indexes")
     return dict(schema=OUTCOME_SCHEMA, status=status, task_id=request["task_id"],

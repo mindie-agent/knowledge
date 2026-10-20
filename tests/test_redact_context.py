@@ -21,6 +21,25 @@ HEX64_A = "a" * 64
 HEX64_B = "b" * 64
 
 
+class PinnedSourceUrlEntropyTests(unittest.TestCase):
+    def test_reviewed_skill_and_gitcode_sources_keep_path_boundaries(self):
+        urls = (
+            'https://github.com/obra/superpowers/blob/b7a8f76985f1e93e75dd2f2a3b424dc731bd9d37/skills/requesting-code-review/SKILL.md#L8-L22',
+            'https://gitcode.com/Ascend/msprof-analyze/blob/639eb8702c1884813dfab59ddb371f7838caab6d/msprof_analyze/cluster_analyse/operator_mfu.py#L41-L170',
+        )
+        for url in urls:
+            self.assertNotIn('credential-high-entropy', rules_hit(url))
+            self.assertNotIn('credential-high-entropy', rules_hit('[source](' + url + ')'))
+
+    def test_source_url_does_not_hide_secret_segments_parameters_or_userinfo(self):
+        base = 'https://github.com/obra/superpowers/blob/' + 'b7a8f76985f1e93e75dd2f2a3b424dc731bd9d37/'
+        secret = 'SyntheticOnlySecretValue9876543210ABCxyz'
+        for value in (base + secret + '/SKILL.md', base + 'SKILL.md?token=' + secret,
+                      base.replace('https://', 'https://user:password@')):
+            self.assertTrue(any(rule.startswith('credential-') for rule in rules_hit(value)), value)
+        self.assertIn('credential-high-entropy', rules_hit(base.replace('/blob/', '/tree/') + 'SKILL.md'))
+
+
 class MindieRefUsernameAtHostTests(unittest.TestCase):
     def test_complete_tokens_are_not_username_at_host(self):
         tokens = (
@@ -146,6 +165,21 @@ class FindingOffsetsAndMaskTests(unittest.TestCase):
 
 
 class PackageVersionIpv4Tests(unittest.TestCase):
+    def test_observed_firmware_version_kept_address_still_masked(self):
+        # Captured by npu-smi during the independent five-stage A2 run.
+        version = "7.7.0.10.220"
+        address = synthetic_ipv4()
+        text = f"Firmware Version: {version}; peer {address}."
+        findings = [f for f in redact.scan_text(text) if f.rule == "ipv4-address"]
+        self.assertEqual([f.value for f in findings], [address])
+        masked, rules = public_redact(
+            text, executable=install_scanner(), key=b"synthetic-redaction-test-key"
+        )
+        self.assertIn(f"Firmware Version: {version};", masked)
+        self.assertNotIn(address, masked)
+        self.assertIn("ipv4-address", rules)
+        self.assertTrue(masked.endswith("."))
+
     def test_package_grammar_versions_survive(self):
         clean = (
             # Public pip-check shape: the four-part token is a version.

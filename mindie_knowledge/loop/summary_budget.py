@@ -25,6 +25,14 @@ def worker_timeout():
     return seconds
 
 
+def distill_rpc_timeout():
+    """Two scans and a worker, plus six SQLite busy windows and cleanup."""
+    from .transcript_redaction import _redaction_timeout
+
+    return (2 * _redaction_timeout() + IDENTITY_SECONDS + worker_timeout()
+            + 6 * 5 + CLEANUP_SECONDS)
+
+
 def native_timeout(max_seconds=300.0):
     deadline = os.environ.get(DEADLINE_ENV)
     remaining = (float(deadline) - time.monotonic()

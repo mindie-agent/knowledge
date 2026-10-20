@@ -21,7 +21,7 @@ from mindie_knowledge.loop.export import build_batch
 from mindie_knowledge.loop.feed import Feed
 from mindie_knowledge.loop.store import Store, digest
 from mindie_knowledge.materials.publication import load_batch_payload, staging_path
-from .conftest import commit_tree_file, git
+from .conftest import REPO, commit_tree_file, git
 
 TASK = "b" * 64
 
@@ -47,7 +47,7 @@ def mark(store, batch_id, receipt):
 
 
 def build(store):
-    return build_batch(store, settings=SimpleNamespace(generation="g1"))
+    return build_batch(store, settings=SimpleNamespace(generation="g1", repository=REPO, branch="main"))
 
 
 def merge(transport, settings, receipt):
@@ -205,8 +205,7 @@ def test_uncertain_revision_never_replaced_or_cleaned(tmp_path, status):
 
 @pytest.mark.parametrize("receipt_failure", [False, True])
 def test_replacement_cleanup_failure_does_not_block_or_repeat_new_send(tmp_path, monkeypatch, receipt_failure):
-    import threading
-    from mindie_knowledge.loop.operations import OperationOwner
+    from mindie_knowledge.loop.engine import Engine
     from mindie_knowledge.loop.publication_worker import PublicationWorker
     from mindie_knowledge.materials import publication
 
@@ -229,8 +228,10 @@ def test_replacement_cleanup_failure_does_not_block_or_repeat_new_send(tmp_path,
             return real_set(key, value)
         monkeypatch.setattr(store, "feed_set", fail_final_receipt)
         errors, sent = [], []
-        engine = SimpleNamespace(store=store, _settings=lambda: SimpleNamespace(generation="g1", allows_capture=lambda: True),
-                                 _error=errors.append, operations=OperationOwner(threading.Event()))
+        engine = Engine(store)
+        monkeypatch.setattr(engine, '_settings', lambda: SimpleNamespace(
+            generation="g1", repository=REPO, branch="main", allows_capture=lambda: True))
+        monkeypatch.setattr(engine, '_error', errors.append)
         worker = PublicationWorker(engine)
         monkeypatch.setattr(worker, 'submit', lambda row: sent.append(row["revision"]))
         worker.flush()

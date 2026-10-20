@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Source-side redaction ruleset for the knowledge corpus.
 
+[Role] Find private identifiers before knowledge capture or publication.
+[Invariants] Preserve non-address version tokens; mask complete address tokens.
+[Timeouts & Locks] Pure parsing has no subprocess, network, lock or wait.
+[Side-Effect Policy] Scanning returns findings without modifying source text.
+
 This module is the *single* declaration of the redaction ruleset. Its version
 is ``REDACTION_PROFILE`` and is what an exported entry records in
 ``provenance.redaction_profile``. Tightening any rule, adding a rule, or
@@ -104,6 +109,9 @@ from mindie_knowledge._common import (  # noqa: E402
 #: beyond a token still go through the same privacy rules. A relaxation; keep r3.
 #: r3: mask complete private-key blocks. Missing or mismatched END markers
 #: cover the supplied remainder, including blank lines and long fragments.
+#: r3 (correction): an IPv4 token cannot end inside a longer dotted number,
+#: such as the observed firmware version 7.7.0.10.220. Sentence-final periods
+#: remain valid address boundaries. A relaxation; keep r3.
 REDACTION_PROFILE = "r3"
 
 
@@ -137,6 +145,18 @@ _UUID = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
 )
 _TOKEN_CANDIDATE = re.compile(r"[A-Za-z0-9+/_=-]{32,}")
+_PINNED_SOURCE_URL = re.compile(
+    r"(?<![\w:/])https://(?:github\.com|gitcode\.com)/"
+    r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/blob/[0-9a-f]{40}/"
+    r"[A-Za-z0-9_./-]+(?:#L[1-9][0-9]*(?:-L[1-9][0-9]*)?)?"
+    r"(?=$|[\s\"'`<>)\],;])"
+)
+
+
+def _mixed_opaque_token(token: str) -> bool:
+    return (len(token) >= 32 and not _HEX.fullmatch(token) and not _UUID.fullmatch(token)
+            and any(c.isupper() for c in token) and any(c.islower() for c in token)
+            and any(c.isdigit() for c in token))
 
 
 def _high_entropy_tokens(text: str) -> Iterator[tuple[int, int]]:
@@ -146,14 +166,21 @@ def _high_entropy_tokens(text: str) -> Iterator[tuple[int, int]]:
     identifiable and are not credentials, so they are excluded; everything
     else that is >= 32 chars and mixes upper, lower and digits is reported.
     """
+    source_urls = [match.span() for match in _PINNED_SOURCE_URL.finditer(text)]
+    source_index = 0
     for m in _TOKEN_CANDIDATE.finditer(text):
         tok = m.group()
-        if _HEX.match(tok) or _UUID.match(tok):
-            continue
-        has_upper = any(c.isupper() for c in tok)
-        has_lower = any(c.islower() for c in tok)
-        has_digit = any(c.isdigit() for c in tok)
-        if has_upper and has_lower and has_digit:
+        while source_index < len(source_urls) and source_urls[source_index][1] <= m.start():
+            source_index += 1
+        if (source_index < len(source_urls) and source_urls[source_index][0] <= m.start()
+                and m.end() <= source_urls[source_index][1]):
+            # A commit and an uppercase filename separated by real URL path
+            # boundaries are not one opaque token. This is tokenization, not a
+            # host allowlist: every segment and every other rule still runs.
+            for segment in re.finditer(r"[^/]+", tok):
+                if _mixed_opaque_token(segment.group()):
+                    yield m.start() + segment.start(), m.start() + segment.end()
+        elif _mixed_opaque_token(tok):
             yield m.span()
 
 
@@ -173,7 +200,8 @@ _INTERNAL_TLDS = "local|localdomain|internal|intranet|lan|corp|home|priv|private
 
 # Standalone MindIE reference: mindie://<domain>/<id>@<revision>. Domain is the
 # same grammar as documents.DOMAIN_RE (duplicated here so the redactor does
-# not import loop/storage). Id and revision are 16- or 64-char lowercase hex.
+# not import loop/storage). Legacy IDs use hex; C5 uses units/unit-* and a
+# complete 64-character semantic content digest. Neither accepts suffixes.
 # Only a complete token with a strict opening delimiter-or-start and closing
 # delimiter-or-end is recognized. Permitted surroundings: whitespace, quotes,
 # backticks, Markdown-link parentheses, angle brackets. URI prefixes and any
@@ -184,8 +212,8 @@ _MINDIE_REF_TOKEN = re.compile(
     _MINDIE_REF_OPEN
     + r"mindie://"
     r"[a-z][a-z0-9-]{0,63}/"
-    r"(?:[a-f0-9]{16}|[a-f0-9]{64})@"
-    r"(?:[a-f0-9]{16}|[a-f0-9]{64})"
+    r"(?:(?:[a-f0-9]{16}|[a-f0-9]{64})@(?:[a-f0-9]{16}|[a-f0-9]{64})"
+    r"|units/unit-[a-z0-9]+(?:-[a-z0-9]+)*@[1-9][0-9]*)"
     + _MINDIE_REF_CLOSE
 )
 
@@ -284,7 +312,7 @@ def _username_at_host_spans(text: str) -> Iterator[tuple[int, int]]:
 _IPV4_PATTERN = re.compile(
     r"(?<![\w.])(?:" + _OCTET + r"\.){3}" + _OCTET +
     r"(?:\s*-\s*(?:(?:" + _OCTET + r"\.){0,3}" + _OCTET + r"))?"
-    r"(?:/\d{1,2})?(?![\w])"
+    r"(?:/\d{1,2})?(?![\w]|\.\d)"
 )
 
 # Strong software-version grammar in which a four-part dotted token is a
