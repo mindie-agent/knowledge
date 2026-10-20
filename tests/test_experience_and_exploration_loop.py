@@ -247,8 +247,8 @@ def test_stagnation_counts_information_not_infrastructure_and_deduplicates_runs(
 def test_exploration_context_strips_l3_and_only_mounts_valid_matching_refutations():
     units = [
         {"id": "unit-l1", "tier": "L1", "revision": 1, "body": "hard constraint"},
-        {"id": "unit-l2", "tier": "L2", "revision": 2, "body": "diagnostic steps"},
-        {"id": "unit-l3", "tier": "L3", "revision": 1, "body": "old recommendation"},
+        {"id": "unit-l2", "category": "sop", "revision": 2, "body": "diagnostic steps"},
+        {"id": "unit-l3", "category": "workflow", "revision": 1, "body": "old recommendation"},
         {"id": "unit-l4", "tier": "L4", "revision": 3, "body": "code transform"},
     ]
     ledger = [
@@ -441,11 +441,15 @@ def test_incomplete_related_body_cannot_overwrite_existing_branches(store, legac
     assert store.explain(ref(existing))["content"] == existing.body
 
 
-def test_negative_branch_folding_keeps_one_compacted_l3_unit():
+def test_negative_branch_folding_keeps_one_compacted_l3_unit(store, tmp_path, monkeypatch):
     existing = fixture_unit(
         "unit-k3-a5-pipeline-fusion", tier="L3", category="workflow",
         title="K3/A5 pipeline fusion triage",
         body=(
+            "## Active branches and rare conditions\n\n"
+            "Keep double-buffered UB ping-pong when burst_skew=19 on decode_tp=8.\n\n"
+            "Conditional counter-evidence: under dynamic_prefix_cache=true, disable static workspace reuse.\n\n"
+            "Superseded plan: legacy split-K workspace layout was replaced by persistent tile staging.\n\n"
             "## Negative pipeline attempts\n\n"
             "PV2 on the K3 A5 decode path: the isolated PV2 schedule removed the staging copy, "
             "but the paired full-pipeline run regressed because the producer still materialized "
@@ -457,40 +461,70 @@ def test_negative_branch_folding_keeps_one_compacted_l3_unit():
             "gain; the branch was rejected.\n"
         ),
     )
-    compact = (
-        "## Verified exclusion branches\n\n"
-        "| Branch | Conditions | Physical reason | Paired data |\n"
-        "| --- | --- | --- | --- |\n"
-        "| PV2 | K3/A5 decode, batch 1 | Producer and consumer still round-trip through GM | "
-        "Local cycles fell while the paired run regressed |\n"
-        "| Score2 | K3/A5 decode, batch 1 | Shorter score tile leaves the fused region unchanged | "
-        "Critical path and GM traffic stayed flat |\n"
-        "| vmula | K3/A5 decode, batch 1 | A collective barrier splits the fused region | "
-        "Added synchronization erased the local gain |\n"
+    store.graded.install([existing])
+    calls = tmp_path / "c6_calls.txt"
+    monkeypatch.setenv("MINDIE_GRADED_FIXTURE_CALLS", str(calls))
+    monkeypatch.setenv(
+        "MINDIE_GRADED_FIXTURE_SOURCE_TYPE",
+        existing.metadata["provenance"]["source_type"],
     )
-    metadata = {key: value for key, value in existing.metadata.items() if key != "revision"}
-    decision = {
-        "schema_version": "mindie-distill-decision/1", "session_digest": "d" * 64,
-        "evidence_inputs": ["authorized_transcript"],
-        "action": "propose_graded_units", "drop_reason": None,
-        "units": [{"target_unit_id": existing.id, "target_tier": metadata["tier"],
-                   "category": metadata["category"],
-                   "evidence_strength": metadata["evidence_strength"],
-                   "domain_path": metadata["domain_path"],
-                   "operation": "merge_into_existing", "frontmatter": deepcopy(metadata),
-                   "markdown_body": compact}],
+    monkeypatch.setenv(
+        "MINDIE_GRADED_FIXTURE_STRENGTH",
+        existing.metadata["evidence_strength"],
+    )
+    monkeypatch.setenv(
+        "MINDIE_GRADED_FIXTURE_DOMAIN_PATH",
+        existing.metadata["domain_path"],
+    )
+    engine = Engine(
+        store,
+        redactor_executable=scanner(),
+        summary_command=[sys.executable, str(Path(__file__).parent / "fixtures/graded_worker.py")],
+    )
+    new_evidence = {
+        "kind": "authorized_transcript",
+        "outcome": "verified",
+        "source_locator": existing.metadata["provenance"]["source_locator"],
+        "content": (
+            "## Active branches and rare conditions\n\n"
+            "Keep double-buffered UB ping-pong when burst_skew=19 on decode_tp=8.\n\n"
+            "New verified branch: enable fused QKV epilogue when head_dim=128 and seq_len>=2048.\n\n"
+            "PipeV3 on the K3 A5 decode path: async cube-vector prefetch overlapped MTE2, "
+            "but L0C accumulator contention stalled the consumer; the branch was rejected.\n"
+        ),
+        "evidence_refs": ["run-k3-a5-pipev3"],
+        "repetitions": 2,
     }
-
-    plan = prepare_decision(decision, RoutingIndex([existing]))
-
-    assert plan.status == "proposed"
-    assert len(plan.writes) == 1 and plan.writes[0]["unit_id"] == existing.id
-    assert all(name in plan.writes[0]["markdown_body"] for name in ("PV2", "Score2", "vmula"))
-    assert plan.anti_bloat["active_unit_delta"] == 0
-    assert plan.anti_bloat["net_bytes_delta"] < 0
-    assert plan.anti_bloat["max_unit_body_bytes"] == len(
-        plan.writes[0]["markdown_body"].encode("utf-8"))
-    assert plan.anti_bloat["compacted_within_budget"] is True
+    result = engine.distill_selected(
+        [new_evidence],
+        session_digest="d" * 64,
+        task_state="completed",
+        related_refs=[existing.id],
+    )
+    assert result["status"] == "applied"
+    assert result["admitted_unit_ids"] == [existing.id]
+    assert calls.read_text() == "1"
+    plan = result["publication_plan"]
+    assert plan["status"] == "proposed"
+    assert len(plan["writes"]) == 1 and plan["writes"][0]["unit_id"] == existing.id
+    revised_body = plan["writes"][0]["markdown_body"]
+    assert "## Verified exclusion branches" in revised_body
+    assert "## Negative pipeline attempts" not in revised_body
+    assert all(name in revised_body for name in ("PV2", "Score2", "vmula", "PipeV3"))
+    assert "burst_skew=19" in revised_body
+    assert "Conditional counter-evidence: under dynamic_prefix_cache=true" in revised_body
+    assert "Superseded plan: legacy split-K workspace layout" in revised_body
+    assert "New verified branch: enable fused QKV epilogue" in revised_body
+    assert plan["anti_bloat"]["active_unit_delta"] == 0
+    assert plan["anti_bloat"]["net_bytes_delta"] < 0
+    assert plan["anti_bloat"]["max_unit_body_bytes"] == len(revised_body.encode("utf-8"))
+    assert plan["anti_bloat"]["compacted_within_budget"] is True
+    assert plan["anti_bloat"]["conditions_retained"] is True
+    assert plan["anti_bloat"]["evidence_refs_retained"] is True
+    assert plan["anti_bloat"]["triggers_retained"] is True
+    explained = store.explain(ref(existing, 2))
+    assert explained["revision"] == 2
+    assert explained["content"] == revised_body
 
 
 def test_bloated_unit_body_is_rejected_before_admission(store):

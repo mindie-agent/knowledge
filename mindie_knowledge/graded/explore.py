@@ -20,6 +20,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from .conditions import match_conditions
+from .units import CATEGORY_TO_TIER
 
 CONTEXT_SCHEMA = "mindie-exploration-context/1"
 EVALUATION_SCHEMA = "mindie-exploration-evaluation/1"
@@ -98,7 +99,7 @@ def assess_stagnation(attempts: Sequence[Mapping[str, Any]], *,
 
 
 def _compact_unit(unit: dict) -> dict | None:
-    tier = unit.get("tier")
+    tier = unit.get("tier") or CATEGORY_TO_TIER.get(unit.get("category"))
     if tier == "L3":
         return None
     if tier not in {"L1", "L2", "L4"}:
@@ -124,7 +125,8 @@ def build_exploration_context(*, goal: str, retrieved_units: Sequence[Mapping[st
     mounted, stripped, ledger_refs, avoid = [], [], [], []
     for index, raw in enumerate(retrieved_units or ()):
         unit = _mapping(raw, f"retrieved_units[{index}]")
-        if unit.get("tier") == "L3":
+        effective_tier = unit.get("tier") or CATEGORY_TO_TIER.get(unit.get("category"))
+        if effective_tier == "L3":
             ident = unit.get("id")
             if not isinstance(ident, str) or not ident:
                 raise ValueError("retrieved L3 unit requires a stable id")

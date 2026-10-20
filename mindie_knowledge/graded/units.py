@@ -21,6 +21,7 @@ SCHEMA = "mindie-graded-unit/1"
 UNIT_ID = re.compile(r"unit-[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 SHA256 = re.compile(r"[a-f0-9]{64}\Z")
 TIER_CATEGORIES = {"L1": {"axiom", "measurement"}, "L2": {"sop"}, "L3": {"workflow"}, "L4": {"mutator"}}
+CATEGORY_TO_TIER = {category: tier for tier, categories in TIER_CATEGORIES.items() for category in categories}
 STRENGTHS = {"hardware_spec", "software_contract", "reproduced_empirical", "single_observation", "hypothesis"}
 STATUSES = {"active", "suspect", "archived", "superseded"}
 
@@ -136,6 +137,10 @@ class GradedUnit:
         return self.metadata["revision"]
 
     @property
+    def category(self) -> str:
+        return self.metadata["category"]
+
+    @property
     def status(self) -> str:
         return self.metadata.get("status", "active")
 
@@ -153,6 +158,9 @@ class GradedUnit:
         if not isinstance(metadata.get("id"), str) or not UNIT_ID.fullmatch(metadata["id"]):
             raise ValueError("stable id must use unit- followed by lowercase words")
         tier, category = metadata.get("tier"), metadata.get("category")
+        if tier is None and isinstance(category, str) and category in CATEGORY_TO_TIER:
+            tier = CATEGORY_TO_TIER[category]
+            metadata["tier"] = tier
         if category not in TIER_CATEGORIES.get(tier, set()):
             raise ValueError("tier/category do not describe the same use")
         strength = metadata.get("evidence_strength")

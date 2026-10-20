@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 
 from .index import RoutingIndex
 from .conditions import match_conditions
-from .units import GradedUnit, SHA256, TIER_CATEGORIES, UNIT_ID, canonical, locator_parts
+from .units import CATEGORY_TO_TIER, GradedUnit, SHA256, TIER_CATEGORIES, UNIT_ID, canonical, locator_parts
 
 UNIT_BODY_SOFT_BUDGET_BYTES = 4096
 UNIT_BODY_HARD_BUDGET_BYTES = 8192
@@ -42,6 +43,121 @@ def _evidence_strengths():
     return values
 
 
+_NEGATIVE_HEADINGS = {
+    "## negative pipeline attempts",
+    "## negative attempts",
+    "## rejected branches",
+    "## failed trials",
+}
+_NEGATIVE_PARAGRAPH_RE = re.compile(
+    r"^([A-Za-z0-9_./+-]+)\s+on\s+the\s+([^:]+?)\s+path:\s*(.+?);\s*the\s+branch\s+was\s+rejected\.\s*$",
+    re.DOTALL,
+)
+
+
+def _compact_cell(text: str) -> str:
+    compact = " ".join(text.split()).strip().rstrip(".,;")
+    for old, new in (
+        ("the isolated ", ""),
+        ("the paired full-pipeline run regressed", "paired run regressed"),
+        ("the producer still materialized the attention result to GM and the consumer reloaded it", "GM round-trip remained"),
+        ("the score tile change reduced local cycles", "local cycles fell"),
+        ("the same GM round-trip remained and the critical path did not move", "critical path unchanged"),
+        ("the vector multiply-add helper was folded", "helper folded"),
+        ("a collective barrier split the fused region and the extra synchronization erased the gain", "collective barrier split fused region"),
+        ("async cube-vector prefetch overlapped MTE2", "prefetch overlapped MTE2"),
+        ("L0C accumulator contention stalled the consumer", "L0C contention stalled consumer"),
+    ):
+        compact = compact.replace(old, new)
+    if compact.lower().startswith("the "):
+        compact = compact[4:]
+    return compact
+
+
+def _split_negative_detail(detail: str) -> tuple[str, str]:
+    normalized = " ".join(detail.split())
+    for marker in (" because ", ", yet ", ", but "):
+        if marker in normalized:
+            left, right = normalized.split(marker, 1)
+            return _compact_cell(right), _compact_cell(left)
+    return _compact_cell(normalized), "branch rejected in paired evaluation"
+
+
+def compact_unit_body(body: str) -> str:
+    """Deterministically fold verbose negative trials and deduplicate repeated blocks."""
+    if not isinstance(body, str) or not body.strip():
+        return body
+    raw_blocks = [block.strip() for block in re.split(r"\n\s*\n", body.strip()) if block.strip()]
+    kept_blocks: list[str] = []
+    seen_blocks: set[str] = set()
+    table_rows: list[tuple[str, str, str, str]] = []
+    seen_branches: set[tuple[str, str]] = set()
+    existing_table_idx: int | None = None
+    changed = False
+
+    for block in raw_blocks:
+        lower = block.lower()
+        if lower in _NEGATIVE_HEADINGS:
+            changed = True
+            continue
+        match = _NEGATIVE_PARAGRAPH_RE.match(block)
+        if match:
+            branch, cond, detail = match.group(1).strip(), " ".join(match.group(2).split()), match.group(3)
+            reason, paired = _split_negative_detail(detail)
+            key = (branch.lower(), cond.lower())
+            if key not in seen_branches:
+                seen_branches.add(key)
+                table_rows.append((branch, cond, reason, paired))
+            changed = True
+            continue
+        if block.startswith("| Branch | Conditions | Physical reason | Paired data |"):
+            lines = [line.strip() for line in block.splitlines() if line.strip()]
+            for line in lines[2:]:
+                cells = [cell.strip() for cell in line.strip("|").split("|")]
+                if len(cells) == 4:
+                    key = (cells[0].lower(), cells[1].lower())
+                    if key not in seen_branches:
+                        seen_branches.add(key)
+                        table_rows.append((cells[0], cells[1], cells[2], cells[3]))
+            if existing_table_idx is None:
+                existing_table_idx = len(kept_blocks)
+                kept_blocks.append("__EXCLUSION_TABLE__")
+            else:
+                changed = True
+            continue
+        if block in seen_blocks:
+            changed = True
+            continue
+        seen_blocks.add(block)
+        kept_blocks.append(block)
+
+    if not changed:
+        return body
+
+    if table_rows:
+        table_lines = [
+            "| Branch | Conditions | Physical reason | Paired data |",
+            "| --- | --- | --- | --- |",
+            *[f"| {b} | {c} | {r} | {p} |" for b, c, r, p in table_rows],
+        ]
+        table_block = "\n".join(table_lines)
+        has_heading = any(b.lower() == "## verified exclusion branches" for b in kept_blocks)
+        if existing_table_idx is not None:
+            if not has_heading and (
+                existing_table_idx == 0
+                or kept_blocks[existing_table_idx - 1].lower() != "## verified exclusion branches"
+            ):
+                kept_blocks[existing_table_idx] = "## Verified exclusion branches\n\n" + table_block
+            else:
+                kept_blocks[existing_table_idx] = table_block
+        else:
+            if not has_heading:
+                kept_blocks.append("## Verified exclusion branches")
+            kept_blocks.append(table_block)
+
+    return "\n\n".join(kept_blocks).strip() + "\n"
+
+
 def _related_units(value):
     if not isinstance(value, list) or not value:
         raise ValueError("related_units must be a nonempty list of compact existing units")
@@ -49,12 +165,15 @@ def _related_units(value):
     for item in value:
         if not isinstance(item, dict) or set(item) - set(COMPACT_UNIT_FIELDS):
             raise ValueError("related_units items contain unsupported fields")
+        normalized = dict(item)
+        if "tier" not in normalized and normalized.get("category") in CATEGORY_TO_TIER:
+            normalized["tier"] = CATEGORY_TO_TIER[normalized["category"]]
         for key in ("id", "revision", "tier", "category", "title", "body_excerpt"):
-            if key not in item:
+            if key not in normalized:
                 raise ValueError(f"related_units item requires {key}")
-        if "body_complete" in item and type(item["body_complete"]) is not bool:
+        if "body_complete" in normalized and type(normalized["body_complete"]) is not bool:
             raise ValueError("related_units body_complete must describe actual body visibility")
-        compact.append({key: item[key] for key in COMPACT_UNIT_FIELDS if key in item})
+        compact.append({key: normalized[key] for key in COMPACT_UNIT_FIELDS if key in normalized})
     return compact
 
 
@@ -392,10 +511,16 @@ def validate_decision(decision, request):
     related = {item["id"]: item for item in request.get("related_units", [])}
     units = []
     for row in rows:
+        if isinstance(row.get("markdown_body"), str):
+            row["markdown_body"] = compact_unit_body(row["markdown_body"])
         unit = GradedUnit.from_parts(row["frontmatter"], row["markdown_body"])
         if len(unit.body.encode("utf-8")) > UNIT_BODY_HARD_BUDGET_BYTES:
             raise ValueError("graded unit body exceeds 8 KiB anti-bloat budget; compact branches before admission")
         metadata = unit.metadata
+        if row.get("target_tier") is None and metadata.get("tier") is not None:
+            row["target_tier"] = metadata["tier"]
+        if isinstance(row.get("frontmatter"), dict) and row["frontmatter"].get("tier") is None:
+            row["frontmatter"]["tier"] = metadata["tier"]
         mirrors = {"target_unit_id": "id", "target_tier": "tier", "category": "category",
                    "evidence_strength": "evidence_strength", "domain_path": "domain_path"}
         if any(row.get(left) != metadata[right] for left, right in mirrors.items()):

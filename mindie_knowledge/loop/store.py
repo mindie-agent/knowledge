@@ -1198,7 +1198,7 @@ class Store:
     # ---------------------------------------------------------------- search
 
     def query(self, query=None, limit=5, conditions=None, continuation=None,
-              domain_path=None, token_budget=800, include_unknown=False,
+              domain_path=None, token_budget=1200, include_unknown=False,
               include_archived=False, navigation_only=False, run_id=None):
         if continuation is not None or not self.graded.available():
             return self._query_materials(query, limit, conditions, continuation)

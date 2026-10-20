@@ -32,9 +32,9 @@ import re
 from typing import Any
 
 from ..redact import REDACTION_PROFILE, scan_text
-from .distill import UNIT_BODY_HARD_BUDGET_BYTES
+from .distill import UNIT_BODY_HARD_BUDGET_BYTES, compact_unit_body
 from .index import RoutingIndex
-from .units import GradedUnit, UNIT_ID, canonical
+from .units import CATEGORY_TO_TIER, GradedUnit, UNIT_ID, canonical
 
 DECISION_SCHEMA = "mindie-distill-decision/1"
 PROPOSAL_SCHEMA = "mindie-graded-publication-proposal/1"
@@ -186,6 +186,10 @@ def _markdown_body(entry: dict) -> str:
 
 
 def _mirror(entry: dict, frontmatter: dict) -> None:
+    if frontmatter.get("tier") is None and frontmatter.get("category") in CATEGORY_TO_TIER:
+        frontmatter["tier"] = CATEGORY_TO_TIER[frontmatter["category"]]
+    if entry.get("target_tier") is None and entry.get("category") in CATEGORY_TO_TIER:
+        entry["target_tier"] = CATEGORY_TO_TIER[entry["category"]]
     for decision_field, metadata_field in (
         ("target_tier", "tier"),
         ("category", "category"),
@@ -206,7 +210,8 @@ def _mirror(entry: dict, frontmatter: dict) -> None:
 
 def _parse_unit(entry: dict, path: str) -> GradedUnit:
     try:
-        unit = GradedUnit.from_parts(_frontmatter(entry), _markdown_body(entry), path)
+        compacted_body = compact_unit_body(_markdown_body(entry))
+        unit = GradedUnit.from_parts(_frontmatter(entry), compacted_body, path)
     except (TypeError, ValueError) as exc:
         # C5 messages describe structural expectations and never echo a value.
         reason = str(exc)
@@ -309,20 +314,41 @@ def _anti_bloat_summary(index: RoutingIndex, candidate_units: dict) -> dict:
 
     The 4 KiB target guides rewriting, while the 8 KiB hard budget gates
     admission in ``distill.validate_decision``. This summary exposes both the
-    active-unit and body-byte movement so a caller can see whether folding
-    negative branches actually compacted the corpus.
+    active-unit and body-byte movement as well as semantic retention across
+    in-place revisions so callers can verify that compaction preserved
+    conditions, evidence references, and trigger signatures.
     """
     before = list(index.units.values())
     after = list(candidate_units.values())
     before_bytes = [len(unit.body.encode("utf-8")) for unit in before]
     after_bytes = [len(unit.body.encode("utf-8")) for unit in after]
     max_body = max(after_bytes, default=0)
+    shared_ids = set(index.units) & set(candidate_units)
+    conditions_retained = all(
+        _same_conditions(index.units[uid].metadata["conditions"], candidate_units[uid].metadata["conditions"])
+        for uid in shared_ids
+    )
+    evidence_refs_retained = all(
+        set(index.units[uid].metadata["provenance"].get("evidence_refs", []))
+        <= set(candidate_units[uid].metadata["provenance"].get("evidence_refs", []))
+        for uid in shared_ids
+    )
+    triggers_retained = all(
+        set(index.units[uid].metadata["triggers"].get("keywords", []))
+        <= set(candidate_units[uid].metadata["triggers"].get("keywords", []))
+        and set(index.units[uid].metadata["triggers"].get("error_signatures", []))
+        <= set(candidate_units[uid].metadata["triggers"].get("error_signatures", []))
+        for uid in shared_ids
+    )
     return {
         "active_unit_delta": (sum(unit.status == "active" for unit in after)
                               - sum(unit.status == "active" for unit in before)),
         "net_bytes_delta": sum(after_bytes) - sum(before_bytes),
         "max_unit_body_bytes": max_body,
         "compacted_within_budget": max_body <= UNIT_BODY_HARD_BUDGET_BYTES,
+        "conditions_retained": conditions_retained,
+        "evidence_refs_retained": evidence_refs_retained,
+        "triggers_retained": triggers_retained,
     }
 
 
