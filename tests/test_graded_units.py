@@ -6,7 +6,13 @@ import pytest
 
 from graded_fixture import CONDITIONS, OBSERVED, decision, request, unit
 from mindie_knowledge.graded.conditions import match_conditions
-from mindie_knowledge.graded.distill import _sha, decision_schema, noop_decision, validate_decision
+from mindie_knowledge.graded.distill import (
+    _sha,
+    decision_schema,
+    noop_decision,
+    validate_decision,
+    value_gate,
+)
 from mindie_knowledge.graded.index import RoutingIndex
 from mindie_knowledge.graded.units import GradedUnit
 
@@ -193,8 +199,9 @@ def test_foundation_is_omitted_as_a_whole_when_its_premise_cannot_fit():
     assert result["excluded_budget"] == [premise.id]
 
 
-def test_in_flight_is_incomplete_but_failures_can_support_scoped_observations():
+def test_in_flight_observed_only_is_incomplete_but_failures_can_support_scoped_observations():
     req = request(state="in_flight")
+    assert value_gate(req) == "in_flight_incomplete"
     assert validate_decision(noop_decision(req), req)["action"] == "noop"
     with pytest.raises(ValueError, match="requires noop"):
         validate_decision(decision(req), req)
@@ -206,6 +213,16 @@ def test_in_flight_is_incomplete_but_failures_can_support_scoped_observations():
         proposed["units"][0]["frontmatter"]["evidence_strength"] = "reproduced_empirical"
         with pytest.raises(ValueError, match="repeated verified"):
             validate_decision(proposed, req)
+
+
+def test_in_flight_short_verified_referenced_milestone_is_eligible():
+    # Regression: this short referenced finding was rejected unless unrelated
+    # pending progress was appended to the request.
+    req = request(state="in_flight", outcome="verified")
+    item = req["sanitized_inputs"][0]
+    assert len(item["content"].encode()) < 120 and item["evidence_refs"]
+    assert value_gate(req) is None
+    assert validate_decision(decision(req), req)["action"] == "propose_graded_units"
 
 
 def test_model_cannot_invent_source_locator_digest_or_evidence_refs():
