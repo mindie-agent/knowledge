@@ -35,11 +35,11 @@ APPLY_SCHEMA = "mindie-shard-apply-report/1"
 APPLY_PLAN_SCHEMA = "mindie-shard-apply-plan/1"
 
 LEAF_MAX_UNITS = 25
-LEAF_MAX_TOKENS = 3500
+LEAF_MAX_TOKENS = 25000
 LEAF_MAX_BYTES = 1_500_000
-SUBTREE_MAX_UNITS = 60
+SUBTREE_MAX_UNITS = 120
 SUBTREE_MAX_BYTES = 5_000_000
-FEDERATION_MAX_UNITS = 1200
+FEDERATION_MAX_UNITS = 5000
 FEDERATION_MAX_BYTES = 50_000_000
 FACTOR_MIN_OCCURRENCE = 0.40
 SEMANTIC_MIN_JACCARD = 0.35
@@ -243,7 +243,8 @@ def _groups(units: Iterable[GradedUnit]) -> tuple[dict, dict, dict, dict]:
         parent = PurePosixPath(_unit_path(unit)).parent
         parts = [] if parent.as_posix() in {"", "."} else [part for part in parent.parts if part not in {"", "."}]
         leaves["/".join(parts) if parts else "."].add(unit.id)
-        subtrees["/".join(parts[:2]) if parts else "."].add(unit.id)
+        subtree_parts = parts[:-1] if len(parts) >= 3 else parts[:2]
+        subtrees["/".join(subtree_parts) if subtree_parts else "."].add(unit.id)
         federations[parts[0] if parts else "."].add(unit.id)
     return metrics, leaves, subtrees, federations
 

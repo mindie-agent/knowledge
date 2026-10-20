@@ -377,13 +377,13 @@ def test_shard_plan_reports_threshold_candidates_without_applying_them() -> None
         for index in range(26)
     ]
     token_heavy = [
-        _unit("domain/branch/heavy/unit-heavy-a.md", ident="unit-heavy-a", body="a" * 8000 + "\n"),
-        _unit("domain/branch/heavy/unit-heavy-b.md", ident="unit-heavy-b", body="b" * 8000 + "\n"),
+        _unit("domain/branch/heavy/unit-heavy-a.md", ident="unit-heavy-a", body="a" * 52000 + "\n"),
+        _unit("domain/branch/heavy/unit-heavy-b.md", ident="unit-heavy-b", body="b" * 52000 + "\n"),
     ]
     many_subtree_units = [
-        _unit(f"domain/branch/more/unit-{index:02d}.md", ident=f"unit-{index:02d}",
+        _unit(f"domain/branch/more/unit-{index:03d}.md", ident=f"unit-{index:03d}",
               body=f"Another rule number {index}.\n")
-        for index in range(26, 61)
+        for index in range(26, 125)
     ]
 
     plan = shard_plan(many_leaf_units + token_heavy + many_subtree_units)
@@ -394,31 +394,44 @@ def test_shard_plan_reports_threshold_candidates_without_applying_them() -> None
     leaves = {candidate["path"]: candidate for candidate in plan["candidates"] if candidate["kind"] == "leaf"}
     assert leaves["domain/branch/leaf"]["units"] == 26
     assert "units" in leaves["domain/branch/leaf"]["exceeds"]
-    assert leaves["domain/branch/heavy"]["estimated_tokens"] > 3500
+    assert leaves["domain/branch/heavy"]["estimated_tokens"] > 25000
     assert "estimated_tokens" in leaves["domain/branch/heavy"]["exceeds"]
     subtrees = {
         candidate["path"]: candidate
         for candidate in plan["candidates"]
         if candidate["kind"] == "subtree"
     }
-    assert subtrees["domain/branch"]["units"] == 63
+    assert subtrees["domain/branch"]["units"] == 127
     assert all(candidate["automatic"] is False for candidate in plan["candidates"])
+
+
+def test_deep_hierarchical_subdivision_partitions_subtrees_cleanly() -> None:
+    units = [
+        _unit(f"operators/ascendc/optimizations/branch-{branch}/leaf-{leaf}/unit-{branch}-{leaf}-{idx}.md",
+              ident=f"unit-{branch}-{leaf}-{idx}",
+              body=f"Rule {branch} {leaf} {idx}.\n")
+        for branch in range(3)
+        for leaf in range(3)
+        for idx in range(10)
+    ]
+    plan = shard_plan(units)
+    assert plan["candidates"] == []
 
 
 def test_federation_candidate_covers_the_corpus_boundary() -> None:
     units = [
         _unit(f"domain/leaf/unit-{index:04d}.md", ident=f"unit-{index:04d}",
               body=f"Federation rule {index}.\n")
-        for index in range(1201)
+        for index in range(5001)
     ]
 
     plan = shard_plan(units)
     federation = {candidate["path"]: candidate for candidate in plan["candidates"]
                   if candidate["kind"] == "federation"}
 
-    assert federation["."]["units"] == 1201
+    assert federation["."]["units"] == 5001
     assert "units" in federation["."]["exceeds"]
-    assert federation["domain"]["units"] == 1201
+    assert federation["domain"]["units"] == 5001
     assert federation["."]["automatic"] is False
     assert plan["automatic_splits"] is False
 
