@@ -17,7 +17,7 @@ import time
 
 from ..markdown import _atomic_write_bytes
 from ..materials.references import ReadReferenceError
-from .index import RoutingIndex
+from .index import RoutingIndex, _ref_parts
 from .units import GradedUnit, canonical
 
 CATALOG_KEY = "graded:current"
@@ -344,27 +344,63 @@ class GradedRepository:
                     parent["ref"] = self.ref(parent["id"], parent["revision"])
                     parent["feedback_ref"] = parent["ref"]
                     observe(self.store, index.units[parent["id"]])
+            for card in [*result.get("cards", []), *result.get("foundation_cards", [])]:
+                card["ref"] = self.ref(card["id"], card["revision"])
+                card["unit_ref"] = self.ref(card["id"])
+                card["feedback_ref"] = card["ref"]
         return {"domain": self.store.domain, "retrieval": "graded-bm25", "page": "graded_units", **result}
 
-    def explain(self, ref):
-        prefix = f"mindie://{self.store.domain}/units/"
-        if not isinstance(ref, str) or not ref.startswith(prefix):
-            raise ReadReferenceError("outside_domain", "The graded reference is outside the selected domain.")
-        ident, _, revision_text = ref[len(prefix):].partition("@")
-        revision = int(revision_text) if revision_text else None
+    def _legacy_view(self, index, ident):
+        unit = index.units[ident]
+        return {"kind": "graded_unit", "feedback_ref": self.ref(ident, unit.revision),
+                "feedback": self._feedback(unit), "domain": self.store.domain,
+                "ref": self.ref(ident, unit.revision), "unit_ref": self.ref(ident), "id": ident,
+                "revision": unit.revision,
+                "frontmatter": unit.metadata, "content": unit.body,
+                "inherits_from_closure": index.closure[ident],
+                "status": unit.status, "superseded_by": unit.superseded_by,
+                "note": "Reading a reference does not establish applicability; compare its conditions with observed task facts."}
+
+    def explain(self, ref=None, *, refs=None, conditions=None, known_refs=None, token_budget=4096):
+        # Single-ref reads keep their historical contract and errors. Batch or
+        # condition-aware reads use the closure assembler instead.
+        if isinstance(ref, str) and refs is None and conditions is None and known_refs is None:
+            prefix = f"mindie://{self.store.domain}/units/"
+            if not ref.startswith(prefix):
+                raise ReadReferenceError("outside_domain", "The graded reference is outside the selected domain.")
+            ident, _, revision_text = ref[len(prefix):].partition("@")
+            revision = int(revision_text) if revision_text else None
+            with self.store.lock:
+                index = self._load()
+                unit = index.units.get(ident)
+                if unit is None:
+                    raise ReadReferenceError("removed_or_superseded", "The graded unit is absent from the current collection.")
+                if revision is not None and revision != unit.revision:
+                    raise ReadReferenceError("removed_or_superseded", "The observed graded revision was replaced; no other bytes were substituted.")
+                from .feedback import observe
+                observe(self.store, unit)
+                return self._legacy_view(index, ident)
+        requested = [] if refs is None else (list(refs) if not isinstance(refs, str) else [refs])
+        if ref is not None and ref not in requested:
+            requested.insert(0, ref)
         with self.store.lock:
             index = self._load()
-            unit = index.units.get(ident)
-            if unit is None:
-                raise ReadReferenceError("removed_or_superseded", "The graded unit is absent from the current collection.")
-            if revision is not None and revision != unit.revision:
-                raise ReadReferenceError("removed_or_superseded", "The observed graded revision was replaced; no other bytes were substituted.")
+            result = index.explain_closure(requested, conditions=conditions, known_refs=known_refs,
+                                           domain=self.store.domain, token_budget=token_budget)
             from .feedback import observe
-            observe(self.store, unit)
-            return {"kind": "graded_unit", "feedback_ref": self.ref(ident, unit.revision),
-                    "feedback": self._feedback(unit), "domain": self.store.domain, "ref": self.ref(ident, unit.revision),
-                    "unit_ref": self.ref(ident), "id": ident,
-                    "revision": unit.revision,
-                    "frontmatter": unit.metadata, "content": unit.body,
-                    "inherits_from_closure": index.closure[ident],
-                    "note": "Reading a reference does not establish applicability; compare its conditions with observed task facts."}
+            loaded = {}
+            for bucket in ("requires", "units"):
+                for item in result.get(bucket, []):
+                    unit = index.units[item["id"]]
+                    item["ref"] = self.ref(item["id"], unit.revision)
+                    item["unit_ref"] = self.ref(item["id"])
+                    item["feedback_ref"] = item["ref"]
+                    observe(self.store, unit)
+                    loaded[item["id"]] = item
+            result["domain"] = self.store.domain
+            if isinstance(ref, str):
+                parts = _ref_parts(ref)
+                if (parts is not None and (parts[0] is None or parts[0] == self.store.domain)
+                        and parts[1] in loaded):
+                    result.update(self._legacy_view(index, parts[1]))
+            return result

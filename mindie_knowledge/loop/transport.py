@@ -330,6 +330,7 @@ class Service:
                 domain_path=args.get("domain_path"),
                 token_budget=args.get("token_budget", 800),
                 include_unknown=args.get("include_unknown", False),
+                include_archived=args.get("include_archived", False),
             )
             stale = [source for source in sources if source["status"] == "stale"]
             if stale:
@@ -340,8 +341,9 @@ class Service:
             return result
         if method == "distill":
             from .activation import activation_epoch
-            if set(args) != {"inputs", "task_state"}:
-                raise ValueError("distill accepts explicit inputs and task_state")
+            allowed = {"inputs", "task_state", "related_refs", "proposal"}
+            if not set(args) <= allowed or not {"inputs", "task_state"} <= set(args):
+                raise ValueError("distill accepts explicit inputs and task_state plus optional related_refs/proposal")
             settings = self.engine._settings()
             scope = self.admission.scope_root(session)
             if not settings.allows_capture() or not scope or not settings.in_scope(scope):
@@ -350,11 +352,13 @@ class Service:
                                  activation_epoch=activation_epoch(lease["token"]))
             return self.engine.distill_selected(args["inputs"], session_digest=session_key(session),
                                                task_state=args["task_state"], authorization=authorization,
-                                               cancel=cancel)
+                                               cancel=cancel, related_refs=args.get("related_refs"),
+                                               proposal=args.get("proposal"))
         if method == "explain":
-            if set(args) != {"ref"}:
-                raise ValueError("explain accepts only ref; whole-document offset/limit reading is unavailable")
-            return self.store.explain(args["ref"])
+            allowed = {"ref", "refs", "conditions", "known_refs", "token_budget"}
+            if not set(args) <= allowed or (args.get("ref") is None and args.get("refs") is None):
+                raise ValueError("explain accepts only ref or refs plus optional conditions/known_refs/token_budget")
+            return self.store.explain(**args)
         if method == "feedback":
             settings = self.engine._settings()
             if settings.capture_block_kind() == 'fault':
@@ -367,11 +371,13 @@ class Service:
             )
             vote = self.store.record_vote(
                 root_hash=session_key(root_session), ref=args["ref"],
-                rating=args["rating"], reason=args.get("reason", ""),
+                rating=args.get("rating"), reason=args.get("reason", ""),
                 publishable=publishable,
                 generation=settings.generation if publishable else None,
+                event_type=args.get("event_type"), run_id=args.get("run_id", ""),
+                outcome=args.get("outcome"), step_id=args.get("step_id", ""),
             )
-            if vote["publishable"]:
+            if vote.get("publishable"):
                 self.engine.last_activity = time.monotonic()
             return vote
         if method == "capture":

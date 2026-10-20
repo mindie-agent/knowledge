@@ -1,0 +1,287 @@
+"""Two-task experience replay, 4-stage usage events, growth, and exploration axes."""
+from __future__ import annotations
+
+from copy import deepcopy
+from pathlib import Path
+
+import pytest
+
+from graded_fixture import OBSERVED, unit as fixture_unit
+from mindie_knowledge.graded.distill import prepare_request, value_gate
+from mindie_knowledge.graded.explore import (
+    assess_stagnation,
+    build_exploration_context,
+    evaluate_exploration_candidate,
+)
+from mindie_knowledge.graded.feedback import (
+    record_usage_event,
+    record_vote,
+    summarize_usage_events,
+)
+from mindie_knowledge.graded.index import token_estimate
+from mindie_knowledge.graded.maintenance import growth_metrics
+from mindie_knowledge.graded.units import GradedUnit
+from mindie_knowledge.loop.engine import Engine
+from mindie_knowledge.materials.references import ReadReferenceError
+
+ROOT = "a" * 64
+DOMAIN = "vllm-ascend"
+
+
+def scanner():
+    matches = list((Path.home() / ".cache/mindie-agent/gitleaks/8.30.1").glob("*/gitleaks"))
+    if not matches:
+        pytest.skip("installed pinned scanner not present; no download in component tests")
+    return str(matches[0])
+
+
+def ref(item, revision=None):
+    revision = item.revision if revision is None else revision
+    return f"mindie://{DOMAIN}/units/{item.id}@{revision}"
+
+
+def evidence(item, *, outcome="verified", refs=None):
+    return {"kind": "authorized_transcript", "outcome": outcome,
+            "source_locator": item.metadata["provenance"]["source_locator"],
+            "content": item.body.strip(), "evidence_refs": refs or ["fixture-observation"],
+            "repetitions": 1}
+
+
+def proposal(session_digest, item, *, operation="create", body=None):
+    metadata = {key: value for key, value in item.metadata.items() if key != "revision"}
+    return {"schema_version": "mindie-distill-decision/1", "session_digest": session_digest,
+            "evidence_inputs": ["authorized_transcript"], "action": "propose_graded_units",
+            "drop_reason": None,
+            "units": [{"target_unit_id": item.id, "target_tier": metadata["tier"],
+                       "category": metadata["category"],
+                       "evidence_strength": metadata["evidence_strength"],
+                       "domain_path": metadata["domain_path"], "operation": operation,
+                       "frontmatter": metadata, "markdown_body": body or item.body}]}
+
+
+def test_verified_in_flight_milestone_and_foreground_proposal_apply_without_model(store):
+    item = fixture_unit()
+    engine = Engine(store, redactor_executable=scanner())
+    session = "a" * 64
+    result = engine.distill_selected([evidence(item)], session_digest=session,
+                                     task_state="verified_milestone", proposal=proposal(session, item))
+    assert result["status"] == "applied"
+    assert result["admitted_unit_ids"] == [item.id]
+    assert result["model_calls"] == 0
+    assert result["model_execution"] == "foreground_proposal"
+    assert result["model_status"] == "not_invoked"
+    explained = store.explain(ref(item, 1))
+    assert explained["content"] == item.body
+    assert explained["revision"] == 1
+
+
+def test_value_gate_admits_verified_milestone_and_blocks_in_flight(store):
+    item = fixture_unit()
+    observed = prepare_request([evidence(item, outcome="observed")], session_digest="a" * 64,
+                               task_state="in_flight", redactor_executable=scanner(),
+                               redaction_key=store.redaction_key())
+    assert value_gate(observed) == "in_flight_incomplete"
+    verified = prepare_request([evidence(item)], session_digest="a" * 64,
+                               task_state="verified_milestone", redactor_executable=scanner(),
+                               redaction_key=store.redaction_key())
+    assert value_gate(verified) is None
+    all_pending = prepare_request([evidence(item, outcome="in_flight")], session_digest="a" * 64,
+                                  task_state="verified_milestone", redactor_executable=scanner(),
+                                  redaction_key=store.redaction_key())
+    assert value_gate(all_pending) == "in_flight_incomplete"
+
+
+def test_two_task_replay_revises_and_deduplicates_usage_and_inconclusive_failure(store):
+    item = fixture_unit()
+    engine = Engine(store, redactor_executable=scanner())
+    session_a = "a" * 64
+    applied = engine.distill_selected([evidence(item)], session_digest=session_a,
+                                      task_state="verified_milestone", proposal=proposal(session_a, item))
+    assert applied["status"] == "applied"
+    explained = store.explain(ref(item, 1))
+    assert explained["revision"] == 1
+
+    # Task B discovers, loads, declares applied, and records a refutation.
+    assert record_usage_event(store, root_hash=ROOT, ref=ref(item, 1),
+                              event_type="discovered", run_id="run-b1")["duplicate"] is False
+    record_usage_event(store, root_hash=ROOT, ref=ref(item, 1),
+                       event_type="loaded", run_id="run-b1")
+    record_usage_event(store, root_hash=ROOT, ref=ref(item, 1), event_type="applied",
+                       run_id="run-b1", step_id="step-3")
+    refuted = record_usage_event(store, root_hash=ROOT, ref=ref(item, 1),
+                                 event_type="evaluated", run_id="run-b1",
+                                 outcome="refuted", reason="run-b1 regressed the decode path")
+    assert refuted["outcome"] == "refuted" and refuted["duplicate"] is False
+    summary = summarize_usage_events(store, item.id, 1)
+    assert summary == {"unit_id": item.id, "revision": 1, "discovered": 1, "loaded": 1,
+                       "applied": 1, "evaluated": 1, "supported": 0, "refuted": 1,
+                       "inconclusive": 0}
+
+    with pytest.raises(ValueError, match="run_id"):
+        record_usage_event(store, root_hash=ROOT, ref=ref(item, 1),
+                           event_type="evaluated", run_id="", outcome="refuted")
+    record_usage_event(store, root_hash=ROOT, ref=ref(item, 1), event_type="evaluated",
+                       run_id="run-b1-infra", outcome="inconclusive",
+                       reason="device unavailable before measurement")
+    duplicate = record_usage_event(store, root_hash=ROOT, ref=ref(item, 1),
+                                   event_type="evaluated", run_id="run-b1",
+                                   outcome="refuted")
+    assert duplicate["duplicate"] is True
+    summary = summarize_usage_events(store, item.id, 1)
+    assert summary["evaluated"] == 2 and summary["refuted"] == 1
+    assert summary["supported"] == 0 and summary["inconclusive"] == 1
+
+    # Task B revises U@1 -> U@2 with a boundary that does not overlap triggers.
+    revised = GradedUnit.from_parts(
+        {**deepcopy(item.metadata),
+         "provenance": {**deepcopy(item.metadata["provenance"]),
+                        "evidence_refs": ["fixture-observation", "run-b1-experiment"]}},
+        item.body + "Boundary from run-b1: decode gains did not transfer to the measured shape.\n",
+        item.path,
+    )
+    session_b = "b" * 64
+    task_b_input = evidence(item, refs=["fixture-observation", "run-b1-experiment"])
+    result = engine.distill_selected([task_b_input], session_digest=session_b,
+                                     task_state="completed",
+                                     proposal=proposal(session_b, revised,
+                                                       operation="merge_into_existing"))
+    assert result["status"] == "applied" and result["admitted_unit_ids"] == [item.id]
+    assert result["model_calls"] == 0
+    updated = store.explain(ref(item, 2))
+    assert updated["revision"] == 2 and "Boundary from run-b1" in updated["content"]
+    with pytest.raises(ReadReferenceError, match="replaced"):
+        store.explain(ref(item, 1))
+    assert store.query("graph", conditions=OBSERVED)["results"][0]["revision"] == 2
+
+    vote = record_vote(store, root_hash=ROOT, ref=ref(item, 2), rating="up", reason="",
+                       publishable=False, event_type="applied", run_id="run-b1-vote")
+    assert vote["rating"] == "up" and vote["usage_event"]["event_type"] == "applied"
+    assert summarize_usage_events(store, item.id, 2)["applied"] == 1
+
+
+def test_growth_metrics_are_per_milestone_and_none_without_milestones():
+    old = fixture_unit("unit-growth-a", body="Older rule body.\n")
+    current_a = fixture_unit("unit-growth-a", body="Older rule body plus a boundary.\n")
+    current_b = fixture_unit("unit-growth-b", body="Second active rule.\n")
+    archived = fixture_unit("unit-growth-c", body="Archived rule.\n", status="archived")
+    superseded = fixture_unit("unit-growth-d", body="Superseded rule.\n",
+                              status="superseded", superseded_by="unit-growth-b")
+    current = [current_a, current_b, archived, superseded]
+    metrics = growth_metrics(current, completed_milestones=2, previous_units=[old],
+                             loaded_tokens_delta=42)
+    assert metrics["active_units"] == 2
+    assert metrics["archived_units"] == 1 and metrics["superseded_units"] == 1
+    assert metrics["delta_active_units"] == 1
+    assert metrics["g_units"] == 0.5
+    assert metrics["g_read"] == 42
+    net_body = sum(token_estimate(unit.body) for unit in current) - token_estimate(old.body)
+    assert net_body > 0 and metrics["g_body"] == net_body / 2
+    unmeasured = growth_metrics(current, completed_milestones=0, previous_units=[old])
+    assert unmeasured["g_units"] is None and unmeasured["g_body"] is None
+
+
+def test_exploration_judgment_keeps_valid_subtarget_gain_and_separates_axes():
+    common = dict(run_id="run-e1", candidate_id="cand-tile", conditions={"soc": "Ascend910B"},
+                  mutation_summary="tile the reduction", compile_ok=True, oracle_passed=True,
+                  measurement_passed=True, min_speedup_ratio=1.05, noise_margin=0.01)
+    subtarget = evaluate_exploration_candidate(speedup_ratio=1.04, ablation_retained=False, **common)
+    assert subtarget["axes"] == {"evidence_validity": "valid",
+                                 "goal_attainment": "not_attained",
+                                 "reusability": "reusable_observation"}
+    assert subtarget["verdict"] == "subtarget_valid"
+    assert subtarget["distill_ready"] is True
+    assert subtarget["return_tier"] == "L2"
+    assert subtarget["conditional_avoid"] == []
+
+    negative = evaluate_exploration_candidate(speedup_ratio=0.95, ablation_retained=True, **common)
+    assert negative["reusability"] == "reusable_negative_boundary"
+    assert negative["verdict"] == "refuted" and negative["conditional_avoid"]
+    noise = evaluate_exploration_candidate(speedup_ratio=1.005, ablation_retained=None, **common)
+    assert noise["reusability"] == "inconclusive" and noise["distill_ready"] is False
+    broken = evaluate_exploration_candidate(**{**common, "compile_ok": False}, speedup_ratio=1.04)
+    assert broken["evidence_validity"] == "compile_failed"
+    assert broken["goal_attainment"] == "not_applicable"
+    assert broken["distill_ready"] is False
+
+
+def test_stagnation_counts_information_not_infrastructure_and_deduplicates_runs():
+    deduped = assess_stagnation([
+        {"run_id": "run-1", "verdict": "unsupported"},
+        {"run_id": "run-1", "verdict": "unsupported"},
+        {"run_id": "run-2", "verdict": "supported"},
+    ])
+    assert deduped["status"] == "progressing" and deduped["stalled"] is False
+    assert deduped["stalled_count"] == 0
+    repair = assess_stagnation([
+        {"run_id": "run-3", "outcome": "infra_failed"},
+        {"run_id": "run-4", "verdict": "inconclusive"},
+    ])
+    assert repair["status"] == "repair_execution_conditions"
+    assert repair["stalled"] is False and repair["stalled_count"] == 0
+    stalled = assess_stagnation([
+        {"run_id": "run-5", "verdict": "unsupported"},
+        {"run_id": "run-6", "verdict": "unsupported"},
+    ])
+    assert stalled["status"] == "stalled" and stalled["stalled"] is True
+    assert stalled["stalled_count"] == 2
+
+
+def test_exploration_context_strips_l3_and_only_mounts_valid_matching_refutations():
+    units = [
+        {"id": "unit-l1", "tier": "L1", "revision": 1, "body": "hard constraint"},
+        {"id": "unit-l2", "tier": "L2", "revision": 2, "body": "diagnostic steps"},
+        {"id": "unit-l3", "tier": "L3", "revision": 1, "body": "old recommendation"},
+        {"id": "unit-l4", "tier": "L4", "revision": 3, "body": "code transform"},
+    ]
+    ledger = [
+        {"run_id": "run-1", "verdict": "refuted", "axes": {"evidence_validity": "valid"},
+         "conditions": {"soc": "Ascend910B"}, "mutation_summary": "bad tile"},
+        {"run_id": "run-2", "verdict": "refuted", "axes": {"evidence_validity": "valid"},
+         "conditions": {"soc": "Ascend910C"}, "mutation_summary": "other chip"},
+        {"run_id": "run-3", "verdict": "supported", "axes": {"evidence_validity": "valid"},
+         "conditions": {"soc": "Ascend910B"}},
+        {"run_id": "run-4", "verdict": "refuted", "axes": {"evidence_validity": "invalid"},
+         "conditions": {"soc": "Ascend910B"}},
+    ]
+    context = build_exploration_context(
+        goal="explain the decode gap", retrieved_units=units,
+        bottleneck_summary={"layer": "attention"}, ledger_entries=ledger,
+        conditions={"soc": "Ascend910B"}, native_subcontext=True,
+    )
+    assert context["isolation_mode"] == "native_subcontext"
+    assert context["stripped_l3_ids"] == ["unit-l3"]
+    assert {unit["id"] for unit in context["mounted_units"]} == {"unit-l1", "unit-l2", "unit-l4"}
+    assert [item["run_id"] for item in context["conditional_avoid"]] == ["run-1"]
+    assert context["conditional_avoid"][0]["avoid"] == "bad tile"
+
+
+def test_query_forwards_include_archived_and_explain_forwards_batch_refs(store):
+    active = fixture_unit("unit-archive-active")
+    archived = fixture_unit("unit-archive-old", status="archived")
+    store.graded.install([active, archived])
+    default = store.query("graph", conditions=OBSERVED)
+    assert archived.id not in {row["id"] for row in default["results"]}
+    included = store.query("graph", conditions=OBSERVED, include_archived=True)
+    assert archived.id in {row["id"] for row in included["results"]}
+    batch = store.explain(refs=[ref(active), ref(archived)])
+    assert {item["id"] for item in batch["units"]} == {active.id, archived.id}
+
+
+def test_related_units_feed_the_organizer_prompt_without_changing_old_digests(store):
+    item = fixture_unit()
+    request = prepare_request([evidence(item)], session_digest="a" * 64,
+                              task_state="completed", redactor_executable=scanner(),
+                              redaction_key=store.redaction_key())
+    assert "related_units" not in request
+    related = [{"id": item.id, "revision": 1, "tier": item.metadata["tier"],
+                "category": item.metadata["category"], "title": item.metadata["title"],
+                "conditions": item.metadata["conditions"], "triggers": item.metadata["triggers"],
+                "body_excerpt": item.body[:100]}]
+    with_related = prepare_request([evidence(item)], session_digest="a" * 64,
+                                   task_state="completed", redactor_executable=scanner(),
+                                   redaction_key=store.redaction_key(), related_units=related)
+    assert with_related["related_units"] == related
+    assert with_related["request_digest"] != request["request_digest"]
+    from mindie_knowledge.graded.distill import build_prompt
+    prompt = build_prompt(with_related)
+    assert "related_units" in prompt and "merge_into_existing" in prompt

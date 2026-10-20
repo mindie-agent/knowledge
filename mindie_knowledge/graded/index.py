@@ -2,6 +2,8 @@
 
 [Invariants] Resolve all stable references at build time; never truncate semantic
 inheritance by depth. Each returned parent independently matches task conditions.
+Shared parents are charged once per response; explain_closure never truncates a
+unit body and reports every budget miss explicitly.
 [Timeouts & Locks] No model/network work; build time is separate from query time.
 [Side-Effect Policy] Read explicit corpus roots only; never write or import tasks.
 """
@@ -17,7 +19,7 @@ import time
 
 from ..retrieval import token_counts, tokens
 from .conditions import match_conditions
-from .units import GradedUnit, canonical
+from .units import UNIT_ID, GradedUnit, canonical
 
 SKIP_DIRECTORIES = {".git", "tasks", "feedback", "index", "docs", "private"}
 MAX_UNIT_BYTES = 262_144
@@ -27,6 +29,11 @@ FOUNDATION_SCORE = 0.05
 def token_estimate(text: str) -> int:
     """Conservative UTF-8/4 estimate, explicitly not a model tokenizer count."""
     return math.ceil(len(text.encode("utf-8")) / 4)
+
+
+def response_token_estimate(payload) -> int:
+    """Whole-response estimate over its canonical JSON serialization."""
+    return token_estimate(canonical(payload))
 
 
 def _excerpt(text: str, budget: int) -> tuple[str, int, bool]:
@@ -59,6 +66,24 @@ def read_units(root: Path) -> list[GradedUnit]:
                 raise ValueError(f"graded unit exceeds {MAX_UNIT_BYTES} bytes: {path.relative_to(root)}")
             units.append(GradedUnit.from_text(raw.decode("utf-8"), path.relative_to(root).as_posix()))
     return units
+
+
+def _ref_parts(value):
+    """Parse a stable ID or a mindie://<domain>/units/<id>[@<revision>] ref."""
+    if not isinstance(value, str):
+        return None
+    if UNIT_ID.fullmatch(value):
+        return None, value, None
+    match = re.fullmatch(r"([^@\s]+)@([1-9][0-9]*)", value)
+    if match and UNIT_ID.fullmatch(match.group(1)):
+        return None, match.group(1), int(match.group(2))
+    match = re.fullmatch(r"mindie://([^/\s]+)/units/([^@\s]+)(?:@([1-9][0-9]*))?", value)
+    if not match:
+        return None
+    domain, ident, revision = match.groups()
+    if not UNIT_ID.fullmatch(ident):
+        return None
+    return domain, ident, int(revision) if revision else None
 
 
 class RoutingIndex:
@@ -144,7 +169,8 @@ class RoutingIndex:
                 "units": rows, "unit_count": len(rows), "build_elapsed_ms": self.build_elapsed_ms,
                 "token_estimator": "utf8_bytes_div_4_ceiling", "query_budget_excludes_build": True}
 
-    def query(self, query, *, conditions=None, domain_path=None, token_budget=800, include_unknown=False, limit=8):
+    def query(self, query, *, conditions=None, domain_path=None, token_budget=800, include_unknown=False,
+              include_archived=False, limit=8):
         if not isinstance(query, str) or not query.strip():
             raise ValueError("query must be nonempty text")
         if conditions is not None and not isinstance(conditions, dict):
@@ -161,7 +187,13 @@ class RoutingIndex:
         applicability = {ident: grouped[key] for ident, key in self.condition_keys.items()}
         scores = {}
         rejected = Counter()
+        archived_excluded = 0
         for ident, unit in self.units.items():
+            # Archived and superseded units remain addressable by reference but
+            # do not enter ordinary discovery unless explicitly requested.
+            if unit.status in {"archived", "superseded"} and not include_archived:
+                archived_excluded += 1
+                continue
             status = applicability[ident].status
             if status == "mismatch" or (status == "unknown" and not include_unknown):
                 rejected[status] += 1
@@ -197,7 +229,10 @@ class RoutingIndex:
         left = token_budget
         results = []
         excluded_budget = []
+        charged_parents: set[str] = set()
         for position, (score, ident, route) in enumerate(selected):
+            if ident in charged_parents:
+                continue
             if left < 1:
                 break
             unit = self.units[ident]
@@ -213,6 +248,16 @@ class RoutingIndex:
                 if status.status != "matched":
                     omitted.append({"id": parent_id, **status.to_dict()})
                     return
+                # A parent already delivered by an earlier result is referenced,
+                # not charged or expanded a second time in the same response.
+                if parent_id in charged_parents:
+                    inherited.append({"id": parent_id, "revision": parent.revision,
+                                      "tier": parent.metadata["tier"],
+                                      "evidence_strength": parent.metadata["evidence_strength"],
+                                      "conditions": parent.metadata["conditions"],
+                                      "provenance": parent.metadata["provenance"],
+                                      "applicability": status.to_dict(), "deduplicated": True})
+                    return
                 # An inherited rule is injected only as a complete condition-bound
                 # rule. A budget miss is visible, never silent truncation of a premise.
                 cost = token_estimate(parent.body)
@@ -220,6 +265,7 @@ class RoutingIndex:
                     omitted.append({"id": parent_id, "status": "budget_excluded"})
                     return
                 left -= cost
+                charged_parents.add(parent_id)
                 inherited.append({"id": parent_id, "revision": parent.revision,
                                   "content": parent.body, "conditions": parent.metadata["conditions"],
                                   "tier": parent.metadata["tier"], "evidence_strength": parent.metadata["evidence_strength"],
@@ -249,12 +295,276 @@ class RoutingIndex:
                             "evidence_strength": unit.metadata["evidence_strength"],
                             "domain_path": unit.metadata["domain_path"], "conditions": unit.metadata["conditions"],
                             "provenance": unit.metadata["provenance"], "applicability": applicability[ident].to_dict(),
+                            "status": unit.status, "superseded_by": unit.superseded_by,
+                            "ready_to_apply": applicability[ident].status == "matched" and not omitted,
                             "excerpt": content, "excerpt_truncated": truncated,
                             "score": score, "route": route,
                             "inherited_rules": inherited, "inheritance_excluded": omitted})
-        return {"results": results, "generation": self.generation, "unit_count": len(self.units),
+        cards = []
+        for row in results:
+            ident = row["id"]
+            unit = self.units[ident]
+            cards.append({"id": ident, "revision": unit.revision,
+                          "title": unit.metadata["title"], "tier": unit.metadata["tier"],
+                          "category": unit.metadata["category"],
+                          "evidence_strength": unit.metadata["evidence_strength"],
+                          "status": unit.status, "superseded_by": unit.superseded_by,
+                          "domain_path": unit.metadata["domain_path"],
+                          "match_status": row["match_status"],
+                          "ready_to_apply": row["ready_to_apply"],
+                          "missing_conditions": row["missing_conditions"],
+                          "inherits_from": list(unit.metadata["inherits_from"]),
+                          "body_token_estimate": token_estimate(unit.body),
+                          "closure_token_estimate": token_estimate(unit.body) + sum(
+                              token_estimate(self.units[parent].body) for parent in self.closure[ident]),
+                          "route": row["route"], "score": row["score"]})
+        foundation_cards = [card for card in cards
+                            if card["tier"] == "L1" or card["route"] == "foundation_baseline"]
+        seen_foundation = {card["id"] for card in foundation_cards}
+        for parent_id in sorted(charged_parents):
+            parent = self.units[parent_id]
+            if parent.metadata["tier"] != "L1" or parent_id in seen_foundation:
+                continue
+            foundation_cards.append({
+                "id": parent_id, "revision": parent.revision,
+                "title": parent.metadata["title"], "tier": parent.metadata["tier"],
+                "category": parent.metadata["category"],
+                "evidence_strength": parent.metadata["evidence_strength"],
+                "status": parent.status, "superseded_by": parent.superseded_by,
+                "domain_path": parent.metadata["domain_path"],
+                "match_status": "matched",
+                "ready_to_apply": True,
+                "missing_conditions": [],
+                "inherits_from": list(parent.metadata["inherits_from"]),
+                "body_token_estimate": token_estimate(parent.body),
+                "closure_token_estimate": token_estimate(parent.body) + sum(
+                    token_estimate(self.units[anc].body) for anc in self.closure[parent_id]),
+                "route": "inherited_foundation", "score": scores.get(parent_id, FOUNDATION_SCORE),
+            })
+        excluded_conditions = dict(rejected)
+        if archived_excluded:
+            excluded_conditions["archived_or_superseded"] = archived_excluded
+        usage = {"token_budget": token_budget, "body_token_estimate": token_budget - left,
+                 "estimated_tokens": response_token_estimate({"cards": cards, "results": results}),
+                 "estimator": "utf8_bytes_div_4_ceiling", "has_more": bool(excluded_budget),
+                 "excluded_budget": list(excluded_budget)}
+        return {"results": results, "cards": cards, "foundation_cards": foundation_cards,
+                "generation": self.generation, "unit_count": len(self.units),
                 "body_token_estimate": token_budget - left, "token_budget": token_budget,
                 "budget_scope": "body excerpts and inherited rules; metadata excluded",
                 "excluded_budget": excluded_budget,
-                "excluded_conditions": dict(rejected), "query_elapsed_ms": (time.perf_counter() - started) * 1000,
+                "excluded_conditions": excluded_conditions, "usage": usage,
+                "query_elapsed_ms": (time.perf_counter() - started) * 1000,
                 "note": "Conditions must be established. Unknown conditions are not evidence of applicability; retrieval scores are not confidence."}
+
+    def explain_closure(self, refs, *, conditions=None, known_refs=None, domain=None, token_budget=4096):
+        """Assemble an exact dependency closure without truncating any body.
+
+        ``known_refs`` names only exact, currently visible ``id@revision``
+        pairs. Shared ancestors are emitted once in topological order and
+        budget misses stay explicit; a body is never shortened to fit.
+        """
+        if type(token_budget) is not int or not 1 <= token_budget <= 16000:
+            raise ValueError("token_budget must be between 1 and 16000")
+        if conditions is not None and not isinstance(conditions, dict):
+            raise ValueError("conditions must be an object of observed facts")
+        if isinstance(refs, str):
+            refs = [refs]
+        if refs is None:
+            refs = []
+        try:
+            requested = list(refs)
+        except TypeError as exc:
+            raise ValueError("refs must be a sequence of stable unit references") from exc
+        if isinstance(known_refs, str):
+            known_refs = [known_refs]
+        known_refs = [] if known_refs is None else known_refs
+
+        visible = set()
+        for raw in known_refs:
+            parts = _ref_parts(raw)
+            if parts is None:
+                continue
+            ref_domain, ident, revision = parts
+            if domain is not None and ref_domain is not None and ref_domain != domain:
+                continue
+            # Only an exact revision can suppress re-sending a body. An
+            # unversioned or older ref never hides the current revision.
+            if revision is not None:
+                visible.add((ident, revision))
+
+        grouped = None
+        if conditions is not None:
+            grouped = {key: match_conditions(required, conditions)
+                       for key, required in self.conditions.items()}
+
+        def status_of(ident):
+            return grouped[self.condition_keys[ident]]
+
+        def missing_of(status):
+            return [reason.split(":", 1)[0] for reason in status.reasons
+                    if reason.endswith(("not supplied", "version not supplied"))]
+
+        units_out = []
+        requires_out = []
+        unresolved_out = []
+        seen_unresolved = set()
+
+        def add_unresolved(entry):
+            key = (entry.get("id"), entry.get("status"))
+            if key in seen_unresolved:
+                return
+            seen_unresolved.add(key)
+            unresolved_out.append(entry)
+
+        resolved = []
+        seen_requested = set()
+        for raw in requested:
+            parts = _ref_parts(raw)
+            if parts is None:
+                add_unresolved({"id": str(raw), "status": "not_found"})
+                continue
+            ref_domain, ident, revision = parts
+            if domain is not None and ref_domain is not None and ref_domain != domain:
+                add_unresolved({"id": ident, "status": "not_found"})
+                continue
+            if (ident, revision) in seen_requested:
+                continue
+            seen_requested.add((ident, revision))
+            unit = self.units.get(ident)
+            if unit is None:
+                add_unresolved({"id": ident, "status": "not_found"})
+                continue
+            if revision is not None and revision != unit.revision:
+                entry = {"id": ident, "status": "removed_or_superseded",
+                         "current_revision": unit.revision}
+                if unit.superseded_by is not None:
+                    entry["superseded_by"] = unit.superseded_by
+                add_unresolved(entry)
+                continue
+            if unit.status == "superseded":
+                entry = {"id": ident, "status": "removed_or_superseded",
+                         "current_revision": unit.revision}
+                if unit.superseded_by is not None:
+                    entry["superseded_by"] = unit.superseded_by
+                add_unresolved(entry)
+                continue
+            resolved.append((ident, revision))
+
+        valid = []
+        for ident, _revision in resolved:
+            if grouped is None:
+                valid.append(ident)
+                continue
+            nodes = [*self.closure[ident], ident]
+            unmatched = [node for node in nodes if status_of(node).status != "matched"]
+            if not unmatched:
+                valid.append(ident)
+                continue
+            for node in unmatched:
+                status = status_of(node)
+                add_unresolved({"id": node,
+                                "status": "condition_mismatch" if status.status == "mismatch" else "condition_unknown",
+                                "missing_conditions": missing_of(status)})
+            # A matched child is still not applicable when a required premise
+            # is missing or contradicts the observed facts.
+            if ident not in {entry["id"] for entry in unresolved_out}:
+                mismatched = any(status_of(node).status == "mismatch" for node in unmatched)
+                missing = []
+                for node in unmatched:
+                    for name in missing_of(status_of(node)):
+                        if name not in missing:
+                            missing.append(name)
+                add_unresolved({"id": ident,
+                                "status": "condition_mismatch" if mismatched else "condition_unknown",
+                                "missing_conditions": missing})
+
+        valid_set = set(valid)
+        ordered = []
+
+        def add_ordered(ident):
+            if ident in ordered:
+                return
+            for parent in self.closure[ident]:
+                if parent in valid_set:
+                    add_ordered(parent)
+            ordered.append(ident)
+
+        for ident in valid:
+            add_ordered(ident)
+
+        def entry_for(ident):
+            unit = self.units[ident]
+            status = status_of(ident) if grouped is not None else None
+            return {"id": ident, "revision": unit.revision,
+                    "title": unit.metadata["title"], "tier": unit.metadata["tier"],
+                    "category": unit.metadata["category"],
+                    "evidence_strength": unit.metadata["evidence_strength"],
+                    "status": unit.status, "superseded_by": unit.superseded_by,
+                    "domain_path": unit.metadata["domain_path"],
+                    "conditions": unit.metadata["conditions"],
+                    "provenance": unit.metadata["provenance"],
+                    "inherits_from": list(unit.metadata["inherits_from"]),
+                    "content": unit.body,
+                    "applicability": status.to_dict() if status is not None else None,
+                    "ready_to_apply": bool(status is not None and status.status == "matched"),
+                    "missing_conditions": missing_of(status) if status is not None else []}
+
+        loaded = set()
+        body_tokens = 0
+
+        def estimate(requires, units):
+            return response_token_estimate(
+                {"units": units, "requires": requires, "unresolved": unresolved_out})
+
+        for ident in ordered:
+            unit = self.units[ident]
+            ancestors = self.closure[ident]
+            new_ancestors = [parent for parent in ancestors
+                             if parent not in loaded
+                             and (parent, self.units[parent].revision) not in visible]
+            unit_needed = ident not in loaded and (ident, unit.revision) not in visible
+            # A requested ancestor excluded earlier for budget leaves this
+            # child without a required premise; do not assemble a partial rule.
+            blocked = [parent for parent in new_ancestors
+                       if parent in valid_set and parent not in loaded
+                       and (parent, self.units[parent].revision) not in visible]
+            if blocked:
+                new_requires = [entry_for(parent) for parent in new_ancestors if parent not in valid_set]
+                new_units = [entry_for(ident)] if unit_needed else []
+                required = estimate(requires_out + new_requires, units_out + new_units) - estimate(
+                    requires_out, units_out)
+                add_unresolved({"id": ident, "status": "budget_excluded",
+                                "required_tokens": max(0, required)})
+                continue
+            new_requires = [entry_for(parent) for parent in new_ancestors if parent not in valid_set]
+            new_units = [entry_for(ident)] if unit_needed else []
+            if not new_requires and not new_units:
+                continue
+            trial_requires = requires_out + new_requires
+            trial_units = units_out + new_units
+            current_estimate = estimate(requires_out, units_out)
+            trial_estimate = estimate(trial_requires, trial_units)
+            if trial_estimate > token_budget:
+                required = trial_estimate - current_estimate
+                if required <= 0:
+                    required = sum(token_estimate(item["content"])
+                                   for item in new_requires + new_units)
+                add_unresolved({"id": ident, "status": "budget_excluded",
+                                "required_tokens": required})
+                continue
+            requires_out, units_out = trial_requires, trial_units
+            loaded.add(ident)
+            if unit_needed:
+                body_tokens += token_estimate(unit.body)
+            for item in new_requires:
+                loaded.add(item["id"])
+                body_tokens += token_estimate(item["content"])
+
+        estimated = estimate(requires_out, units_out)
+        return {"units": units_out, "requires": requires_out, "unresolved": unresolved_out,
+                "usage": {"token_budget": token_budget, "estimated_tokens": estimated,
+                          "body_token_estimate": body_tokens,
+                          "estimator": "utf8_bytes_div_4_ceiling",
+                          "has_more": any(item["status"] == "budget_excluded"
+                                          for item in unresolved_out)}}

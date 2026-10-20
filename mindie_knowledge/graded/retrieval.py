@@ -38,10 +38,12 @@ def mixed_query(store, legacy, query, *, limit, conditions, domain_path, token_b
         raise ValueError("token_budget must be between 1 and 16000")
     if type(limit) is not int or not 1 <= limit <= 20:
         raise ValueError("limit must be between 1 and 20")
-    # Preserve at least one result slot for each matching source when the
-    # caller permits two; per-source ranks are then interleaved transparently.
+    # Graded units are assembled first; they receive the whole response budget
+    # when no legacy row competes for it, and whatever legacy excerpts leave
+    # behind otherwise. There is no fixed half-budget split.
     graded_limit = max(1, (limit + 1) // 2)
-    graded_budget = max(1, token_budget // 2)
+    graded_budget = token_budget if not legacy["results"] else max(
+        1, token_budget * min(limit, graded_limit + len(legacy["results"])) // limit)
     graded = store.graded.query(query, limit=graded_limit, conditions=conditions,
                                 domain_path=domain_path, token_budget=graded_budget,
                                 include_unknown=include_unknown)
@@ -52,7 +54,7 @@ def mixed_query(store, legacy, query, *, limit, conditions, domain_path, token_b
     used = graded["body_token_estimate"]
     old = []
     for position, item in enumerate(selected_legacy):
-        share = remaining // (len(selected_legacy) - position)
+        share = max(0, remaining // (len(selected_legacy) - position))
         result, cost = _legacy_excerpt(item, share)
         old.append(result)
         used += cost
@@ -64,7 +66,10 @@ def mixed_query(store, legacy, query, *, limit, conditions, domain_path, token_b
         if position < len(old):
             combined.append(old[position])
     return {"domain": store.domain, "retrieval": "mixed-bm25", "page": "mixed",
-            "results": combined, "body_token_estimate": used, "token_budget": token_budget,
+            "results": combined, "cards": graded.get("cards", []),
+            "foundation_cards": graded.get("foundation_cards", []),
+            "usage": graded.get("usage", {}),
+            "body_token_estimate": used, "token_budget": token_budget,
             "budget_scope": "body excerpts, related excerpts and inherited rules; metadata excluded",
             "source_results": {"graded": len(rows), "legacy_material": len(old)},
             "domain_path_scope": "graded ranking preference only; legacy matches retain their existing domain",

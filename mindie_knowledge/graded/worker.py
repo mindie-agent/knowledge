@@ -20,7 +20,73 @@ from ..loop.transcript_redaction import redact_tree
 from ..materials.summarizer import SummaryLedger, outcome, validate_identity, validate_outcome
 from .distill import (apply_decision, noop_decision, prepare_request, validate_decision,
                       result_view, value_gate, with_worker_identity)
-from .units import canonical, locator_parts
+from .feedback import parse_feedback_ref
+from .units import UNIT_ID, canonical, locator_parts
+
+
+def _compact_related(unit):
+    return {"id": unit.id, "revision": unit.revision, "tier": unit.metadata["tier"],
+            "category": unit.metadata["category"], "title": unit.metadata["title"],
+            "conditions": unit.metadata["conditions"], "triggers": unit.metadata["triggers"],
+            "body_excerpt": unit.body[:1200]}
+
+
+def _matching_related_units(store, inputs, related_refs):
+    """Read-only topic lookup; selected evidence and existing units stay separate."""
+    if related_refs is not None and not isinstance(related_refs, (list, tuple)):
+        raise ValueError("related_refs must be a list of stable unit IDs or graded references")
+    try:
+        if not store.graded.available():
+            return None
+        index = store.graded._load()
+    except (ValueError, OSError):
+        return None
+    ordered, seen = [], set()
+    for raw in related_refs or ():
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValueError("related_refs require stable unit IDs or graded references")
+        ident = (parse_feedback_ref(raw, store.domain)["unit_id"]
+                 if "/units/" in raw else raw)
+        if not UNIT_ID.fullmatch(ident):
+            raise ValueError("related_refs require an exact stable graded unit identifier")
+        unit = index.units.get(ident)
+        if unit is not None and ident not in seen:
+            ordered.append(unit)
+            seen.add(ident)
+    terms = []
+    for item in inputs or ():
+        if not isinstance(item, dict):
+            continue
+        terms.extend(ref for ref in item.get("evidence_refs", ()) if isinstance(ref, str))
+        if isinstance(item.get("content"), str):
+            terms.append(item["content"][:4000])
+    query = " ".join(terms).strip()
+    if query:
+        try:
+            found = index.query(query, conditions=None, include_unknown=True, limit=3, token_budget=16000)
+        except ValueError:
+            found = {"results": []}
+        for row in found["results"]:
+            unit = index.units[row["id"]]
+            if unit.id not in seen:
+                ordered.append(unit)
+                seen.add(unit.id)
+    return [_compact_related(unit) for unit in ordered[:3]] or None
+
+
+def _validated_decision(pending, request, engine, store, private_paths, cancel):
+    pending = json.loads(canonical(pending))
+    for item in pending.get("units", []):
+        provenance = item["frontmatter"]["provenance"]
+        provenance["source_locator"] = locator_parts(provenance["source_locator"]) or provenance["source_locator"]
+    pending, _ = redact_tree(pending, executable=engine.redactor_executable,
+                             key=store.redaction_key(), private_paths=private_paths, cancel=cancel)
+    for item in pending.get("units", []):
+        provenance = item["frontmatter"]["provenance"]
+        locator = provenance["source_locator"]
+        if isinstance(locator, dict):
+            provenance["source_locator"] = f"{locator['repository']}@{locator['revision']}:{locator['path']}"
+    return validate_decision(pending, request)
 
 
 def _local_failure(response, attempt, error, stage, *, recording_error=None, decision=None):
@@ -43,7 +109,8 @@ def _local_failure(response, attempt, error, stage, *, recording_error=None, dec
     return result_view(result)[0]
 
 
-def run(engine, inputs, *, session_digest, task_state, authorization=None, cancel=None):
+def run(engine, inputs, *, session_digest, task_state, authorization=None, cancel=None,
+        related_refs=None, proposal=None):
     store = engine.store
 
     def revalidate():
@@ -53,12 +120,30 @@ def run(engine, inputs, *, session_digest, task_state, authorization=None, cance
 
     revalidate()
     private_paths = ((authorization["scope"],) if authorization else ()) + (str(Path.home()),)
+    related_units = (None if proposal is not None or not related_refs
+                     else _matching_related_units(store, inputs, related_refs))
     request = prepare_request(inputs, session_digest=session_digest, task_state=task_state,
                               redactor_executable=engine.redactor_executable, redaction_key=store.redaction_key(),
-                              private_paths=private_paths, cancel=cancel)
+                              private_paths=private_paths, cancel=cancel, related_units=related_units)
     gate = value_gate(request)
     if gate:
         return apply_decision(store, request, noop_decision(request, gate))
+    if proposal is not None:
+        if not isinstance(proposal, dict):
+            raise ValueError("proposal must be a mindie-distill-decision/1 object")
+        decision = _validated_decision(proposal, request, engine, store, private_paths, cancel)
+        receipt_key = "graded:applied:" + request["request_digest"]
+        with store._write_txn():
+            revalidate()
+            result = apply_decision(store, request, decision,
+                                    generation=authorization.get("generation") if authorization else None)
+            receipt = {key: value for key, value in result.items() if key != "publication_plan"}
+            receipt.update(attempt_id=None, model_calls=0, usage=0,
+                           billing_status="not_applicable", model_execution="foreground_proposal",
+                           model_status="not_invoked", model_replayed=False,
+                           related_unit_ids=[item["id"] for item in request.get("related_units", [])])
+            store.db.execute("INSERT OR REPLACE INTO state VALUES(?,?)", (receipt_key, canonical(receipt)))
+        return {**result, **receipt, "decision": decision}
     if not engine.summary_command:
         raise ValueError("C6 requires a configured native summary worker")
     # The same command supplies its declared capability before receiving any
@@ -127,18 +212,7 @@ def run(engine, inputs, *, session_digest, task_state, authorization=None, cance
     response = json.loads(attempt["response"])
     decision = None
     try:
-        pending = json.loads(canonical(response["result"]))
-        for item in pending.get("units", []):
-            provenance = item["frontmatter"]["provenance"]
-            provenance["source_locator"] = locator_parts(provenance["source_locator"]) or provenance["source_locator"]
-        pending, _ = redact_tree(pending, executable=engine.redactor_executable,
-                                 key=store.redaction_key(), private_paths=private_paths, cancel=cancel)
-        for item in pending.get("units", []):
-            provenance = item["frontmatter"]["provenance"]
-            locator = provenance["source_locator"]
-            if isinstance(locator, dict):
-                provenance["source_locator"] = f"{locator['repository']}@{locator['revision']}:{locator['path']}"
-        decision = validate_decision(pending, request)
+        decision = _validated_decision(response["result"], request, engine, store, private_paths, cancel)
         with store._write_txn():
             revalidate()
             result = apply_decision(store, request, decision,
