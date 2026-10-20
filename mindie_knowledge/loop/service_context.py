@@ -1,6 +1,6 @@
 """[Role] Transfer declared caller bindings to a detached service.
 
-[Invariants] Only declared values cross the boundary. Windows DPAPI binds the
+[Invariants] Only declared values and shared network settings cross the boundary. Windows DPAPI binds the
 short-lived transfer to the current user and launch identity.
 [Timeouts & Locks] Local DPAPI calls; no subprocesses or additional locks.
 [Side-Effect Policy] Capture encrypts Windows credentials; successful consumption
@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import stat
+from mindie_diagnostics.service_environment import NETWORK_ENV as TRANSPORT_ENV
 
 SCHEMA = "mindie-service-context/1"
 LIMIT = 128 * 1024
@@ -26,6 +27,10 @@ _FORBIDDEN = {
 }
 _PREFIXES = ("PYTHON", "LD_", "DYLD_", "GIT_CONFIG", "GIT_SSH", "BASH_ENV",
              "NODE_OPTIONS", "NODE_PATH")
+NETWORK_ENV = (
+    *TRANSPORT_ENV, "GH_TOKEN", "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
+)
 
 
 class ContextError(ValueError):
@@ -84,7 +89,8 @@ def _crypt(raw, entropy, *, decrypt=False):
 
 def capture(config, binding):
     declaration = validate(config)
-    values = {key: os.environ[key] for key in declaration["environment"]
+    names = set(declaration["environment"]) | set(NETWORK_ENV)
+    values = {key: os.environ[key] for key in names
               if key in os.environ}
     value = dict(schema=SCHEMA, binding=binding, paths=declaration["paths"], environment=values)
     raw = json.dumps(value, sort_keys=True, ensure_ascii=True).encode()
@@ -123,7 +129,7 @@ def consume(path, config, binding):
     if (not isinstance(value, dict) or value.get("schema") != SCHEMA
             or value.get("binding") != binding or value.get("paths") != declaration["paths"]
             or not isinstance(value.get("environment"), dict)
-            or set(value["environment"]) - set(declaration["environment"])
+            or set(value["environment"]) - (set(declaration["environment"]) | set(NETWORK_ENV))
             or any(not isinstance(item, str) or "\x00" in item
                    for item in value["environment"].values())):
         raise ContextError("service_context_binding_invalid")
@@ -138,7 +144,7 @@ def consume(path, config, binding):
 def apply(config, values):
     """Apply the authenticated caller projection, including declared absence."""
     normalize = str.casefold if _windows() else lambda key: key
-    declared = {normalize(key) for key in validate(config)["environment"]}
+    declared = {normalize(key) for key in (*validate(config)["environment"], *NETWORK_ENV)}
     # A scheduled task can inherit stale user-level credentials/proxies.
     # Explicitly absent caller values must remain absent in its service.
     for key in list(os.environ):
