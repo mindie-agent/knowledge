@@ -289,16 +289,19 @@ def test_posix_transfer_is_private_one_use_and_preserves_case(tmp_path, monkeypa
     config = dict(service_launch_context=dict(environment=["SELECTED_KEY", "HTTPS_PROXY"]))
     monkeypatch.delenv("SELECTED_KEY", raising=False)
     monkeypatch.delenv("HTTPS_PROXY", raising=False)
+    monkeypatch.setenv("https_proxy", "caller-posix-proxy")
     path = tmp_path / "context"
     path.write_bytes(context.capture(config, {"attempt": "one"}))
     with pytest.raises(context.ContextError, match="file_invalid"):
         context.consume(path, config, {"attempt": "one"})
     path.chmod(0o600)
     monkeypatch.setenv("SELECTED_KEY", "stale")
-    monkeypatch.setenv("https_proxy", "separate-posix-name")
+    monkeypatch.setenv("HTTPS_PROXY", "stale-uppercase-proxy")
+    monkeypatch.setenv("https_proxy", "stale-lowercase-proxy")
     context.apply(config, context.consume(path, config, {"attempt": "one"}))
     assert "SELECTED_KEY" not in os.environ
-    assert os.environ["https_proxy"] == "separate-posix-name"
+    assert "HTTPS_PROXY" not in os.environ
+    assert os.environ["https_proxy"] == "caller-posix-proxy"
     assert not path.exists()
 
 
