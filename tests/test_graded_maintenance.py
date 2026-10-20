@@ -66,7 +66,7 @@ def _unit(
 def _write(root: Path, unit: GradedUnit) -> Path:
     target = root / unit.path
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(unit.render(), encoding="utf-8")
+    target.write_text(unit.render(), encoding="utf-8", newline="\n")
     return target
 
 
@@ -257,6 +257,7 @@ def test_failed_lint_leaves_previous_manifest_unchanged(tmp_path: Path) -> None:
         "---\n"
         "A malformed rule with no conditions or provenance.\n",
         encoding="utf-8",
+        newline="\n",
     )
 
     assert lint_corpus(tmp_path)["valid"] is False
@@ -355,6 +356,7 @@ def test_invalid_graded_entry_fails_lint_visibly(tmp_path: Path, capsys) -> None
         "---\n"
         "A rule without conditions, triggers or provenance.\n",
         encoding="utf-8",
+        newline="\n",
     )
 
     report = lint_corpus(tmp_path)

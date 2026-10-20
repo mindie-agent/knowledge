@@ -162,7 +162,7 @@ def test_same_domain_multifeed_export_uses_target_tree_and_frozen_receipts(tmp_p
     reference = unit("unit-reference-only")
     path = other_work / reference.path
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(reference.render())
+    path.write_text(reference.render(), encoding="utf-8", newline="\n")
     build_routing_index(other_work)
     commit(other_work, "Install independent reference source")
     config = configured(tmp_path, settings, "target", target_repo, target_remote)

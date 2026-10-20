@@ -203,7 +203,7 @@ def test_graded_path_move_preserves_reference_and_remote_correction_blocks_stale
         # The producer deliberately stays on its older observed snapshot.
         git(["pull", "--ff-only", "origin", "main"], cwd=maintainer)
         corrected = GradedUnit.from_parts({**moved.metadata, "revision": 2}, moved.body + "Public correction.\n", moved.path)
-        (maintainer / moved.path).write_text(corrected.render())
+        (maintainer / moved.path).write_text(corrected.render(), encoding="utf-8", newline="\n")
         assert build_routing_index(maintainer)["ok"]
         commit(maintainer, "Maintainer correction")
         stale = GradedUnit.from_parts({**moved.metadata, "revision": 3}, moved.body + "Stale local rewrite.\n", moved.path)
@@ -231,7 +231,7 @@ def test_reviewed_factor_survives_git_feed_and_group_withdrawal(tmp_path, remote
     for value in original:
         path = maintainer / value.path
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(value.render())
+        path.write_text(value.render(), encoding="utf-8", newline="\n")
     assert build_routing_index(maintainer)["ok"]
     commit(maintainer, "Publish synthetic rules before reviewed factoring")
 

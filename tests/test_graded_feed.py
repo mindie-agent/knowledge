@@ -60,7 +60,7 @@ def write_units(repo, *units):
     for value in units:
         path = repo / value.path
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(value.render(), encoding="utf-8")
+        path.write_text(value.render(), encoding="utf-8", newline="\n")
 
 
 def unit_files(*units):
@@ -382,7 +382,7 @@ def test_feed_sync_v2_update_move_and_removal(tmp_path):
         assert feed.sync()["entries"] == 2
 
         updated = revised(child, "Updated child rule; no hardware claim.\n")
-        (remote / child.path).write_text(updated.render(), encoding="utf-8")
+        (remote / child.path).write_text(updated.render(), encoding="utf-8", newline="\n")
         commit(remote, "update child")
         assert feed.sync()["entries"] == 2
         assert {item["id"] for item in store.graded.query(

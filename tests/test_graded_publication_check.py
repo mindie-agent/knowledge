@@ -167,7 +167,7 @@ def test_v2_change_classes_cover_updates_moves_removals_and_contract(tmp_path):
 
     updated = revised(value, "Updated synthetic rule; no hardware claim.\n")
     path = repo / updated.path
-    path.write_text(updated.render(), encoding="utf-8")
+    path.write_text(updated.render(), encoding="utf-8", newline="\n")
     head = commit(repo, "update")
     checked = validate(repo, head, DOMAIN, base_revision=base)
     assert checked["content_only"] is True and checked["review_mode"] == "content"
@@ -178,7 +178,7 @@ def test_v2_change_classes_cover_updates_moves_removals_and_contract(tmp_path):
     path.unlink()
     moved_path = repo / moved.path
     moved_path.parent.mkdir(parents=True, exist_ok=True)
-    moved_path.write_text(moved.render(), encoding="utf-8")
+    moved_path.write_text(moved.render(), encoding="utf-8", newline="\n")
     head = commit(repo, "move")
     checked = validate(repo, head, DOMAIN, base_revision=base)
     assert checked["entries"] == 1 and checked["content_only"] is True

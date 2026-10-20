@@ -9,7 +9,8 @@ import time
 import pytest
 
 from conftest import write_settings
-from mindie_knowledge.loop.activation import Admission
+from mindie_knowledge.loop.activation import Admission, AdmissionUnavailable
+import mindie_knowledge.loop.domain_routes as domain_routes
 from mindie_knowledge.loop.domain_routes import (
     activate_selected_domain, deactivate_registered_domains, register_domain_config, select_engine_config,
 )
@@ -113,25 +114,83 @@ def test_native_deactivation_revokes_registered_domains_after_scope_change_witho
     assert repeated["status"] == "inactive" and not repeated["changed"]
 
 
-def test_native_deactivation_lock_failure_is_partial_and_other_domain_still_revokes_within_total_budget(tmp_path):
+def test_native_deactivation_real_sqlite_lock_is_partial_and_preserves_lease(tmp_path):
     default, first_path = engine_config(tmp_path, "vllm-ascend")
-    target, second_path = engine_config(tmp_path, "operators")
-    first, second = Admission(first_path), Admission(second_path)
+    first = Admission(first_path)
     first.activate("current", project_root=str(tmp_path))
-    second.activate("current", project_root=str(tmp_path))
     with first._database() as locked:
         locked.execute("BEGIN IMMEDIATE")
         started = time.monotonic()
-        result = deactivate_registered_domains(default, session="current", timeout=0.2,
-                                               domain_configs={"operators": str(target)})
+        result = deactivate_registered_domains(default, session="current", timeout=0.2)
         elapsed = time.monotonic() - started
         locked.rollback()
-    assert result["status"] == "partial" and elapsed < 0.8
+    assert result["status"] == "partial" and elapsed < 0.8 and not result["changed"]
     outcomes = {item["domain"]: item for item in result["domains"]}
     assert outcomes["vllm-ascend"]["status"] == "unavailable"
-    assert outcomes["operators"]["status"] == "inactive"
     assert first.active_lease("current")["enabled"]
-    assert second.active_lease("current") is None
+
+
+@pytest.mark.parametrize(
+    ("first_elapsed", "expected_second", "second_called"),
+    [
+        (0.1, "inactive", True),
+        (0.2, "timed_out", False),
+    ],
+)
+def test_native_deactivation_shares_total_budget_and_continues_after_unavailable(
+        tmp_path, monkeypatch, first_elapsed, expected_second, second_called):
+    default, first_path = engine_config(tmp_path, "vllm-ascend")
+    target, second_path = engine_config(tmp_path, "operators")
+
+    class Clock:
+        def __init__(self):
+            self.current = 0.0
+
+        def monotonic(self):
+            return self.current
+
+    clock = Clock()
+
+    class Boundary:
+        def __init__(self, path):
+            self.path = Path(path)
+            self.enabled = True
+            self.calls = []
+
+        def deactivate(self, session, *, timeout):
+            self.calls.append((session, timeout))
+            if self.path == first_path:
+                clock.current += first_elapsed
+                raise AdmissionUnavailable("fixture locked store")
+            self.enabled = False
+            return True
+
+    boundaries = {}
+
+    def admission(path):
+        boundary = Boundary(path)
+        boundaries[boundary.path] = boundary
+        return boundary
+
+    monkeypatch.setattr("mindie_knowledge.loop.activation.Admission", admission)
+    monkeypatch.setattr(domain_routes, "time", clock)
+    result = deactivate_registered_domains(
+        default, session="current", timeout=0.2,
+        domain_configs={"operators": str(target)})
+
+    outcomes = {item["domain"]: item["status"] for item in result["domains"]}
+    assert result["status"] == "partial"
+    assert outcomes == {"vllm-ascend": "unavailable", "operators": expected_second}
+    assert boundaries[first_path].calls == [("current", pytest.approx(0.1))]
+    assert boundaries[first_path].enabled
+    if second_called:
+        assert boundaries[second_path].calls == [("current", pytest.approx(0.1))]
+        assert not boundaries[second_path].enabled
+        assert result["changed"]
+    else:
+        assert boundaries[second_path].calls == []
+        assert boundaries[second_path].enabled
+        assert not result["changed"]
 
 
 def test_admission_deactivation_in_process_lock_respects_caller_timeout(tmp_path):

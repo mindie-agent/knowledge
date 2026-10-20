@@ -12,7 +12,7 @@ def write(root, *units):
     for value in units:
         path = root / value.path
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(value.render(), encoding="utf-8")
+        path.write_text(value.render(), encoding="utf-8", newline="\n")
 
 
 def change(old, new=None):

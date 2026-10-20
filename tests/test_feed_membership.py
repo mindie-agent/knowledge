@@ -119,7 +119,7 @@ def test_declared_units_under_scripts_tests_and_materials_are_not_prefiltered(tm
         assert is_graded_unit_path(value.path)
         path = tmp_path / value.path
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(value.render())
+        path.write_text(value.render(), encoding="utf-8", newline="\n")
     assert {value.metadata["domain_path"] for value in read_units(tmp_path)} == set(areas)
 
 
