@@ -286,7 +286,7 @@ def _rows(kind: str, groups: dict, metrics: dict) -> list[dict]:
 
 def _status(unit: GradedUnit) -> str:
     status = unit.metadata.get("status", "active")
-    return status if status in {"active", "archived", "superseded"} else "active"
+    return status if status in {"active", "suspect", "archived", "superseded"} else "active"
 
 
 def growth_metrics(units, *, completed_milestones: int = 0, previous_units=None,
@@ -302,6 +302,7 @@ def growth_metrics(units, *, completed_milestones: int = 0, previous_units=None,
     else:
         previous = list(previous_units or ())
     active = {unit.id for unit in current if _status(unit) == "active"}
+    suspect = {unit.id for unit in current if _status(unit) == "suspect"}
     archived = {unit.id for unit in current if _status(unit) == "archived"}
     superseded = {unit.id for unit in current if _status(unit) == "superseded"}
     previous_active = {unit.id for unit in previous if _status(unit) == "active"}
@@ -311,6 +312,7 @@ def growth_metrics(units, *, completed_milestones: int = 0, previous_units=None,
     net_body = body_tokens - previous_body_tokens
     return {
         "active_units": len(active),
+        "suspect_units": len(suspect),
         "archived_units": len(archived),
         "superseded_units": len(superseded),
         "delta_active_units": delta_active,
@@ -459,6 +461,26 @@ def build_routing_index(root: Path | str, *, index_dir: Path | str | None = None
         return report
     report.update(ok=True, written=True)
     return report
+
+
+def build_index(root: Path | str, *, index_dir: Path | str | None = None,
+                check: bool = False) -> dict:
+    """Compatibility name for the routing-index rebuild entry point."""
+    return build_routing_index(root, index_dir=index_dir, check=check)
+
+
+def validate_repository(root: Path | str) -> dict:
+    """Validate a graded corpus and its derivable routing index without writing."""
+    units, index, errors = load_corpus(root)
+    tiers = {tier: sum(1 for unit in units if unit.metadata["tier"] == tier)
+             for tier in ("L1", "L2", "L3", "L4")}
+    categories = {category: sum(1 for unit in units if unit.metadata["category"] == category)
+                  for category in ("axiom", "measurement", "sop", "workflow", "mutator")}
+    return {"schema": "mindie-repository-validation/1", "ok": not errors,
+            "valid": not errors and index is not None, "unit_count": len(units),
+            "tiers": tiers, "categories": categories,
+            "generation": index.generation if index is not None else None,
+            "errors": list(errors)}
 
 
 def lint_corpus(root: Path | str) -> dict:

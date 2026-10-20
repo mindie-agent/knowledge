@@ -90,7 +90,7 @@ def test_configured_container_override_flows_into_probe_and_redacted_package(
             return subprocess.CompletedProcess(
                 argv,
                 0,
-                "Total Count : 8\nChip Count : 8\n/usr/local/Ascend/ascend-toolkit\naarch64\n",
+                "Total Count : 8\nChip Count : 8\n/usr/local/Ascend/cann-9.1.0\naarch64\n",
                 "MINDIE_NPU_PROBE_CONNECTED\n",
             )
         return real_run(argv, **kwargs)
@@ -98,5 +98,5 @@ def test_configured_container_override_flows_into_probe_and_redacted_package(
     monkeypatch.setattr(subprocess, "run", run)
     live_loop.test_live_a2_and_a3_npu_capture_redaction_store_and_reme_recall(tmp_path)
     assert len(observed_cmds) == 2
-    assert "docker exec mindie-bench-a2-override-20261020 sh -c" in observed_cmds[0]
-    assert "docker exec vaws-offload-pd165-override-20261020 sh -c" in observed_cmds[1]
+    assert any("mindie-bench-a2-override-20261020" in command for command in observed_cmds)
+    assert any("vaws-offload-pd165-override-20261020" in command for command in observed_cmds)

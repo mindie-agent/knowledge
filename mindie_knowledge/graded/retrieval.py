@@ -34,7 +34,9 @@ def _legacy_excerpt(row, budget):
 
 
 def mixed_query(store, legacy, query, *, limit, conditions, domain_path, token_budget,
-                include_unknown, navigation_only=False, run_id=None):
+                include_unknown, navigation_only=False, run_id=None, mode="reuse",
+                ledger_entries=None, bottleneck_summary=None, native_subcontext=False,
+                goal=""):
     if type(token_budget) is not int or not 1 <= token_budget <= 16000:
         raise ValueError("token_budget must be between 1 and 16000")
     if type(limit) is not int or not 1 <= limit <= 20:
@@ -48,7 +50,9 @@ def mixed_query(store, legacy, query, *, limit, conditions, domain_path, token_b
     graded = store.graded.query(query, limit=graded_limit, conditions=conditions,
                                 domain_path=domain_path, token_budget=graded_budget,
                                 include_unknown=include_unknown, navigation_only=navigation_only,
-                                run_id=run_id)
+                                run_id=run_id, mode=mode, ledger_entries=ledger_entries,
+                                bottleneck_summary=bottleneck_summary,
+                                native_subcontext=native_subcontext, goal=goal)
     rows = graded["results"]
     legacy_slots = limit - len(rows)
     selected_legacy = legacy["results"][:legacy_slots]
@@ -67,13 +71,17 @@ def mixed_query(store, legacy, query, *, limit, conditions, domain_path, token_b
             combined.append(rows[position])
         if position < len(old):
             combined.append(old[position])
-    return {"domain": store.domain, "retrieval": "mixed-bm25", "page": "mixed",
-            "results": combined, "cards": graded.get("cards", []),
-            "foundation_cards": graded.get("foundation_cards", []),
-            "usage": graded.get("usage", {}),
-            "body_token_estimate": used, "token_budget": token_budget,
-            "budget_scope": "body excerpts, related excerpts and inherited rules; metadata excluded",
-            "source_results": {"graded": len(rows), "legacy_material": len(old)},
-            "domain_path_scope": "graded ranking preference only; legacy matches retain their existing domain",
-            "note": "Graded rules and legacy task material retain distinct reference types. Per-source ranks are "
-                    "interleaved within one limit. Legacy related_next cursors continue through the original block query."}
+    payload = {"domain": store.domain, "retrieval": "mixed-bm25", "page": "mixed",
+               "results": combined, "cards": graded.get("cards", []),
+               "foundation_cards": graded.get("foundation_cards", []),
+               "usage": graded.get("usage", {}), "mode": graded.get("mode", mode),
+               "body_token_estimate": used, "token_budget": token_budget,
+               "budget_scope": "body excerpts, related excerpts and inherited rules; metadata excluded",
+               "source_results": {"graded": len(rows), "legacy_material": len(old)},
+               "domain_path_scope": "graded ranking preference only; legacy matches retain their existing domain",
+               "note": "Graded rules and legacy task material retain distinct reference types. Per-source ranks are "
+                       "interleaved within one limit. Legacy related_next cursors continue through the original block query."}
+    if mode == "explore":
+        payload["exploration_context"] = graded.get("exploration_context")
+        payload["stripped_l3_ids"] = graded.get("stripped_l3_ids", [])
+    return payload

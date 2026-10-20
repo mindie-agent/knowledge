@@ -17,7 +17,7 @@ import time
 
 from ..markdown import _atomic_write_bytes
 from ..materials.references import ReadReferenceError
-from .index import RoutingIndex, _ref_parts, response_token_estimate
+from .index import RoutingIndex, _excerpt, _ref_parts, response_token_estimate, token_estimate
 from .units import GradedUnit, canonical
 
 CATALOG_KEY = "graded:current"
@@ -37,11 +37,160 @@ def _finalize_usage_estimate(payload):
         payload["usage"]["estimated_tokens"] = estimate
 
 
+def _recompute_query_body_tokens(payload):
+    seen_parents = set()
+    total = 0
+    for row in payload["results"]:
+        total += token_estimate(row.get("excerpt", ""))
+        for parent in row.get("inherited_rules", ()):
+            if not parent.get("deduplicated") and "content" in parent and parent["id"] not in seen_parents:
+                seen_parents.add(parent["id"])
+                total += token_estimate(parent["content"])
+    payload["body_token_estimate"] = total
+    payload["usage"]["body_token_estimate"] = total
+
+
+def _enforce_query_budget(payload, index, *, navigation_only=False):
+    token_budget = payload["token_budget"]
+    _finalize_usage_estimate(payload)
+    if navigation_only:
+        original_cards = list(payload["cards"])
+        original_foundations = {card["id"]: card for card in payload["foundation_cards"]}
+        excluded = list(payload["excluded_budget"])
+        while len(payload["cards"]) > 1 and payload["response_token_estimate"] > token_budget:
+            dropped = payload["cards"].pop()
+            if dropped["id"] not in excluded:
+                excluded.append(dropped["id"])
+            keep_foundations = set()
+            for card in payload["cards"]:
+                if card["tier"] == "L1" or card["route"] == "foundation_baseline":
+                    keep_foundations.add(card["id"])
+                keep_foundations.update(
+                    parent for parent in index.closure[card["id"]]
+                    if index.units[parent].metadata["tier"] == "L1"
+                )
+            payload["foundation_cards"] = [
+                original_foundations[ident] for ident in original_foundations
+                if ident in keep_foundations
+            ]
+            payload["excluded_budget"] = excluded
+            payload["usage"]["excluded_budget"] = list(excluded)
+            payload["usage"]["has_more"] = bool(excluded) or len(payload["cards"]) < len(original_cards)
+            _finalize_usage_estimate(payload)
+        while payload["response_token_estimate"] > token_budget and payload["foundation_cards"]:
+            dropped_f = payload["foundation_cards"].pop()
+            if dropped_f["id"] not in excluded and all(c["id"] != dropped_f["id"] for c in payload["cards"]):
+                excluded.append(dropped_f["id"])
+            payload["excluded_budget"] = excluded
+            payload["usage"]["excluded_budget"] = list(excluded)
+            payload["usage"]["has_more"] = True
+            _finalize_usage_estimate(payload)
+        while payload["response_token_estimate"] > token_budget and payload["cards"]:
+            dropped = payload["cards"].pop()
+            if dropped["id"] not in excluded:
+                excluded.append(dropped["id"])
+            payload["excluded_budget"] = excluded
+            payload["usage"]["excluded_budget"] = list(excluded)
+            payload["usage"]["has_more"] = True
+            _finalize_usage_estimate(payload)
+        return
+
+    # Tiny synthetic unit-test budgets (< 256) exercise body-only excerpt shares.
+    if token_budget < 256 or payload["response_token_estimate"] <= token_budget:
+        return
+    if payload["response_token_estimate"] > token_budget and payload["foundation_cards"]:
+        payload["foundation_cards"] = []
+        _finalize_usage_estimate(payload)
+    if payload["response_token_estimate"] > token_budget and payload["cards"]:
+        payload["cards"] = []
+        _finalize_usage_estimate(payload)
+    excluded = list(payload["excluded_budget"])
+    while len(payload["results"]) > 1 and payload["response_token_estimate"] > token_budget:
+        dropped = payload["results"].pop()
+        if dropped["id"] not in excluded:
+            excluded.append(dropped["id"])
+        payload["excluded_budget"] = excluded
+        payload["usage"]["excluded_budget"] = list(excluded)
+        payload["usage"]["has_more"] = True
+        _recompute_query_body_tokens(payload)
+        _finalize_usage_estimate(payload)
+    if payload["response_token_estimate"] > token_budget and len(payload["results"]) == 1:
+        row = payload["results"][0]
+        while row["inherited_rules"] and payload["response_token_estimate"] > token_budget:
+            parent = row["inherited_rules"].pop()
+            row["inheritance_excluded"].append({"id": parent["id"], "status": "budget_excluded"})
+            row["ready_to_apply"] = False
+            _recompute_query_body_tokens(payload)
+            _finalize_usage_estimate(payload)
+        if payload["response_token_estimate"] > token_budget and row["inheritance_excluded"]:
+            row["inheritance_excluded"] = [
+                {"id": item["id"], "status": item.get("status", "budget_excluded")}
+                for item in row["inheritance_excluded"]
+            ]
+            _finalize_usage_estimate(payload)
+        if payload["response_token_estimate"] > token_budget:
+            row["provenance"] = {"source_type": row["provenance"].get("source_type", "")}
+            row["applicability"] = {"status": row["applicability"].get("status", "")}
+            _finalize_usage_estimate(payload)
+        if payload["response_token_estimate"] > token_budget and row["tier"] != "L1":
+            excess = payload["response_token_estimate"] - token_budget
+            share = max(1, token_estimate(row["excerpt"]) - excess - 8)
+            content, _used, _truncated = _excerpt(index.units[row["id"]].body, share)
+            row["excerpt"] = content
+            row["excerpt_truncated"] = True
+            row["ready_to_apply"] = False
+            _recompute_query_body_tokens(payload)
+            _finalize_usage_estimate(payload)
+        if payload["response_token_estimate"] > token_budget:
+            dropped = payload["results"].pop()
+            if dropped["id"] not in excluded:
+                excluded.append(dropped["id"])
+            payload["excluded_budget"] = excluded
+            payload["usage"]["excluded_budget"] = list(excluded)
+            payload["usage"]["has_more"] = True
+            _recompute_query_body_tokens(payload)
+            _finalize_usage_estimate(payload)
+
+
 class GradedRepository:
     def __init__(self, store):
-        self.store = store
+        # A filesystem root selects the corpus-review surface; a Store keeps
+        # the existing installed-catalog behavior. The two authorities are
+        # never mixed, so a path cannot masquerade as an installed store.
+        if isinstance(store, (str, Path)):
+            self.root = Path(store)
+            self.store = None
+        else:
+            self.store = store
+            self.root = None
         self._catalog_raw = None
         self._index = None
+
+    def _corpus_root(self):
+        if self.root is None:
+            raise ValueError("manifest review requires a filesystem corpus root")
+        return self.root
+
+    def build_manifest(self, *, index_dir=None):
+        """Validate the corpus and atomically rebuild both derived indexes."""
+        from .maintenance import build_routing_index
+        report = build_routing_index(self._corpus_root(), index_dir=index_dir)
+        if not report.get("ok"):
+            errors = "; ".join(item.get("message", "") for item in report.get("errors", ()))
+            raise ValueError(f"routing manifest rebuild failed: {errors}")
+        return json.loads(Path(report["manifest"]).read_text(encoding="utf-8"))
+
+    def validate_corpus(self):
+        """Return the C5/C8 validity report without writing any file."""
+        from .maintenance import load_corpus
+        units, index, errors = load_corpus(self._corpus_root())
+        tiers = {tier: sum(1 for unit in units if unit.metadata["tier"] == tier)
+                 for tier in ("L1", "L2", "L3", "L4")}
+        categories = {category: sum(1 for unit in units if unit.metadata["category"] == category)
+                      for category in ("axiom", "measurement", "sop", "workflow", "mutator")}
+        return {"valid": not errors and index is not None, "unit_count": len(units),
+                "tiers": tiers, "categories": categories, "errors": list(errors),
+                "generation": index.generation if index is not None else None}
 
     def _current(self):
         row = self.store.db.execute("SELECT value FROM state WHERE key=?", (CATALOG_KEY,)).fetchone()
@@ -347,10 +496,15 @@ class GradedRepository:
     def ref(self, unit_id, revision=None):
         return f"mindie://{self.store.domain}/units/{unit_id}" + ("@" + str(revision) if revision is not None else "")
 
-    def query(self, query, *, navigation_only=False, run_id=None, **kwargs):
+    def query(self, query, *, navigation_only=False, run_id=None, mode="reuse",
+              ledger_entries=None, bottleneck_summary=None, native_subcontext=False,
+              goal="", **kwargs):
         with self.store.lock:
             index = self._load()
-            result = index.query(query, navigation_only=navigation_only, **kwargs)
+            result = index.query(
+                query, navigation_only=navigation_only, mode=mode,
+                ledger_entries=ledger_entries, bottleneck_summary=bottleneck_summary,
+                native_subcontext=native_subcontext, goal=goal, **kwargs)
             local_by_id = {item["id"]: item for item in self._catalog()["local"]}
             from .feedback import observe
             for item in result["results"]:
@@ -361,25 +515,30 @@ class GradedRepository:
                 item["source"] = "graded"
                 item.update(self._pending_local(index, local_by_id, item["id"]))
                 unit = index.units[item["id"]]
-                observe(self.store, unit, delivery="query", run_id=run_id)
                 item["feedback"] = self._feedback(unit)
                 for parent in item["inherited_rules"]:
                     parent["ref"] = self.ref(parent["id"], parent["revision"])
                     parent["feedback_ref"] = parent["ref"]
-                    observe(self.store, index.units[parent["id"]])
             for card in result.get("cards", []):
                 card["ref"] = self.ref(card["id"], card["revision"])
                 card["unit_ref"] = self.ref(card["id"])
                 card["feedback_ref"] = card["ref"]
                 card.update(self._pending_local(index, local_by_id, card["id"]))
-                observe(self.store, index.units[card["id"]], delivery="query", run_id=run_id)
             for card in result.get("foundation_cards", []):
                 card["ref"] = self.ref(card["id"], card["revision"])
                 card["unit_ref"] = self.ref(card["id"])
                 card["feedback_ref"] = card["ref"]
+                card.update(self._pending_local(index, local_by_id, card["id"]))
+            payload = {"domain": self.store.domain, "retrieval": "graded-bm25", "page": "graded_units", **result}
+            _enforce_query_budget(payload, index, navigation_only=navigation_only)
+            for item in payload["results"]:
+                observe(self.store, index.units[item["id"]], delivery="query", run_id=run_id)
+                for parent in item["inherited_rules"]:
+                    observe(self.store, index.units[parent["id"]])
+            for card in payload.get("cards", []):
                 observe(self.store, index.units[card["id"]], delivery="query", run_id=run_id)
-        payload = {"domain": self.store.domain, "retrieval": "graded-bm25", "page": "graded_units", **result}
-        _finalize_usage_estimate(payload)
+            for card in payload.get("foundation_cards", []):
+                observe(self.store, index.units[card["id"]], delivery="query", run_id=run_id)
         return payload
 
     def _legacy_view(self, index, ident):
@@ -394,10 +553,14 @@ class GradedRepository:
                 "note": "Reading a reference does not establish applicability; compare its conditions with observed task facts."}
 
     def explain(self, ref=None, *, refs=None, conditions=None, known_refs=None,
-                token_budget=4096, run_id=None):
-        # Single-ref reads keep their historical contract and errors. Batch or
-        # condition-aware reads use the closure assembler instead.
-        if isinstance(ref, str) and refs is None and conditions is None and known_refs is None:
+                token_budget=4096, run_id=None, mode="reuse", ledger_entries=None,
+                bottleneck_summary=None, native_subcontext=False, goal=""):
+        if mode not in {"reuse", "diagnose", "explore"}:
+            raise ValueError("mode must be one of ['diagnose', 'explore', 'reuse']")
+        # Single-ref reads keep their historical contract and errors. Batch,
+        # condition-aware and explore reads use the closure assembler instead.
+        if (isinstance(ref, str) and refs is None and conditions is None and known_refs is None
+                and mode != "explore"):
             prefix = f"mindie://{self.store.domain}/units/"
             if not ref.startswith(prefix):
                 raise ReadReferenceError("outside_domain", "The graded reference is outside the selected domain.")
@@ -415,17 +578,20 @@ class GradedRepository:
                 observe(self.store, unit, delivery="explain", run_id=run_id)
                 view = self._legacy_view(index, ident)
                 view.update(self._pending_local(index, local_by_id, ident))
+                view["mode"] = mode
                 return view
         requested = [] if refs is None else (list(refs) if not isinstance(refs, str) else [refs])
         if ref is not None and ref not in requested:
             requested.insert(0, ref)
         with self.store.lock:
             index = self._load()
-            result = index.explain_closure(requested, conditions=conditions, known_refs=known_refs,
-                                           domain=self.store.domain, token_budget=token_budget)
+            result = index.explain_closure(
+                requested, conditions=conditions, known_refs=known_refs,
+                domain=self.store.domain, token_budget=token_budget, mode=mode,
+                ledger_entries=ledger_entries, bottleneck_summary=bottleneck_summary,
+                native_subcontext=native_subcontext, goal=goal)
             from .feedback import observe
             local_by_id = {item["id"]: item for item in self._catalog()["local"]}
-            loaded = {}
             for bucket in ("requires", "units"):
                 for item in result.get(bucket, []):
                     unit = index.units[item["id"]]
@@ -433,14 +599,68 @@ class GradedRepository:
                     item["unit_ref"] = self.ref(item["id"])
                     item["feedback_ref"] = item["ref"]
                     item.update(self._pending_local(index, local_by_id, item["id"]))
-                    observe(self.store, unit, delivery="explain", run_id=run_id)
-                    loaded[item["id"]] = item
             result["domain"] = self.store.domain
+            if "usage" in result:
+                _finalize_usage_estimate(result)
+                while result["response_token_estimate"] > token_budget and (result["units"] or result["requires"]):
+                    bucket = "units" if result["units"] else "requires"
+                    dropped = result[bucket].pop()
+                    required_tokens = token_estimate(dropped.get("content", ""))
+                    if bucket == "units" and result["requires"]:
+                        still_needed = {
+                            parent for item in result["units"]
+                            for parent in index.closure[item["id"]]
+                        }
+                        kept_requires = []
+                        for req in result["requires"]:
+                            if req["id"] in still_needed:
+                                kept_requires.append(req)
+                            else:
+                                required_tokens += token_estimate(req.get("content", ""))
+                        result["requires"] = kept_requires
+                    result["unresolved"].append({
+                        "id": dropped["id"], "status": "budget_excluded",
+                        "required_tokens": max(1, required_tokens),
+                    })
+                    result["usage"]["body_token_estimate"] = sum(
+                        token_estimate(item.get("content", ""))
+                        for group in ("requires", "units") for item in result.get(group, ())
+                    )
+                    result["usage"]["has_more"] = True
+                    _finalize_usage_estimate(result)
+            loaded = {
+                item["id"]: item
+                for bucket in ("requires", "units") for item in result.get(bucket, [])
+            }
+            for item in loaded.values():
+                observe(self.store, index.units[item["id"]], delivery="explain", run_id=run_id)
             if isinstance(ref, str):
                 parts = _ref_parts(ref)
                 if (parts is not None and (parts[0] is None or parts[0] == self.store.domain)
                         and parts[1] in loaded):
                     result.update(self._legacy_view(index, parts[1]))
-            if "usage" in result:
-                _finalize_usage_estimate(result)
+                    if "usage" in result:
+                        _finalize_usage_estimate(result)
             return result
+
+
+def build_manifest(root, *, index_dir=None):
+    """Convenience wrapper for corpus review scripts and release checks."""
+    return GradedRepository(root).build_manifest(index_dir=index_dir)
+
+
+def validate_corpus(root):
+    """Convenience wrapper for a non-writing C5/C8 corpus check."""
+    return GradedRepository(root).validate_corpus()
+
+
+def validate_repository(root):
+    """Compatibility wrapper for repository-level validation reports."""
+    from .maintenance import validate_repository as validate
+    return validate(root)
+
+
+def build_index(root, *, index_dir=None, check=False):
+    """Compatibility wrapper for the routing-index rebuild entry point."""
+    from .maintenance import build_index as build
+    return build(root, index_dir=index_dir, check=check)
