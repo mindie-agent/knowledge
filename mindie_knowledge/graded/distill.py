@@ -1,9 +1,8 @@
 """[Role] C6 authorized-evidence preparation and deterministic decision admission.
 
-[Invariants] Stop is not completion. An in_flight task may still yield a verified
-substantive partial milestone, but unverified or still-running progress cannot
-become evidence. A model cannot upgrade failed/unverified input into reproduced
-evidence or introduce an unobserved source reference.
+[Invariants] An unfinished task may contain a verified substantive milestone.
+Admission is eligibility, never a mandatory unit. Stop and in-flight progress
+are not evidence. A model cannot invent provenance or upgrade failed inputs.
 [Timeouts & Locks] One bounded Gitleaks call for all selected input; validation
 is pure memory. Callers budget the scanner's 30s plus model and cleanup budgets.
 [Side-Effect Policy] No transcript discovery, model invocation or publication.
@@ -286,7 +285,11 @@ def _trivial_verified(inputs, summary):
 
 
 def value_gate(request):
-    """Admit an in_flight task only through a verified substantive milestone."""
+    """Admit an in_flight task only through a verified substantive milestone.
+
+    In an in_flight task a referenced short finding is substantive; only short
+    unreferenced verified QA is trivial. Pending or observed progress cannot admit.
+    """
     inputs = _request(request)
     if not inputs:
         return "routine_qa_or_unverified"
@@ -295,10 +298,6 @@ def value_gate(request):
             return "in_flight_incomplete"
         if _trivial_verified(inputs, str(request.get("summary", ""))):
             return "routine_qa_or_unverified"
-        if not any(item["outcome"] == "in_flight" for item in inputs) and all(
-            len(item["content"].encode("utf-8")) < 120 for item in inputs if item["outcome"] == "verified"
-        ):
-            return "in_flight_incomplete"
         return None
     if all(item["outcome"] == "in_flight" for item in inputs):
         return "in_flight_incomplete"
@@ -400,7 +399,12 @@ def build_prompt(request):
         "knowledge, or fails the provenance/evidence rules. If admission.admitted is false, return noop with "
         "drop_reason=admission.drop_reason and no units. In an in_flight task, unverified progress and "
         "still-running inputs alone never justify a unit. In every task state, in_flight inputs cannot be "
-        "cited as provenance or evidence_refs. verified_milestone refers to the selected finished finding, "
+        "cited as provenance or evidence_refs. `session_digest` and `evidence_inputs` are the prepared "
+        "request's identity envelope, not a list of the inputs that support a unit. Copy `session_digest` "
+        "and the complete `request.evidence_inputs` array unchanged. `evidence_inputs` lists every selected "
+        "source kind, including a kind whose inputs are in_flight and therefore excluded from unit "
+        "provenance and evidence_refs; omitting that input from a unit never removes its kind from "
+        "`evidence_inputs`. verified_milestone refers to the selected finished finding, "
         "not completion of the wider task. "
         "Read infrastructure failures, source code, build glue and shell scripts as first-class evidence. "
         "Extract supported mechanisms and limits; failure labels or filenames alone never justify dropping a source. "

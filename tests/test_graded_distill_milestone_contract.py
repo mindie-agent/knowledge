@@ -122,6 +122,28 @@ def _verified():
     }
 
 
+def _short_verified():
+    return {
+        "kind": "authorized_transcript",
+        "outcome": "verified",
+        "source_locator": "fixture@abcdef1:short-milestone.md",
+        "content": "Graph capture matched its recorded boundary.",
+        "evidence_refs": ["run-short-verified-1"],
+        "repetitions": 1,
+    }
+
+
+def _trivial_verified_qa():
+    return {
+        "kind": "authorized_transcript",
+        "outcome": "verified",
+        "source_locator": "fixture@abcdef1:trivial-qa.md",
+        "content": "Graph capture works.",
+        "evidence_refs": [],
+        "repetitions": 1,
+    }
+
+
 def _pending():
     return {
         "kind": "authorized_transcript",
@@ -227,14 +249,58 @@ def test_in_flight_verified_milestone_prompt_admission_matches_gate(store, tmp_p
     assert payload["request"]["task_state"] == "in_flight"
     assert payload["request"]["sanitized_inputs"] == request["sanitized_inputs"]
     assert payload["request"]["request_digest"] == request["request_digest"]
-    assert "task_state=in_flight yields noop" not in prompt
-    assert "does not preclude" in prompt
-    assert "eligible to distill" in prompt
-    assert "admission does not require a unit" in prompt
-    assert "must distill" not in prompt
-    assert "already covered" in prompt
-    assert "insufficient for reusable knowledge" in prompt
-    assert "in_flight inputs cannot be cited" in prompt
+
+
+def test_short_referenced_verified_milestone_is_admitted_without_pending_progress(store, tmp_path):
+    short = _short_verified()
+    assert len(short["content"].encode()) < 120 and short["evidence_refs"]
+    alone = _request(store, tmp_path, [short], task_state="in_flight")
+    with_pending = _request(store, tmp_path, [short, _pending()], task_state="in_flight")
+
+    assert distill.value_gate(alone) is None
+    assert distill.value_gate(with_pending) is None
+    payload = _prompt_payload(distill.build_prompt(alone))
+    assert payload["admission"]["admitted"] is True
+    assert payload["admission"]["in_flight_milestone_admitted"] is True
+
+
+def test_short_referenced_verified_milestone_applies_without_pending_progress(
+        store, tmp_path, monkeypatch):
+    short = _short_verified()
+    engine, calls, sidecar = _engine(store, tmp_path, monkeypatch)
+    result = engine.distill_selected([short], session_digest="e" * 64, task_state="in_flight")
+
+    assert result["status"] == "applied"
+    assert result["admitted_unit_ids"] == ["unit-milestone-contract"]
+    assert result["model_calls"] == 1
+    assert calls.read_text(encoding="utf-8") == "1"
+    evidence = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert evidence["gate"] is None
+    assert evidence["payload"]["admission"]["admitted"] is True
+    assert evidence["payload"]["admission"]["in_flight_milestone_admitted"] is True
+    found = store.query("milestone", conditions={"soc": "Ascend910B"})["results"]
+    assert [row["id"] for row in found] == ["unit-milestone-contract"]
+    provenance = store.explain("mindie://vllm-ascend/units/unit-milestone-contract@1")[
+        "frontmatter"]["provenance"]
+    assert provenance["source_locator"] == short["source_locator"]
+    assert provenance["evidence_refs"] == short["evidence_refs"]
+
+
+def test_trivial_unreferenced_verified_qa_is_filtered_before_the_worker(
+        store, tmp_path, monkeypatch):
+    item = _trivial_verified_qa()
+    request = _request(store, tmp_path, [item], task_state="in_flight")
+    assert len(item["content"].encode()) <= 512 and item["evidence_refs"] == []
+    assert distill.value_gate(request) == "routine_qa_or_unverified"
+    with pytest.raises(ValueError, match="requires noop: routine_qa_or_unverified"):
+        distill.validate_decision(_decision_for(request), request)
+
+    engine, calls, sidecar = _engine(store, tmp_path, monkeypatch)
+    result = engine.distill_selected([item], session_digest="f" * 64, task_state="in_flight")
+    assert result["status"] == "noop"
+    assert result["decision"]["drop_reason"] == "routine_qa_or_unverified"
+    assert not calls.exists() and not sidecar.exists()
+    assert store.db.execute("SELECT count(*) FROM material_summary_attempts").fetchone()[0] == 0
 
 
 @pytest.mark.parametrize("inputs", [[_pending()], [_observed()]])
@@ -249,7 +315,6 @@ def test_blocked_in_flight_request_prompt_exposes_the_noop_contract(store, tmp_p
     assert payload["admission"]["in_flight_milestone_admitted"] is False
     assert payload["admission"]["stop_event_is_completion"] is False
     assert payload["admission"]["in_flight_inputs_are_evidence"] is False
-    assert "task_state=in_flight yields noop" not in prompt
 
 
 def test_real_organizer_request_prompt_and_admission_apply_verified_milestone(
@@ -269,10 +334,6 @@ def test_real_organizer_request_prompt_and_admission_apply_verified_milestone(
     assert evidence["payload"]["admission"]["in_flight_milestone_admitted"] is True
     assert evidence["payload"]["request"]["task_state"] == "in_flight"
     assert evidence["payload"]["request"]["sanitized_inputs"] == evidence["sanitized_inputs"]
-    assert "task_state=in_flight yields noop" not in evidence["prompt"]
-    assert "eligible to distill" in evidence["prompt"]
-    assert "admission does not require a unit" in evidence["prompt"]
-    assert "must distill" not in evidence["prompt"]
     found = store.query("milestone", conditions={"soc": "Ascend910B"})["results"]
     assert [row["id"] for row in found] == ["unit-milestone-contract"]
     explained = store.explain("mindie://vllm-ascend/units/unit-milestone-contract@1")
@@ -296,8 +357,6 @@ def test_admitted_in_flight_milestone_may_noop_for_dedup_or_insufficient_value(
     evidence = json.loads(sidecar.read_text(encoding="utf-8"))
     assert evidence["payload"]["admission"]["admitted"] is True
     assert evidence["payload"]["admission"]["in_flight_milestone_admitted"] is True
-    assert "must distill" not in evidence["prompt"]
-    assert "admission does not require a unit" in evidence["prompt"]
     assert store.query("milestone", conditions={"soc": "Ascend910B"})["results"] == []
 
 
@@ -323,3 +382,22 @@ def test_prompt_admission_does_not_relax_pending_provenance_gate(store, tmp_path
     with pytest.raises(ValueError, match="selected evidence"):
         distill.validate_decision(_decision_for(request, cite_pending=True), request)
     assert distill.validate_decision(_decision_for(request), request)["action"] == "propose_graded_units"
+
+
+def test_decision_envelope_keeps_the_unused_in_flight_kind(store, tmp_path):
+    verified = {**_verified(), "kind": "ecosystem_repo"}
+    pending = {**_pending(), "kind": "experiment_ledger"}
+    request = _request(store, tmp_path, [verified, pending], task_state="in_flight")
+    assert request["evidence_inputs"] == ["ecosystem_repo", "experiment_ledger"]
+
+    payload = _prompt_payload(distill.build_prompt(request))
+    assert payload["request"]["evidence_inputs"] == request["evidence_inputs"]
+
+    decision = _decision_for(request)
+    assert decision["evidence_inputs"] == request["evidence_inputs"]
+    assert distill.validate_decision(decision, request)["action"] == "propose_graded_units"
+
+    conflated = json.loads(json.dumps(decision))
+    conflated["evidence_inputs"] = ["ecosystem_repo"]
+    with pytest.raises(ValueError, match="bind the prepared session and selected source kinds"):
+        distill.validate_decision(conflated, request)

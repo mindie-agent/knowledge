@@ -149,9 +149,11 @@ def test_native_c6_call_then_local_failure_reuses_saved_result(store, tmp_path, 
     assert store.explain(found["ref"])["content"] == "Fixture graph probe; no hardware claim.\n"
 
 
-def test_in_flight_stop_is_noop_without_a_native_worker(store):
+def test_in_flight_observed_only_is_noop_without_a_native_worker(store):
+    observed = inputs()
+    assert observed[0]["outcome"] == "observed"
     engine = Engine(store, redactor_executable=scanner())
-    result = engine.distill_selected(inputs(), session_digest="c" * 64, task_state="in_flight")
+    result = engine.distill_selected(observed, session_digest="c" * 64, task_state="in_flight")
     assert result["status"] == "noop" and result["decision"]["drop_reason"] == "in_flight_incomplete"
     assert store.db.execute("SELECT count(*) FROM material_summary_attempts").fetchone()[0] == 0
 
