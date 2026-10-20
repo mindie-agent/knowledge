@@ -33,7 +33,8 @@ def _legacy_excerpt(row, budget):
     return result, used
 
 
-def mixed_query(store, legacy, query, *, limit, conditions, domain_path, token_budget, include_unknown):
+def mixed_query(store, legacy, query, *, limit, conditions, domain_path, token_budget,
+                include_unknown, navigation_only=False, run_id=None):
     if type(token_budget) is not int or not 1 <= token_budget <= 16000:
         raise ValueError("token_budget must be between 1 and 16000")
     if type(limit) is not int or not 1 <= limit <= 20:
@@ -46,7 +47,8 @@ def mixed_query(store, legacy, query, *, limit, conditions, domain_path, token_b
         1, token_budget * min(limit, graded_limit + len(legacy["results"])) // limit)
     graded = store.graded.query(query, limit=graded_limit, conditions=conditions,
                                 domain_path=domain_path, token_budget=graded_budget,
-                                include_unknown=include_unknown)
+                                include_unknown=include_unknown, navigation_only=navigation_only,
+                                run_id=run_id)
     rows = graded["results"]
     legacy_slots = limit - len(rows)
     selected_legacy = legacy["results"][:legacy_slots]

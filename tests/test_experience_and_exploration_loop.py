@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -18,7 +19,7 @@ from mindie_knowledge.graded.feedback import (
     record_vote,
     summarize_usage_events,
 )
-from mindie_knowledge.graded.index import token_estimate
+from mindie_knowledge.graded.index import response_token_estimate, token_estimate
 from mindie_knowledge.graded.maintenance import growth_metrics
 from mindie_knowledge.graded.units import GradedUnit
 from mindie_knowledge.loop.engine import Engine
@@ -265,6 +266,84 @@ def test_query_forwards_include_archived_and_explain_forwards_batch_refs(store):
     assert archived.id in {row["id"] for row in included["results"]}
     batch = store.explain(refs=[ref(active), ref(archived)])
     assert {item["id"] for item in batch["units"]} == {active.id, archived.id}
+
+
+def test_exploration_negative_boundary_stays_l2_and_non_speedup_goals_share_axes():
+    common = dict(run_id="run-x", candidate_id="cand-x", conditions={"soc": "Ascend910B"},
+                  mutation_summary="guarded candidate", compile_ok=True, oracle_passed=True,
+                  measurement_passed=True)
+    negative = evaluate_exploration_candidate(speedup_ratio=0.95, ablation_retained=True,
+                                              target_tier="L4", **common)
+    assert negative["reusability"] == "reusable_negative_boundary"
+    assert negative["return_tier"] == "L2"
+
+    correct = evaluate_exploration_candidate(goal_type="correctness", goal_met=True, **common)
+    assert correct["axes"] == {"evidence_validity": "valid", "goal_attainment": "attained",
+                               "reusability": "reusable_observation"}
+    assert correct["verdict"] == "attained" and correct["return_tier"] == "L2"
+
+    diagnose = evaluate_exploration_candidate(goal_type="diagnose", diagnostic_gain=True, **common)
+    assert diagnose["goal_attainment"] == "attained"
+    assert diagnose["verdict"] == "attained" and diagnose["return_tier"] == "L2"
+
+
+def test_repository_outer_response_estimate_matches_usage(store):
+    item = fixture_unit()
+    store.graded.install([item])
+    found = store.query("graph", conditions=OBSERVED)
+    assert found["usage"]["estimated_tokens"] == response_token_estimate(found)
+    assert found["response_token_estimate"] == response_token_estimate(found)
+
+    closure = store.graded.explain(refs=[item.id], conditions=OBSERVED, token_budget=16000)
+    assert closure["usage"]["estimated_tokens"] == response_token_estimate(closure)
+    assert closure["response_token_estimate"] == response_token_estimate(closure)
+
+
+def test_delivery_counts_and_evaluated_evidence_source_are_queryable(store):
+    item = fixture_unit()
+    store.graded.install([item])
+    store.query("graph", conditions=OBSERVED, run_id="run-query")
+    explained = store.explain(store.graded.ref(item.id), run_id="run-explain")
+    record_usage_event(store, root_hash=ROOT, ref=explained["feedback_ref"],
+                       event_type="evaluated", run_id="run-eval", outcome="supported",
+                       evidence_source="run_manifest_verified")
+    summary = summarize_usage_events(store, item.id, include_delivery=True)
+    assert summary["query_deliveries"] >= 1
+    assert summary["explain_deliveries"] >= 1
+    assert summary["evidence_sources"]["run_manifest_verified"] == 1
+    assert summarize_usage_events(store, item.id) == {
+        "unit_id": item.id, "revision": None, "discovered": 0, "loaded": 0,
+        "applied": 0, "evaluated": 1, "supported": 1, "refuted": 0,
+        "inconclusive": 0,
+    }
+
+
+def test_default_related_lookup_is_snapshotted_for_idempotent_retry(store, tmp_path, monkeypatch):
+    from mindie_knowledge.graded import worker
+    existing = fixture_unit("unit-related-existing",
+                            body="Graph capture fixture replay details for comparison.\n")
+    store.graded.install([existing])
+    calls = tmp_path / "calls.txt"
+    monkeypatch.setenv("MINDIE_GRADED_FIXTURE_CALLS", str(calls))
+    engine = Engine(store, redactor_executable=scanner(),
+                    summary_command=[sys.executable, str(Path(__file__).parent / "fixtures/graded_worker.py")])
+    captured = []
+    original = worker.prepare_request
+
+    def capture(inputs, **kwargs):
+        captured.append(kwargs.get("related_units"))
+        return original(inputs, **kwargs)
+
+    monkeypatch.setattr(worker, "prepare_request", capture)
+    selected = [evidence(fixture_unit())]
+    first = engine.distill_selected(selected, session_digest="b" * 64,
+                                    task_state="verified_milestone")
+    assert first["status"] == "applied" and calls.read_text() == "1"
+    retry = engine.distill_selected(selected, session_digest="b" * 64,
+                                    task_state="verified_milestone")
+    assert retry["replay"] == "existing_local_receipt" and calls.read_text() == "1"
+    assert len(captured) == 2 and captured[0] == captured[1]
+    assert [item["id"] for item in captured[0]] == [existing.id]
 
 
 def test_related_units_feed_the_organizer_prompt_without_changing_old_digests(store):

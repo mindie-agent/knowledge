@@ -9,6 +9,7 @@ prepares an inspectable contribution plan. No Git/GitHub write occurs.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import time
@@ -74,6 +75,26 @@ def _matching_related_units(store, inputs, related_refs):
     return [_compact_related(unit) for unit in ordered[:3]] or None
 
 
+def _related_snapshot(store, inputs, *, session_digest, task_state, related_refs):
+    """Bind one automatic related-unit lookup to the initial request identity."""
+    rel_key = "graded:related:" + hashlib.sha256(canonical({
+        "session_digest": session_digest, "task_state": task_state,
+        "inputs": inputs, "related_refs": list(related_refs or ()),
+    }).encode()).hexdigest()
+    with store.lock:
+        row = store.db.execute("SELECT value FROM state WHERE key=?", (rel_key,)).fetchone()
+        if row is not None:
+            return json.loads(row[0])
+        related_units = _matching_related_units(store, inputs, related_refs)
+    with store._write_txn():
+        row = store.db.execute("SELECT value FROM state WHERE key=?", (rel_key,)).fetchone()
+        if row is not None:
+            return json.loads(row[0])
+        store.db.execute("INSERT OR REPLACE INTO state VALUES(?,?)",
+                         (rel_key, canonical(related_units)))
+    return related_units
+
+
 def _validated_decision(pending, request, engine, store, private_paths, cancel):
     pending = json.loads(canonical(pending))
     for item in pending.get("units", []):
@@ -120,8 +141,8 @@ def run(engine, inputs, *, session_digest, task_state, authorization=None, cance
 
     revalidate()
     private_paths = ((authorization["scope"],) if authorization else ()) + (str(Path.home()),)
-    related_units = (None if proposal is not None or not related_refs
-                     else _matching_related_units(store, inputs, related_refs))
+    related_units = _related_snapshot(store, inputs, session_digest=session_digest,
+                                      task_state=task_state, related_refs=related_refs)
     request = prepare_request(inputs, session_digest=session_digest, task_state=task_state,
                               redactor_executable=engine.redactor_executable, redaction_key=store.redaction_key(),
                               private_paths=private_paths, cancel=cancel, related_units=related_units)

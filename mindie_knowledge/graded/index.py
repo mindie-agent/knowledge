@@ -169,8 +169,8 @@ class RoutingIndex:
                 "units": rows, "unit_count": len(rows), "build_elapsed_ms": self.build_elapsed_ms,
                 "token_estimator": "utf8_bytes_div_4_ceiling", "query_budget_excludes_build": True}
 
-    def query(self, query, *, conditions=None, domain_path=None, token_budget=800, include_unknown=False,
-              include_archived=False, limit=8):
+    def query(self, query, *, conditions=None, domain_path=None, limit=5, token_budget=1200,
+              include_unknown=False, include_archived=False, navigation_only=False):
         if not isinstance(query, str) or not query.strip():
             raise ValueError("query must be nonempty text")
         if conditions is not None and not isinstance(conditions, dict):
@@ -226,6 +226,88 @@ class RoutingIndex:
                 ranked.append((FOUNDATION_SCORE, ident, "foundation_baseline"))
         ranked.sort(key=lambda item: (-item[0], item[1]))
         selected = ranked[:limit]
+        active_closure = {
+            ident: all(self.units[node].status == "active"
+                       for node in self.closure[ident] if node != ident)
+            for ident in self.units
+        }
+
+        def missing_for(ident):
+            return [reason.split(":", 1)[0] for reason in applicability[ident].reasons
+                    if reason.endswith(("not supplied", "version not supplied"))]
+
+        def card_for(ident, *, score, route, ready, missing):
+            unit = self.units[ident]
+            return {"id": ident, "revision": unit.revision,
+                    "title": unit.metadata["title"], "tier": unit.metadata["tier"],
+                    "category": unit.metadata["category"],
+                    "evidence_strength": unit.metadata["evidence_strength"],
+                    "status": unit.status, "superseded_by": unit.superseded_by,
+                    "domain_path": unit.metadata["domain_path"],
+                    "match_status": {"matched": "matched", "mismatch": "mismatched",
+                                     "unknown": "condition_unknown"}[applicability[ident].status],
+                    "ready_to_apply": ready,
+                    "conditions_matched": applicability[ident].status == "matched",
+                    "missing_conditions": missing,
+                    "inherits_from": list(unit.metadata["inherits_from"]),
+                    "body_token_estimate": token_estimate(unit.body),
+                    "closure_token_estimate": token_estimate(unit.body) + sum(
+                        token_estimate(self.units[parent].body) for parent in self.closure[ident]),
+                    "route": route, "score": score}
+
+        if navigation_only:
+            cards = [card_for(ident, score=score, route=route,
+                              ready=(applicability[ident].status == "matched" and active_closure[ident]),
+                              missing=missing_for(ident))
+                     for score, ident, route in selected]
+
+            def foundation_cards_for(rows):
+                found, seen = [], set()
+
+                def add(ident, *, route="inherited_foundation"):
+                    unit = self.units[ident]
+                    if ident in seen or unit.metadata["tier"] != "L1" or unit.status != "active":
+                        return
+                    seen.add(ident)
+                    found.append(card_for(
+                        ident, score=scores.get(ident, FOUNDATION_SCORE), route=route,
+                        ready=(applicability[ident].status == "matched" and active_closure[ident]),
+                        missing=missing_for(ident)))
+
+                for row in rows:
+                    if row["tier"] == "L1" or row["route"] == "foundation_baseline":
+                        add(row["id"], route=row["route"])
+                    for parent in self.closure[row["id"]]:
+                        add(parent)
+                return found
+
+            # Navigation cards do not charge bodies. Their own bounded metadata
+            # is the delivered budget, so a truncated excerpt can never appear.
+            accepted = []
+            for card in cards:
+                trial = accepted + [card]
+                foundations = foundation_cards_for(trial)
+                payload = {"cards": trial, "foundation_cards": foundations, "results": []}
+                if response_token_estimate(payload) <= token_budget:
+                    accepted = trial
+            cards = accepted
+            foundation_cards = foundation_cards_for(cards)
+            excluded_conditions = dict(rejected)
+            if archived_excluded:
+                excluded_conditions["archived_or_superseded"] = archived_excluded
+            estimated = response_token_estimate(
+                {"cards": cards, "foundation_cards": foundation_cards, "results": []})
+            usage = {"token_budget": token_budget, "body_token_estimate": 0,
+                     "estimated_tokens": estimated, "estimator": "utf8_bytes_div_4_ceiling",
+                     "has_more": len(cards) < len(selected), "excluded_budget": []}
+            return {"results": [], "cards": cards, "foundation_cards": foundation_cards,
+                    "generation": self.generation, "unit_count": len(self.units),
+                    "body_token_estimate": 0, "token_budget": token_budget,
+                    "budget_scope": "navigation cards; metadata excluded",
+                    "excluded_budget": [], "excluded_conditions": excluded_conditions,
+                    "usage": usage, "query_elapsed_ms": (time.perf_counter() - started) * 1000,
+                    "note": "Conditions must be established. Unknown conditions are not evidence of applicability; retrieval scores are not confidence."}
+
         left = token_budget
         results = []
         excluded_budget = []
@@ -289,35 +371,25 @@ class RoutingIndex:
             results.append({"id": ident, "title": unit.metadata["title"],
                             "revision": unit.revision,
                             "match_status": {"matched": "matched", "mismatch": "mismatched", "unknown": "condition_unknown"}[applicability[ident].status],
-                            "missing_conditions": [reason.split(":", 1)[0] for reason in applicability[ident].reasons
-                                                   if reason.endswith(("not supplied", "version not supplied"))],
+                            "missing_conditions": missing_for(ident),
                             "tier": unit.metadata["tier"], "category": unit.metadata["category"],
                             "evidence_strength": unit.metadata["evidence_strength"],
                             "domain_path": unit.metadata["domain_path"], "conditions": unit.metadata["conditions"],
                             "provenance": unit.metadata["provenance"], "applicability": applicability[ident].to_dict(),
                             "status": unit.status, "superseded_by": unit.superseded_by,
-                            "ready_to_apply": applicability[ident].status == "matched" and not omitted,
+                            "ready_to_apply": (applicability[ident].status == "matched" and not omitted
+                                               and not truncated and active_closure[ident]),
                             "excerpt": content, "excerpt_truncated": truncated,
                             "score": score, "route": route,
                             "inherited_rules": inherited, "inheritance_excluded": omitted})
         cards = []
         for row in results:
             ident = row["id"]
-            unit = self.units[ident]
-            cards.append({"id": ident, "revision": unit.revision,
-                          "title": unit.metadata["title"], "tier": unit.metadata["tier"],
-                          "category": unit.metadata["category"],
-                          "evidence_strength": unit.metadata["evidence_strength"],
-                          "status": unit.status, "superseded_by": unit.superseded_by,
-                          "domain_path": unit.metadata["domain_path"],
-                          "match_status": row["match_status"],
-                          "ready_to_apply": row["ready_to_apply"],
-                          "missing_conditions": row["missing_conditions"],
-                          "inherits_from": list(unit.metadata["inherits_from"]),
-                          "body_token_estimate": token_estimate(unit.body),
-                          "closure_token_estimate": token_estimate(unit.body) + sum(
-                              token_estimate(self.units[parent].body) for parent in self.closure[ident]),
-                          "route": row["route"], "score": row["score"]})
+            cards.append(card_for(
+                ident, score=row["score"], route=row["route"],
+                ready=(applicability[ident].status == "matched" and not row["inheritance_excluded"]
+                       and active_closure[ident]),
+                missing=row["missing_conditions"]))
         foundation_cards = [card for card in cards
                             if card["tier"] == "L1" or card["route"] == "foundation_baseline"]
         seen_foundation = {card["id"] for card in foundation_cards}
@@ -325,22 +397,11 @@ class RoutingIndex:
             parent = self.units[parent_id]
             if parent.metadata["tier"] != "L1" or parent_id in seen_foundation:
                 continue
-            foundation_cards.append({
-                "id": parent_id, "revision": parent.revision,
-                "title": parent.metadata["title"], "tier": parent.metadata["tier"],
-                "category": parent.metadata["category"],
-                "evidence_strength": parent.metadata["evidence_strength"],
-                "status": parent.status, "superseded_by": parent.superseded_by,
-                "domain_path": parent.metadata["domain_path"],
-                "match_status": "matched",
-                "ready_to_apply": True,
-                "missing_conditions": [],
-                "inherits_from": list(parent.metadata["inherits_from"]),
-                "body_token_estimate": token_estimate(parent.body),
-                "closure_token_estimate": token_estimate(parent.body) + sum(
-                    token_estimate(self.units[anc].body) for anc in self.closure[parent_id]),
-                "route": "inherited_foundation", "score": scores.get(parent_id, FOUNDATION_SCORE),
-            })
+            foundation_cards.append(card_for(
+                parent_id, score=scores.get(parent_id, FOUNDATION_SCORE),
+                route="inherited_foundation",
+                ready=(parent.status == "active" and active_closure[parent_id]),
+                missing=[]))
         excluded_conditions = dict(rejected)
         if archived_excluded:
             excluded_conditions["archived_or_superseded"] = archived_excluded
@@ -449,10 +510,20 @@ class RoutingIndex:
                     entry["superseded_by"] = unit.superseded_by
                 add_unresolved(entry)
                 continue
-            resolved.append((ident, revision))
+            resolved.append((ident, revision, raw))
 
         valid = []
-        for ident, _revision in resolved:
+        for ident, _revision, raw in resolved:
+            superseded_node = next(
+                (node for node in self.closure[ident]
+                 if node != ident and self.units[node].status == "superseded"), None)
+            if superseded_node is not None:
+                unit = self.units[ident]
+                add_unresolved({"ref": raw, "id": ident, "status": "removed_or_superseded",
+                                "blocked_by": superseded_node,
+                                "superseded_by": self.units[superseded_node].superseded_by,
+                                "current_revision": unit.revision})
+                continue
             if grouped is None:
                 valid.append(ident)
                 continue

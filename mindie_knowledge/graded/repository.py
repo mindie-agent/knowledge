@@ -17,11 +17,24 @@ import time
 
 from ..markdown import _atomic_write_bytes
 from ..materials.references import ReadReferenceError
-from .index import RoutingIndex, _ref_parts
+from .index import RoutingIndex, _ref_parts, response_token_estimate
 from .units import GradedUnit, canonical
 
 CATALOG_KEY = "graded:current"
 INDEX_KEY = "graded:index"
+
+
+def _finalize_usage_estimate(payload):
+    """Bind the outer delivery estimate and its own field to one fixed point."""
+    payload["usage"]["estimated_tokens"] = 0
+    payload["response_token_estimate"] = 0
+    for _ in range(8):
+        estimate = response_token_estimate(payload)
+        if (payload["response_token_estimate"] == estimate
+                and payload["usage"]["estimated_tokens"] == estimate):
+            break
+        payload["response_token_estimate"] = estimate
+        payload["usage"]["estimated_tokens"] = estimate
 
 
 class GradedRepository:
@@ -51,6 +64,14 @@ class GradedRepository:
         value.setdefault("feeds", {})
         value.setdefault("retired_local", [])
         return value
+
+    @staticmethod
+    def _pending_local(index, local_by_id, ident):
+        candidate = local_by_id.get(ident)
+        if candidate is not None and candidate["content_sha256"] != index.units[ident].content_sha256:
+            return {"has_pending_local_candidate": True,
+                    "pending_local_revision": candidate["revision"]}
+        return {}
 
     def _descriptor(self, unit, **metadata):
         raw = unit.render().encode("utf-8")
@@ -326,29 +347,40 @@ class GradedRepository:
     def ref(self, unit_id, revision=None):
         return f"mindie://{self.store.domain}/units/{unit_id}" + ("@" + str(revision) if revision is not None else "")
 
-    def query(self, query, **kwargs):
+    def query(self, query, *, navigation_only=False, run_id=None, **kwargs):
         with self.store.lock:
             index = self._load()
-            result = index.query(query, **kwargs)
+            result = index.query(query, navigation_only=navigation_only, **kwargs)
+            local_by_id = {item["id"]: item for item in self._catalog()["local"]}
+            from .feedback import observe
             for item in result["results"]:
                 item["ref"] = self.ref(item["id"], item["revision"])
                 item["unit_ref"] = self.ref(item["id"])
                 item["feedback_ref"] = item["ref"]
                 item["reference_kind"] = "graded_unit"
                 item["source"] = "graded"
-                from .feedback import observe
+                item.update(self._pending_local(index, local_by_id, item["id"]))
                 unit = index.units[item["id"]]
-                observe(self.store, unit)
+                observe(self.store, unit, delivery="query", run_id=run_id)
                 item["feedback"] = self._feedback(unit)
                 for parent in item["inherited_rules"]:
                     parent["ref"] = self.ref(parent["id"], parent["revision"])
                     parent["feedback_ref"] = parent["ref"]
                     observe(self.store, index.units[parent["id"]])
-            for card in [*result.get("cards", []), *result.get("foundation_cards", [])]:
+            for card in result.get("cards", []):
                 card["ref"] = self.ref(card["id"], card["revision"])
                 card["unit_ref"] = self.ref(card["id"])
                 card["feedback_ref"] = card["ref"]
-        return {"domain": self.store.domain, "retrieval": "graded-bm25", "page": "graded_units", **result}
+                card.update(self._pending_local(index, local_by_id, card["id"]))
+                observe(self.store, index.units[card["id"]], delivery="query", run_id=run_id)
+            for card in result.get("foundation_cards", []):
+                card["ref"] = self.ref(card["id"], card["revision"])
+                card["unit_ref"] = self.ref(card["id"])
+                card["feedback_ref"] = card["ref"]
+                observe(self.store, index.units[card["id"]], delivery="query", run_id=run_id)
+        payload = {"domain": self.store.domain, "retrieval": "graded-bm25", "page": "graded_units", **result}
+        _finalize_usage_estimate(payload)
+        return payload
 
     def _legacy_view(self, index, ident):
         unit = index.units[ident]
@@ -361,7 +393,8 @@ class GradedRepository:
                 "status": unit.status, "superseded_by": unit.superseded_by,
                 "note": "Reading a reference does not establish applicability; compare its conditions with observed task facts."}
 
-    def explain(self, ref=None, *, refs=None, conditions=None, known_refs=None, token_budget=4096):
+    def explain(self, ref=None, *, refs=None, conditions=None, known_refs=None,
+                token_budget=4096, run_id=None):
         # Single-ref reads keep their historical contract and errors. Batch or
         # condition-aware reads use the closure assembler instead.
         if isinstance(ref, str) and refs is None and conditions is None and known_refs is None:
@@ -377,9 +410,12 @@ class GradedRepository:
                     raise ReadReferenceError("removed_or_superseded", "The graded unit is absent from the current collection.")
                 if revision is not None and revision != unit.revision:
                     raise ReadReferenceError("removed_or_superseded", "The observed graded revision was replaced; no other bytes were substituted.")
+                local_by_id = {item["id"]: item for item in self._catalog()["local"]}
                 from .feedback import observe
-                observe(self.store, unit)
-                return self._legacy_view(index, ident)
+                observe(self.store, unit, delivery="explain", run_id=run_id)
+                view = self._legacy_view(index, ident)
+                view.update(self._pending_local(index, local_by_id, ident))
+                return view
         requested = [] if refs is None else (list(refs) if not isinstance(refs, str) else [refs])
         if ref is not None and ref not in requested:
             requested.insert(0, ref)
@@ -388,6 +424,7 @@ class GradedRepository:
             result = index.explain_closure(requested, conditions=conditions, known_refs=known_refs,
                                            domain=self.store.domain, token_budget=token_budget)
             from .feedback import observe
+            local_by_id = {item["id"]: item for item in self._catalog()["local"]}
             loaded = {}
             for bucket in ("requires", "units"):
                 for item in result.get(bucket, []):
@@ -395,7 +432,8 @@ class GradedRepository:
                     item["ref"] = self.ref(item["id"], unit.revision)
                     item["unit_ref"] = self.ref(item["id"])
                     item["feedback_ref"] = item["ref"]
-                    observe(self.store, unit)
+                    item.update(self._pending_local(index, local_by_id, item["id"]))
+                    observe(self.store, unit, delivery="explain", run_id=run_id)
                     loaded[item["id"]] = item
             result["domain"] = self.store.domain
             if isinstance(ref, str):
@@ -403,4 +441,6 @@ class GradedRepository:
                 if (parts is not None and (parts[0] is None or parts[0] == self.store.domain)
                         and parts[1] in loaded):
                     result.update(self._legacy_view(index, parts[1]))
+            if "usage" in result:
+                _finalize_usage_estimate(result)
             return result

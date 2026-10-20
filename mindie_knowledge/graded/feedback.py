@@ -32,6 +32,7 @@ from ..materials.references import ReadReferenceError
 SCHEMA_FEEDBACK = "mindie-graded-feedback/1"
 EVENT_TYPES = ("discovered", "loaded", "applied", "evaluated")
 EVAL_OUTCOMES = ("supported", "refuted", "inconclusive")
+EVIDENCE_SOURCES = ("agent_declared", "run_manifest_verified", "ablation_verified")
 RATINGS = ("up", "down")
 PUBLIC_VOTE_FIELDS = ("vote_id", "root_id", "unit_id", "revision", "rating", "reason")
 MAX_FEEDBACK_VOTES = 500
@@ -39,7 +40,8 @@ MAX_IDENTITY_CHARS = 256
 OBSERVED_PREFIX = "graded:observed:"
 EVENT_PREFIX = "graded:event:"
 _EVENT_FIELDS = frozenset({"event_id", "root_id", "unit_id", "revision", "event_type",
-                           "run_id", "outcome", "step_id", "reason"})
+                           "run_id", "outcome", "step_id", "reason", "evidence_source"})
+_EVENT_LEGACY_FIELDS = _EVENT_FIELDS - {"evidence_source"}
 
 _DOMAIN = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
 _REF = re.compile(
@@ -47,6 +49,7 @@ _REF = re.compile(
     r"(?P<unit_id>[^/@\s]+)@(?P<revision>[1-9][0-9]*)\Z"
 )
 _OBSERVED_FIELDS = frozenset({"unit_id", "revision"})
+_OBSERVED_DELIVERIES = frozenset({"query_deliveries", "explain_deliveries"})
 
 
 class FeedbackError(ValueError):
@@ -257,10 +260,17 @@ def _decode_observed(raw: Any, *, unit_id: str | None = None, revision: int | No
         value = json.loads(raw)
     except (TypeError, ValueError):
         raise FeedbackError("stored graded observation is unreadable") from None
-    if not isinstance(value, dict) or set(value) != _OBSERVED_FIELDS:
+    if (not isinstance(value, dict) or not _OBSERVED_FIELDS <= set(value)
+            or set(value) - (_OBSERVED_FIELDS | _OBSERVED_DELIVERIES)):
         raise FeedbackError("stored graded observation is not a compact identity")
     observed = {"unit_id": _unit_id(value["unit_id"]),
                 "revision": _stored_revision(value["revision"])}
+    for name in _OBSERVED_DELIVERIES:
+        if name in value:
+            count = value[name]
+            if type(count) is not int or count < 0:
+                raise FeedbackError("stored graded delivery count is invalid")
+            observed[name] = count
     if unit_id is not None and observed["unit_id"] != unit_id:
         raise FeedbackError("stored graded observation names another unit")
     if revision is not None and observed["revision"] != revision:
@@ -317,11 +327,15 @@ def _decode_event(raw: Any) -> dict:
         value = json.loads(raw)
     except (TypeError, ValueError):
         raise FeedbackError("stored usage event is unreadable") from None
-    if not isinstance(value, dict) or set(value) != _EVENT_FIELDS:
+    if (not isinstance(value, dict) or not _EVENT_LEGACY_FIELDS <= set(value)
+            or set(value) - _EVENT_FIELDS):
         raise FeedbackError("stored usage event is not a compact identity")
     outcome = value["outcome"]
     if outcome is not None:
         outcome = _eval_outcome(outcome)
+    evidence_source = value.get("evidence_source", "agent_declared")
+    if evidence_source not in EVIDENCE_SOURCES:
+        raise FeedbackError(f"evidence_source must be one of {EVIDENCE_SOURCES}")
     return {"event_id": _identity_text(value["event_id"], "event_id"),
             "root_id": _identity_text(value["root_id"], "root_id"),
             "unit_id": _unit_id(value["unit_id"]),
@@ -330,11 +344,15 @@ def _decode_event(raw: Any) -> dict:
             "run_id": _optional_text(value["run_id"], "run_id"),
             "outcome": outcome,
             "step_id": _optional_text(value["step_id"], "step_id"),
-            "reason": _reason(value["reason"])}
+            "reason": _reason(value["reason"]),
+            "evidence_source": evidence_source}
 
 
 def _write_usage_event(store, *, opaque: str, observed: dict, event_type: str,
-                       run_id: str, outcome: str | None, step_id: str, reason: str) -> dict:
+                       run_id: str, outcome: str | None, step_id: str, reason: str,
+                       evidence_source: str = "agent_declared") -> dict:
+    if evidence_source not in EVIDENCE_SOURCES:
+        raise FeedbackError(f"evidence_source must be one of {EVIDENCE_SOURCES}")
     unit_id, revision = observed["unit_id"], observed["revision"]
     event_id = _event_id(opaque, unit_id, revision, event_type, run_id)
     key = _event_key(unit_id, revision, event_id)
@@ -343,20 +361,24 @@ def _write_usage_event(store, *, opaque: str, observed: dict, event_type: str,
         return {**_decode_event(row[0]), "duplicate": True}
     event = {"event_id": event_id, "root_id": opaque, "unit_id": unit_id,
              "revision": revision, "event_type": event_type, "run_id": run_id,
-             "outcome": outcome, "step_id": step_id, "reason": reason}
+             "outcome": outcome, "step_id": step_id, "reason": reason,
+             "evidence_source": evidence_source}
     store.db.execute("INSERT INTO state VALUES(?,?)", (key, canonical(event)))
     return {**event, "duplicate": False}
 
 
 def record_usage_event(store, *, root_hash: str, ref: str, event_type: str,
                        run_id: str = "", outcome: str | None = None,
-                       step_id: str = "", reason: str = "") -> dict:
+                       step_id: str = "", reason: str = "",
+                       evidence_source: str = "agent_declared") -> dict:
     """Append one idempotent 4-stage usage/evaluation event for an observed unit."""
     root = _identity_text(root_hash, "root_hash")
     event_type = _event_type(event_type)
     run_id = _optional_text(run_id, "run_id")
     step_id = _optional_text(step_id, "step_id")
     reason = _reason(reason)
+    if evidence_source not in EVIDENCE_SOURCES:
+        raise FeedbackError(f"evidence_source must be one of {EVIDENCE_SOURCES}")
     if event_type == "evaluated":
         outcome = _eval_outcome(outcome)
         if not run_id:
@@ -369,16 +391,22 @@ def record_usage_event(store, *, root_hash: str, ref: str, event_type: str,
         opaque = store.opaque_for(root)
         return _write_usage_event(store, opaque=opaque, observed=observed,
                                   event_type=event_type, run_id=run_id, outcome=outcome,
-                                  step_id=step_id, reason=reason)
+                                  step_id=step_id, reason=reason,
+                                  evidence_source=evidence_source)
 
 
-def summarize_usage_events(store, unit_id: str, revision: int | None = None) -> dict:
+def summarize_usage_events(store, unit_id: str, revision: int | None = None, *,
+                           include_delivery: bool = False) -> dict:
     """Derive counts from deduplicated events; inconclusive never becomes evidence."""
     unit_id = _unit_id(unit_id)
     if revision is not None:
         revision = _revision(revision)
+    if type(include_delivery) is not bool:
+        raise FeedbackError("include_delivery must be a boolean")
     counts = {event_type: 0 for event_type in EVENT_TYPES}
     outcomes = {outcome: 0 for outcome in EVAL_OUTCOMES}
+    evidence_sources = {source: 0 for source in EVIDENCE_SOURCES}
+    deliveries = {name: 0 for name in _OBSERVED_DELIVERIES}
     with store.lock:
         rows = store.db.execute(
             "SELECT value FROM state WHERE key LIKE ?", (f"{EVENT_PREFIX}{unit_id}:%",)
@@ -388,30 +416,59 @@ def summarize_usage_events(store, unit_id: str, revision: int | None = None) -> 
             if revision is not None and event["revision"] != revision:
                 continue
             counts[event["event_type"]] += 1
+            evidence_sources[event["evidence_source"]] += 1
             if event["event_type"] == "evaluated":
                 outcomes[event["outcome"]] += 1
-    return {"unit_id": unit_id, "revision": revision, **counts, **outcomes}
+        if include_delivery:
+            observed_rows = store.db.execute(
+                "SELECT value FROM state WHERE key LIKE ?",
+                (f"{OBSERVED_PREFIX}{unit_id}:%",)
+            ).fetchall()
+            for row in observed_rows:
+                observed = _decode_observed(row[0], unit_id=unit_id)
+                if revision is not None and observed["revision"] != revision:
+                    continue
+                for name in _OBSERVED_DELIVERIES:
+                    deliveries[name] += observed.get(name, 0)
+    summary = {"unit_id": unit_id, "revision": revision, **counts, **outcomes}
+    if include_delivery:
+        summary.update(deliveries)
+        summary["evidence_sources"] = evidence_sources
+    return summary
 
 
-def observe(store, unit: GradedUnit) -> dict:
+def observe(store, unit: GradedUnit, *, delivery=None, run_id=None) -> dict:
     unit_id, revision = _unit_fields(unit)
     identity = {"unit_id": unit_id, "revision": revision}
+    if delivery not in {None, "query", "explain"}:
+        raise FeedbackError("delivery must be query, explain, or None")
+    counter = None if delivery is None else f"{delivery}_deliveries"
     key = _observed_key(unit_id, revision)
     with store.lock:
         row = store.db.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
         if row is not None:
-            if _decode_observed(row[0], unit_id=unit_id, revision=revision) != identity:
+            observed = _decode_observed(row[0], unit_id=unit_id, revision=revision)
+            if any(observed[name] != value for name, value in identity.items()):
                 raise FeedbackError("graded observation identity changed for the same revision")
             known = store.db.execute("SELECT 1 FROM known_revisions WHERE entry_id=? AND revision=?",
                                      (unit_id, revision)).fetchone()
-            if known is not None:
+            if known is not None and counter is None:
                 return identity
     with store._write_txn():
         row = store.db.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
-        if row is not None and _decode_observed(row[0], unit_id=unit_id, revision=revision) != identity:
-            raise FeedbackError("graded observation identity changed for the same revision")
-        if row is None:
-            store.db.execute("INSERT INTO state VALUES(?,?)", (key, canonical(identity)))
+        if row is not None:
+            observed = _decode_observed(row[0], unit_id=unit_id, revision=revision)
+            if any(observed[name] != value for name, value in identity.items()):
+                raise FeedbackError("graded observation identity changed for the same revision")
+            if counter is not None:
+                updated = {**observed, counter: observed.get(counter, 0) + 1}
+                store.db.execute("UPDATE state SET value=? WHERE key=?",
+                                 (canonical(updated), key))
+        else:
+            stored = dict(identity)
+            if counter is not None:
+                stored[counter] = 1
+            store.db.execute("INSERT INTO state VALUES(?,?)", (key, canonical(stored)))
         store.db.execute("INSERT OR IGNORE INTO known_revisions VALUES(?,?)", (unit_id, revision))
     return identity
 
@@ -423,7 +480,8 @@ def _vote_id(root: str, unit_id: str, revision: int) -> str:
 def record_vote(store, *, root_hash: str, ref: str, rating: str | None = None,
                 reason: str = "", publishable: bool = False, generation: str | None = None,
                 event_type: str | None = None, run_id: str = "",
-                outcome: str | None = None, step_id: str = "") -> dict:
+                outcome: str | None = None, step_id: str = "",
+                evidence_source: str = "agent_declared") -> dict:
     """Record a rating and/or one usage event; both are atomically idempotent."""
     if rating is None and event_type is None:
         raise FeedbackError("feedback requires rating or event_type")
@@ -443,6 +501,8 @@ def record_vote(store, *, root_hash: str, ref: str, rating: str | None = None,
     if event_type is not None:
         event_type = _event_type(event_type)
         run_id, step_id = _optional_text(run_id, "run_id"), _optional_text(step_id, "step_id")
+        if evidence_source not in EVIDENCE_SOURCES:
+            raise FeedbackError(f"evidence_source must be one of {EVIDENCE_SOURCES}")
         if event_type == "evaluated":
             outcome = _eval_outcome(outcome)
             if not run_id:
@@ -456,7 +516,8 @@ def record_vote(store, *, root_hash: str, ref: str, rating: str | None = None,
         if event_type is not None:
             event = _write_usage_event(store, opaque=opaque, observed=observed,
                                        event_type=event_type, run_id=run_id,
-                                       outcome=outcome, step_id=step_id, reason=reason)
+                                       outcome=outcome, step_id=step_id, reason=reason,
+                                       evidence_source=evidence_source)
         if rating is None:
             return event
         store.db.execute("INSERT OR REPLACE INTO votes VALUES(?,?,?,?,?,?,NULL,?)",
@@ -530,8 +591,9 @@ def summarize_votes(votes: Iterable[Mapping[str, Any]], unit: GradedUnit) -> dic
 
 
 __all__ = [
-    "EVAL_OUTCOMES", "EVENT_TYPES", "FeedbackError", "FeedbackReferenceError",
-    "SCHEMA_FEEDBACK", "merge_votes", "observe", "outbound_votes",
-    "parse_feedback_ref", "record_usage_event", "record_vote", "render_feedback",
-    "summarize_usage_events", "summarize_votes", "validate_feedback",
+    "EVAL_OUTCOMES", "EVENT_TYPES", "EVIDENCE_SOURCES", "FeedbackError",
+    "FeedbackReferenceError", "SCHEMA_FEEDBACK", "merge_votes", "observe",
+    "outbound_votes", "parse_feedback_ref", "record_usage_event", "record_vote",
+    "render_feedback", "summarize_usage_events", "summarize_votes",
+    "validate_feedback",
 ]

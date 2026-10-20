@@ -63,6 +63,45 @@ def test_two_l3_units_share_parent_bodies_once_in_query_and_closure():
     assert closure["unresolved"] == []
 
 
+def test_truncated_excerpts_are_never_ready_and_navigation_only_has_no_inline_body():
+    big = unit("unit-navigation-long", body="Graph capture step. " * 200)
+    index = RoutingIndex([big])
+    truncated = index.query("graph capture", conditions=OBSERVED, token_budget=40)["results"][0]
+    assert truncated["excerpt_truncated"] is True
+    assert truncated["ready_to_apply"] is False
+
+    navigation = index.query("graph capture", conditions=OBSERVED, navigation_only=True,
+                             token_budget=16000)
+    assert navigation["results"] == []
+    assert navigation["body_token_estimate"] == 0
+    assert [card["id"] for card in navigation["cards"]] == [big.id]
+    assert "excerpt" not in navigation["cards"][0]
+    assert big.body not in json.dumps(navigation, ensure_ascii=False)
+
+    tight = index.query("graph capture", conditions=OBSERVED, navigation_only=True,
+                        token_budget=20)
+    assert tight["cards"] == [] and tight["foundation_cards"] == []
+    assert response_token_estimate({"cards": tight["cards"],
+                                    "foundation_cards": tight["foundation_cards"]}) <= 20
+
+
+def test_explain_closure_blocks_a_superseded_ancestor():
+    old = unit("unit-old-premise", status="superseded", superseded_by="unit-new-premise",
+               body="Superseded graph capture premise.")
+    replacement = unit("unit-new-premise", body="Current graph capture premise.")
+    child = unit("unit-child-of-old", parents=[old.id], body="Child graph capture step.")
+    index = RoutingIndex([old, replacement, child])
+
+    closure = index.explain_closure([child.id], conditions=OBSERVED)
+    assert closure["units"] == []
+    blocked = closure["unresolved"][0]
+    assert blocked["status"] == "removed_or_superseded"
+    assert blocked["blocked_by"] == old.id
+    assert blocked["superseded_by"] == replacement.id
+    assert blocked["current_revision"] == child.revision
+    assert blocked["ref"] == child.id
+
+
 def test_narrow_budget_excludes_the_whole_unit_and_never_truncates_steps():
     big = unit("unit-big-workflow", tier="L3", category="workflow",
                body="STEP 1: capture the graph, then verify every queue.\n" * 200)
