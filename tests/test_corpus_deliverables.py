@@ -19,12 +19,14 @@ CORPORA = {
     "operators": {
         "root": Path("/Volumes/data/code/knowledge-operators"),
         "new": "unit-vectorized-bf16-fp32-accumulation-cast-fusion-mutator",
-        "l4": 2,
+        "l4": 4,
+        "unit_count": 21,
     },
     "vllm-ascend": {
         "root": Path("/Users/maoxx241/code/mindie-transcript-20261004/content"),
-        "new": "unit-vllm-ascend-gdn-idle-dp-zero-pad-workspace-mutator",
-        "l4": 1,
+        "new": "unit-vllm-ascend-dspark-mtp-aclgraph-d2h-elimination-mutator",
+        "l4": 3,
+        "unit_count": 22,
     },
 }
 
@@ -42,7 +44,7 @@ def test_corpus_contract_and_rebuilt_manifest(name):
     root = entry["root"]
     report = GradedRepository(root).validate_corpus()
     assert report["valid"] is True, report["errors"]
-    assert report["unit_count"] == 11
+    assert report["unit_count"] == entry["unit_count"]
     assert report["tiers"]["L4"] == entry["l4"]
     checked = build_routing_index(root, check=True)
     assert checked["ok"] is True, checked["errors"]
@@ -74,7 +76,7 @@ def test_corpus_contract_and_rebuilt_manifest(name):
         assert "fallback" in unit.body.lower()
 
     manifest = json.loads((root / "index/routing-manifest.json").read_text(encoding="utf-8"))
-    assert manifest["unit_count"] == 11
+    assert manifest["unit_count"] == entry["unit_count"]
     assert manifest["generation"] == report["generation"]
     assert {row["id"] for row in manifest["units"]} == set(units)
     assert {row["id"] for row in manifest["units"] if row["tier"] == "L4"} == {

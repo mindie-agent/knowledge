@@ -22,7 +22,8 @@ UNIT_ID = re.compile(r"unit-[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 SHA256 = re.compile(r"[a-f0-9]{64}\Z")
 TIER_CATEGORIES = {"L1": {"axiom", "measurement"}, "L2": {"sop"}, "L3": {"workflow"}, "L4": {"mutator"}}
 CATEGORY_TO_TIER = {category: tier for tier, categories in TIER_CATEGORIES.items() for category in categories}
-STRENGTHS = {"hardware_spec", "software_contract", "reproduced_empirical", "single_observation", "hypothesis"}
+STRENGTHS = {"hardware_spec", "software_contract", "reproduced_empirical",
+             "single_observation", "hypothesis"}
 STATUSES = {"active", "suspect", "archived", "superseded"}
 
 

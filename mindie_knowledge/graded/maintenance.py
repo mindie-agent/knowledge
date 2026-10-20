@@ -463,6 +463,26 @@ def build_routing_index(root: Path | str, *, index_dir: Path | str | None = None
     return report
 
 
+def build_index(root: Path | str, *, index_dir: Path | str | None = None,
+                check: bool = False) -> dict:
+    """Compatibility name for the routing-index rebuild entry point."""
+    return build_routing_index(root, index_dir=index_dir, check=check)
+
+
+def validate_repository(root: Path | str) -> dict:
+    """Validate a graded corpus and its derivable routing index without writing."""
+    units, index, errors = load_corpus(root)
+    tiers = {tier: sum(1 for unit in units if unit.metadata["tier"] == tier)
+             for tier in ("L1", "L2", "L3", "L4")}
+    categories = {category: sum(1 for unit in units if unit.metadata["category"] == category)
+                  for category in ("axiom", "measurement", "sop", "workflow", "mutator")}
+    return {"schema": "mindie-repository-validation/1", "ok": not errors,
+            "valid": not errors and index is not None, "unit_count": len(units),
+            "tiers": tiers, "categories": categories,
+            "generation": index.generation if index is not None else None,
+            "errors": list(errors)}
+
+
 def lint_corpus(root: Path | str) -> dict:
     """Validate C5/C8 and report review candidates without writing anything."""
     units, index, errors = load_corpus(root)

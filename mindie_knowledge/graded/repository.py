@@ -496,10 +496,15 @@ class GradedRepository:
     def ref(self, unit_id, revision=None):
         return f"mindie://{self.store.domain}/units/{unit_id}" + ("@" + str(revision) if revision is not None else "")
 
-    def query(self, query, *, navigation_only=False, run_id=None, **kwargs):
+    def query(self, query, *, navigation_only=False, run_id=None, mode="reuse",
+              ledger_entries=None, bottleneck_summary=None, native_subcontext=False,
+              goal="", **kwargs):
         with self.store.lock:
             index = self._load()
-            result = index.query(query, navigation_only=navigation_only, **kwargs)
+            result = index.query(
+                query, navigation_only=navigation_only, mode=mode,
+                ledger_entries=ledger_entries, bottleneck_summary=bottleneck_summary,
+                native_subcontext=native_subcontext, goal=goal, **kwargs)
             local_by_id = {item["id"]: item for item in self._catalog()["local"]}
             from .feedback import observe
             for item in result["results"]:
@@ -548,10 +553,14 @@ class GradedRepository:
                 "note": "Reading a reference does not establish applicability; compare its conditions with observed task facts."}
 
     def explain(self, ref=None, *, refs=None, conditions=None, known_refs=None,
-                token_budget=4096, run_id=None):
-        # Single-ref reads keep their historical contract and errors. Batch or
-        # condition-aware reads use the closure assembler instead.
-        if isinstance(ref, str) and refs is None and conditions is None and known_refs is None:
+                token_budget=4096, run_id=None, mode="reuse", ledger_entries=None,
+                bottleneck_summary=None, native_subcontext=False, goal=""):
+        if mode not in {"reuse", "diagnose", "explore"}:
+            raise ValueError("mode must be one of ['diagnose', 'explore', 'reuse']")
+        # Single-ref reads keep their historical contract and errors. Batch,
+        # condition-aware and explore reads use the closure assembler instead.
+        if (isinstance(ref, str) and refs is None and conditions is None and known_refs is None
+                and mode != "explore"):
             prefix = f"mindie://{self.store.domain}/units/"
             if not ref.startswith(prefix):
                 raise ReadReferenceError("outside_domain", "The graded reference is outside the selected domain.")
@@ -569,14 +578,18 @@ class GradedRepository:
                 observe(self.store, unit, delivery="explain", run_id=run_id)
                 view = self._legacy_view(index, ident)
                 view.update(self._pending_local(index, local_by_id, ident))
+                view["mode"] = mode
                 return view
         requested = [] if refs is None else (list(refs) if not isinstance(refs, str) else [refs])
         if ref is not None and ref not in requested:
             requested.insert(0, ref)
         with self.store.lock:
             index = self._load()
-            result = index.explain_closure(requested, conditions=conditions, known_refs=known_refs,
-                                           domain=self.store.domain, token_budget=token_budget)
+            result = index.explain_closure(
+                requested, conditions=conditions, known_refs=known_refs,
+                domain=self.store.domain, token_budget=token_budget, mode=mode,
+                ledger_entries=ledger_entries, bottleneck_summary=bottleneck_summary,
+                native_subcontext=native_subcontext, goal=goal)
             from .feedback import observe
             local_by_id = {item["id"]: item for item in self._catalog()["local"]}
             for bucket in ("requires", "units"):
@@ -639,3 +652,15 @@ def build_manifest(root, *, index_dir=None):
 def validate_corpus(root):
     """Convenience wrapper for a non-writing C5/C8 corpus check."""
     return GradedRepository(root).validate_corpus()
+
+
+def validate_repository(root):
+    """Compatibility wrapper for repository-level validation reports."""
+    from .maintenance import validate_repository as validate
+    return validate(root)
+
+
+def build_index(root, *, index_dir=None, check=False):
+    """Compatibility wrapper for the routing-index rebuild entry point."""
+    from .maintenance import build_index as build
+    return build(root, index_dir=index_dir, check=check)

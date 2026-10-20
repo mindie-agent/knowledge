@@ -736,7 +736,8 @@ class Store:
         navigation. No full-document assembly, historical package or old
         offset-based reading path is reachable through this interface.
         """
-        supported = {"refs", "conditions", "known_refs", "token_budget", "run_id"}
+        supported = {"refs", "conditions", "known_refs", "token_budget", "run_id",
+                     "mode", "ledger_entries", "bottleneck_summary", "native_subcontext", "goal"}
         unknown = set(kwargs) - supported
         if unknown:
             raise TypeError(f"explain() got an unexpected keyword argument {sorted(unknown)[0]!r}")
@@ -747,7 +748,12 @@ class Store:
             values = {"ref": ref, "refs": refs, "conditions": kwargs.get("conditions"),
                       "known_refs": kwargs.get("known_refs"),
                       "token_budget": kwargs.get("token_budget"),
-                      "run_id": kwargs.get("run_id")}
+                      "run_id": kwargs.get("run_id"),
+                      "mode": kwargs.get("mode"),
+                      "ledger_entries": kwargs.get("ledger_entries"),
+                      "bottleneck_summary": kwargs.get("bottleneck_summary"),
+                      "native_subcontext": kwargs.get("native_subcontext"),
+                      "goal": kwargs.get("goal")}
             try:
                 parameters = inspect.signature(self.graded.explain).parameters
             except (TypeError, ValueError):
@@ -1199,21 +1205,29 @@ class Store:
 
     def query(self, query=None, limit=5, conditions=None, continuation=None,
               domain_path=None, token_budget=1200, include_unknown=False,
-              include_archived=False, navigation_only=False, run_id=None):
+              include_archived=False, navigation_only=False, run_id=None,
+              mode="reuse", ledger_entries=None, bottleneck_summary=None,
+              native_subcontext=False, goal=""):
+        options = dict(mode=mode, ledger_entries=ledger_entries,
+                       bottleneck_summary=bottleneck_summary,
+                       native_subcontext=native_subcontext, goal=goal)
         if continuation is not None or not self.graded.available():
-            return self._query_materials(query, limit, conditions, continuation)
+            result = self._query_materials(query, limit, conditions, continuation)
+            if mode != "reuse":
+                result["mode"] = mode
+            return result
         legacy = self._query_materials(query, limit, conditions)
         if legacy["results"]:
             from ..graded.retrieval import mixed_query
             return mixed_query(self, legacy, query, limit=limit, conditions=conditions,
                                domain_path=domain_path, token_budget=token_budget,
                                include_unknown=include_unknown, navigation_only=navigation_only,
-                               run_id=run_id,
+                               run_id=run_id, **options,
                                **_option_kwargs(mixed_query, "include_archived", include_archived))
         return self.graded.query(query, limit=limit, conditions=conditions,
                                  domain_path=domain_path, token_budget=token_budget,
                                  include_unknown=include_unknown, navigation_only=navigation_only,
-                                 run_id=run_id,
+                                 run_id=run_id, **options,
                                  **_option_kwargs(self.graded.query, "include_archived", include_archived))
 
     def _query_materials(self, query=None, limit=5, conditions=None, continuation=None):

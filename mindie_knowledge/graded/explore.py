@@ -1,13 +1,12 @@
-"""[Role] Model-free stagnation, de-biased context, and three-axis exploration judgment.
+"""[Role] Model-free RSI stagnation, de-biased context, and 4-gate judgment.
 
 [Invariants] Information stagnation is distinct from execution failure: an
 infrastructure or measurement fault requests repair and never counts as an
-unsupported attempt. L3 bodies are stripped from exploration context; only
-L1/L2/L4 rules mount, and a conditional avoidance needs a valid refuted ledger
-entry whose recorded conditions match the task. Evidence validity, goal
-attainment, and reusability are orthogonal; a valid 1.04x gain below a 1.05x
-target is subtarget_valid/reusable_observation, never refuted. Native run and
-event identities deduplicate attempts.
+unsupported attempt. L3 workflow bodies are stripped, but any L1/L2 foundation
+they carry is promoted before stripping. Conditional avoidance needs valid
+refuted evidence and remains scoped to its recorded conditions. Evidence
+validity, goal attainment, and reusable encoding are orthogonal. Native run and
+event identities deduplicate attempts with the latest update winning.
 [Timeouts & Locks] Pure in-memory validation and arithmetic; no subprocess,
 network, model call, sleep, or lock is introduced.
 [Side-Effect Policy] Returns derived judgments only; never writes knowledge,
@@ -15,17 +14,35 @@ runs experiments, or changes a unit revision or conditions.
 """
 from __future__ import annotations
 
+import argparse
+import json
 import math
+import sys
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 from .conditions import match_conditions
+from .explore_support import (
+    build_citation_feedback_record,
+    enforce_direction_budget,
+    flagged,
+    guard_regression,
+    legacy_evaluate,
+)
 from .units import CATEGORY_TO_TIER
 
 CONTEXT_SCHEMA = "mindie-exploration-context/1"
 EVALUATION_SCHEMA = "mindie-exploration-evaluation/1"
+PACK_SCHEMA = "mindie-rsi-subagent-pack/1"
+SCOPE_NOTE = ("Negative result under recorded conditions only; not a universal ban "
+              "when conditions or bottleneck change.")
 TIERS = {"L1", "L2", "L3", "L4"}
 REPAIR_OUTCOMES = {"infra_failed", "measurement_invalid"}
+PROGRESS_VERDICTS = {"supported", "attained", "subtarget_valid", "improved",
+                     "qualified_improvement", "distill_candidate"}
+NEGATIVE_VERDICTS = {"refuted", "failed", "negative", "rejected", "unsupported",
+                     "record_conditional_finding"}
 
 
 def _mapping(value: Any, label: str) -> dict:
@@ -48,36 +65,65 @@ def _number(value: Any, label: str, *, optional: bool = False) -> float | None:
     return float(value)
 
 
-def assess_stagnation(attempts: Sequence[Mapping[str, Any]], *,
-                      max_stalled_attempts: int = 2) -> dict[str, Any]:
-    """Deduplicate attempts and count only attempts that produced no new fact."""
-    if type(max_stalled_attempts) is not int or max_stalled_attempts < 1:
-        raise ValueError("max_stalled_attempts must be a positive integer")
-    unique, seen = [], set()
-    for index, raw in enumerate(attempts or ()):
-        attempt = _mapping(raw, f"attempts[{index}]")
-        run_id = attempt.get("run_id")
-        key = ("run", run_id.strip()) if isinstance(run_id, str) and run_id.strip() else ("attempt", index)
-        if key not in seen:
-            seen.add(key)
-            unique.append(attempt)
-    stalled_count, repair, progressed = 0, False, False
+def _tier_of(unit: Mapping[str, Any]) -> str | None:
+    tier = unit.get("tier")
+    return tier if tier in TIERS else CATEGORY_TO_TIER.get(unit.get("category"))
+
+
+def _missing(status) -> list[str]:
+    return [reason.split(":", 1)[0] for reason in status.reasons
+            if reason.endswith(("not supplied", "version not supplied"))]
+
+
+def assess_stagnation(ledger_entries: Sequence[Mapping[str, Any]], *,
+                      consecutive_limit: int = 3,
+                      max_stalled_attempts: int | None = None) -> dict[str, Any]:
+    """Deduplicate ledger attempts by run_id (latest wins) and count non-progress."""
+    limit = consecutive_limit if max_stalled_attempts is None else max_stalled_attempts
+    if type(limit) is not int or limit < 1:
+        raise ValueError("consecutive_limit must be a positive integer")
+    unique: list[dict] = []
+    positions: dict[str, int] = {}
+    for index, raw in enumerate(ledger_entries or ()):
+        entry = _mapping(raw, f"ledger_entries[{index}]")
+        run_id = entry.get("run_id")
+        key = run_id.strip() if isinstance(run_id, str) and run_id.strip() else f"attempt:{index}"
+        if key in positions:
+            unique[positions[key]] = entry
+        else:
+            positions[key] = len(unique)
+            unique.append(entry)
+    stalled_count, repair, progressed, budget_exhausted, unverified = 0, False, False, False, 0
     for attempt in unique:
         verdict, outcome = attempt.get("verdict"), attempt.get("outcome")
         axes = attempt.get("axes")
-        attainment = (axes.get("goal_attainment") if isinstance(axes, Mapping) else None) or attempt.get("goal_attainment")
-        if outcome in REPAIR_OUTCOMES or (verdict == "inconclusive" and outcome != "speedup_within_noise"):
+        attainment = (axes.get("goal_attainment") if isinstance(axes, Mapping) else None) \
+            or attempt.get("goal_attainment")
+        if attempt.get("budget_exhausted") is True:
+            budget_exhausted = True
+        if attempt.get("hypothesis") and not (attempt.get("hypothesis_verified") is True
+                                              or verdict in PROGRESS_VERDICTS):
+            unverified += 1
+        if outcome in REPAIR_OUTCOMES or (verdict == "inconclusive"
+                                          and outcome != "speedup_within_noise"):
             repair = True
-        elif (verdict in {"supported", "attained", "subtarget_valid"}
-              or attainment == "attained"
+        elif (verdict in PROGRESS_VERDICTS or attainment == "attained"
               or attempt.get("new_observation") is True
-              or attempt.get("divergent_layer_identified") is True):
+              or attempt.get("divergent_layer_identified") is True
+              or attempt.get("improvement") is True
+              or (isinstance(axes, Mapping) and axes.get("goal_achieved") is True)):
             stalled_count, progressed = 0, True
         else:
             stalled_count += 1
-    if stalled_count >= max_stalled_attempts:
+    # Two consecutive legacy "unsupported" verdicts remain the historical
+    # threshold; richer ledger entries use the requested three-attempt window.
+    legacy = bool(unique) and all(
+        "verdict" in entry and "outcome" not in entry
+        and "budget_exhausted" not in entry and "hypothesis" not in entry for entry in unique)
+    threshold = min(limit, 2) if legacy and max_stalled_attempts is None else limit
+    if stalled_count >= threshold:
         status, stalled = "stalled", True
-        reason = f"{stalled_count} deduplicated attempts produced no new observation or identified layer"
+        reason = "consecutive_unimproved_limit_reached"
     elif repair and not stalled_count:
         status, stalled = "repair_execution_conditions", False
         reason = "execution conditions are invalid; repair them before judging information stagnation"
@@ -86,7 +132,7 @@ def assess_stagnation(attempts: Sequence[Mapping[str, Any]], *,
         reason = "no attempts were supplied"
     elif stalled_count:
         status, stalled = "monitoring", False
-        reason = f"{stalled_count} unproductive attempt(s); below the {max_stalled_attempts} reminder threshold"
+        reason = f"{stalled_count} unproductive attempt(s); below the {threshold} reminder threshold"
     elif progressed:
         status, stalled = "progressing", False
         reason = "a new observation, supported verdict, or identified divergent layer is progress"
@@ -95,11 +141,16 @@ def assess_stagnation(attempts: Sequence[Mapping[str, Any]], *,
         reason = "no decisive information yet"
     if repair and status in {"progressing", "monitoring"}:
         reason += "; some attempts require repaired execution conditions"
-    return {"stalled": stalled, "stalled_count": stalled_count, "status": status, "reason": reason}
+    return {"stalled": stalled, "stalled_count": stalled_count, "consecutive_limit": limit,
+            "status": status, "reason": reason,
+            "tail_run_ids": [entry["run_id"] for entry in unique[-limit:]
+                             if isinstance(entry.get("run_id"), str)],
+            "unverified_hypotheses_remaining": unverified, "budget_exhausted": budget_exhausted,
+            "should_escalate": bool(stalled), "escalation_reason": reason}
 
 
 def _compact_unit(unit: dict) -> dict | None:
-    tier = unit.get("tier") or CATEGORY_TO_TIER.get(unit.get("category"))
+    tier = _tier_of(unit)
     if tier == "L3":
         return None
     if tier not in {"L1", "L2", "L4"}:
@@ -113,189 +164,291 @@ def _compact_unit(unit: dict) -> dict | None:
             "body": unit.get("body") or unit.get("content") or unit.get("excerpt") or ""}
 
 
-def build_exploration_context(*, goal: str, retrieved_units: Sequence[Mapping[str, Any]],
-                              bottleneck_summary: Mapping[str, Any],
-                              ledger_entries: Sequence[Mapping[str, Any]],
-                              conditions: Mapping[str, Any],
-                              native_subcontext: bool = False) -> dict[str, Any]:
-    """Assemble the minimal independent fact pack; old L3 guidance is withheld."""
-    goal = _text(goal, "goal")
-    current = _mapping(conditions, "conditions")
-    bottleneck = _mapping(bottleneck_summary, "bottleneck_summary")
-    mounted, stripped, ledger_refs, avoid = [], [], [], []
-    for index, raw in enumerate(retrieved_units or ()):
-        unit = _mapping(raw, f"retrieved_units[{index}]")
-        effective_tier = unit.get("tier") or CATEGORY_TO_TIER.get(unit.get("category"))
-        if effective_tier == "L3":
-            ident = unit.get("id")
-            if not isinstance(ident, str) or not ident:
-                raise ValueError("retrieved L3 unit requires a stable id")
-            stripped.append(ident)
-        else:
-            compact = _compact_unit(unit)
-            if compact is not None:
-                mounted.append(compact)
-    for index, raw in enumerate(ledger_entries or ()):
-        entry = _mapping(raw, f"ledger_entries[{index}]")
-        ledger_refs.append({"run_id": entry.get("run_id"), "verdict": entry.get("verdict")})
-        axes = entry.get("axes")
-        if not isinstance(axes, Mapping) or axes.get("evidence_validity") != "valid":
-            continue
-        if entry.get("verdict") != "refuted":
+def _promoted_foundations(units: Sequence[Mapping[str, Any]]) -> dict[str, dict]:
+    """Collect L1/L2 foundations carried by L3 units before the L3 strip."""
+    promoted: dict[str, dict] = {}
+    by_id = {unit.get("id"): unit for unit in units if isinstance(unit.get("id"), str)}
+
+    def visit(unit: Mapping[str, Any], depth: int = 0) -> None:
+        if depth > 4 or _tier_of(unit) != "L3":
+            return
+        for key in ("inherited_rules", "foundation", "requires_units", "requires"):
+            rules = unit.get(key)
+            if not isinstance(rules, Sequence) or isinstance(rules, (str, bytes)):
+                continue
+            for rule in rules:
+                rule = by_id.get(rule) if isinstance(rule, str) else rule
+                if not isinstance(rule, Mapping):
+                    continue
+                compact = _compact_unit(dict(rule))
+                if compact is not None and compact["tier"] != "L3":
+                    promoted.setdefault(compact["id"], compact)
+                    visit(compact, depth + 1)
+
+    for raw in units:
+        visit(raw)
+    return promoted
+
+
+def _normalized_avoid(entries: Sequence[Mapping[str, Any]], *, conditions, bottleneck) -> list[dict]:
+    avoid = []
+    for index, raw in enumerate(entries):
+        entry = _mapping(raw, f"failed_attempts[{index}]")
+        verdict, outcome, axes = entry.get("verdict"), entry.get("outcome"), entry.get("axes")
+        valid = (entry.get("evidence_valid") is not False and (
+            not isinstance(axes, Mapping) or axes.get("evidence_validity") in (None, "valid")))
+        negative = (verdict in NEGATIVE_VERDICTS or outcome in NEGATIVE_VERDICTS
+                    or (verdict == "inconclusive" and entry.get("budget_exhausted") is True))
+        if not valid or not negative:
             continue
         required = entry.get("conditions")
         if required is None and isinstance(entry.get("applicability"), Mapping):
             required = entry["applicability"].get("conditions")
         if not isinstance(required, Mapping) or not required:
+            required = dict(bottleneck or {})
+        if conditions is not None and required and match_conditions(
+                dict(required), dict(conditions)).status != "matched":
             continue
-        if match_conditions(dict(required), current).status != "matched":
-            continue
-        avoid.append({"run_id": entry.get("run_id"), "conditions": dict(required),
-                      "avoid": entry.get("mutation_summary") or entry.get("candidate_id"),
-                      "reason": entry.get("reason") or entry.get("failure_reason") or ""})
-    mounted.sort(key=lambda item: (item["id"], item.get("revision") or 0))
-    stripped.sort()
+        mutation = entry.get("mutation_summary") or entry.get("candidate_id") or entry.get("unit_id") or ""
+        avoid.append({
+            "unit_id": entry.get("unit_id") or entry.get("candidate_id") or entry.get("id") or "",
+            "hypothesis": entry.get("hypothesis") or mutation,
+            "failure_reason": entry.get("failure_reason") or entry.get("reason") or verdict or outcome or "",
+            "observed_bottleneck": entry.get("observed_bottleneck") or entry.get("bottleneck")
+            or dict(bottleneck or {}),
+            "conditions": dict(required), "scope_note": SCOPE_NOTE,
+            "run_id": entry.get("run_id"), "avoid": mutation,
+            "reason": entry.get("reason") or entry.get("failure_reason") or ""})
     avoid.sort(key=lambda item: (str(item["run_id"]), str(item["avoid"])))
-    ledger_refs.sort(key=lambda item: (str(item["run_id"]), str(item["verdict"])))
-    return {
-        "schema": CONTEXT_SCHEMA, "goal": goal,
-        "isolation_mode": "native_subcontext" if native_subcontext else "in_session_strategy_shift",
-        "native_subcontext": bool(native_subcontext), "mounted_units": mounted,
-        "units": mounted, "stripped_l3_ids": stripped, "conditional_avoid": avoid,
-        "bottleneck_summary": bottleneck, "conditions": current, "ledger_refs": ledger_refs,
-        "notes": [
-            "Retrieved L3 recommendation steps are withheld to reduce anchoring.",
-            "Deleting an L3 dictionary key does not remove already-visible history; only native_subcontext claims real isolation.",
-            "Conditional avoidance is conditional evidence, not a permanent ban.",
-        ],
-    }
+    return avoid
 
 
-def evaluate_exploration_candidate(*, run_id: str, candidate_id: str,
-                                   mutation_summary: str, conditions: Mapping[str, Any],
-                                   compile_ok: bool, oracle_passed: bool,
-                                   measurement_passed: bool,
-                                   speedup_ratio: float | None = None,
-                                   min_speedup_ratio: float = 1.05,
-                                   noise_margin: float = 0.01,
-                                   ablation_retained: bool | None = None,
-                                   target_tier: str = "L4",
-                                   failure_reason: str = "",
-                                   goal_type: str = "speedup",
-                                   goal_met: bool | None = None,
-                                   diagnostic_gain: bool = False) -> dict[str, Any]:
-    """Judge evidence, goal, and reuse independently; never refute a valid subtarget gain."""
-    run_id = _text(run_id, "run_id")
-    candidate_id = _text(candidate_id, "candidate_id")
-    mutation_summary = _text(mutation_summary, "mutation_summary")
-    current = _mapping(conditions, "conditions")
-    if target_tier not in TIERS:
-        raise ValueError(f"target_tier must be one of {sorted(TIERS)}")
-    if goal_type not in {"speedup", "correctness", "diagnose"}:
-        raise ValueError("goal_type must be one of ['correctness', 'diagnose', 'speedup']")
-    if goal_met is not None and type(goal_met) is not bool:
-        raise ValueError("goal_met must be a boolean or None")
-    if type(diagnostic_gain) is not bool:
-        raise ValueError("diagnostic_gain must be a boolean")
-    for name, value in (("compile_ok", compile_ok), ("oracle_passed", oracle_passed),
-                        ("measurement_passed", measurement_passed)):
-        if type(value) is not bool:
-            raise ValueError(f"{name} must be a boolean")
-    if ablation_retained is not None and type(ablation_retained) is not bool:
-        raise ValueError("ablation_retained must be a boolean or None")
-    ratio = _number(speedup_ratio, "speedup_ratio", optional=True)
-    minimum = _number(min_speedup_ratio, "min_speedup_ratio")
-    noise = _number(noise_margin, "noise_margin")
-    if minimum <= 0 or noise < 0:
-        raise ValueError("min_speedup_ratio must be positive and noise_margin nonnegative")
-    if failure_reason is None:
-        failure_reason = ""
-    if not isinstance(failure_reason, str):
-        raise ValueError("failure_reason must be text")
+def _prompt_brief(goal: str, foundations, bottleneck, mutators, avoid) -> str:
+    lines = ["# RSI subagent brief", f"**Goal:** {goal or '(not supplied)'}", "",
+             "## L1 hard constraints"]
+    lines.extend(f"- {unit['id']}: {unit.get('title') or unit.get('body', '')[:120]}"
+                 for unit in foundations) if foundations else lines.append("- none mounted")
+    lines += ["", "## L2 bottleneck evidence", json.dumps(bottleneck or {}, sort_keys=True)[:600],
+              "", "## L4 allowed mutators"]
+    lines.extend(f"- {unit['id']}: {unit.get('title') or unit.get('body', '')[:120]}"
+                 for unit in mutators) if mutators else lines.append("- none mounted")
+    lines += ["", "## Conditional avoid"]
+    lines.extend(f"- {item['unit_id'] or item['avoid']}: {item['failure_reason']} "
+                 f"(scope: {item['scope_note']})" for item in avoid) if avoid else lines.append("- none")
+    lines += ["", "Do not replay prior L3 workflow steps; derive the next experiment "
+              "from the mounted L1/L2 facts and L4 mutators only."]
+    return "\n".join(lines)[:1199]
 
-    if not compile_ok:
-        validity, reusability = "compile_failed", "inconclusive"
-    elif not oracle_passed:
-        validity, reusability = "oracle_failed", "inconclusive"
-    elif not measurement_passed:
-        validity, reusability = "measurement_invalid", "inconclusive"
-    else:
-        validity, reusability = "valid", None
-    if validity != "valid":
-        attainment = "not_applicable"
-    elif goal_met is not None:
-        attainment = "attained" if goal_met else "not_attained"
-    elif goal_type == "speedup":
-        if ratio is None:
-            attainment = "not_applicable"
-        elif ratio >= minimum:
-            attainment = "attained" if ablation_retained is True else "not_applicable"
+
+def build_exploration_context(units=None, *, bottleneck_summary=None, failed_attempts=None,
+                              native_subcontext: bool = False, goal: str = "",
+                              retrieved_units=None, ledger_entries=None,
+                              conditions=None) -> dict[str, Any]:
+    """Assemble a self-contained fact pack for a fresh RSI subcontext."""
+    if units is not None and retrieved_units is not None:
+        raise ValueError("supply units or retrieved_units, not both")
+    raw = units if units is not None else retrieved_units
+    raw_units = [_mapping(item, f"units[{index}]") for index, item in enumerate(raw or ())]
+    goal = "" if goal is None else str(goal)
+    bottleneck = _mapping(bottleneck_summary, "bottleneck_summary") \
+        if bottleneck_summary is not None else {}
+    current = _mapping(conditions, "conditions") if conditions is not None else None
+    entries = [*list(failed_attempts or ()), *list(ledger_entries or ())]
+    promoted = _promoted_foundations(raw_units)
+    mounted, stripped = [], []
+    for raw_unit in raw_units:
+        tier = _tier_of(raw_unit)
+        if tier == "L3":
+            ident = raw_unit.get("id")
+            if not isinstance(ident, str) or not ident:
+                raise ValueError("retrieved L3 unit requires a stable id")
+            stripped.append(ident)
         else:
-            attainment = "not_attained"
-    elif goal_type == "correctness":
-        attainment = "attained" if oracle_passed else "not_applicable"
-    else:
-        attainment = "attained" if diagnostic_gain else "not_attained"
-
-    if validity == "valid" and reusability is None:
-        if attainment == "attained" and goal_type == "speedup":
-            reusability = "reusable_mutator" if target_tier == "L4" else "reusable_observation"
-        elif goal_type == "speedup" and ratio is not None and ratio >= minimum:
-            reusability = "inconclusive" if ablation_retained is None else "reusable_negative_boundary"
-        elif attainment == "attained":
-            reusability = ("reusable_mutator" if ablation_retained is True
-                           else "reusable_observation")
-        elif ratio is None:
-            reusability = ("reusable_negative_boundary" if ablation_retained is False
-                           else "reusable_observation")
-        elif ratio < 1.0 - noise:
-            reusability = "reusable_negative_boundary"
-        elif ratio <= 1.0 + noise:
-            reusability = "inconclusive"
-        else:
-            # A positive gain below target stays reusable evidence even when the
-            # proposed mutator ablation did not retain the change.
-            reusability = "reusable_observation"
-
-    if validity != "valid":
-        verdict = validity
-    elif attainment == "attained":
-        verdict = "attained"
-    elif reusability == "reusable_negative_boundary":
-        verdict = "refuted"
-    elif reusability == "reusable_observation" and ratio is not None and ratio > 1.0 + noise:
-        verdict = "subtarget_valid"
-    elif reusability == "inconclusive":
-        verdict = "inconclusive"
-    else:
-        verdict = "unconfirmed"
-
-    if reusability == "reusable_negative_boundary":
-        return_tier = "L2" if target_tier == "L4" else target_tier
-        conditional_avoid = [{"conditions": current, "avoid": mutation_summary,
-                              "reason": failure_reason or verdict}]
-    elif reusability == "reusable_observation":
-        return_tier = "L2" if target_tier in {"L3", "L4"} else target_tier
-        conditional_avoid = []
-    else:
-        return_tier, conditional_avoid = target_tier, []
-    distill_ready = reusability in {"reusable_mutator", "reusable_observation",
-                                    "reusable_negative_boundary"}
-    axes = {"evidence_validity": validity, "goal_attainment": attainment,
-            "reusability": reusability}
-    return {
-        "schema": EVALUATION_SCHEMA, "run_id": run_id, "candidate_id": candidate_id,
-        "mutation_summary": mutation_summary, "conditions": current, "axes": axes,
-        **axes, "verdict": verdict, "distill_ready": distill_ready,
-        "return_tier": return_tier, "conditional_avoid": conditional_avoid,
-        "speedup_ratio": ratio, "min_speedup_ratio": minimum, "noise_margin": noise,
-        "ablation_retained": ablation_retained, "target_tier": target_tier,
-        "goal_type": goal_type, "goal_met": goal_met, "diagnostic_gain": diagnostic_gain,
-        "reason": failure_reason or (
-            "valid gain is below the stated target but remains reusable evidence"
-            if verdict == "subtarget_valid" else verdict),
+            compact = _compact_unit(raw_unit)
+            if compact is not None:
+                mounted.append(compact)
+    mounted_ids = {unit["id"] for unit in mounted}
+    mounted.extend(unit for ident, unit in sorted(promoted.items()) if ident not in mounted_ids)
+    mounted.sort(key=lambda item: (item["id"], item.get("revision") or 0))
+    stripped = sorted(set(stripped))
+    avoid = _normalized_avoid(entries, conditions=current, bottleneck=bottleneck)
+    ledger_refs = sorted(({"run_id": _mapping(entry, "ledger_entry").get("run_id"),
+                           "verdict": _mapping(entry, "ledger_entry").get("verdict")}
+                          for entry in entries),
+                         key=lambda item: (str(item["run_id"]), str(item["verdict"])))
+    l1 = [unit for unit in mounted if unit["tier"] == "L1"]
+    l4 = [unit for unit in mounted if unit["tier"] == "L4"]
+    isolation = "native_subcontext" if native_subcontext else "in_session_warning"
+    budget_policy = {
+        "kb_dir_cap": 1,
+        "require_cold_direction": True,
+        "roofline_status": str(bottleneck.get("roofline_status") or "calibrated"),
     }
+    pack = {"schema_version": PACK_SCHEMA, "goal": goal, "isolation_required": True,
+            "isolation_mode": isolation, "mounted_tiers": ["L1", "L2", "L4"],
+            "stripped_tiers": ["L3"], "stripped_l3_ids": stripped,
+            "l1_foundation_ids": [unit["id"] for unit in l1],
+            "l2_bottleneck": bottleneck, "l4_mutator_ids": [unit["id"] for unit in l4],
+            "conditional_avoid": avoid, "direction_budget_policy": budget_policy,
+            "prompt_brief": _prompt_brief(goal, l1, bottleneck, l4, avoid)}
+    return {"schema": CONTEXT_SCHEMA, "schema_version": CONTEXT_SCHEMA, "mode": "explore",
+            "goal": goal, "isolation_mode": isolation, "native_subcontext": bool(native_subcontext),
+            "requires_fresh_subcontext": not bool(native_subcontext),
+            "mounted_units": mounted, "units": mounted,
+            "mounted_tiers": ["L1", "L2", "L4"], "stripped_tiers": ["L3"],
+            "stripped_l3_ids": stripped, "l1_foundation": l1, "l2_bottleneck": bottleneck,
+            "l4_mutators": l4, "conditional_avoid": avoid, "bottleneck_summary": bottleneck,
+            "conditions": current or {}, "ledger_refs": ledger_refs,
+            "direction_budget_policy": budget_policy, "subagent_fact_pack": pack,
+            "notes": ["Retrieved L3 recommendation steps are withheld to reduce anchoring.",
+                      "L1/L2 foundations carried by stripped L3 units are promoted before stripping.",
+                      "Deleting an L3 key does not remove visible history; only native_subcontext claims isolation.",
+                      "Conditional avoidance is conditional evidence, not a permanent ban."]}
 
 
-__all__ = ["assess_stagnation", "build_exploration_context",
-           "evaluate_exploration_candidate"]
+def _gates(candidate, target):
+    compile_ok = bool(candidate.get("compile_ok", candidate.get("compile",
+                     candidate.get("compiled", candidate.get("syntax_ok", True)))))
+    parity = candidate.get("correctness_ok", candidate.get("parity_ok", candidate.get(
+        "numerical_parity", candidate.get("oracle_passed", True))))
+    hidden_bad = ("hidden_input_summary" in candidate
+                  and flagged(candidate.get("hidden_input_summary"), "opt_regression"))
+    speedup = candidate.get("speedup", candidate.get("profiler_speedup",
+               candidate.get("speedup_ratio")))
+    if speedup is None and isinstance(candidate.get("measurement"), Mapping):
+        speedup = candidate["measurement"].get("speedup")
+    speedup = _number(speedup, "speedup", optional=True)
+    ablation = candidate.get("ablation_ok", candidate.get("ablation_passed",
+               candidate.get("ablation_retained", True)))
+    hygiene = candidate.get("hygiene_ok", candidate.get("hygiene_passed", True))
+    workspace = candidate.get("workspace_delta_bytes")
+    workspace_ok = workspace is None or (
+        isinstance(workspace, int) and not isinstance(workspace, bool)
+        and workspace <= candidate.get("_max_workspace_delta_bytes", 4096))
+    guard_ok = (not guard_regression(candidate.get("guard_workloads"))
+                if "guard_workloads" in candidate else True)
+    scope_ok = not (candidate.get("require_reusable_scope")
+                    and candidate.get("reusable_scope") is False)
+    checks = {
+        "G0": (compile_ok, "compile/syntax"),
+        "G1": (bool(parity) and not hidden_bad, "numerical parity and hidden retention"),
+        "G2": (speedup is not None and speedup >= target, "profiler target speedup"),
+        "G3": (ablation is not False and hygiene is not False and workspace_ok and guard_ok
+               and scope_ok, "ablation, hygiene, workspace and guard workload")}
+    gates = {name: {"passed": passed, "ok": passed,
+                    "status": "passed" if passed else "failed", "check": label}
+             for name, (passed, label) in checks.items()}
+    reached = next((name for name in ("G0", "G1", "G2", "G3") if not checks[name][0]), "PASSED")
+    outcome = {"G0": "compile_failed", "G1": "correctness_failed",
+               "G2": "sub_target_valid_evidence", "G3": "ablation_or_hygiene_failed"}.get(
+                   reached, "qualified_improvement")
+    return {"gates": gates, "gate_reached": reached, "outcome": outcome,
+            "compile_ok": compile_ok, "correctness_ok": bool(parity),
+            "speedup": speedup, "target_speedup": target,
+            "ablation_ok": ablation is not False, "workspace_delta_bytes": workspace,
+            "guard_workloads_ok": guard_ok}
+
+
+def _evaluate_candidate(candidate: Mapping[str, Any], *, target_speedup: float,
+                        require_reusable_scope: bool, preserve_subtarget_evidence: bool,
+                        max_workspace_delta_bytes: int = 4096) -> dict[str, Any]:
+    if isinstance(target_speedup, bool) or not isinstance(target_speedup, (int, float)) \
+            or not math.isfinite(target_speedup) or target_speedup <= 0:
+        raise ValueError("target_speedup must be a positive finite number")
+    values = dict(candidate)
+    values["_max_workspace_delta_bytes"] = max_workspace_delta_bytes
+    values["require_reusable_scope"] = require_reusable_scope
+    gate = _gates(values, float(target_speedup))
+    evidence_valid = (gate["gates"]["G0"]["passed"] and gate["gates"]["G1"]["passed"]
+                      and values.get("evidence_valid") is not False)
+    goal_achieved = gate["gates"]["G2"]["passed"] and values.get("goal_achieved") is not False
+    reusable = gate["gates"]["G3"]["passed"] and values.get("reusable_encoding") is not False
+    if not evidence_valid:
+        verdict, tier = "reject_invalid_evidence", values.get("target_tier", "L2")
+    elif not goal_achieved:
+        verdict, tier = "record_conditional_finding", "L2"
+    elif not reusable:
+        verdict, tier = "retain_verified_evidence", values.get("target_tier", "L4")
+    else:
+        verdict, tier = "distill_candidate", values.get("target_tier", "L4")
+    if not preserve_subtarget_evidence and verdict == "record_conditional_finding":
+        verdict = "reject_invalid_evidence"
+    avoid = []
+    if verdict == "record_conditional_finding":
+        avoid = [{"unit_id": values.get("unit_id") or values.get("candidate_id") or "",
+                  "hypothesis": values.get("hypothesis") or values.get("mutation_summary") or "",
+                  "failure_reason": gate["outcome"],
+                  "observed_bottleneck": values.get("observed_bottleneck")
+                  or values.get("bottleneck") or {},
+                  "conditions": dict(values.get("conditions") or {}), "scope_note": SCOPE_NOTE}]
+    axes = {"evidence_valid": bool(evidence_valid), "goal_achieved": bool(goal_achieved),
+            "reusable_encoding": bool(reusable)}
+    return {"schema": EVALUATION_SCHEMA, "run_id": values.get("run_id"),
+            "candidate_id": values.get("candidate_id") or values.get("unit_id"),
+            "mutation_summary": values.get("mutation_summary") or values.get("hypothesis") or "",
+            "conditions": dict(values.get("conditions") or {}), "axes": axes, **axes,
+            "verdict": verdict, "distill_ready": verdict == "distill_candidate",
+            "return_tier": tier, "conditional_avoid": avoid, "reason": gate["outcome"], **gate}
+
+
+def evaluate_exploration_candidate(candidate=None, *, target_speedup=None,
+                                   require_reusable_scope=True,
+                                   preserve_subtarget_evidence=True,
+                                   max_workspace_delta_bytes=4096, **legacy) -> dict[str, Any]:
+    """Judge evidence, goal, and reuse with an explicit G0-G3 gate breakdown."""
+    if isinstance(candidate, Mapping):
+        if legacy:
+            raise ValueError(f"unexpected candidate arguments: {sorted(legacy)}")
+        values = dict(candidate)
+        return _evaluate_candidate(
+            values, target_speedup=1.05 if target_speedup is None else target_speedup,
+            require_reusable_scope=require_reusable_scope,
+            preserve_subtarget_evidence=preserve_subtarget_evidence,
+            max_workspace_delta_bytes=max_workspace_delta_bytes)
+    if candidate is not None:
+        raise ValueError("candidate must be an object")
+    minimum = legacy.pop("min_speedup_ratio", 1.05)
+    if target_speedup is not None:
+        minimum = target_speedup
+    return legacy_evaluate(**legacy, min_speedup_ratio=minimum)
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(prog="python -m mindie_knowledge.graded.explore")
+    sub = parser.add_subparsers(dest="command", required=True)
+    for name in ("stagnation", "context", "evaluate"):
+        sub.add_parser(name).add_argument("--input", default="-")
+    args = parser.parse_args(argv)
+    text = sys.stdin.read() if args.input in (None, "-") else Path(args.input).read_text(encoding="utf-8")
+    payload = json.loads(text)
+    if args.command == "stagnation":
+        if isinstance(payload, Mapping):
+            entries = payload.get("ledger_entries") or payload.get("attempts") or []
+            options = {key: payload[key] for key in ("consecutive_limit", "max_stalled_attempts")
+                       if key in payload}
+        else:
+            entries, options = payload, {}
+        result = assess_stagnation(entries, **options)
+    elif args.command == "context":
+        if not isinstance(payload, Mapping):
+            raise ValueError("context input must be an object")
+        result = build_exploration_context(**payload)
+    else:
+        if not isinstance(payload, Mapping):
+            raise ValueError("evaluate input must be an object")
+        candidate = payload.get("candidate", payload)
+        options = {key: payload[key] for key in
+                   ("target_speedup", "require_reusable_scope",
+                    "preserve_subtarget_evidence", "max_workspace_delta_bytes")
+                   if key in payload}
+        result = evaluate_exploration_candidate(candidate, **options)
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
+__all__ = ["assess_stagnation", "build_citation_feedback_record", "build_exploration_context",
+           "enforce_direction_budget", "evaluate_exploration_candidate", "main"]

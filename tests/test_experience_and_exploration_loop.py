@@ -10,6 +10,8 @@ import pytest
 from graded_fixture import OBSERVED, unit as fixture_unit
 from mindie_knowledge.graded.distill import (
     UNIT_BODY_HARD_BUDGET_BYTES,
+    apply_decision,
+    noop_decision,
     prepare_request,
     validate_decision,
     value_gate,
@@ -96,6 +98,49 @@ def test_value_gate_admits_verified_milestone_and_blocks_in_flight(store):
                                   task_state="verified_milestone", redactor_executable=scanner(),
                                   redaction_key=store.redaction_key())
     assert value_gate(all_pending) == "in_flight_incomplete"
+
+
+def test_in_flight_session_distills_verified_milestone_but_blocks_unverified_inputs(store):
+    item = fixture_unit()
+    session = "f" * 64
+    pending = {
+        "kind": "authorized_transcript",
+        "outcome": "in_flight",
+        "source_locator": "fixture@abcdef1:pending.md",
+        "content": "Only the verified milestone may become evidence; this probe is still running.",
+        "evidence_refs": ["pending-run"],
+        "repetitions": 1,
+    }
+    only_pending = prepare_request([pending], session_digest=session, task_state="in_flight",
+                                   redactor_executable=scanner(), redaction_key=store.redaction_key())
+    assert value_gate(only_pending) == "in_flight_incomplete"
+    assert noop_decision(only_pending)["drop_reason"] == "in_flight_incomplete"
+
+    mixed = prepare_request([evidence(item), pending], session_digest=session, task_state="in_flight",
+                            redactor_executable=scanner(), redaction_key=store.redaction_key())
+    assert value_gate(mixed) is None
+    applied = apply_decision(store, mixed, proposal(session, item))
+    assert applied["status"] == "applied"
+    assert applied["admitted_unit_ids"] == [item.id]
+    assert store.explain(ref(item, 1))["content"] == item.body
+
+    cites_pending_source = proposal(session, item)
+    row = cites_pending_source["units"][0]
+    row["frontmatter"]["provenance"] = {
+        **row["frontmatter"]["provenance"],
+        "source_locator": pending["source_locator"],
+        "evidence_refs": ["pending-run"],
+    }
+    with pytest.raises(ValueError, match="selected evidence"):
+        validate_decision(cites_pending_source, mixed)
+
+    cites_pending_ref = proposal(session, item)
+    cites_pending_ref["units"][0]["frontmatter"]["provenance"] = {
+        **cites_pending_ref["units"][0]["frontmatter"]["provenance"],
+        "evidence_refs": ["pending-run"],
+    }
+    with pytest.raises(ValueError, match="not present"):
+        validate_decision(cites_pending_ref, mixed)
 
 
 def test_two_task_replay_revises_and_deduplicates_usage_and_inconclusive_failure(store):

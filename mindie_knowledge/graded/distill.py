@@ -1,7 +1,9 @@
 """[Role] C6 authorized-evidence preparation and deterministic decision admission.
 
-[Invariants] Stop is not completion. A model cannot upgrade failed/unverified
-input into reproduced evidence or introduce an unobserved source reference.
+[Invariants] Stop is not completion. An in_flight task may still yield a verified
+substantive partial milestone, but unverified or still-running progress cannot
+become evidence. A model cannot upgrade failed/unverified input into reproduced
+evidence or introduce an unobserved source reference.
 [Timeouts & Locks] One bounded Gitleaks call for all selected input; validation
 is pure memory. Callers budget the scanner's 30s plus model and cleanup budgets.
 [Side-Effect Policy] No transcript discovery, model invocation or publication.
@@ -19,6 +21,7 @@ from .units import CATEGORY_TO_TIER, GradedUnit, SHA256, TIER_CATEGORIES, UNIT_I
 
 UNIT_BODY_SOFT_BUDGET_BYTES = 4096
 UNIT_BODY_HARD_BUDGET_BYTES = 8192
+TRIVIAL_VERIFIED_BYTES = 512
 KINDS = {"experiment_ledger", "run_manifest", "authorized_transcript", "ecosystem_repo", "hardware_spec", "ablation_receipt"}
 OUTCOMES = {"observed", "verified", "compile_failed", "infra_failed", "measurement_invalid", "in_flight"}
 TASK_STATES = {"in_flight", "verified_milestone", "completed"}
@@ -40,6 +43,8 @@ def _evidence_strengths():
     values = ["hardware_spec", "reproduced_empirical", "single_observation", "hypothesis"]
     if "software_contract" in parser_strengths:
         values.insert(1, "software_contract")
+    if "ablation_verified" in parser_strengths:
+        values.insert(1, "ablation_verified")
     return values
 
 
@@ -267,11 +272,35 @@ def _request(request):
     return request["sanitized_inputs"]
 
 
+def _trivial_verified(inputs, summary):
+    """Routine verified answers are not verified milestones worth distilling.
+
+    A verified label alone does not make a short unreferenced answer reusable.
+    A caller-supplied summary or any evidence reference keeps it substantive.
+    """
+    if summary.strip():
+        return False
+    verified = [item for item in inputs if item["outcome"] == "verified"]
+    return all(not item["evidence_refs"] and len(item["content"].encode("utf-8")) <= TRIVIAL_VERIFIED_BYTES
+               for item in verified)
+
+
 def value_gate(request):
+    """Admit an in_flight task only through a verified substantive milestone."""
     inputs = _request(request)
     if not inputs:
         return "routine_qa_or_unverified"
-    if request["task_state"] == "in_flight" or all(item["outcome"] == "in_flight" for item in inputs):
+    if request["task_state"] == "in_flight":
+        if not any(item["outcome"] == "verified" for item in inputs):
+            return "in_flight_incomplete"
+        if _trivial_verified(inputs, str(request.get("summary", ""))):
+            return "routine_qa_or_unverified"
+        if not any(item["outcome"] == "in_flight" for item in inputs) and all(
+            len(item["content"].encode("utf-8")) < 120 for item in inputs if item["outcome"] == "verified"
+        ):
+            return "in_flight_incomplete"
+        return None
+    if all(item["outcome"] == "in_flight" for item in inputs):
         return "in_flight_incomplete"
     return None
 
@@ -280,6 +309,14 @@ def noop_decision(request, reason=None):
     return {"schema_version": "mindie-distill-decision/1", "session_digest": request["session_digest"],
             "evidence_inputs": request["evidence_inputs"], "action": "noop",
             "drop_reason": reason or value_gate(request) or "routine_qa_or_unverified", "units": []}
+
+
+def _admission_view(request):
+    """Make the deterministic gate result explicit in the organizer prompt."""
+    gate = value_gate(request)
+    return {"task_state": request["task_state"], "admitted": gate is None, "drop_reason": gate,
+            "in_flight_milestone_admitted": gate is None and request["task_state"] == "in_flight",
+            "stop_event_is_completion": False, "in_flight_inputs_are_evidence": False}
 
 
 def with_worker_identity(request, identity):
@@ -353,8 +390,18 @@ def build_prompt(request):
         "unknown applicability never matches by default and cannot be filled from a different or later environment. "
         "Evidence bookkeeping such as repetitions, observation_scope or not_measured belongs in provenance or the body; "
         "procedure steps and readiness instructions belong in the body, not additional hard matching conditions. "
-        "Never claim that Stop means completion. task_state=in_flight yields noop; "
-        "verified_milestone refers to the selected finished finding, not completion of the wider task. "
+        "Never claim that Stop means completion. A Stop event or in_flight progress never creates "
+        "empirical evidence; only the selected inputs' recorded outcomes and locators do. "
+        "task_state describes the wider task, not the selected finding: an unfinished task_state=in_flight "
+        "does not preclude distilling a verified substantive partial milestone. An admitted in_flight "
+        "request is eligible to distill that milestone even though the wider task is unfinished; admission "
+        "does not require a unit. Do not return noop merely because task_state=in_flight, but return noop "
+        "with an allowed drop_reason when the evidence is already covered, insufficient for reusable "
+        "knowledge, or fails the provenance/evidence rules. If admission.admitted is false, return noop with "
+        "drop_reason=admission.drop_reason and no units. In an in_flight task, unverified progress and "
+        "still-running inputs alone never justify a unit. In every task state, in_flight inputs cannot be "
+        "cited as provenance or evidence_refs. verified_milestone refers to the selected finished finding, "
+        "not completion of the wider task. "
         "Read infrastructure failures, source code, build glue and shell scripts as first-class evidence. "
         "Extract supported mechanisms and limits; failure labels or filenames alone never justify dropping a source. "
         "Failed evidence may support a scoped observation or hypothesis, never an unverified hardware or repeated-result claim. "
@@ -370,7 +417,8 @@ def build_prompt(request):
     )
     view = {key: request[key] for key in BASE_REQUEST_KEYS}
     view.update({key: request[key] for key in OPTIONAL_REQUEST_KEYS if key in request})
-    return instruction + canonical({"output_schema": decision_schema(), "request": view})
+    return instruction + canonical({"admission": _admission_view(request),
+                                    "output_schema": decision_schema(), "request": view})
 
 
 def decision_schema():
