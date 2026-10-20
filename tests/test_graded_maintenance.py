@@ -269,7 +269,7 @@ def test_failed_lint_leaves_previous_manifest_unchanged(tmp_path: Path) -> None:
     assert topology_path.read_bytes() == topology_before
 
 
-def test_routing_index_writes_stable_mapping_closure_digest_and_check(tmp_path: Path) -> None:
+def test_routing_index_writes_stable_mapping_and_check(tmp_path: Path) -> None:
     parent = _unit("rules/unit-parent.md", ident="unit-parent")
     child = _unit("rules/unit-child.md", ident="unit-child", inherits_from=["unit-parent"])
     _make_corpus(tmp_path, parent, child)
@@ -288,9 +288,9 @@ def test_routing_index_writes_stable_mapping_closure_digest_and_check(tmp_path: 
         "unit-parent": "rules/unit-parent.md",
     }
     assert manifest["closure"]["unit-child"] == ["unit-parent"]
-    assert len(manifest["digest"]) == hashlib.sha256().digest_size * 2
+    assert "digest" not in manifest
     assert manifest["build_elapsed_ms"] >= 0
-    assert topology["index_digest"] == manifest["digest"]
+    assert "index_digest" not in topology
     assert topology["closure"]["unit-child"] == ["unit-parent"]
     assert topology["units"]["unit-parent"]["path"] == "rules/unit-parent.md"
     assert topology["leaves"][0]["unit_ids"] == ["unit-child", "unit-parent"]
@@ -313,7 +313,7 @@ def test_check_detects_a_tampered_manifest_without_rewriting_it(tmp_path: Path) 
     checked = build_routing_index(tmp_path, check=True)
 
     assert checked["ok"] is False
-    assert any("digest does not match" in item["message"] for item in checked["errors"])
+    assert any("stale" in item["message"] for item in checked["errors"])
     assert manifest_path.read_bytes() == tampered
 
 

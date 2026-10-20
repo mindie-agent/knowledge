@@ -166,9 +166,6 @@ def _unit_from_checkpoint(value, path):
         unit = GradedUnit.from_parts(metadata, body, path)
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f'{path}: checkpointed graded unit is invalid: {exc}') from exc
-    if (unit.metadata.get('content_digest') != metadata.get('content_digest')
-            or unit.content_sha256 != value.get('content_sha256')):
-        raise ValueError(f'{path}: checkpointed graded unit digest differs')
     expected = f"{unit.metadata['domain_path']}/{unit.id}.md"
     if path != expected:
         raise ValueError(f'{path}: unit path must be exactly {expected}')
@@ -300,7 +297,6 @@ def _validate_graded_tree(repo, revision, domain, state_path, context, verified,
                         verified[path] = {
                             'type': 'unit', 'sha': sha, 'path': path,
                             'metadata': unit.metadata, 'body': unit.body,
-                            'content_sha256': unit.content_sha256,
                         }
                     elif content_kind == 'feedback':
                         if scan_text(text):
@@ -482,14 +478,12 @@ def classify_changes(repo, base_revision, revision, *, schema=SCHEMA):
             "development_paths": development}
 
 
-def validate(repo,revision,domain,state=None,*,base_revision=None,expected_contract_sha256=None):
+def validate(repo,revision,domain,state=None,*,base_revision=None):
     if not re.fullmatch(r'[0-9a-f]{40}',revision):
         raise ValueError('revision must be a full immutable Git commit SHA')
     if _git(repo,['cat-file','-t',revision],4096).strip()!=b'commit':
         raise ValueError('revision must identify a commit')
-    contract = read_git_contract(repo, revision, domain,
-                                 expected_sha256=expected_contract_sha256,
-                                 env=_git_env())
+    contract = read_git_contract(repo, revision, domain, env=_git_env())
     selected_format = data_format(contract['contract'])
     context=_validator_context(domain)
     context['publication_contract_sha256'] = contract['sha256']
@@ -520,12 +514,11 @@ def main(argv=None):
     parser.add_argument('--revision',required=True)
     parser.add_argument('--domain',default='vllm-ascend')
     parser.add_argument('--base-revision', help='exact trusted base for content-only PR classification')
-    parser.add_argument('--contract-sha256', help='publication declaration pinned by the product')
     parser.add_argument('--state',default=None,
                         help='checkpoint file override (default: the candidate repo Git metadata dir)')
     args=parser.parse_args(argv)
     try:result=validate(args.repo,args.revision,args.domain,state=args.state,
-                        base_revision=args.base_revision, expected_contract_sha256=args.contract_sha256)
+                        base_revision=args.base_revision)
     except (ValueError,CommunityError,OSError,UnicodeError) as exc:
         parser.exit(1,f'Invalid publication: {str(exc)[:500]}\n')
     print(json.dumps(result,sort_keys=True))

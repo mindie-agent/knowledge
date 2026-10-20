@@ -307,13 +307,12 @@ def shard_plan(units: Iterable[GradedUnit]) -> dict:
     }
 
 
-def topology(units: Iterable[GradedUnit], index_digest: str, closure: dict | None = None) -> dict:
+def topology(units: Iterable[GradedUnit], closure: dict | None = None) -> dict:
     units = list(units)
     metrics, leaves, subtrees, federations = _groups(units)
     domains = {path: ids for path, ids in federations.items() if path != "."}
     payload = {
         "schema": TOPOLOGY_SCHEMA,
-        "index_digest": index_digest,
         "closure": closure or {},
         "unit_count": len(units),
         "units": metrics,
@@ -322,7 +321,6 @@ def topology(units: Iterable[GradedUnit], index_digest: str, closure: dict | Non
         "federation": {"corpus": _entry("federation", ".", set(metrics), metrics),
                        "domains": _rows("federation", domains, metrics)},
     }
-    payload["digest"] = _digest(payload)
     return payload
 
 
@@ -335,8 +333,7 @@ def _payloads(units: Iterable[GradedUnit], index: RoutingIndex) -> tuple[dict, d
     manifest["units"] = sorted(manifest["units"], key=lambda row: row["id"])
     manifest["id_path"] = {row["id"]: row["path"] for row in manifest["units"]}
     manifest["closure"] = {ident: list(parents) for ident, parents in sorted(index.closure.items())}
-    manifest["digest"] = _digest(manifest)
-    topology_doc = topology(units, manifest["digest"], manifest["closure"])
+    topology_doc = topology(units, manifest["closure"])
     topology_doc["index_build_elapsed_ms"] = index.build_elapsed_ms
     return manifest, topology_doc
 
@@ -392,9 +389,7 @@ def _check_payloads(manifest_path: Path, topology_path: Path, manifest: dict, to
             continue
         if not isinstance(existing, dict) or existing.get("schema") != expected.get("schema"):
             errors.append(f"{label} schema changed")
-        elif existing.get("digest") != _digest(existing):
-            errors.append(f"{label} digest does not match its own stable content")
-        elif existing.get("digest") != expected.get("digest"):
+        elif _digest(existing) != _digest(expected):
             errors.append(f"{label} is stale; rebuild required")
     return errors
 
@@ -415,7 +410,7 @@ def build_routing_index(root: Path | str, *, index_dir: Path | str | None = None
         report["errors"].append(_error("routing_build_failed", str(exc)))
         return report
     report.update(unit_count=manifest["unit_count"], generation=manifest["generation"],
-                  digest=manifest["digest"], index_build_elapsed_ms=manifest["build_elapsed_ms"])
+                  index_build_elapsed_ms=manifest["build_elapsed_ms"])
     if check:
         report["errors"].extend(_error("stale_routing_index", message)
                                 for message in _check_payloads(manifest_path, topology_path, manifest, topology_doc))

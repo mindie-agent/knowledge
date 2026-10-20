@@ -175,7 +175,7 @@ def build_prompt(request):
         "starting with unit- followed by lowercase words separated by hyphens, for example unit-cache-readiness. "
         "Use that exact ID in target_unit_id and frontmatter.id; never substitute a tier or category prefix such as sop-. "
         "Return tier/category/evidence_strength/domain_path both in the unit target fields and C5 frontmatter. "
-        "The runtime assigns revision and computes content_digest; omit these derived fields in new proposals. "
+        "The runtime assigns revision; omit derived revision fields in new proposals. "
         "Return JSON only; no prose or markdown fences.\n\n"
     )
     return instruction + canonical({"output_schema": decision_schema(),
@@ -198,7 +198,7 @@ def decision_schema():
                                 "required": ["error_signatures", "keywords"],
                                 "properties": {"error_signatures": strings, "keywords": strings}},
                    "provenance": {"type": "object", "additionalProperties": False,
-                                  "required": ["source_type", "source_locator", "source_digest", "evidence_refs", "supersedes"],
+                                  "required": ["source_type", "source_locator", "evidence_refs", "supersedes"],
                                   "properties": {"source_type": string, "source_locator": string,
                                                  "source_digest": string, "evidence_refs": strings, "supersedes": strings}}}
     fields = {"target_tier": {"enum": ["L1", "L2", "L3", "L4"]},
@@ -207,8 +207,7 @@ def decision_schema():
               "domain_path": string, "operation": {"enum": ["create", "merge_into_existing", "propose_semantic_merge_review"]},
               "target_unit_id": unit_id, "frontmatter": {"type": "object", "additionalProperties": False,
                                                            "required": list(frontmatter),
-                                                           "properties": {**frontmatter, "revision": {"type": "integer", "minimum": 1},
-                                                                          "content_digest": string}},
+                                                           "properties": {**frontmatter, "revision": {"type": "integer", "minimum": 1}}},
               "markdown_body": string}
     pairs = [{"properties": {"target_tier": {"const": tier}, "category": {"const": category},
                               "frontmatter": {"properties": {"tier": {"const": tier},
@@ -328,7 +327,10 @@ def validate_decision(decision, request):
             raise ValueError("unsupported unit operation")
         provenance = metadata["provenance"]
         usable = [item for item in inputs if item["outcome"] != "in_flight"]
-        bound = [item for item in usable if item["source_digest"] == provenance["source_digest"] and item["source_locator"] == provenance["source_locator"]]
+        bound = [item for item in usable
+                 if item["source_locator"] == provenance["source_locator"]
+                 and (not provenance.get("source_digest")
+                      or item.get("source_digest") == provenance["source_digest"])]
         if not bound:
             raise ValueError("unit provenance is not bound to selected evidence")
         refs = set(provenance["evidence_refs"])

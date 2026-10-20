@@ -40,7 +40,7 @@ def test_install_query_explain_move_update_and_withdrawal(store):
     changed = GradedUnit.from_parts(moved.metadata, moved.body + "Later correction.\n", moved.path)
     store.graded.install([changed])
     current = store.query("graph", conditions=OBSERVED)["results"][0]
-    assert current["revision"] == 2 and current["content_digest"] != found["content_digest"]
+    assert current["revision"] == 2 and current["ref"] != found["ref"]
     with pytest.raises(ReadReferenceError, match="replaced"):
         store.explain(found["ref"])
     store.graded.install([])

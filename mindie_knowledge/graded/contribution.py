@@ -66,7 +66,7 @@ def validate_files(files, refs, domain):
             formats.add("graded" if graded else "material-package")
             if graded:
                 for vote in checked["votes"]:
-                    ref = f"mindie://{domain}/units/{vote['unit_id']}@{vote['content_digest'][7:]}"
+                    ref = f"mindie://{domain}/units/{vote['unit_id']}@{vote['revision']}"
                     if ref not in refs:
                         raise CommunityError("graded feedback requires its exact observed revision reference")
         else:
@@ -77,7 +77,7 @@ def validate_files(files, refs, domain):
             if unit.id in units:
                 raise CommunityError("graded contribution repeats a stable unit ID")
             units[unit.id] = unit
-            if f"mindie://{domain}/units/{unit.id}@{unit.content_sha256}" not in refs:
+            if f"mindie://{domain}/units/{unit.id}@{unit.revision}" not in refs:
                 raise CommunityError("graded unit requires its exact content revision reference")
     if len(formats) != 1:
         raise CommunityError("one contribution must use exactly one publication data format")

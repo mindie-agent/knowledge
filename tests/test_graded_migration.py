@@ -55,7 +55,7 @@ def test_only_returned_inherited_parent_is_observed_for_feedback(store):
                              reason="Parent premise applied.", publishable=False)
     assert vote["unit_id"] == parent.id and vote["revision"] == parent.revision
     with pytest.raises(ValueError, match="actually returned"):
-        store.record_vote(root_hash="fixture-parent-reader", ref=store.graded.ref(unrelated.id, unrelated.content_sha256),
+        store.record_vote(root_hash="fixture-parent-reader", ref=store.graded.ref(unrelated.id, unrelated.revision),
                           rating="up", reason="Not observed.", publishable=False)
 
 
@@ -73,11 +73,13 @@ def test_public_parent_withdrawal_retires_dependent_local_candidate_without_resu
     assert store.graded._catalog()["retired_local"][0]["id"] == child.id
 
 
-def test_redactor_recognizes_only_complete_pinned_graded_refs():
-    ref = "mindie://npu/units/unit-rule@" + "a" * 64
+def test_redactor_recognizes_only_complete_graded_revision_refs():
+    ref = "mindie://npu/units/unit-rule@7"
     assert not scan_text(f"Read `{ref}`.")
-    for malformed in (ref + "/extra", ref + "?token=x", ref[:-2], "ssh://" + ref, "operator@private-host"):
+    for malformed in (ref + "/extra", ref + "?token=x", "mindie://npu/units/unit-rule@0", "ssh://" + ref, "operator@private-host"):
         assert any(finding.rule == "username-at-host" for finding in scan_text(malformed))
+    old_digest_ref = "mindie://npu/units/unit-rule@" + "a" * 64
+    assert any(finding.rule == "username-at-host" for finding in scan_text(old_digest_ref))
 
 
 @pytest.mark.parametrize("old_generation", [None, "g0"])

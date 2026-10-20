@@ -243,18 +243,8 @@ def _require_schema(value: dict, path: str, field: str, supported: str) -> None:
         raise ValueError(f"{path}: unsupported derived schema {declared!r}")
 
 
-def _check_self_digest(value: dict, path: str) -> None:
-    if "digest" not in value:
-        return
-    from .maintenance import _digest
-
-    if value["digest"] != _digest(value):
-        raise ValueError(f"{path}: derived digest does not match its stable content")
-
-
 def _validate_manifest(value: dict, units: dict[str, GradedUnit], index: RoutingIndex) -> None:
     path = ROUTING_MANIFEST_PATH
-    _check_self_digest(value, path)
     if "schema_version" in value:
         _require_schema(value, path, "schema_version", ROUTING_MANIFEST_SCHEMA)
     if "schema" in value:
@@ -289,12 +279,7 @@ def _validate_manifest(value: dict, units: dict[str, GradedUnit], index: Routing
         seen.add(ident)
         unit = units[ident]
         expected_path = unit.path or f"{unit.metadata['domain_path']}/{ident}.md"
-        checks = {
-            "path": expected_path,
-            "revision": unit.revision,
-            "content_digest": unit.metadata["content_digest"],
-            "content_sha256": unit.content_sha256,
-        }
+        checks = {"path": expected_path, "revision": unit.revision}
         for field, expected in checks.items():
             if field in row and row[field] != expected:
                 raise ValueError(f"{path}: manifest {field} differs from the actual unit {ident}")
@@ -305,7 +290,6 @@ def _validate_manifest(value: dict, units: dict[str, GradedUnit], index: Routing
 def _validate_topology(value: dict, units: dict[str, GradedUnit], index: RoutingIndex,
                        manifest: dict | None) -> None:
     path = SHARD_TOPOLOGY_PATH
-    _check_self_digest(value, path)
     _require_schema(value, path, "schema", SHARD_TOPOLOGY_SCHEMA)
     if "unit_count" in value and (type(value["unit_count"]) is not int or value["unit_count"] != len(units)):
         raise ValueError(f"{path}: unit_count differs from the actual units")
@@ -313,9 +297,6 @@ def _validate_topology(value: dict, units: dict[str, GradedUnit], index: Routing
         expected = {ident: list(parents) for ident, parents in index.closure.items()}
         if value["closure"] != expected:
             raise ValueError(f"{path}: closure differs from the actual units")
-    if "index_digest" in value and manifest is not None and "digest" in manifest:
-        if value["index_digest"] != manifest["digest"]:
-            raise ValueError(f"{path}: index_digest differs from the routing manifest")
     rows = value.get("units")
     if rows is None:
         return
@@ -328,8 +309,6 @@ def _validate_topology(value: dict, units: dict[str, GradedUnit], index: Routing
         expected_path = unit.path or f"{unit.metadata['domain_path']}/{ident}.md"
         if "path" in row and row["path"] != expected_path:
             raise ValueError(f"{path}: topology path differs from the actual unit {ident}")
-        if "content_sha256" in row and row["content_sha256"] != unit.content_sha256:
-            raise ValueError(f"{path}: topology digest differs from the actual unit {ident}")
 
 
 def validate_derived(manifest: dict | None, topology: dict | None,

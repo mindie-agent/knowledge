@@ -21,6 +21,7 @@ from .units import GradedUnit, canonical
 
 SKIP_DIRECTORIES = {".git", "tasks", "feedback", "index", "docs", "private"}
 MAX_UNIT_BYTES = 262_144
+FOUNDATION_SCORE = 0.05
 
 
 def token_estimate(text: str) -> int:
@@ -97,10 +98,6 @@ class RoutingIndex:
             visit(ident)
         if counts is not None and set(counts) != set(self.units):
             raise ValueError("precomputed counts do not describe the current units")
-        self.closure_digests = {ident: "sha256:" + hashlib.sha256(canonical([
-            (member, self.units[member].revision, self.units[member].content_sha256)
-            for member in [*ancestors, ident]
-        ]).encode()).hexdigest() for ident, ancestors in self.closure.items()}
         self.counts = {}
         self.frequencies = Counter()
         self.condition_keys = {}
@@ -119,7 +116,7 @@ class RoutingIndex:
         self.lengths = {ident: sum(count.values()) for ident, count in self.counts.items()}
         self.average = sum(self.lengths.values()) / max(1, len(self.units)) or 1
         self.generation = hashlib.sha256(canonical([
-            (ident, unit.revision, unit.content_sha256, unit.path, unit.metadata["domain_path"])
+            (ident, unit.revision, unit.path, unit.metadata["domain_path"])
             for ident, unit in sorted(self.units.items())
         ]).encode()).hexdigest()
         self.build_elapsed_ms = (time.perf_counter() - started) * 1000
@@ -139,9 +136,7 @@ class RoutingIndex:
                 **{key: metadata[key] for key in ("id", "tier", "evidence_strength", "category", "domain_path", "title", "triggers", "conditions", "inherits_from")},
                 "inherits_from_closure": self.closure[ident],
                 "path": unit.path or f"{metadata['domain_path']}/{ident}.md",
-                "content_sha256": unit.content_sha256,
-                "revision": unit.revision, "content_digest": unit.metadata["content_digest"],
-                "closure_digest": self.closure_digests[ident],
+                "revision": unit.revision,
                 "token_estimate": token_estimate(unit.body),
                 "provenance": metadata["provenance"],
             })
@@ -164,7 +159,7 @@ class RoutingIndex:
         # rule still selects its own condition group independently.
         grouped = {key: match_conditions(required, conditions) for key, required in self.conditions.items()}
         applicability = {ident: grouped[key] for ident, key in self.condition_keys.items()}
-        ranked = []
+        scores = {}
         rejected = Counter()
         for ident, unit in self.units.items():
             status = applicability[ident].status
@@ -178,14 +173,30 @@ class RoutingIndex:
                 if frequency:
                     inverse = math.log(1 + (len(self.units) - self.frequencies[term] + .5) / (self.frequencies[term] + .5))
                     score += inverse * frequency * 2.2 / (frequency + 1.2 * (.25 + .75 * self.lengths[ident] / self.average))
+            scores[ident] = score
+        # A matched L1 premise in _common (or the requested domain) is part of
+        # the task foundation even without lexical overlap. Mount each one once,
+        # unless a higher-scoring matched unit already injects it as a parent.
+        inherited_by_higher = set()
+        for ident, score in scores.items():
+            if score > 0 and applicability[ident].status == "matched":
+                inherited_by_higher.update(self.closure[ident])
+        ranked = []
+        for ident, score in scores.items():
+            path = self.units[ident].metadata["domain_path"]
+            preferred = bool(domain_path and (path == domain_path or path.startswith(domain_path + "/")))
             if score:
-                preferred = bool(domain_path and (unit.metadata["domain_path"] == domain_path or unit.metadata["domain_path"].startswith(domain_path + "/")))
-                ranked.append((score * (1.1 if preferred else 1), ident, preferred))
+                ranked.append((score * (1.1 if preferred else 1), ident,
+                               "preferred_domain" if preferred else "cross_directory"))
+            elif (conditions is not None and self.units[ident].metadata["tier"] == "L1"
+                  and (path == "_common" or path.startswith("_common/") or preferred)
+                  and applicability[ident].status == "matched" and ident not in inherited_by_higher):
+                ranked.append((FOUNDATION_SCORE, ident, "foundation_baseline"))
         ranked.sort(key=lambda item: (-item[0], item[1]))
         selected = ranked[:limit]
         left = token_budget
         results = []
-        for position, (score, ident, preferred) in enumerate(selected):
+        for position, (score, ident, route) in enumerate(selected):
             if left < 1:
                 break
             unit = self.units[ident]
@@ -206,15 +217,12 @@ class RoutingIndex:
                     omitted.append({"id": parent_id, "status": "budget_excluded"})
                     continue
                 left -= cost
-                inherited.append({"id": parent_id, "content_sha256": parent.content_sha256,
-                                  "revision": parent.revision, "content_digest": parent.metadata["content_digest"],
-                                  "closure_digest": self.closure_digests[parent_id],
+                inherited.append({"id": parent_id, "revision": parent.revision,
                                   "content": parent.body, "conditions": parent.metadata["conditions"],
                                   "tier": parent.metadata["tier"], "evidence_strength": parent.metadata["evidence_strength"],
                                   "provenance": parent.metadata["provenance"], "applicability": status.to_dict()})
-            results.append({"id": ident, "content_sha256": unit.content_sha256, "title": unit.metadata["title"],
-                            "revision": unit.revision, "content_digest": unit.metadata["content_digest"],
-                            "closure_digest": self.closure_digests[ident],
+            results.append({"id": ident, "title": unit.metadata["title"],
+                            "revision": unit.revision,
                             "match_status": {"matched": "matched", "mismatch": "mismatched", "unknown": "condition_unknown"}[applicability[ident].status],
                             "missing_conditions": [reason.split(":", 1)[0] for reason in applicability[ident].reasons
                                                    if reason.endswith(("not supplied", "version not supplied"))],
@@ -223,7 +231,7 @@ class RoutingIndex:
                             "domain_path": unit.metadata["domain_path"], "conditions": unit.metadata["conditions"],
                             "provenance": unit.metadata["provenance"], "applicability": applicability[ident].to_dict(),
                             "excerpt": content, "excerpt_truncated": truncated,
-                            "score": score, "route": "preferred_domain" if preferred else "cross_directory",
+                            "score": score, "route": route,
                             "inherited_rules": inherited, "inheritance_excluded": omitted})
         return {"results": results, "generation": self.generation, "unit_count": len(self.units),
                 "body_token_estimate": token_budget - left, "token_budget": token_budget,

@@ -213,7 +213,7 @@ _MINDIE_REF_TOKEN = re.compile(
     + r"mindie://"
     r"[a-z][a-z0-9-]{0,63}/"
     r"(?:(?:[a-f0-9]{16}|[a-f0-9]{64})@(?:[a-f0-9]{16}|[a-f0-9]{64})"
-    r"|units/unit-[a-z0-9]+(?:-[a-z0-9]+)*@[a-f0-9]{64})"
+    r"|units/unit-[a-z0-9]+(?:-[a-z0-9]+)*@[1-9][0-9]*)"
     + _MINDIE_REF_CLOSE
 )
 

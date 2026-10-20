@@ -92,13 +92,11 @@ def test_snapshot_rejects_legacy_tasks_tree(tmp_path):
         snapshot(repo, sha, tmp_path)
 
 
-@pytest.mark.parametrize("damage", ["digest", "duplicate", "missing-parent", "path", "executable", "private-path"])
+@pytest.mark.parametrize("damage", ["duplicate", "missing-parent", "path", "executable", "private-path"])
 def test_snapshot_rejects_malformed_units(tmp_path, damage):
     parent = unit("unit-parent")
     files = unit_files(parent)
-    if damage == "digest":
-        files[parent.path] = files[parent.path].replace("content_digest: sha256:", "content_digest: sha256:" + "b" * 64 + " #")
-    elif damage == "duplicate":
+    if damage == "duplicate":
         files.update(unit_files(unit("unit-parent", domain_path="serving/other")))
     elif damage == "missing-parent":
         files.update(unit_files(unit("unit-orphan", parents=["unit-absent"])))
@@ -194,7 +192,7 @@ def test_snapshot_uses_the_graded_feedback_authority(tmp_path):
     from mindie_knowledge.graded.feedback import SCHEMA_FEEDBACK
     value = unit("unit-parent")
     vote = {"vote_id": "vote-v2", "root_id": "root-v2", "unit_id": value.id,
-            "revision": value.revision, "content_digest": value.metadata["content_digest"],
+            "revision": value.revision,
             "rating": "up", "reason": "Synthetic protocol observation."}
     files = {**unit_files(value),
              "feedback/votes.json": json.dumps({"schema": SCHEMA_FEEDBACK, "votes": [vote]}) + "\n"}
@@ -216,7 +214,7 @@ def _store_feed(tmp_path, remote):
 
 
 def test_inconsistent_feedback_is_rejected_before_readable_feed_switch(tmp_path):
-    from mindie_knowledge.graded.feedback import render_feedback
+    from mindie_knowledge.graded.feedback import SCHEMA_FEEDBACK
     from mindie_knowledge.publication_check import validate
     value = unit("unit-vote-target", revision=2)
     repo, first = publish(tmp_path, unit_files(value))
@@ -224,13 +222,14 @@ def test_inconsistent_feedback_is_rejected_before_readable_feed_switch(tmp_path)
     try:
         assert feed.sync(force=True)["status"] == "synced"
         observed = store.query("graph", conditions=OBSERVED)["results"][0]
-        vote = dict(vote_id="wrong-revision", root_id="reader", unit_id=value.id, revision=1,
-                    content_digest=value.metadata["content_digest"], rating="up", reason="Fixture observation.")
+        vote = dict(vote_id="wrong-revision", root_id="reader", unit_id=value.id, revision=0,
+                    rating="up", reason="Fixture observation.")
         path = repo / "feedback/votes.json"
         path.parent.mkdir()
-        path.write_text(render_feedback([vote]), encoding="utf-8", newline="\n")
-        bad = commit(repo, "contradictory feedback identity")
-        with pytest.raises(ValueError, match="contradict"):
+        path.write_text(json.dumps({"schema": SCHEMA_FEEDBACK, "votes": [vote]}),
+                        encoding="utf-8", newline="\n")
+        bad = commit(repo, "invalid feedback identity")
+        with pytest.raises(ValueError, match="positive integer"):
             validate(repo, bad, DOMAIN)
         receipt = feed.sync(force=True)
         assert receipt["status"] == "invalid" and receipt["retained_commit"] == first
@@ -238,17 +237,6 @@ def test_inconsistent_feedback_is_rejected_before_readable_feed_switch(tmp_path)
         assert store.query("graph", conditions=OBSERVED)["results"][0]["feedback"]["total"] == 0
     finally:
         store.close()
-
-
-def test_first_feed_cannot_replace_an_observed_digest_with_another_revision(store):
-    value = unit()
-    store.graded.install([value])
-    observed = store.query("graph", conditions=OBSERVED)["results"][0]
-    changed_revision = GradedUnit.from_parts({**value.metadata, "revision": 2}, value.body, value.path)
-    with pytest.raises(ValueError, match="already observed"):
-        store.graded.install_feed([changed_revision], feed_ident="new-public-source", source_revision="b" * 40)
-    assert store.explain(observed["ref"])["revision"] == 1
-    assert store.graded._catalog()["feeds"] == {}
 
 
 def test_feed_sync_v2_uses_the_single_graded_installer_or_reports_dependency(tmp_path):
@@ -283,7 +271,7 @@ def test_feed_sync_v2_invalid_candidate_keeps_previous_corpus(tmp_path):
         assert feed.sync()["status"] == "synced"
         assert feed.sync()["status"] == "unchanged"
         (remote / parent.path).write_text(
-            parent.render().replace("content_digest: sha256:", "content_digest: sha256:" + "b" * 64 + " #"),
+            parent.render().replace("revision: 1", "revision: zero"),
             encoding="utf-8",
             newline="\n",
         )

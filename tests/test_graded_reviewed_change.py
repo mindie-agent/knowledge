@@ -16,7 +16,7 @@ def write(root, *units):
 
 
 def change(old, new=None):
-    value = dict(id=(old or new).id, expected_content_sha256=old.content_sha256 if old else None)
+    value = dict(id=(old or new).id, expected_revision=old.revision if old else None)
     return {**value, **(dict(path=new.path, content=new.render()) if new else dict(content=None))}
 
 

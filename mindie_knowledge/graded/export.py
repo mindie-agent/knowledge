@@ -87,7 +87,7 @@ def build_batch(store, *, settings, revision_fn=None):
             text = render_feedback(outbound_votes(store, votes))
             files.append(dict(path=f"feedback/votes-{lineage[6:]}.json", content=text,
                               sha256=sha256_text(text), base_sha256=None))
-        refs = sorted({store.graded.ref(item["id"], item["content_sha256"]) for item in descriptors}
+        refs = sorted({store.graded.ref(item["id"], item["revision"]) for item in descriptors}
                       | {store.graded.ref(vote["entry_id"], vote["revision"]) for vote in votes})
         base_commit = target["source_commit"]
         revision = (revision_fn or batch_revision)(files, store.domain, base_commit, refs)

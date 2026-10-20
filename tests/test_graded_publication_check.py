@@ -101,16 +101,13 @@ def test_v2_rejects_legacy_tasks_tree_instead_of_claiming_empty(tmp_path):
 
 
 @pytest.mark.parametrize("damage", [
-    "digest", "duplicate", "missing-parent", "path", "crlf", "revision", "executable",
+    "duplicate", "missing-parent", "path", "crlf", "revision", "executable",
     "nonunit-markdown", "private-path",
 ])
 def test_v2_malformed_units_are_rejected(tmp_path, damage):
     parent = unit("unit-parent")
     files = unit_files(parent)
-    if damage == "digest":
-        path = parent.path
-        files[path] = files[path].replace("content_digest: sha256:", "content_digest: sha256:" + "b" * 64 + " #")
-    elif damage == "duplicate":
+    if damage == "duplicate":
         files.update(unit_files(unit("unit-parent", domain_path="serving/other")))
     elif damage == "missing-parent":
         files.update(unit_files(unit("unit-orphan", parents=["unit-absent"])))
@@ -219,7 +216,7 @@ def test_v2_feedback_uses_the_graded_schema_and_vote_fields(tmp_path):
     from mindie_knowledge.graded.feedback import SCHEMA_FEEDBACK
     value = unit("unit-parent")
     vote = {"vote_id": "vote-v2", "root_id": "root-v2", "unit_id": value.id,
-            "revision": value.revision, "content_digest": value.metadata["content_digest"],
+            "revision": value.revision,
             "rating": "up", "reason": "Synthetic protocol observation."}
     files = {**unit_files(value),
              "feedback/votes.json": json.dumps({"schema": SCHEMA_FEEDBACK, "votes": [vote]}) + "\n"}

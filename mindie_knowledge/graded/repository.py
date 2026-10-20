@@ -85,8 +85,7 @@ class GradedRepository:
         from .precomputed import dump_index
         # Both rows belong to the caller's existing write transaction. The
         # small catalog stays cheap to read on every query and feedback lookup.
-        snapshot = dump_index(index, catalog["units"])
-        catalog["index_sha256"] = hashlib.sha256(snapshot.encode()).hexdigest()
+        snapshot = dump_index(index)
         self.store.db.execute("INSERT OR REPLACE INTO state VALUES(?,?)", (INDEX_KEY, snapshot))
         raw = canonical(catalog)
         self.store.db.execute("INSERT OR REPLACE INTO state VALUES(?,?)", (CATALOG_KEY, raw))
@@ -273,22 +272,43 @@ class GradedRepository:
             from .precomputed import load_index
             started = time.perf_counter()
             raw, catalog, snapshot = self._index_rows()
-            if "index_sha256" not in catalog:
-                # One-time upgrade of the earlier catalog format. Re-read
-                # after obtaining the write lock so a newer feed is never lost.
-                with self.store._write_txn():
-                    raw, catalog, snapshot = self._index_rows()
-                    if "index_sha256" not in catalog:
-                        index = RoutingIndex(self._read(item) for item in catalog["units"])
-                        if index.generation != catalog["generation"]:
-                            raise ValueError("graded catalog generation mismatch")
-                        self._persist_index(catalog, index)
-                        index.build_elapsed_ms = (time.perf_counter() - started) * 1000
-                        return index
-            index = load_index(snapshot, catalog, self._read_blob)
+            if snapshot is None:
+                return self._rebuild_index(catalog, started)
+            try:
+                index = load_index(snapshot, catalog)
+            except ValueError as exc:
+                if str(exc) not in {"unsupported graded index schema",
+                                    "graded index generation mismatch"}:
+                    raise
+                return self._rebuild_index(catalog, started)
             index.build_elapsed_ms = (time.perf_counter() - started) * 1000
             self._catalog_raw, self._index = raw, index
         return self._index
+
+    def _rebuild_index(self, catalog, started):
+        # The projection is derived; rebuild it once under the existing write
+        # transaction, re-reading catalog/index after the lock so a newer feed
+        # publication is never replaced by this reader.
+        with self.store._write_txn():
+            raw, current, snapshot = self._index_rows()
+            index = None
+            if snapshot is not None:
+                from .precomputed import load_index
+                try:
+                    index = load_index(snapshot, current)
+                except ValueError as exc:
+                    if str(exc) not in {"unsupported graded index schema",
+                                        "graded index generation mismatch"}:
+                        raise
+            if index is None:
+                index = RoutingIndex(self._read(item) for item in current["units"])
+                if index.generation != current["generation"]:
+                    raise ValueError("graded catalog generation mismatch")
+                self._persist_index(current, index)
+                raw = self._catalog_raw
+            index.build_elapsed_ms = (time.perf_counter() - started) * 1000
+            self._catalog_raw, self._index = raw, index
+            return index
 
     def _index_rows(self):
         # A single statement sees one SQLite snapshot even if another process
@@ -304,14 +324,14 @@ class GradedRepository:
         return raw, catalog, rows.get(INDEX_KEY)
 
     def ref(self, unit_id, revision=None):
-        return f"mindie://{self.store.domain}/units/{unit_id}" + ("@" + revision if revision else "")
+        return f"mindie://{self.store.domain}/units/{unit_id}" + ("@" + str(revision) if revision is not None else "")
 
     def query(self, query, **kwargs):
         with self.store.lock:
             index = self._load()
             result = index.query(query, **kwargs)
             for item in result["results"]:
-                item["ref"] = self.ref(item["id"], item["content_sha256"])
+                item["ref"] = self.ref(item["id"], item["revision"])
                 item["unit_ref"] = self.ref(item["id"])
                 item["feedback_ref"] = item["ref"]
                 item["reference_kind"] = "graded_unit"
@@ -321,7 +341,7 @@ class GradedRepository:
                 observe(self.store, unit)
                 item["feedback"] = self._feedback(unit)
                 for parent in item["inherited_rules"]:
-                    parent["ref"] = self.ref(parent["id"], parent["content_sha256"])
+                    parent["ref"] = self.ref(parent["id"], parent["revision"])
                     parent["feedback_ref"] = parent["ref"]
                     observe(self.store, index.units[parent["id"]])
         return {"domain": self.store.domain, "retrieval": "graded-bm25", "page": "graded_units", **result}
@@ -330,24 +350,21 @@ class GradedRepository:
         prefix = f"mindie://{self.store.domain}/units/"
         if not isinstance(ref, str) or not ref.startswith(prefix):
             raise ReadReferenceError("outside_domain", "The graded reference is outside the selected domain.")
-        ident, _, revision = ref[len(prefix):].partition("@")
+        ident, _, revision_text = ref[len(prefix):].partition("@")
+        revision = int(revision_text) if revision_text else None
         with self.store.lock:
             index = self._load()
             unit = index.units.get(ident)
             if unit is None:
                 raise ReadReferenceError("removed_or_superseded", "The graded unit is absent from the current collection.")
-            if revision and revision != unit.content_sha256:
+            if revision is not None and revision != unit.revision:
                 raise ReadReferenceError("removed_or_superseded", "The observed graded revision was replaced; no other bytes were substituted.")
-            catalog = json.loads(self._catalog_raw)
-            descriptor = next(item for item in catalog["units"] if item["id"] == ident)
-            unit = self._read(descriptor)
             from .feedback import observe
             observe(self.store, unit)
-            return {"kind": "graded_unit", "feedback_ref": self.ref(ident, unit.content_sha256),
-                    "feedback": self._feedback(unit), "domain": self.store.domain, "ref": self.ref(ident, unit.content_sha256),
-                    "unit_ref": self.ref(ident), "id": ident, "content_sha256": unit.content_sha256,
-                    "revision": unit.revision, "content_digest": unit.metadata["content_digest"],
-                    "closure_digest": index.closure_digests[ident],
+            return {"kind": "graded_unit", "feedback_ref": self.ref(ident, unit.revision),
+                    "feedback": self._feedback(unit), "domain": self.store.domain, "ref": self.ref(ident, unit.revision),
+                    "unit_ref": self.ref(ident), "id": ident,
+                    "revision": unit.revision,
                     "frontmatter": unit.metadata, "content": unit.body,
                     "inherits_from_closure": index.closure[ident],
                     "note": "Reading a reference does not establish applicability; compare its conditions with observed task facts."}

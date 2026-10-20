@@ -352,7 +352,6 @@ def _publication_base(checked, settings, state_dir, deadline, *, repository, wri
         )
     contract = read_git_contract(
         work_dir, base_tip, checked["domain"],
-        expected_sha256=settings.get("publication_contract_sha256"),
         deadline=deadline.limit, env=genv, cancel=deadline.cancel,
     )
     if data_format(contract["contract"]) != checked["data_format"]:
@@ -414,7 +413,6 @@ def _publish(checked, settings, state_dir, ledger, deadline, transport, *,
     selected_commit = gitops._git(["rev-parse", checkout_ref], deadline, cwd=work_dir, env=genv).strip()
     try:
         read_git_contract(work_dir, selected_commit, checked["domain"],
-                          expected_sha256=prepared["contract"]["sha256"],
                           deadline=deadline.limit, env=genv, cancel=deadline.cancel)
     except ContractMismatch as exc:
         raise CommunityError(f"contribution head contract differs from its upstream base: {exc}",

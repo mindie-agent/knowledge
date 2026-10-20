@@ -3,8 +3,9 @@
 [Invariants] The declaration is untrusted data and cannot choose code to run.
 Its schema selects exactly one data format (contract/1 material packages or
 contract/2 graded Markdown); mismatched formats and unknown schemas fail closed.
-Trusted repository CI selects validator code from its base commit, and the
-product release separately pins the exact declaration bytes it accepts.
+Trusted repository CI selects validator code from its base commit. A valid
+current declaration at the selected exact Git commit is authoritative; it is
+not pinned to release-specific declaration bytes.
 [Timeouts & Locks] Pure parsing; Git reads honor the caller's deadline/cancel.
 [Side-Effect Policy] Validate/read data only; never execute, download or modify
 a candidate tree.
@@ -108,17 +109,12 @@ def render_contract(value):
                       indent=2, sort_keys=True) + "\n"
 
 
-def parse_contract(raw, domain, expected_sha256=None):
+def parse_contract(raw, domain):
     if isinstance(raw, str):
         raw = raw.encode("utf-8")
     if not isinstance(raw, bytes) or not raw or len(raw) > MAX_CONTRACT_BYTES:
         raise ContractMismatch("publication contract is missing or exceeds its byte envelope")
     digest = hashlib.sha256(raw).hexdigest()
-    if expected_sha256 is not None:
-        if not isinstance(expected_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
-            raise ContractMismatch("configured publication contract digest is invalid")
-        if digest != expected_sha256:
-            raise ContractMismatch("publication contract differs from the selected product combination")
     try:
         value = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique)
     except (UnicodeError, json.JSONDecodeError) as exc:
@@ -126,7 +122,7 @@ def parse_contract(raw, domain, expected_sha256=None):
     return {"contract": validate_contract(value, domain), "sha256": digest}
 
 
-def read_git_contract(repo, revision, domain, *, expected_sha256=None, deadline=None, prefix="", env=None, cancel=None):
+def read_git_contract(repo, revision, domain, *, deadline=None, prefix="", env=None, cancel=None):
     """Read one plain Git blob at an exact commit, never a checkout or symlink."""
     from .community.common import git_executable, run_argv
     from .gitread import CatFileBatch
@@ -167,4 +163,4 @@ def read_git_contract(repo, revision, domain, *, expected_sha256=None, deadline=
         reader.close()
     if raw is None:
         raise OSError("the listed publication contract blob could not be read")
-    return parse_contract(raw, domain, expected_sha256)
+    return parse_contract(raw, domain)

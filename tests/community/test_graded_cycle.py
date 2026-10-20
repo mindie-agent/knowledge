@@ -127,7 +127,7 @@ def test_c6_outbox_git_feed_feedback_update_and_withdrawal(tmp_path, settings, s
             consumer.explain(old_ref)
         old_vote = consumer.record_vote(root_hash="fixture-root", ref=old_ref, rating="down", reason="Observed old revision failed.",
                                         publishable=True, generation="g2")
-        assert old_vote["revision"] == 1 and old_vote["content_digest"] == found["content_digest"]
+        assert old_vote["revision"] == 1
 
         git(["pull", "--ff-only", "origin", "main"], cwd=maintainer)
         (maintainer / current.path).unlink()
@@ -241,7 +241,7 @@ def test_reviewed_factor_survives_git_feed_and_group_withdrawal(tmp_path, remote
                     changes=changes)
 
     def replacement(old, new):
-        return dict(id=new.id, expected_content_sha256=old.content_sha256 if old else None,
+        return dict(id=new.id, expected_revision=old.revision if old else None,
                     path=new.path, content=new.render())
 
     with closing(Store(tmp_path / "consumer", "npu")) as consumer:
@@ -271,7 +271,7 @@ def test_reviewed_factor_survives_git_feed_and_group_withdrawal(tmp_path, remote
         assert consumer.explain(parent_ref)["content"] == common.body
 
         def delete(value):
-            return dict(id=value.id, expected_content_sha256=value.content_sha256, content=None)
+            return dict(id=value.id, expected_revision=value.revision, content=None)
 
         with pytest.raises(ValueError, match="missing inherited unit"):
             apply_change(maintainer, authored([delete(common)]))

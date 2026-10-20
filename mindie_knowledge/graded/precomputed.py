@@ -1,14 +1,12 @@
 """[Role] JSON projection of validated C5 units and their BM25 token counts.
 
-[Invariants] The catalog binds this projection by SHA256 and generation. Loading
-still verifies every authoritative Markdown blob and every unit content digest;
-only YAML parsing and token expansion are reused from the publishing transaction.
+[Invariants] The catalog binds the projection by its generation. Loading trusts
+the installed projection/body and does not re-read source blobs on query.
 [Timeouts & Locks] No locks or subprocesses; the repository owns SQLite atomicity.
 [Side-Effect Policy] Reads immutable blobs through the repository; never writes.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 
 from .index import RoutingIndex
@@ -18,20 +16,17 @@ from .units import GradedUnit, canonical
 SCHEMA = "mindie-graded-index/1"
 
 
-def dump_index(index, descriptors):
-    blobs = {item["id"]: item["blob"] for item in descriptors}
+def dump_index(index):
     return canonical({"schema": SCHEMA, "generation": index.generation, "units": [
         {"metadata": unit.metadata, "body": unit.body, "path": unit.path,
-         "blob": blobs[ident], "counts": dict(index.counts[ident])}
+         "counts": dict(index.counts[ident])}
         for ident, unit in index.units.items()
     ]})
 
 
-def load_index(raw, catalog, read_blob):
+def load_index(raw, catalog):
     if raw is None:
         raise ValueError("declared graded index is missing")
-    if hashlib.sha256(raw.encode()).hexdigest() != catalog["index_sha256"]:
-        raise ValueError("graded index digest mismatch")
     data = json.loads(raw)
     if data["schema"] != SCHEMA:
         raise ValueError("unsupported graded index schema")
@@ -47,13 +42,8 @@ def load_index(raw, catalog, read_blob):
         item = descriptors.get(unit.id)
         if item is None or unit.id in counts:
             raise ValueError("graded index unit set differs from catalog")
-        if (row["blob"] != item["blob"] or unit.path != item["path"]
-                or metadata.get("revision") != item["revision"] or unit.content_sha256 != item["content_sha256"]
-                or metadata.get("content_digest") != unit.metadata["content_digest"]):
+        if unit.path != item["path"] or metadata.get("revision") != item["revision"]:
             raise ValueError("graded index and catalog content disagree")
-        # Keeping this cold read preserves detection of missing/corrupt source
-        # blobs after reopening a Store; the derived JSON is not a replacement.
-        read_blob(item)
         frequencies = row["counts"]
         if not isinstance(frequencies, dict) or any(
                 not isinstance(term, str) or type(value) is not int or value < 1

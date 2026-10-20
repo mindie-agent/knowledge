@@ -50,9 +50,9 @@ def prepare_change(root, plan):
             raise ValueError("every reviewed change must select one unique stable ID")
         selected.add(ident)
         old = before.units.get(ident)
-        expected = old.content_sha256 if old is not None else None
-        if change.get("expected_content_sha256") != expected:
-            raise ValueError(f"{ident}: reviewed content digest differs")
+        expected = old.revision if old is not None else None
+        if change.get("expected_revision") != expected:
+            raise ValueError(f"{ident}: reviewed revision differs")
         content = change.get("content")
         if content is None:
             if old is None:

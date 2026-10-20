@@ -226,13 +226,9 @@ def _fingerprints(unit: GradedUnit) -> set[str]:
     return {value.strip().lower() for value in values if value.strip()}
 
 
-def _source_identity(unit: GradedUnit) -> tuple[str, str, str]:
+def _source_identity(unit: GradedUnit) -> tuple[str, str]:
     provenance = unit.metadata["provenance"]
-    return (
-        provenance["source_type"],
-        provenance["source_locator"],
-        provenance["source_digest"],
-    )
+    return provenance["source_type"], provenance["source_locator"]
 
 
 def _merged_provenance(target: GradedUnit, proposed: GradedUnit) -> dict:
@@ -245,7 +241,10 @@ def _merged_provenance(target: GradedUnit, proposed: GradedUnit) -> dict:
         merged[key] = deepcopy(value)
     merged["source_type"] = original["source_type"]
     merged["source_locator"] = original["source_locator"]
-    merged["source_digest"] = original["source_digest"]
+    if "source_digest" in original:
+        merged["source_digest"] = original["source_digest"]
+    else:
+        merged.pop("source_digest", None)
     merged["evidence_refs"] = list(dict.fromkeys([
         *original.get("evidence_refs", []),
         *incoming.get("evidence_refs", []),
@@ -293,7 +292,7 @@ def _routing_summary(index: RoutingIndex, proposed_ids: list[str]) -> dict:
         proposed.append({
             "id": unit_id,
             "path": row["path"],
-            "content_sha256": row["content_sha256"],
+            "revision": row["revision"],
             "inherits_from_closure": list(index.closure[unit_id]),
         })
     return {

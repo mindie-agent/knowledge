@@ -140,7 +140,7 @@ def test_feedback_from_a_feed_without_the_unit_does_not_poison_other_source(stor
     value = unit(revision=2)
     store.graded.install_feed([value], feed_ident='feed-a', source_revision='a' * 40)
     bad = dict(vote_id='foreign-vote', root_id='foreign-root', unit_id=value.id,
-               revision=1, content_digest=value.metadata['content_digest'], rating='up')
+               revision=1, rating='up')
     store.graded.install_feed([], feed_ident='feed-b', source_revision='b' * 40, feedback=[bad])
     result = store.query('graph', conditions=OBSERVED)
     assert result['results'][0]['id'] == value.id

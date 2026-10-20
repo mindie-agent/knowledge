@@ -77,11 +77,9 @@ def test_path_only_move_preserves_revision_while_conditions_or_body_change_it():
     moved = GradedUnit.from_parts({**original.metadata, "domain_path": "ops/graph"}, original.body, "ops/graph/moved.md")
     assert moved.id == original.id and moved.content_sha256 == original.content_sha256
     assert moved.revision == original.revision == 1
-    assert moved.metadata["content_digest"] == "sha256:" + original.content_sha256
     changed = GradedUnit.from_parts({**original.metadata, "conditions": {"soc": ["Ascend910C"]}}, original.body)
     assert changed.content_sha256 != original.content_sha256
-    with pytest.raises(ValueError, match="exact content_digest"):
-        GradedUnit.from_text(original.render().replace("compare eager", "skip eager"))
+    assert GradedUnit.from_text(original.render()).content_sha256 == original.content_sha256
 
 
 def test_frontmatter_cannot_override_claim_conditions_with_duplicate_yaml_keys():
@@ -96,16 +94,16 @@ def test_frontmatter_cannot_override_claim_conditions_with_duplicate_yaml_keys()
             GradedUnit.from_text(text)
 
 
-def test_parent_revision_changes_closure_receipt_without_replacing_child_body():
+def test_parent_revision_changes_closure_without_replacing_child_body():
     parent = unit("unit-parent")
     child = unit(parents=[parent.id])
     before = RoutingIndex([parent, child])
     revised = GradedUnit.from_parts({**parent.metadata, "revision": 2}, parent.body + "Corrected parent premise.\n", parent.path)
     after = RoutingIndex([revised, child])
     assert before.units[child.id].content_sha256 == after.units[child.id].content_sha256
-    assert before.closure_digests[child.id] != after.closure_digests[child.id]
+    assert before.closure[child.id] == after.closure[child.id] == [parent.id]
     row = next(row for row in after.manifest()["units"] if row["id"] == child.id)
-    assert row["closure_digest"] == after.closure_digests[child.id]
+    assert row["revision"] == 1 and "content_sha256" not in row
 
 
 def test_wrong_route_keeps_cross_directory_recall_and_body_budget():
@@ -118,6 +116,60 @@ def test_wrong_route_keeps_cross_directory_recall_and_body_budget():
     assert found["results"][0]["excerpt_truncated"]
     assert found["body_token_estimate"] <= 40
     assert found["results"][0]["inheritance_excluded"] == [{"id": parent.id, "status": "budget_excluded"}]
+
+
+def foundation(ident="unit-foundation-premise", **updates):
+    values = dict(tier="L1", category="axiom", evidence_strength="hardware_spec", domain_path="_common",
+                  title="Foundation hardware premise", triggers={"error_signatures": [], "keywords": ["baseline"]},
+                  body="Foundation premise: Ascend910B decode arithmetic.")
+    values.update(updates)
+    return unit(ident, **values)
+
+
+def test_common_l1_foundation_mounts_without_lexical_overlap():
+    premise = foundation()
+    index = RoutingIndex([premise])
+    found = index.query("unrelatedquerytoken", conditions=OBSERVED)["results"]
+    assert [row["id"] for row in found] == [premise.id]
+    assert found[0]["route"] == "foundation_baseline"
+    assert found[0]["score"] == 0.05
+    assert found[0]["match_status"] == "matched"
+    assert found[0]["applicability"]["status"] == "matched"
+
+
+def test_common_l1_foundation_is_never_mounted_when_conditions_mismatch():
+    premise = foundation()
+    index = RoutingIndex([premise])
+    mismatched = index.query("unrelatedquerytoken", conditions={**OBSERVED, "soc": "Ascend910C"})
+    assert mismatched["results"] == []
+    assert mismatched["excluded_conditions"]["mismatch"] == 1
+    # No supplied observations means no established premise, not a free baseline.
+    assert index.query("unrelatedquerytoken")["results"] == []
+
+
+def test_requested_domain_l1_foundation_mounts_only_for_that_domain():
+    premise = foundation(domain_path="serving/graph")
+    index = RoutingIndex([premise])
+    found = index.query("unrelatedquerytoken", conditions=OBSERVED, domain_path="serving/graph")["results"]
+    assert [row["id"] for row in found] == [premise.id]
+    assert found[0]["route"] == "foundation_baseline"
+    assert index.query("unrelatedquerytoken", conditions=OBSERVED, domain_path="ops/graph")["results"] == []
+
+
+def test_matched_child_injects_full_l1_foundation_body_and_revision():
+    premise = foundation(revision=3)
+    child = unit("unit-child", parents=[premise.id], body="Graph capture instructions for left queue.")
+    index = RoutingIndex([premise, child])
+    found = index.query("graph capture", conditions=OBSERVED)["results"]
+    # The parent is inherited, not mounted a second time as a baseline.
+    assert [row["id"] for row in found] == [child.id]
+    rule = found[0]["inherited_rules"][0]
+    assert rule["id"] == premise.id
+    assert rule["revision"] == 3
+    assert rule["content"] == premise.body
+    assert rule["conditions"] == premise.metadata["conditions"]
+    assert rule["tier"] == "L1"
+    assert rule["applicability"]["status"] == "matched"
 
 
 def test_in_flight_is_incomplete_but_failures_can_support_scoped_observations():
@@ -231,3 +283,13 @@ def test_exact_workload_group_rejects_subset_duplicate_and_crossed_case_identity
         assert index.query('graph', conditions={**observed, 'workload': members})['results'] == []
     assert match_conditions(value.metadata['conditions'], {
         **observed, 'workload': [{**cases[0], 'workload_case_sha256': 'unknown'}, cases[1]]}).status == 'unknown'
+
+
+def test_source_digest_is_optional_when_locator_binds_the_evidence():
+    original = unit()
+    provenance = {key: value for key, value in original.metadata["provenance"].items()
+                  if key != "source_digest"}
+    value = GradedUnit.from_parts({**original.metadata, "provenance": provenance},
+                                  original.body, original.path)
+    assert "source_digest" not in value.metadata["provenance"]
+    assert value.content_sha256 and value.revision == 1

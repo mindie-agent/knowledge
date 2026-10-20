@@ -78,12 +78,6 @@ class Feed:
         ):
             raise ValueError("feed requires a GitHub owner/repository and ref")
         self.repository, self.ref = repository, ref
-        self.contract_sha256 = config.get("contract_sha256")
-        if self.contract_sha256 is not None and (
-            not isinstance(self.contract_sha256, str)
-            or not re.fullmatch(r"[0-9a-f]{64}", self.contract_sha256)
-        ):
-            raise ValueError("feed contract_sha256 must be a complete SHA256 digest")
         self.prefix = (config.get("prefix") or "").strip("/")
         self.url = config.get("url") or f"https://github.com/{repository}.git"
         self.ident = feed_ident(repository, ref, self.prefix)
@@ -175,10 +169,8 @@ class Feed:
         receipt = self.store.feed_get("feed:" + self.ident) or {}
         candidate = self._candidate()
         commit = receipt.get("commit")
-        contract = receipt.get("contract_sha256")
         installed = (isinstance(commit, str)
-                     and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit)
-                     and isinstance(contract, str) and re.fullmatch(r"[0-9a-f]{64}", contract))
+                     and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit))
         sync_status = receipt.get("status", "not-synced")
         if sync_status not in {"synced", "unchanged", "unavailable", "invalid", "deferred"}:
             sync_status = "unknown"
@@ -461,8 +453,7 @@ class Feed:
                 ))
                 return self.store.feed_get(receipt_key)
             self.store.feed_set(discovery_key, {"failures": 0, "commit": commit})
-            if (receipt.get("commit") == commit and receipt.get("contract_sha256")
-                    and receipt.get("contract_requirement") == self.contract_sha256 and not force):
+            if receipt.get("commit") == commit and not force:
                 cleaned = dict(receipt)
                 cleaned.pop("detail", None)
                 cleaned.pop("retained_commit", None)
@@ -472,10 +463,8 @@ class Feed:
                 self.store.feed_set(receipt_key, cleaned)
                 return cleaned
             candidate = self._candidate()
-            if (candidate.get("commit") != commit
-                    or candidate.get("contract_requirement", "") != self.contract_sha256):
-                candidate = {"commit": commit, "attempts": 0, "status": "new",
-                             "contract_requirement": self.contract_sha256}
+            if candidate.get("commit") != commit:
+                candidate = {"commit": commit, "attempts": 0, "status": "new"}
             if candidate.get("status") == "invalid":
                 result = dict(status="invalid", repository=self.repository,
                               commit=commit, detail=candidate.get("detail", ""),
@@ -500,7 +489,7 @@ class Feed:
             try:
                 contract = read_git_contract(
                     self.repo, commit, self.store.domain, prefix=self.prefix,
-                    expected_sha256=self.contract_sha256, deadline=deadline, env=_feed_git_env(), cancel=cancel,
+                    deadline=deadline, env=_feed_git_env(), cancel=cancel,
                 )
                 selected_format = data_format(contract["contract"])
                 installed_entries = None
@@ -565,15 +554,13 @@ class Feed:
                 prefix=self.prefix, commit=commit, entries=installed["entries"],
                 attempts=candidate["attempts"], checked=time.time(),
                 contract_sha256=contract["sha256"], contract_schema=contract["contract"]["schema"],
-                contract_requirement=self.contract_sha256,
             )
             if installed.get("cleanup_error"):
                 receipt["material_cleanup_error"] = installed["cleanup_error"]
             self._cleanup_receipt(receipt)
             try:
                 self.store.feed_set(receipt_key, receipt)
-                self._save_candidate({"commit": commit, "attempts": 0, "status": "ok",
-                                      "contract_requirement": self.contract_sha256})
+                self._save_candidate({"commit": commit, "attempts": 0, "status": "ok"})
             except Exception as exc:
                 # The file snapshot is already installed. Report its known
                 # outcome even when saving the secondary sync receipt fails.

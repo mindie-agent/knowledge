@@ -7,7 +7,7 @@ Tier describes use; evidence strength and source provenance remain separate.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 from pathlib import PurePosixPath
@@ -28,7 +28,7 @@ def canonical(value: Any) -> str:
 
 
 def semantic_digest(metadata: dict, body: str) -> str:
-    content = {key: value for key, value in metadata.items() if key not in {"domain_path", "revision", "content_digest"}}
+    content = {key: value for key, value in metadata.items() if key not in {"domain_path", "revision"}}
     return hashlib.sha256(canonical([content, body]).encode()).hexdigest()
 
 
@@ -114,6 +114,12 @@ class GradedUnit:
     metadata: dict
     body: str
     path: str = ""
+    _content_sha256: str = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self):
+        # Internal semantic storage key for update checks and content-addressed
+        # blobs. Public refs, votes and observations use integer revisions.
+        object.__setattr__(self, "_content_sha256", semantic_digest(self.metadata, self.body))
 
     @property
     def id(self) -> str:
@@ -121,8 +127,7 @@ class GradedUnit:
 
     @property
     def content_sha256(self) -> str:
-        # Location-only moves retain the observed claim revision and references.
-        return semantic_digest(self.metadata, self.body)
+        return self._content_sha256
 
     @property
     def revision(self) -> int:
@@ -166,8 +171,10 @@ class GradedUnit:
         for key in ("source_type", "source_locator"):
             if not isinstance(provenance.get(key), str) or not provenance[key].strip():
                 raise ValueError(f"provenance.{key} is required")
-        if not isinstance(provenance.get("source_digest"), str) or not SHA256.fullmatch(provenance["source_digest"]):
-            raise ValueError("provenance.source_digest requires an exact SHA256")
+        if "source_digest" in provenance and (
+                not isinstance(provenance["source_digest"], str)
+                or not SHA256.fullmatch(provenance["source_digest"])):
+            raise ValueError("provenance.source_digest must be an exact SHA256 when supplied")
         _strings(provenance.get("evidence_refs"), "provenance.evidence_refs", nonempty=strength == "reproduced_empirical" or tier == "L4")
         _strings(provenance.get("supersedes", []), "provenance.supersedes")
         if strength in {"hardware_spec", "reproduced_empirical"} and provenance.get("experiment_status") in {"compile_failed", "infra_failed", "measurement_invalid", "in_flight"}:
@@ -179,9 +186,6 @@ class GradedUnit:
             raise ValueError("revision must be a positive integer")
         body = body.strip() + "\n"
         metadata["revision"] = revision
-        # Proposal producers do not calculate cryptographic digests. Persisted
-        # Markdown is checked separately by from_text before it is admitted.
-        metadata["content_digest"] = "sha256:" + semantic_digest(metadata, body)
         return cls(metadata, body, path)
 
     @classmethod
@@ -196,10 +200,9 @@ class GradedUnit:
             metadata = yaml.load("\n".join(lines[1:end]), Loader=_UniqueLoader)
         except yaml.YAMLError as exc:
             raise ValueError(f"invalid graded frontmatter: {exc}") from exc
-        unit = cls.from_parts(metadata, "\n".join(lines[end + 1:]), path)
-        if "revision" not in metadata or metadata.get("content_digest") != unit.metadata["content_digest"]:
-            raise ValueError("persisted C5 unit requires revision and exact content_digest")
-        return unit
+        if "revision" not in metadata:
+            raise ValueError("persisted C5 unit requires an explicit revision")
+        return cls.from_parts(metadata, "\n".join(lines[end + 1:]), path)
 
     def render(self) -> str:
         return "---\n" + yaml.safe_dump(self.metadata, allow_unicode=True, sort_keys=False) + "---\n" + self.body
