@@ -199,6 +199,11 @@ def test_exploration_judgment_keeps_valid_subtarget_gain_and_separates_axes():
     assert negative["verdict"] == "refuted" and negative["conditional_avoid"]
     noise = evaluate_exploration_candidate(speedup_ratio=1.005, ablation_retained=None, **common)
     assert noise["reusability"] == "inconclusive" and noise["distill_ready"] is False
+    pending_ablation = evaluate_exploration_candidate(speedup_ratio=1.06, ablation_retained=None, **common)
+    assert pending_ablation["axes"] == {"evidence_validity": "valid",
+                                        "goal_attainment": "not_applicable",
+                                        "reusability": "inconclusive"}
+    assert pending_ablation["verdict"] == "inconclusive" and pending_ablation["distill_ready"] is False
     broken = evaluate_exploration_candidate(**{**common, "compile_ok": False}, speedup_ratio=1.04)
     assert broken["evidence_validity"] == "compile_failed"
     assert broken["goal_attainment"] == "not_applicable"
@@ -213,6 +218,12 @@ def test_stagnation_counts_information_not_infrastructure_and_deduplicates_runs(
     ])
     assert deduped["status"] == "progressing" and deduped["stalled"] is False
     assert deduped["stalled_count"] == 0
+    attained = assess_stagnation([
+        {"run_id": "run-a1", "verdict": "attained"},
+        {"run_id": "run-a2", "verdict": "attained"},
+    ])
+    assert attained["status"] == "progressing" and attained["stalled"] is False
+    assert attained["stalled_count"] == 0
     repair = assess_stagnation([
         {"run_id": "run-3", "outcome": "infra_failed"},
         {"run_id": "run-4", "verdict": "inconclusive"},

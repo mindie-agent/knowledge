@@ -63,9 +63,13 @@ def assess_stagnation(attempts: Sequence[Mapping[str, Any]], *,
     stalled_count, repair, progressed = 0, False, False
     for attempt in unique:
         verdict, outcome = attempt.get("verdict"), attempt.get("outcome")
-        if outcome in REPAIR_OUTCOMES or verdict == "inconclusive":
+        axes = attempt.get("axes")
+        attainment = (axes.get("goal_attainment") if isinstance(axes, Mapping) else None) or attempt.get("goal_attainment")
+        if outcome in REPAIR_OUTCOMES or (verdict == "inconclusive" and outcome != "speedup_within_noise"):
             repair = True
-        elif (verdict == "supported" or attempt.get("new_observation") is True
+        elif (verdict in {"supported", "attained", "subtarget_valid"}
+              or attainment == "attained"
+              or attempt.get("new_observation") is True
               or attempt.get("divergent_layer_identified") is True):
             stalled_count, progressed = 0, True
         else:
@@ -223,7 +227,7 @@ def evaluate_exploration_candidate(*, run_id: str, candidate_id: str,
         if ratio is None:
             attainment = "not_applicable"
         elif ratio >= minimum:
-            attainment = "attained"
+            attainment = "attained" if ablation_retained is True else "not_applicable"
         else:
             attainment = "not_attained"
     elif goal_type == "correctness":
@@ -233,9 +237,9 @@ def evaluate_exploration_candidate(*, run_id: str, candidate_id: str,
 
     if validity == "valid" and reusability is None:
         if attainment == "attained" and goal_type == "speedup":
-            reusability = ("reusable_mutator" if ablation_retained is True
-                           else "reusable_negative_boundary" if ablation_retained is False
-                           else "reusable_observation")
+            reusability = "reusable_mutator" if target_tier == "L4" else "reusable_observation"
+        elif goal_type == "speedup" and ratio is not None and ratio >= minimum:
+            reusability = "inconclusive" if ablation_retained is None else "reusable_negative_boundary"
         elif attainment == "attained":
             reusability = ("reusable_mutator" if ablation_retained is True
                            else "reusable_observation")

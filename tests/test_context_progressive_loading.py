@@ -255,6 +255,30 @@ def test_repository_closure_attaches_refs_and_keeps_single_ref_fields(store):
     assert [item["id"] for item in compacted["units"]] == [step.id]
 
 
+def test_store_query_enforces_outer_response_token_budget(store):
+    premise, procedure, left, right = shared_workflows()
+    extra = [
+        unit(f"unit-workflow-extra-{idx}", tier="L3", category="workflow",
+             parents=[procedure.id], body=("Extra graph capture workflow step. " * 25))
+        for idx in range(3)
+    ]
+    store.graded.install([premise, procedure, left, right, *extra])
+
+    nav = store.query("graph capture", conditions=OBSERVED, navigation_only=True, token_budget=800)
+    assert nav["cards"]
+    assert nav["response_token_estimate"] <= 800
+    assert response_token_estimate(nav) <= 800
+    assert nav["usage"]["has_more"] is True
+    assert nav["excluded_budget"]
+
+    full = store.query("graph capture", conditions=OBSERVED, navigation_only=False, token_budget=800)
+    assert full["results"]
+    assert full["response_token_estimate"] <= 800
+    assert response_token_estimate(full) <= 800
+    assert full["usage"]["has_more"] is True
+    assert full["excluded_budget"]
+
+
 def test_response_estimate_uses_canonical_utf8_bytes():
     payload = {"z": "capture", "a": ["规则", 1]}
     from mindie_knowledge.graded.units import canonical

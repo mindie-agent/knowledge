@@ -22,7 +22,7 @@ UNIT_ID = re.compile(r"unit-[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 SHA256 = re.compile(r"[a-f0-9]{64}\Z")
 TIER_CATEGORIES = {"L1": {"axiom", "measurement"}, "L2": {"sop"}, "L3": {"workflow"}, "L4": {"mutator"}}
 STRENGTHS = {"hardware_spec", "software_contract", "reproduced_empirical", "single_observation", "hypothesis"}
-STATUSES = {"active", "archived", "superseded"}
+STATUSES = {"active", "suspect", "archived", "superseded"}
 
 
 def canonical(value: Any) -> str:
@@ -164,7 +164,7 @@ class GradedUnit:
         status = metadata.get("status")
         if "status" in metadata:
             if not isinstance(status, str) or status not in STATUSES:
-                raise ValueError("status must be active, archived or superseded")
+                raise ValueError("status must be active, suspect, archived or superseded")
         superseded_by = metadata.get("superseded_by")
         if "superseded_by" in metadata:
             if (not isinstance(superseded_by, str) or not UNIT_ID.fullmatch(superseded_by)

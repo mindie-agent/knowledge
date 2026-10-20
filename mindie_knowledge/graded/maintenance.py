@@ -286,7 +286,7 @@ def _rows(kind: str, groups: dict, metrics: dict) -> list[dict]:
 
 def _status(unit: GradedUnit) -> str:
     status = unit.metadata.get("status", "active")
-    return status if status in {"active", "archived", "superseded"} else "active"
+    return status if status in {"active", "suspect", "archived", "superseded"} else "active"
 
 
 def growth_metrics(units, *, completed_milestones: int = 0, previous_units=None,
@@ -302,6 +302,7 @@ def growth_metrics(units, *, completed_milestones: int = 0, previous_units=None,
     else:
         previous = list(previous_units or ())
     active = {unit.id for unit in current if _status(unit) == "active"}
+    suspect = {unit.id for unit in current if _status(unit) == "suspect"}
     archived = {unit.id for unit in current if _status(unit) == "archived"}
     superseded = {unit.id for unit in current if _status(unit) == "superseded"}
     previous_active = {unit.id for unit in previous if _status(unit) == "active"}
@@ -311,6 +312,7 @@ def growth_metrics(units, *, completed_milestones: int = 0, previous_units=None,
     net_body = body_tokens - previous_body_tokens
     return {
         "active_units": len(active),
+        "suspect_units": len(suspect),
         "archived_units": len(archived),
         "superseded_units": len(superseded),
         "delta_active_units": delta_active,

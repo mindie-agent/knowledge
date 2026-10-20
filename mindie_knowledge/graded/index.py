@@ -188,11 +188,17 @@ class RoutingIndex:
         scores = {}
         rejected = Counter()
         archived_excluded = 0
+        suspect_excluded = 0
         for ident, unit in self.units.items():
-            # Archived and superseded units remain addressable by reference but
-            # do not enter ordinary discovery unless explicitly requested.
+            # Archived, superseded and suspect units remain addressable by
+            # reference but do not enter ordinary discovery. Suspect is a
+            # demotion state: evidence is no longer sufficient for adoption,
+            # while the body is retained for audit and recovery.
             if unit.status in {"archived", "superseded"} and not include_archived:
                 archived_excluded += 1
+                continue
+            if unit.status == "suspect" and not include_archived:
+                suspect_excluded += 1
                 continue
             status = applicability[ident].status
             if status == "mismatch" or (status == "unknown" and not include_unknown):
@@ -228,7 +234,7 @@ class RoutingIndex:
         selected = ranked[:limit]
         active_closure = {
             ident: all(self.units[node].status == "active"
-                       for node in self.closure[ident] if node != ident)
+                       for node in [*self.closure[ident], ident])
             for ident in self.units
         }
 
@@ -284,12 +290,15 @@ class RoutingIndex:
             # Navigation cards do not charge bodies. Their own bounded metadata
             # is the delivered budget, so a truncated excerpt can never appear.
             accepted = []
+            excluded_budget = []
             for card in cards:
                 trial = accepted + [card]
                 foundations = foundation_cards_for(trial)
                 payload = {"cards": trial, "foundation_cards": foundations, "results": []}
                 if response_token_estimate(payload) <= token_budget:
                     accepted = trial
+                else:
+                    excluded_budget.append(card["id"])
             cards = accepted
             foundation_cards = foundation_cards_for(cards)
             excluded_conditions = dict(rejected)
@@ -299,12 +308,12 @@ class RoutingIndex:
                 {"cards": cards, "foundation_cards": foundation_cards, "results": []})
             usage = {"token_budget": token_budget, "body_token_estimate": 0,
                      "estimated_tokens": estimated, "estimator": "utf8_bytes_div_4_ceiling",
-                     "has_more": len(cards) < len(selected), "excluded_budget": []}
+                     "has_more": len(cards) < len(selected), "excluded_budget": list(excluded_budget)}
             return {"results": [], "cards": cards, "foundation_cards": foundation_cards,
                     "generation": self.generation, "unit_count": len(self.units),
                     "body_token_estimate": 0, "token_budget": token_budget,
                     "budget_scope": "navigation cards; metadata excluded",
-                    "excluded_budget": [], "excluded_conditions": excluded_conditions,
+                    "excluded_budget": excluded_budget, "excluded_conditions": excluded_conditions,
                     "usage": usage, "query_elapsed_ms": (time.perf_counter() - started) * 1000,
                     "note": "Conditions must be established. Unknown conditions are not evidence of applicability; retrieval scores are not confidence."}
 
@@ -405,6 +414,8 @@ class RoutingIndex:
         excluded_conditions = dict(rejected)
         if archived_excluded:
             excluded_conditions["archived_or_superseded"] = archived_excluded
+        if suspect_excluded:
+            excluded_conditions["suspect"] = suspect_excluded
         usage = {"token_budget": token_budget, "body_token_estimate": token_budget - left,
                  "estimated_tokens": response_token_estimate({"cards": cards, "results": results}),
                  "estimator": "utf8_bytes_div_4_ceiling", "has_more": bool(excluded_budget),
@@ -524,6 +535,15 @@ class RoutingIndex:
                                 "superseded_by": self.units[superseded_node].superseded_by,
                                 "current_revision": unit.revision})
                 continue
+            suspect_node = next(
+                (node for node in self.closure[ident]
+                 if node != ident and self.units[node].status == "suspect"), None)
+            if suspect_node is not None:
+                unit = self.units[ident]
+                add_unresolved({"ref": raw, "id": ident, "status": "suspect_ancestor",
+                                "blocked_by": suspect_node,
+                                "current_revision": unit.revision})
+                continue
             if grouped is None:
                 valid.append(ident)
                 continue
@@ -578,7 +598,8 @@ class RoutingIndex:
                     "inherits_from": list(unit.metadata["inherits_from"]),
                     "content": unit.body,
                     "applicability": status.to_dict() if status is not None else None,
-                    "ready_to_apply": bool(status is not None and status.status == "matched"),
+                    "ready_to_apply": bool(status is not None and status.status == "matched"
+                                           and unit.status == "active"),
                     "missing_conditions": missing_of(status) if status is not None else []}
 
         loaded = set()

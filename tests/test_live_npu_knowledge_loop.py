@@ -9,8 +9,13 @@ real NPU hardware/CANN topology and operator troubleshooting logs, and verifies:
 from __future__ import annotations
 
 from contextlib import closing
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+import hashlib
 import json
+import os
+import re
+import shlex
 import subprocess
 import time
 
@@ -19,6 +24,8 @@ import pytest
 from conftest import make_admission, write_settings
 from lane_support import load_parser
 from material_worker_fixture import package_body
+from mindie_knowledge.graded.feedback import record_usage_event, summarize_usage_events
+from mindie_knowledge.graded.units import GradedUnit
 from mindie_knowledge.loop.activation import Admission
 from mindie_knowledge.loop.engine import Engine
 from mindie_knowledge.loop.store import Store
@@ -34,7 +41,21 @@ A3_CONTAINER = "vaws-offload-pd165-20261016"
 _CONNECTED = "MINDIE_NPU_PROBE_CONNECTED"
 
 
+def _live_targets() -> dict[str, tuple[str, str]]:
+    return {
+        "a2": (
+            os.environ.get("MINDIE_LIVE_A2_HOST", "").strip() or A2_HOST,
+            os.environ.get("MINDIE_LIVE_A2_CONTAINER", "").strip() or A2_CONTAINER,
+        ),
+        "a3": (
+            os.environ.get("MINDIE_LIVE_A3_HOST", "").strip() or A3_HOST,
+            os.environ.get("MINDIE_LIVE_A3_CONTAINER", "").strip() or A3_CONTAINER,
+        ),
+    }
+
+
 def _ssh_probe(host: str, container: str) -> str:
+    quoted_container = shlex.quote(container)
     cmd = [
         "ssh",
         "-n",
@@ -45,7 +66,7 @@ def _ssh_probe(host: str, container: str) -> str:
         (
             f"printf '{_CONNECTED}\\n' >&2; "
             f"npu-smi info -l && "
-            f"docker exec {container} sh -c "
+            f"docker exec {quoted_container} sh -c "
             f"'ls -d /usr/local/Ascend/* 2>/dev/null; uname -m'"
         ),
     ]
@@ -83,9 +104,69 @@ def _append_turn(path, role: str, text: str) -> None:
         stream.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def _live_graded_check(store, probe_text: str, *, label: str):
+    """Install and exercise one probe-bound local unit; never claim performance."""
+    cann = re.search(r"/Ascend/cann-(\d+(?:\.\d+)+)", probe_text)
+    arch = next((name for name in ("aarch64", "x86_64") if name in probe_text), None)
+    if cann is None or arch is None:
+        return None
+    cann_version = cann.group(1)
+    ident = f"unit-live-{label}-topology-probe"
+    live_unit = GradedUnit.from_parts(
+        {
+            "schema": "mindie-graded-unit/1",
+            "id": ident,
+            "revision": 1,
+            "tier": "L2",
+            "category": "sop",
+            "domain_path": f"vllm-ascend/runtime/live-npu-{label}",
+            "evidence_strength": "single_observation",
+            "title": f"Live {label} NPU runtime probe receipt",
+            "conditions": {"cann": cann_version, "architecture": arch},
+            "inherits_from": [],
+            "provenance": {
+                "source_type": "live_npu_probe",
+                "source_locator": f"live-npu-probe:{label}",
+                "source_digest": hashlib.sha256(probe_text.encode()).hexdigest(),
+                "evidence_refs": [f"live-{label}-probe"],
+                "supersedes": [],
+            },
+            "triggers": {
+                "error_signatures": ["topology probe identity is missing from the live receipt"],
+                "keywords": ["npu-smi", "topology", f"cann-{cann_version}", arch, label],
+            },
+        },
+        "Read the probe receipt before reusing a topology-dependent rule.",
+        f"vllm-ascend/runtime/live-npu-{label}/{ident}.md",
+    )
+    store.graded.install([live_unit])
+    observed = {"cann": cann_version, "architecture": arch}
+    found = store.graded.query("topology probe", conditions=observed)
+    assert [item["id"] for item in found["results"]] == [live_unit.id]
+    assert found["results"][0]["ready_to_apply"] is True
+    ref = found["results"][0]["ref"]
+    assert store.graded.explain(ref)["content"] == live_unit.body
+    record_usage_event(store, root_hash=f"live-{label}", ref=ref,
+                       event_type="applied", run_id=f"live-{label}")
+    record_usage_event(store, root_hash=f"live-{label}", ref=ref,
+                       event_type="evaluated", run_id=f"live-{label}",
+                       outcome="supported", evidence_source="run_manifest_verified")
+    summary = summarize_usage_events(store, live_unit.id, 1)
+    assert summary["applied"] == 1 and summary["supported"] == 1
+    return {"id": live_unit.id, "cann": cann_version, "architecture": arch}
+
+
 def test_live_a2_and_a3_npu_capture_redaction_store_and_reme_recall(tmp_path):
-    a2_output = _ssh_probe(A2_HOST, A2_CONTAINER)
-    a3_output = _ssh_probe(A3_HOST, A3_CONTAINER)
+    targets = _live_targets()
+    a2_host, a2_container = targets["a2"]
+    a3_host, a3_container = targets["a3"]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        probes = {
+            name: pool.submit(_ssh_probe, host, container)
+            for name, (host, container) in targets.items()
+        }
+        outputs = {name: probe.result() for name, probe in probes.items()}
+    a2_output, a3_output = outputs["a2"], outputs["a3"]
 
     assert "Total Count" in a2_output and "Chip Count" in a2_output
     assert "Total Count" in a3_output and "Chip Count" in a3_output
@@ -103,15 +184,15 @@ def test_live_a2_and_a3_npu_capture_redaction_store_and_reme_recall(tmp_path):
 
     private_host_dir = "/home/ascend_engineer/private_bench_workspace"
     user_prompt = (
-        f"Investigating NPU 显存分配 failure on A2 node {A2_HOST} ({A2_CONTAINER}) "
-        f"and A3 node {A3_HOST} ({A3_CONTAINER}) mounted from {private_host_dir}/logs.\n"
+        f"Investigating NPU 显存分配 failure on A2 node {a2_host} ({a2_container}) "
+        f"and A3 node {a3_host} ({a3_container}) mounted from {private_host_dir}/logs.\n"
         f"A2 probe:\n{a2_output}\n"
         f"A3 probe:\n{a3_output}\n"
     )
     assistant_reply = (
         f"Observed ACL_ERROR_RT_MEMORY_ALLOCATION during GroupedMatmulSwiglu and "
-        f"torch_npu.npu_rms_norm dispatch on {A2_HOST} (8x1 Ascend910B4) and "
-        f"{A3_HOST} (8x2 Ascend910C dual-die) under cann-9.1.0 at {private_host_dir}/run.py. "
+        f"torch_npu.npu_rms_norm dispatch on {a2_host} (8x1 Ascend910B4) and "
+        f"{a3_host} (8x2 Ascend910C dual-die) under cann-9.1.0 at {private_host_dir}/run.py. "
         f"Setting PYTORCH_NPU_ALLOC_CONF=expandable_segments:True resolved the 显存分配 fragmentation."
     )
     _append_turn(transcript, "user", user_prompt)
@@ -142,8 +223,8 @@ def test_live_a2_and_a3_npu_capture_redaction_store_and_reme_recall(tmp_path):
         full_body = package_body(exported)
 
         # 1. Deterministic redaction of live cluster IPs and private user paths
-        assert A2_HOST not in full_body
-        assert A3_HOST not in full_body
+        assert a2_host not in full_body
+        assert a3_host not in full_body
         assert private_host_dir not in full_body
         assert "ascend_engineer" not in full_body
         assert "<redacted:ipv4-address:" in full_body
@@ -151,6 +232,8 @@ def test_live_a2_and_a3_npu_capture_redaction_store_and_reme_recall(tmp_path):
 
         # 2. Real NPU hardware topology & technical identifiers survive intact
         for preserved in (
+            a2_container,
+            a3_container,
             "ACL_ERROR_RT_MEMORY_ALLOCATION",
             "GroupedMatmulSwiglu",
             "torch_npu.npu_rms_norm",
@@ -178,3 +261,20 @@ def test_live_a2_and_a3_npu_capture_redaction_store_and_reme_recall(tmp_path):
             assert res["retrieval"] == "reme-bm25"
             assert res["results"], f"Expected recall for {query_term}"
             assert res["results"][0]["entry_id"] == entry_id
+
+        # 5. Tier-2 graded knowledge loop over the observed live topology.
+        # The unit is local test knowledge; it records a real probe identity and
+        # makes no performance claim. Query/explain/usage stay on the real paths.
+        result = _live_graded_check(store, f"{a2_output}\n{a3_output}", label="a2-a3")
+        assert result is not None
+
+
+def test_live_a3_graded_knowledge_loop_when_a2_is_unavailable(tmp_path):
+    """Tier-2 A3 fallback: do not let one unreachable host hide the live path."""
+    a3_host, a3_container = _live_targets()["a3"]
+    output = _ssh_probe(a3_host, a3_container)
+    assert "Total Count" in output and "Chip Count" in output
+    with closing(Store(tmp_path / "store", "vllm-ascend")) as store:
+        result = _live_graded_check(store, output, label="a3")
+        assert result is not None
+        assert result["cann"] and result["architecture"] == "aarch64"
