@@ -22,3 +22,28 @@ def test_frequency_index_retains_repeated_api_aliases_and_overlapping_cjk_bigram
         'npu_rms_norm': 2, 'rms': 2, 'norm': 2,
         '显存': 2, '存泄': 2, '泄漏': 2, '哈哈': 2,
     }
+
+
+def test_ascend_camel_pascal_snake_and_chip_subword_tokenization():
+    sample = (
+        'DataCopyPad PipeBarrier SetFlag WaitFlag MatmulImpl '
+        'ACLGraph GatedDeltaNet aclrtSynchronizeStream '
+        'Ascend910B Ascend910B4 npu_fused_infer_attention_score'
+    )
+    expanded = set(tokens(sample))
+    counts = token_counts(sample)
+    assert counts == {term: tokens(sample).count(term) for term in counts}
+    for expected_group in (
+        {'datacopypad', 'data', 'copy', 'pad'},
+        {'pipebarrier', 'pipe', 'barrier'},
+        {'setflag', 'set', 'flag'},
+        {'waitflag', 'wait', 'flag'},
+        {'matmulimpl', 'matmul', 'impl'},
+        {'aclgraph', 'acl', 'graph'},
+        {'gateddeltanet', 'gated', 'delta', 'net'},
+        {'aclrtsynchronizestream', 'aclrt', 'synchronize', 'stream'},
+        {'ascend910b', 'ascend', '910b'},
+        {'ascend910b4', 'ascend', '910b4'},
+        {'npu_fused_infer_attention_score', 'npu', 'fused', 'infer', 'attention', 'score'},
+    ):
+        assert expected_group.issubset(expanded)
