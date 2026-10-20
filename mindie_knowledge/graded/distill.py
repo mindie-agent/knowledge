@@ -238,7 +238,7 @@ def prepare_request(inputs, *, session_digest, task_state, redactor_executable,
         selected.append({"kind": item["kind"], "outcome": item["outcome"],
                          "source_locator": locator_parts(item["source_locator"]) or item["source_locator"], "content": item["content"],
                          "source_digest": hashlib.sha256(item["content"].encode()).hexdigest(),
-                         "evidence_refs": refs, "repetitions": repetitions})
+                         "evidence_refs": [locator_parts(ref) or ref for ref in refs], "repetitions": repetitions})
     raw = canonical(selected)
     if len(raw.encode()) > 262144:
         raise ValueError("selected distillation input exceeds 256 KiB; select a smaller evidence scope")
@@ -251,6 +251,10 @@ def prepare_request(inputs, *, session_digest, task_state, redactor_executable,
             locator = item["source_locator"]
             if isinstance(locator, dict):
                 item["source_locator"] = f"{locator['repository']}@{locator['revision']}:{locator['path']}"
+            item["evidence_refs"] = [
+                f"{ref['repository']}@{ref['revision']}:{ref['path']}" if isinstance(ref, dict) else ref
+                for ref in item["evidence_refs"]
+            ]
     request = {"schema_version": "mindie-distill-request/1", "session_digest": session_digest,
                "task_state": task_state, "evidence_inputs": sorted({item["kind"] for item in selected}),
                "sanitized_inputs": selected, "redaction_rules": rules,

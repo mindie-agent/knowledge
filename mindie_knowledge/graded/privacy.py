@@ -6,14 +6,38 @@ scanned repository, commit and path fields. Arbitrary strings keep every rule.
 [Side-Effect Policy] Reports findings only; never modifies source bytes.
 """
 from ..redact import scan_tree
-from .units import locator_parts
+from .units import is_graded_unit_path, locator_parts
+
+
+def _scan_locator(value):
+    parts = locator_parts(value)
+    if parts is None:
+        return value
+    return {**parts, "path": parts["path"].split("/")}
+
+
+def _scan_unit_path(value):
+    if isinstance(value, str) and is_graded_unit_path(value if value.endswith(".md") else f"{value}.md"):
+        return value.split("/")
+    return value
 
 
 def metadata_findings(value, path):
     def visit(item):
         if isinstance(item, dict):
-            return {key: (locator_parts(member) or member) if key == "source_locator" and isinstance(member, str)
-                    else visit(member) for key, member in item.items()}
+            out = {}
+            for key, member in item.items():
+                if key == "source_locator" and isinstance(member, str):
+                    out[key] = _scan_locator(member)
+                elif key == "evidence_refs" and isinstance(member, list):
+                    out[key] = [_scan_locator(ref) if isinstance(ref, str) else visit(ref) for ref in member]
+                elif key == "path" and isinstance(member, str):
+                    out[key] = _scan_unit_path(member)
+                elif key == "id_path" and isinstance(member, dict):
+                    out[key] = {k: _scan_unit_path(v) for k, v in member.items()}
+                else:
+                    out[key] = visit(member)
+            return out
         if isinstance(item, list):
             return [visit(member) for member in item]
         return item

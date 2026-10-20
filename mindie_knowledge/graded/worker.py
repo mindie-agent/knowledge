@@ -111,6 +111,11 @@ def _validated_decision(pending, request, engine, store, private_paths, cancel):
     for item in pending.get("units", []):
         provenance = item["frontmatter"]["provenance"]
         provenance["source_locator"] = locator_parts(provenance["source_locator"]) or provenance["source_locator"]
+        if isinstance(provenance.get("evidence_refs"), list):
+            provenance["evidence_refs"] = [
+                locator_parts(ref) or ref if isinstance(ref, str) else ref
+                for ref in provenance["evidence_refs"]
+            ]
     pending, _ = redact_tree(pending, executable=engine.redactor_executable,
                              key=store.redaction_key(), private_paths=private_paths, cancel=cancel)
     for item in pending.get("units", []):
@@ -118,6 +123,11 @@ def _validated_decision(pending, request, engine, store, private_paths, cancel):
         locator = provenance["source_locator"]
         if isinstance(locator, dict):
             provenance["source_locator"] = f"{locator['repository']}@{locator['revision']}:{locator['path']}"
+        if isinstance(provenance.get("evidence_refs"), list):
+            provenance["evidence_refs"] = [
+                f"{ref['repository']}@{ref['revision']}:{ref['path']}" if isinstance(ref, dict) else ref
+                for ref in provenance["evidence_refs"]
+            ]
     return validate_decision(pending, request)
 
 

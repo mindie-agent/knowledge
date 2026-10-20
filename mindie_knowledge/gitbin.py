@@ -1,4 +1,4 @@
-"""One deterministic resolution of the git executable for every spawn.
+r"""One deterministic resolution of the git executable for every spawn.
 
 Reduced-PATH environments (Windows Task Scheduler Session 0, minimal
 containers) do not carry Git on PATH, so a bare ``"git"`` argv[0] fails at

@@ -146,9 +146,11 @@ _UUID = re.compile(
 )
 _TOKEN_CANDIDATE = re.compile(r"[A-Za-z0-9+/_=-]{32,}")
 _PINNED_SOURCE_URL = re.compile(
-    r"(?<![\w:/])https://(?:github\.com|gitcode\.com)/"
-    r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/blob/[0-9a-f]{40}/"
-    r"[A-Za-z0-9_./-]+(?:#L[1-9][0-9]*(?:-L[1-9][0-9]*)?)?"
+    r"(?<![\w:/])https://(?:"
+    r"(?:github\.com|gitcode\.com)/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/blob/[0-9a-f]{40}/[A-Za-z0-9_./-]+"
+    r"|gitcode\.com/cann/[A-Za-z0-9_.-]+/blob/master/[A-Za-z0-9_./-]+"
+    r"|www\.hiascend\.com/document/detail/[A-Za-z0-9_./-]+"
+    r")(?:#L[1-9][0-9]*(?:-L[1-9][0-9]*)?)?"
     r"(?=$|[\s\"'`<>)\],;])"
 )
 
@@ -652,6 +654,9 @@ BUILTIN_ALLOW_PATTERNS: tuple[str, ...] = (
     r"(?:[\w-]+\.)*example\.(?:com|org|net|local|internal|lan|home|corp|priv|private|localdomain|localnet|intranet)",
     r"[\w.+-]+@(?:users\.)?noreply\.github\.com",
     r"RFC-\d+",
+    r"aclnn[A-Za-z0-9_/+.-]+",
+    r"E[A-Z]\d{4}-[A-Za-z0-9_.-]+",
+    r"G[1-4]_[a-z0-9_]+",
     r"<[^<>]+>",  # <placeholder>
 )
 
