@@ -3,7 +3,15 @@ import subprocess
 
 import pytest
 
-from test_live_npu_knowledge_loop import _ssh_probe
+import test_live_npu_knowledge_loop as live_loop
+from test_live_npu_knowledge_loop import (
+    A2_CONTAINER,
+    A2_HOST,
+    A3_CONTAINER,
+    A3_HOST,
+    _live_targets,
+    _ssh_probe,
+)
 
 
 def test_connected_remote_command_failure_is_a_test_failure(monkeypatch):
@@ -44,3 +52,51 @@ def test_connected_probe_preserves_hardware_output(monkeypatch):
         return subprocess.CompletedProcess(argv, 0, output, "MINDIE_NPU_PROBE_CONNECTED\n")
     monkeypatch.setattr(subprocess, "run", run)
     assert _ssh_probe("test-host", "test-container") == output.strip()
+
+
+def test_live_targets_env_override_and_blank_fallback(monkeypatch):
+    for key in (
+        "MINDIE_LIVE_A2_HOST",
+        "MINDIE_LIVE_A2_CONTAINER",
+        "MINDIE_LIVE_A3_HOST",
+        "MINDIE_LIVE_A3_CONTAINER",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    assert _live_targets() == {
+        "a2": (A2_HOST, A2_CONTAINER),
+        "a3": (A3_HOST, A3_CONTAINER),
+    }
+
+    monkeypatch.setenv("MINDIE_LIVE_A2_CONTAINER", "mindie-bench-a2-custom-20261020")
+    monkeypatch.setenv("MINDIE_LIVE_A3_CONTAINER", "   ")
+    assert _live_targets() == {
+        "a2": (A2_HOST, "mindie-bench-a2-custom-20261020"),
+        "a3": (A3_HOST, A3_CONTAINER),
+    }
+
+
+def test_configured_container_override_flows_into_probe_and_redacted_package(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("MINDIE_LIVE_A2_CONTAINER", "mindie-bench-a2-override-20261020")
+    monkeypatch.setenv("MINDIE_LIVE_A3_CONTAINER", "vaws-offload-pd165-override-20261020")
+    observed_cmds: list[str] = []
+
+    real_run = subprocess.run
+
+    def run(argv, **kwargs):
+        if argv and argv[0] == "ssh":
+            observed_cmds.append(argv[-1])
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                "Total Count : 8\nChip Count : 8\n/usr/local/Ascend/ascend-toolkit\naarch64\n",
+                "MINDIE_NPU_PROBE_CONNECTED\n",
+            )
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    live_loop.test_live_a2_and_a3_npu_capture_redaction_store_and_reme_recall(tmp_path)
+    assert len(observed_cmds) == 2
+    assert "docker exec mindie-bench-a2-override-20261020 sh -c" in observed_cmds[0]
+    assert "docker exec vaws-offload-pd165-override-20261020 sh -c" in observed_cmds[1]
