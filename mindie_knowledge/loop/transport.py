@@ -352,10 +352,13 @@ class Service:
                 raise ValueError("selected evidence is outside current contribution authorization")
             authorization = dict(session=session, generation=settings.generation, scope=scope,
                                  activation_epoch=activation_epoch(lease["token"]))
+            proposal = args.get("proposal")
+            if isinstance(proposal, dict) and proposal.get("session_digest") in (None, ""):
+                proposal = {**proposal, "session_digest": session_key(session)}
             return self.engine.distill_selected(args["inputs"], session_digest=session_key(session),
                                                task_state=args["task_state"], authorization=authorization,
                                                cancel=cancel, related_refs=args.get("related_refs"),
-                                               proposal=args.get("proposal"))
+                                               proposal=proposal)
         if method == "explain":
             allowed = {"ref", "refs", "conditions", "known_refs", "token_budget", "run_id"}
             if not set(args) <= allowed or (args.get("ref") is None and args.get("refs") is None):
