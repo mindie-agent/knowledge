@@ -2,6 +2,7 @@
 
 [Invariants] One admitted paid call per evidence request. Returned decisions
 resume local application; failed or uncertain calls are never replayed here.
+Related bodies are complete or explicitly omitted, never silently truncated.
 [Timeouts & Locks] Existing summary_budget bounds identity/model subprocesses;
 Gitleaks uses its 30s budget outside SQLite transactions. Writes use Store locks.
 [Side-Effect Policy] Runs the configured worker; applies local graded units and
@@ -25,11 +26,14 @@ from .feedback import parse_feedback_ref
 from .units import UNIT_ID, canonical, locator_parts
 
 
-def _compact_related(unit):
+RELATED_BODY_BUDGET_BYTES = 16384
+
+
+def _compact_related(unit, *, body_complete):
     return {"id": unit.id, "revision": unit.revision, "tier": unit.metadata["tier"],
             "category": unit.metadata["category"], "title": unit.metadata["title"],
             "conditions": unit.metadata["conditions"], "triggers": unit.metadata["triggers"],
-            "body_excerpt": unit.body[:1200]}
+            "body_excerpt": unit.body if body_complete else "", "body_complete": body_complete}
 
 
 def _matching_related_units(store, inputs, related_refs):
@@ -72,7 +76,14 @@ def _matching_related_units(store, inputs, related_refs):
             if unit.id not in seen:
                 ordered.append(unit)
                 seen.add(unit.id)
-    return [_compact_related(unit) for unit in ordered[:3]] or None
+    related, remaining = [], RELATED_BODY_BUDGET_BYTES
+    for unit in ordered[:3]:
+        size = len(unit.body.encode("utf-8"))
+        complete = size <= remaining
+        related.append(_compact_related(unit, body_complete=complete))
+        if complete:
+            remaining -= size
+    return related or None
 
 
 def _related_snapshot(store, inputs, *, session_digest, task_state, related_refs):

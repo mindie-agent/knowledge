@@ -153,6 +153,11 @@ class RoutingIndex:
         index.build_elapsed_ms = (time.perf_counter() - started) * 1000
         return index
 
+    @classmethod
+    def from_directory(cls, root):
+        """Compatibility alias for callers that build from a corpus directory."""
+        return cls.from_root(root)
+
     def manifest(self):
         rows = []
         for ident, unit in sorted(self.units.items()):
@@ -170,9 +175,13 @@ class RoutingIndex:
                 "token_estimator": "utf8_bytes_div_4_ceiling", "query_budget_excludes_build": True}
 
     def query(self, query, *, conditions=None, domain_path=None, limit=5, token_budget=1200,
-              include_unknown=False, include_archived=False, navigation_only=False):
+              include_unknown=False, include_archived=False, navigation_only=False,
+              mode="reuse", ledger_entries=None, bottleneck_summary=None,
+              native_subcontext=False, goal=""):
         if not isinstance(query, str) or not query.strip():
             raise ValueError("query must be nonempty text")
+        if mode not in {"reuse", "diagnose", "explore"}:
+            raise ValueError("mode must be one of ['diagnose', 'explore', 'reuse']")
         if conditions is not None and not isinstance(conditions, dict):
             raise ValueError("conditions must be an object of observed facts")
         if type(token_budget) is not int or not 1 <= token_budget <= 16000:
@@ -188,11 +197,17 @@ class RoutingIndex:
         scores = {}
         rejected = Counter()
         archived_excluded = 0
+        suspect_excluded = 0
         for ident, unit in self.units.items():
-            # Archived and superseded units remain addressable by reference but
-            # do not enter ordinary discovery unless explicitly requested.
+            # Archived, superseded and suspect units remain addressable by
+            # reference but do not enter ordinary discovery. Suspect is a
+            # demotion state: evidence is no longer sufficient for adoption,
+            # while the body is retained for audit and recovery.
             if unit.status in {"archived", "superseded"} and not include_archived:
                 archived_excluded += 1
+                continue
+            if unit.status == "suspect" and not include_archived:
+                suspect_excluded += 1
                 continue
             status = applicability[ident].status
             if status == "mismatch" or (status == "unknown" and not include_unknown):
@@ -226,15 +241,60 @@ class RoutingIndex:
                 ranked.append((FOUNDATION_SCORE, ident, "foundation_baseline"))
         ranked.sort(key=lambda item: (-item[0], item[1]))
         selected = ranked[:limit]
+        source_selected = list(selected)
+        stripped_l3_ids = []
+        if mode == "explore":
+            promoted = {}
+            for _score, ident, _route in source_selected:
+                unit = self.units[ident]
+                if unit.metadata["tier"] != "L3":
+                    continue
+                stripped_l3_ids.append(ident)
+                if applicability[ident].status != "matched":
+                    continue
+                for parent in self.closure[ident]:
+                    parent_unit = self.units[parent]
+                    if (parent_unit.metadata["tier"] in {"L1", "L2"}
+                            and applicability[parent].status == "matched"):
+                        promoted[parent] = scores.get(parent, FOUNDATION_SCORE)
+            existing = {ident for _score, ident, _route in source_selected}
+            selected = [row for row in source_selected
+                        if self.units[row[1]].metadata["tier"] != "L3"]
+            for parent, score in sorted(promoted.items(), key=lambda item: (-item[1], item[0])):
+                if parent not in existing:
+                    selected.append((score, parent, "promoted_l3_foundation"))
+                    existing.add(parent)
+            stripped_l3_ids = sorted(set(stripped_l3_ids))
         active_closure = {
             ident: all(self.units[node].status == "active"
-                       for node in self.closure[ident] if node != ident)
+                       for node in [*self.closure[ident], ident])
+            for ident in self.units
+        }
+        matched_closure = {
+            ident: applicability[ident].status == "matched"
+            and all(applicability[parent].status == "matched"
+                    for parent in self.closure[ident])
             for ident in self.units
         }
 
         def missing_for(ident):
-            return [reason.split(":", 1)[0] for reason in applicability[ident].reasons
-                    if reason.endswith(("not supplied", "version not supplied"))]
+            missing = [reason.split(":", 1)[0] for reason in applicability[ident].reasons
+                       if reason.endswith(("not supplied", "version not supplied"))]
+            for parent in self.closure[ident]:
+                status = applicability[parent]
+                if status.status != "matched":
+                    inherited = [reason.split(":", 1)[0] for reason in status.reasons
+                                 if reason.endswith(("not supplied", "version not supplied"))]
+                    missing.extend(inherited)
+                    if not inherited:
+                        missing.append(f"parent_unmatched:{parent}:{status.status}")
+                if self.units[parent].status != "active":
+                    missing.append(f"parent_inactive:{parent}:{self.units[parent].status}")
+            deduplicated = []
+            for reason in missing:
+                if reason not in deduplicated:
+                    deduplicated.append(reason)
+            return deduplicated
 
         def card_for(ident, *, score, route, ready, missing):
             unit = self.units[ident]
@@ -255,9 +315,45 @@ class RoutingIndex:
                         token_estimate(self.units[parent].body) for parent in self.closure[ident]),
                     "route": route, "score": score}
 
+        def finish(payload):
+            payload["mode"] = mode
+            if mode != "explore":
+                return payload
+            rows, seen = [], set()
+            for _score, ident, _route in source_selected:
+                if ident in seen:
+                    continue
+                seen.add(ident)
+                unit = self.units[ident]
+                row = {**unit.metadata, "body": unit.body}
+                if unit.metadata["tier"] == "L3":
+                    row["inherited_rules"] = [
+                        {**self.units[parent].metadata, "body": self.units[parent].body}
+                        for parent in self.closure[ident]
+                        if self.units[parent].metadata["tier"] in {"L1", "L2"}]
+                rows.append(row)
+            for key in ("cards", "foundation_cards", "results"):
+                for item in payload.get(key, ()):
+                    if item["id"] in seen:
+                        continue
+                    seen.add(item["id"])
+                    unit = self.units[item["id"]]
+                    rows.append({**unit.metadata, "body": unit.body})
+            from .explore import assess_stagnation, build_exploration_context
+            context = build_exploration_context(
+                rows, bottleneck_summary=bottleneck_summary or {},
+                failed_attempts=ledger_entries or [], native_subcontext=native_subcontext,
+                goal=goal, conditions=conditions)
+            context["stagnation"] = assess_stagnation(ledger_entries or [])
+            context["stripped_l3_ids"] = stripped_l3_ids
+            context["subagent_fact_pack"]["stripped_l3_ids"] = stripped_l3_ids
+            payload["exploration_context"] = context
+            payload["stripped_l3_ids"] = stripped_l3_ids
+            return payload
+
         if navigation_only:
             cards = [card_for(ident, score=score, route=route,
-                              ready=(applicability[ident].status == "matched" and active_closure[ident]),
+                              ready=(matched_closure[ident] and active_closure[ident]),
                               missing=missing_for(ident))
                      for score, ident, route in selected]
 
@@ -271,7 +367,7 @@ class RoutingIndex:
                     seen.add(ident)
                     found.append(card_for(
                         ident, score=scores.get(ident, FOUNDATION_SCORE), route=route,
-                        ready=(applicability[ident].status == "matched" and active_closure[ident]),
+                        ready=(matched_closure[ident] and active_closure[ident]),
                         missing=missing_for(ident)))
 
                 for row in rows:
@@ -284,12 +380,15 @@ class RoutingIndex:
             # Navigation cards do not charge bodies. Their own bounded metadata
             # is the delivered budget, so a truncated excerpt can never appear.
             accepted = []
+            excluded_budget = []
             for card in cards:
                 trial = accepted + [card]
                 foundations = foundation_cards_for(trial)
                 payload = {"cards": trial, "foundation_cards": foundations, "results": []}
                 if response_token_estimate(payload) <= token_budget:
                     accepted = trial
+                else:
+                    excluded_budget.append(card["id"])
             cards = accepted
             foundation_cards = foundation_cards_for(cards)
             excluded_conditions = dict(rejected)
@@ -299,14 +398,15 @@ class RoutingIndex:
                 {"cards": cards, "foundation_cards": foundation_cards, "results": []})
             usage = {"token_budget": token_budget, "body_token_estimate": 0,
                      "estimated_tokens": estimated, "estimator": "utf8_bytes_div_4_ceiling",
-                     "has_more": len(cards) < len(selected), "excluded_budget": []}
-            return {"results": [], "cards": cards, "foundation_cards": foundation_cards,
-                    "generation": self.generation, "unit_count": len(self.units),
-                    "body_token_estimate": 0, "token_budget": token_budget,
-                    "budget_scope": "navigation cards; metadata excluded",
-                    "excluded_budget": [], "excluded_conditions": excluded_conditions,
-                    "usage": usage, "query_elapsed_ms": (time.perf_counter() - started) * 1000,
-                    "note": "Conditions must be established. Unknown conditions are not evidence of applicability; retrieval scores are not confidence."}
+                     "has_more": len(cards) < len(selected), "excluded_budget": list(excluded_budget)}
+            payload = {"results": [], "cards": cards, "foundation_cards": foundation_cards,
+                       "generation": self.generation, "unit_count": len(self.units),
+                       "body_token_estimate": 0, "token_budget": token_budget,
+                       "budget_scope": "navigation cards; metadata excluded",
+                       "excluded_budget": excluded_budget, "excluded_conditions": excluded_conditions,
+                       "usage": usage, "query_elapsed_ms": (time.perf_counter() - started) * 1000,
+                       "note": "Conditions must be established. Unknown conditions are not evidence of applicability; retrieval scores are not confidence."}
+            return finish(payload)
 
         left = token_budget
         results = []
@@ -405,26 +505,33 @@ class RoutingIndex:
         excluded_conditions = dict(rejected)
         if archived_excluded:
             excluded_conditions["archived_or_superseded"] = archived_excluded
+        if suspect_excluded:
+            excluded_conditions["suspect"] = suspect_excluded
         usage = {"token_budget": token_budget, "body_token_estimate": token_budget - left,
                  "estimated_tokens": response_token_estimate({"cards": cards, "results": results}),
                  "estimator": "utf8_bytes_div_4_ceiling", "has_more": bool(excluded_budget),
                  "excluded_budget": list(excluded_budget)}
-        return {"results": results, "cards": cards, "foundation_cards": foundation_cards,
-                "generation": self.generation, "unit_count": len(self.units),
-                "body_token_estimate": token_budget - left, "token_budget": token_budget,
-                "budget_scope": "body excerpts and inherited rules; metadata excluded",
-                "excluded_budget": excluded_budget,
-                "excluded_conditions": excluded_conditions, "usage": usage,
-                "query_elapsed_ms": (time.perf_counter() - started) * 1000,
-                "note": "Conditions must be established. Unknown conditions are not evidence of applicability; retrieval scores are not confidence."}
+        payload = {"results": results, "cards": cards, "foundation_cards": foundation_cards,
+                   "generation": self.generation, "unit_count": len(self.units),
+                   "body_token_estimate": token_budget - left, "token_budget": token_budget,
+                   "budget_scope": "body excerpts and inherited rules; metadata excluded",
+                   "excluded_budget": excluded_budget,
+                   "excluded_conditions": excluded_conditions, "usage": usage,
+                   "query_elapsed_ms": (time.perf_counter() - started) * 1000,
+                   "note": "Conditions must be established. Unknown conditions are not evidence of applicability; retrieval scores are not confidence."}
+        return finish(payload)
 
-    def explain_closure(self, refs, *, conditions=None, known_refs=None, domain=None, token_budget=4096):
+    def explain_closure(self, refs, *, conditions=None, known_refs=None, domain=None,
+                        token_budget=4096, mode="reuse", ledger_entries=None,
+                        bottleneck_summary=None, native_subcontext=False, goal=""):
         """Assemble an exact dependency closure without truncating any body.
 
         ``known_refs`` names only exact, currently visible ``id@revision``
         pairs. Shared ancestors are emitted once in topological order and
         budget misses stay explicit; a body is never shortened to fit.
         """
+        if mode not in {"reuse", "diagnose", "explore"}:
+            raise ValueError("mode must be one of ['diagnose', 'explore', 'reuse']")
         if type(token_budget) is not int or not 1 <= token_budget <= 16000:
             raise ValueError("token_budget must be between 1 and 16000")
         if conditions is not None and not isinstance(conditions, dict):
@@ -524,6 +631,15 @@ class RoutingIndex:
                                 "superseded_by": self.units[superseded_node].superseded_by,
                                 "current_revision": unit.revision})
                 continue
+            suspect_node = next(
+                (node for node in self.closure[ident]
+                 if node != ident and self.units[node].status == "suspect"), None)
+            if suspect_node is not None:
+                unit = self.units[ident]
+                add_unresolved({"ref": raw, "id": ident, "status": "suspect_ancestor",
+                                "blocked_by": suspect_node,
+                                "current_revision": unit.revision})
+                continue
             if grouped is None:
                 valid.append(ident)
                 continue
@@ -578,7 +694,8 @@ class RoutingIndex:
                     "inherits_from": list(unit.metadata["inherits_from"]),
                     "content": unit.body,
                     "applicability": status.to_dict() if status is not None else None,
-                    "ready_to_apply": bool(status is not None and status.status == "matched"),
+                    "ready_to_apply": bool(status is not None and status.status == "matched"
+                                           and unit.status == "active"),
                     "missing_conditions": missing_of(status) if status is not None else []}
 
         loaded = set()
@@ -632,10 +749,48 @@ class RoutingIndex:
                 loaded.add(item["id"])
                 body_tokens += token_estimate(item["content"])
 
-        estimated = estimate(requires_out, units_out)
-        return {"units": units_out, "requires": requires_out, "unresolved": unresolved_out,
-                "usage": {"token_budget": token_budget, "estimated_tokens": estimated,
-                          "body_token_estimate": body_tokens,
-                          "estimator": "utf8_bytes_div_4_ceiling",
-                          "has_more": any(item["status"] == "budget_excluded"
-                                          for item in unresolved_out)}}
+        stripped_l3_ids = []
+        if mode == "explore":
+            all_entries = [*requires_out, *units_out]
+            stripped_l3_ids = sorted({item["id"] for item in all_entries
+                                      if item.get("tier") == "L3"})
+            if stripped_l3_ids:
+                body_tokens -= sum(token_estimate(item.get("content", ""))
+                                   for item in all_entries if item.get("tier") == "L3")
+                requires_out = [item for item in requires_out if item.get("tier") != "L3"]
+                units_out = [item for item in units_out if item.get("tier") != "L3"]
+        estimated = response_token_estimate(
+            {"units": units_out, "requires": requires_out, "unresolved": unresolved_out})
+        payload = {"units": units_out, "requires": requires_out, "unresolved": unresolved_out,
+                   "usage": {"token_budget": token_budget, "estimated_tokens": estimated,
+                             "body_token_estimate": body_tokens,
+                             "estimator": "utf8_bytes_div_4_ceiling",
+                             "has_more": any(item["status"] == "budget_excluded"
+                                             for item in unresolved_out)},
+                   "mode": mode}
+        if mode == "explore":
+            rows, seen = [], set()
+            for item in [*requires_out, *units_out]:
+                if item["id"] not in seen:
+                    seen.add(item["id"])
+                    rows.append({**item, "body": item.get("content", "")})
+            for ident in stripped_l3_ids:
+                if ident in seen:
+                    continue
+                unit = self.units[ident]
+                rows.append({**unit.metadata, "body": unit.body,
+                             "inherited_rules": [
+                                 {**self.units[parent].metadata, "body": self.units[parent].body}
+                                 for parent in self.closure[ident]
+                                 if self.units[parent].metadata["tier"] in {"L1", "L2"}]})
+            from .explore import assess_stagnation, build_exploration_context
+            context = build_exploration_context(
+                rows, bottleneck_summary=bottleneck_summary or {},
+                failed_attempts=ledger_entries or [], native_subcontext=native_subcontext,
+                goal=goal, conditions=conditions)
+            context["stagnation"] = assess_stagnation(ledger_entries or [])
+            context["stripped_l3_ids"] = stripped_l3_ids
+            context["subagent_fact_pack"]["stripped_l3_ids"] = stripped_l3_ids
+            payload["exploration_context"] = context
+            payload["stripped_l3_ids"] = stripped_l3_ids
+        return payload

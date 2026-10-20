@@ -8,7 +8,14 @@ import sys
 import pytest
 
 from graded_fixture import OBSERVED, unit as fixture_unit
-from mindie_knowledge.graded.distill import prepare_request, value_gate
+from mindie_knowledge.graded.distill import (
+    UNIT_BODY_HARD_BUDGET_BYTES,
+    apply_decision,
+    noop_decision,
+    prepare_request,
+    validate_decision,
+    value_gate,
+)
 from mindie_knowledge.graded.explore import (
     assess_stagnation,
     build_exploration_context,
@@ -19,8 +26,9 @@ from mindie_knowledge.graded.feedback import (
     record_vote,
     summarize_usage_events,
 )
-from mindie_knowledge.graded.index import response_token_estimate, token_estimate
+from mindie_knowledge.graded.index import RoutingIndex, response_token_estimate, token_estimate
 from mindie_knowledge.graded.maintenance import growth_metrics
+from mindie_knowledge.graded.publication import prepare_decision
 from mindie_knowledge.graded.units import GradedUnit
 from mindie_knowledge.loop.engine import Engine
 from mindie_knowledge.materials.references import ReadReferenceError
@@ -90,6 +98,49 @@ def test_value_gate_admits_verified_milestone_and_blocks_in_flight(store):
                                   task_state="verified_milestone", redactor_executable=scanner(),
                                   redaction_key=store.redaction_key())
     assert value_gate(all_pending) == "in_flight_incomplete"
+
+
+def test_in_flight_session_distills_verified_milestone_but_blocks_unverified_inputs(store):
+    item = fixture_unit()
+    session = "f" * 64
+    pending = {
+        "kind": "authorized_transcript",
+        "outcome": "in_flight",
+        "source_locator": "fixture@abcdef1:pending.md",
+        "content": "Only the verified milestone may become evidence; this probe is still running.",
+        "evidence_refs": ["pending-run"],
+        "repetitions": 1,
+    }
+    only_pending = prepare_request([pending], session_digest=session, task_state="in_flight",
+                                   redactor_executable=scanner(), redaction_key=store.redaction_key())
+    assert value_gate(only_pending) == "in_flight_incomplete"
+    assert noop_decision(only_pending)["drop_reason"] == "in_flight_incomplete"
+
+    mixed = prepare_request([evidence(item), pending], session_digest=session, task_state="in_flight",
+                            redactor_executable=scanner(), redaction_key=store.redaction_key())
+    assert value_gate(mixed) is None
+    applied = apply_decision(store, mixed, proposal(session, item))
+    assert applied["status"] == "applied"
+    assert applied["admitted_unit_ids"] == [item.id]
+    assert store.explain(ref(item, 1))["content"] == item.body
+
+    cites_pending_source = proposal(session, item)
+    row = cites_pending_source["units"][0]
+    row["frontmatter"]["provenance"] = {
+        **row["frontmatter"]["provenance"],
+        "source_locator": pending["source_locator"],
+        "evidence_refs": ["pending-run"],
+    }
+    with pytest.raises(ValueError, match="selected evidence"):
+        validate_decision(cites_pending_source, mixed)
+
+    cites_pending_ref = proposal(session, item)
+    cites_pending_ref["units"][0]["frontmatter"]["provenance"] = {
+        **cites_pending_ref["units"][0]["frontmatter"]["provenance"],
+        "evidence_refs": ["pending-run"],
+    }
+    with pytest.raises(ValueError, match="not present"):
+        validate_decision(cites_pending_ref, mixed)
 
 
 def test_two_task_replay_revises_and_deduplicates_usage_and_inconclusive_failure(store):
@@ -199,6 +250,11 @@ def test_exploration_judgment_keeps_valid_subtarget_gain_and_separates_axes():
     assert negative["verdict"] == "refuted" and negative["conditional_avoid"]
     noise = evaluate_exploration_candidate(speedup_ratio=1.005, ablation_retained=None, **common)
     assert noise["reusability"] == "inconclusive" and noise["distill_ready"] is False
+    pending_ablation = evaluate_exploration_candidate(speedup_ratio=1.06, ablation_retained=None, **common)
+    assert pending_ablation["axes"] == {"evidence_validity": "valid",
+                                        "goal_attainment": "not_applicable",
+                                        "reusability": "inconclusive"}
+    assert pending_ablation["verdict"] == "inconclusive" and pending_ablation["distill_ready"] is False
     broken = evaluate_exploration_candidate(**{**common, "compile_ok": False}, speedup_ratio=1.04)
     assert broken["evidence_validity"] == "compile_failed"
     assert broken["goal_attainment"] == "not_applicable"
@@ -213,6 +269,12 @@ def test_stagnation_counts_information_not_infrastructure_and_deduplicates_runs(
     ])
     assert deduped["status"] == "progressing" and deduped["stalled"] is False
     assert deduped["stalled_count"] == 0
+    attained = assess_stagnation([
+        {"run_id": "run-a1", "verdict": "attained"},
+        {"run_id": "run-a2", "verdict": "attained"},
+    ])
+    assert attained["status"] == "progressing" and attained["stalled"] is False
+    assert attained["stalled_count"] == 0
     repair = assess_stagnation([
         {"run_id": "run-3", "outcome": "infra_failed"},
         {"run_id": "run-4", "verdict": "inconclusive"},
@@ -230,8 +292,8 @@ def test_stagnation_counts_information_not_infrastructure_and_deduplicates_runs(
 def test_exploration_context_strips_l3_and_only_mounts_valid_matching_refutations():
     units = [
         {"id": "unit-l1", "tier": "L1", "revision": 1, "body": "hard constraint"},
-        {"id": "unit-l2", "tier": "L2", "revision": 2, "body": "diagnostic steps"},
-        {"id": "unit-l3", "tier": "L3", "revision": 1, "body": "old recommendation"},
+        {"id": "unit-l2", "category": "sop", "revision": 2, "body": "diagnostic steps"},
+        {"id": "unit-l3", "category": "workflow", "revision": 1, "body": "old recommendation"},
         {"id": "unit-l4", "tier": "L4", "revision": 3, "body": "code transform"},
     ]
     ledger = [
@@ -364,3 +426,159 @@ def test_related_units_feed_the_organizer_prompt_without_changing_old_digests(st
     from mindie_knowledge.graded.distill import build_prompt
     prompt = build_prompt(with_related)
     assert "related_units" in prompt and "merge_into_existing" in prompt
+
+
+def test_related_lookup_keeps_late_counterevidence_and_recovery_conditions(store):
+    from mindie_knowledge.graded.worker import _matching_related_units
+
+    # A late correction must survive comparison even after a long procedure.
+    procedure = (
+        "Compare the same logical input and state at each producer/consumer boundary. "
+        "Keep the run reference and distinguish a completed probe from a verified fix.\n"
+    ) * 10
+    correction = (
+        "Correction: the instrumented run passed, but the uninstrumented run still failed. "
+        "The earlier fix claim is withdrawn; the observer effect remains unresolved.\n"
+    )
+    existing = fixture_unit("unit-observer-effect", body=procedure + correction,
+                            tier="L3", category="workflow")
+    store.graded.install([existing])
+    related = _matching_related_units(store, [], [existing.id])
+    assert related[0]["body_complete"] is True
+    assert related[0]["body_excerpt"] == existing.body
+
+
+@pytest.mark.parametrize("legacy_snapshot", [False, True])
+def test_incomplete_related_body_cannot_overwrite_existing_branches(store, legacy_snapshot):
+    from mindie_knowledge.graded.distill import apply_decision
+    from mindie_knowledge.graded.worker import RELATED_BODY_BUDGET_BYTES, _matching_related_units
+
+    branch = "Preserve the initial state, request order, reset semantics and independent oracle.\n"
+    existing = fixture_unit("unit-history-dependent-probe",
+                            body=branch * (RELATED_BODY_BUDGET_BYTES // len(branch) + 1))
+    store.graded.install([existing])
+    related = _matching_related_units(store, [], [existing.id])
+    assert related[0]["body_complete"] is False
+    assert related[0]["body_excerpt"] == ""
+    if legacy_snapshot:
+        related[0].pop("body_complete")
+        related[0]["body_excerpt"] = existing.body[:1200]
+    session = "c" * 64
+    selected = {**evidence(existing, outcome="observed"),
+                "content": "A fresh process passed; the historical request sequence was not tested.",
+                "source_locator": "fixture@abcdef1:history-observation.txt"}
+    request = prepare_request([selected], session_digest=session,
+                              task_state="verified_milestone", redactor_executable=scanner(),
+                              redaction_key=store.redaction_key(), related_units=related)
+    replacement = proposal(session, existing, operation="merge_into_existing",
+                           body="Only retry from a fresh process.\n")
+    replacement["units"][0]["frontmatter"]["provenance"].update(
+        source_locator=selected["source_locator"],
+        source_digest=request["sanitized_inputs"][0]["source_digest"])
+    with pytest.raises(ValueError, match="complete related unit"):
+        apply_decision(store, request, replacement)
+    assert store.explain(ref(existing))["content"] == existing.body
+
+    # The existing review route can retain a candidate without overwriting it.
+    replacement["units"][0]["operation"] = "propose_semantic_merge_review"
+    review = apply_decision(store, request, replacement)
+    assert review["status"] == "review_or_unchanged"
+    assert store.explain(ref(existing))["content"] == existing.body
+
+
+def test_negative_branch_folding_keeps_one_compacted_l3_unit(store, tmp_path, monkeypatch):
+    existing = fixture_unit(
+        "unit-k3-a5-pipeline-fusion", tier="L3", category="workflow",
+        title="K3/A5 pipeline fusion triage",
+        body=(
+            "## Active branches and rare conditions\n\n"
+            "Keep double-buffered UB ping-pong when burst_skew=19 on decode_tp=8.\n\n"
+            "Conditional counter-evidence: under dynamic_prefix_cache=true, disable static workspace reuse.\n\n"
+            "Superseded plan: legacy split-K workspace layout was replaced by persistent tile staging.\n\n"
+            "## Negative pipeline attempts\n\n"
+            "PV2 on the K3 A5 decode path: the isolated PV2 schedule removed the staging copy, "
+            "but the paired full-pipeline run regressed because the producer still materialized "
+            "the attention result to GM and the consumer reloaded it; the branch was rejected.\n\n"
+            "Score2 on the K3 A5 decode path: the score tile change reduced local cycles, yet the "
+            "same GM round-trip remained and the critical path did not move; the branch was rejected.\n\n"
+            "vmula on the K3 A5 decode path: the vector multiply-add helper was folded, but a "
+            "collective barrier split the fused region and the extra synchronization erased the "
+            "gain; the branch was rejected.\n"
+        ),
+    )
+    store.graded.install([existing])
+    calls = tmp_path / "c6_calls.txt"
+    monkeypatch.setenv("MINDIE_GRADED_FIXTURE_CALLS", str(calls))
+    monkeypatch.setenv(
+        "MINDIE_GRADED_FIXTURE_SOURCE_TYPE",
+        existing.metadata["provenance"]["source_type"],
+    )
+    monkeypatch.setenv(
+        "MINDIE_GRADED_FIXTURE_STRENGTH",
+        existing.metadata["evidence_strength"],
+    )
+    monkeypatch.setenv(
+        "MINDIE_GRADED_FIXTURE_DOMAIN_PATH",
+        existing.metadata["domain_path"],
+    )
+    engine = Engine(
+        store,
+        redactor_executable=scanner(),
+        summary_command=[sys.executable, str(Path(__file__).parent / "fixtures/graded_worker.py")],
+    )
+    new_evidence = {
+        "kind": "authorized_transcript",
+        "outcome": "verified",
+        "source_locator": existing.metadata["provenance"]["source_locator"],
+        "content": (
+            "## Active branches and rare conditions\n\n"
+            "Keep double-buffered UB ping-pong when burst_skew=19 on decode_tp=8.\n\n"
+            "New verified branch: enable fused QKV epilogue when head_dim=128 and seq_len>=2048.\n\n"
+            "PipeV3 on the K3 A5 decode path: async cube-vector prefetch overlapped MTE2, "
+            "but L0C accumulator contention stalled the consumer; the branch was rejected.\n"
+        ),
+        "evidence_refs": ["run-k3-a5-pipev3"],
+        "repetitions": 2,
+    }
+    result = engine.distill_selected(
+        [new_evidence],
+        session_digest="d" * 64,
+        task_state="completed",
+        related_refs=[existing.id],
+    )
+    assert result["status"] == "applied"
+    assert result["admitted_unit_ids"] == [existing.id]
+    assert calls.read_text() == "1"
+    plan = result["publication_plan"]
+    assert plan["status"] == "proposed"
+    assert len(plan["writes"]) == 1 and plan["writes"][0]["unit_id"] == existing.id
+    revised_body = plan["writes"][0]["markdown_body"]
+    assert "## Verified exclusion branches" in revised_body
+    assert "## Negative pipeline attempts" not in revised_body
+    assert all(name in revised_body for name in ("PV2", "Score2", "vmula", "PipeV3"))
+    assert "burst_skew=19" in revised_body
+    assert "Conditional counter-evidence: under dynamic_prefix_cache=true" in revised_body
+    assert "Superseded plan: legacy split-K workspace layout" in revised_body
+    assert "New verified branch: enable fused QKV epilogue" in revised_body
+    assert plan["anti_bloat"]["active_unit_delta"] == 0
+    assert plan["anti_bloat"]["net_bytes_delta"] < 0
+    assert plan["anti_bloat"]["max_unit_body_bytes"] == len(revised_body.encode("utf-8"))
+    assert plan["anti_bloat"]["compacted_within_budget"] is True
+    assert plan["anti_bloat"]["conditions_retained"] is True
+    assert plan["anti_bloat"]["evidence_refs_retained"] is True
+    assert plan["anti_bloat"]["triggers_retained"] is True
+    explained = store.explain(ref(existing, 2))
+    assert explained["revision"] == 2
+    assert explained["content"] == revised_body
+
+
+def test_bloated_unit_body_is_rejected_before_admission(store):
+    item = fixture_unit()
+    session = "e" * 64
+    request = prepare_request([evidence(item)], session_digest=session,
+                              task_state="verified_milestone", redactor_executable=scanner(),
+                              redaction_key=store.redaction_key())
+    bloated = proposal(session, item, body="x" * (UNIT_BODY_HARD_BUDGET_BYTES + 1))
+
+    with pytest.raises(ValueError, match="8 KiB anti-bloat budget"):
+        validate_decision(bloated, request)

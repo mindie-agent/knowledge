@@ -83,6 +83,10 @@ def test_path_only_move_preserves_revision_while_conditions_or_body_change_it():
     moved = GradedUnit.from_parts({**original.metadata, "domain_path": "ops/graph"}, original.body, "ops/graph/moved.md")
     assert moved.id == original.id and moved.content_sha256 == original.content_sha256
     assert moved.revision == original.revision == 1
+    without_tier = {k: v for k, v in original.metadata.items() if k != "tier"}
+    derived = GradedUnit.from_parts(without_tier, original.body, original.path)
+    assert derived.category == original.category and derived.metadata["tier"] == original.metadata["tier"]
+    assert derived.content_sha256 == original.content_sha256
     changed = GradedUnit.from_parts({**original.metadata, "conditions": {"soc": ["Ascend910C"]}}, original.body)
     assert changed.content_sha256 != original.content_sha256
     assert GradedUnit.from_text(original.render()).content_sha256 == original.content_sha256

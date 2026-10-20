@@ -127,3 +127,112 @@ def verified_v2(receipt, selected, final):
                 and all(bound >= 1 - loss for bound in retention))
     except (KeyError, IndexError, TypeError, ValueError, ZeroDivisionError, OverflowError):
         return False
+
+
+RETENTION_SCHEMA = "mindie-heldout-retention/1"
+RETENTION_BUCKETS = ("both_pass", "opt_regression", "both_fail",
+                     "opt_improvement", "evaluation_error")
+
+
+def _case_milliseconds(value, label):
+    if value is None:
+        return None
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(value) or value <= 0):
+        raise ValueError(f"{label} must be a positive finite millisecond value")
+    return float(value)
+
+
+def classify_heldout_cases(cases, *, noise_margin: float = 0.0) -> dict:
+    """Classify frozen hidden inputs into the five retention buckets.
+
+    Only a both_pass case with two valid paired timings contributes a speedup
+    ratio. Guard workloads are measured separately: a local gain never masks a
+    guard regression, and an unavailable measurement is evaluation_error rather
+    than a zero or a fabricated pass.
+    """
+    if (isinstance(noise_margin, bool) or not isinstance(noise_margin, (int, float))
+            or not math.isfinite(noise_margin) or noise_margin < 0):
+        raise ValueError("noise_margin must be a nonnegative finite number")
+    rows, seen = [], set()
+    for index, raw in enumerate(cases or ()):
+        if not hasattr(raw, "get"):
+            raise ValueError(f"cases[{index}] must be an object")
+        case_id = raw.get("case_id")
+        if not isinstance(case_id, str) or not case_id.strip() or case_id in seen:
+            raise ValueError(f"cases[{index}].case_id must be unique nonempty text")
+        seen.add(case_id)
+        baseline_ok = raw.get("baseline_pass")
+        candidate_ok = raw.get("candidate_pass")
+        if type(baseline_ok) is not bool or type(candidate_ok) is not bool:
+            raise ValueError(f"{case_id}: baseline_pass and candidate_pass must be booleans")
+        guard = raw.get("guard", False)
+        if type(guard) is not bool:
+            raise ValueError(f"{case_id}: guard must be a boolean")
+        error = raw.get("error")
+        if error is not None and (not isinstance(error, str) or not error.strip()):
+            raise ValueError(f"{case_id}: error must be nonempty text when supplied")
+        ratio, comparable, bucket = None, False, None
+        if error:
+            bucket = "evaluation_error"
+        elif baseline_ok and candidate_ok:
+            bucket = "both_pass"
+            try:
+                baseline_ms = _case_milliseconds(raw.get("baseline_ms"), f"{case_id}.baseline_ms")
+                candidate_ms = _case_milliseconds(raw.get("candidate_ms"), f"{case_id}.candidate_ms")
+            except ValueError as exc:
+                bucket, error = "evaluation_error", str(exc)
+            else:
+                if baseline_ms is not None and candidate_ms is not None:
+                    ratio, comparable = baseline_ms / candidate_ms, True
+        elif baseline_ok:
+            bucket = "opt_regression"
+        elif candidate_ok:
+            bucket = "opt_improvement"
+        else:
+            bucket = "both_fail"
+        rows.append({"case_id": case_id, "bucket": bucket, "guard": guard,
+                     "baseline_pass": baseline_ok, "candidate_pass": candidate_ok,
+                     "comparable": comparable, "speedup_ratio": ratio,
+                     "error": error})
+    counts = {bucket: 0 for bucket in RETENTION_BUCKETS}
+    for row in rows:
+        counts[row["bucket"]] += 1
+    retained, regressed = counts["both_pass"], counts["opt_regression"]
+    denominator = retained + regressed
+    ratios = [row["speedup_ratio"] for row in rows
+              if row["bucket"] == "both_pass" and row["comparable"]]
+    main_ratios = [row["speedup_ratio"] for row in rows
+                   if row["bucket"] == "both_pass" and row["comparable"] and not row["guard"]]
+    guard_ratios = [row["speedup_ratio"] for row in rows
+                    if row["bucket"] == "both_pass" and row["comparable"] and row["guard"]]
+    guards = [row for row in rows if row["guard"]]
+    guard_ok = (all(row["bucket"] == "both_pass" and row["comparable"]
+                    and row["speedup_ratio"] >= 1 - noise_margin for row in guards)
+                if guards else None)
+    return {
+        "schema": RETENTION_SCHEMA,
+        "buckets": counts,
+        "total": len(rows),
+        "cases": rows,
+        "correctness_retention": (retained / denominator if denominator else None),
+        "both_pass": retained,
+        "opt_regression": regressed,
+        "evaluation_errors": counts["evaluation_error"],
+        "comparable_cases": len(ratios),
+        "speedup_geomean": (math.exp(statistics.mean(map(math.log, ratios)))
+                            if ratios else None),
+        "main_speedup_geomean": (math.exp(statistics.mean(map(math.log, main_ratios)))
+                                 if main_ratios else None),
+        "guard_speedup_geomean": (math.exp(statistics.mean(map(math.log, guard_ratios)))
+                                  if guard_ratios else None),
+        "guards_measured": bool(guards),
+        "guard_ok": guard_ok,
+        "noise_margin": float(noise_margin),
+        "complete": bool(rows) and counts["evaluation_error"] == 0,
+    }
+
+
+__all__ = ["RETENTION_BUCKETS", "RETENTION_SCHEMA", "classify_heldout_cases",
+           "verified_v2"]
+

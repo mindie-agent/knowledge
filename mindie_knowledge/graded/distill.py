@@ -12,11 +12,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 
 from .index import RoutingIndex
 from .conditions import match_conditions
-from .units import GradedUnit, SHA256, TIER_CATEGORIES, UNIT_ID, canonical, locator_parts
+from .units import CATEGORY_TO_TIER, GradedUnit, SHA256, TIER_CATEGORIES, UNIT_ID, canonical, locator_parts
 
+UNIT_BODY_SOFT_BUDGET_BYTES = 4096
+UNIT_BODY_HARD_BUDGET_BYTES = 8192
 TRIVIAL_VERIFIED_BYTES = 512
 KINDS = {"experiment_ledger", "run_manifest", "authorized_transcript", "ecosystem_repo", "hardware_spec", "ablation_receipt"}
 OUTCOMES = {"observed", "verified", "compile_failed", "infra_failed", "measurement_invalid", "in_flight"}
@@ -29,7 +32,8 @@ BASE_REQUEST_KEYS = {"schema_version", "session_digest", "task_state", "evidence
 # prepared before related-unit lookup keep their historical digest.
 OPTIONAL_REQUEST_KEYS = {"related_units"}
 DIGEST_KEYS = BASE_REQUEST_KEYS | OPTIONAL_REQUEST_KEYS
-COMPACT_UNIT_FIELDS = ("id", "revision", "tier", "category", "title", "conditions", "triggers", "body_excerpt")
+COMPACT_UNIT_FIELDS = ("id", "revision", "tier", "category", "title", "conditions", "triggers",
+                       "body_excerpt", "body_complete")
 
 
 def _evidence_strengths():
@@ -38,7 +42,124 @@ def _evidence_strengths():
     values = ["hardware_spec", "reproduced_empirical", "single_observation", "hypothesis"]
     if "software_contract" in parser_strengths:
         values.insert(1, "software_contract")
+    if "ablation_verified" in parser_strengths:
+        values.insert(1, "ablation_verified")
     return values
+
+
+_NEGATIVE_HEADINGS = {
+    "## negative pipeline attempts",
+    "## negative attempts",
+    "## rejected branches",
+    "## failed trials",
+}
+_NEGATIVE_PARAGRAPH_RE = re.compile(
+    r"^([A-Za-z0-9_./+-]+)\s+on\s+the\s+([^:]+?)\s+path:\s*(.+?);\s*the\s+branch\s+was\s+rejected\.\s*$",
+    re.DOTALL,
+)
+
+
+def _compact_cell(text: str) -> str:
+    compact = " ".join(text.split()).strip().rstrip(".,;")
+    for old, new in (
+        ("the isolated ", ""),
+        ("the paired full-pipeline run regressed", "paired run regressed"),
+        ("the producer still materialized the attention result to GM and the consumer reloaded it", "GM round-trip remained"),
+        ("the score tile change reduced local cycles", "local cycles fell"),
+        ("the same GM round-trip remained and the critical path did not move", "critical path unchanged"),
+        ("the vector multiply-add helper was folded", "helper folded"),
+        ("a collective barrier split the fused region and the extra synchronization erased the gain", "collective barrier split fused region"),
+        ("async cube-vector prefetch overlapped MTE2", "prefetch overlapped MTE2"),
+        ("L0C accumulator contention stalled the consumer", "L0C contention stalled consumer"),
+    ):
+        compact = compact.replace(old, new)
+    if compact.lower().startswith("the "):
+        compact = compact[4:]
+    return compact
+
+
+def _split_negative_detail(detail: str) -> tuple[str, str]:
+    normalized = " ".join(detail.split())
+    for marker in (" because ", ", yet ", ", but "):
+        if marker in normalized:
+            left, right = normalized.split(marker, 1)
+            return _compact_cell(right), _compact_cell(left)
+    return _compact_cell(normalized), "branch rejected in paired evaluation"
+
+
+def compact_unit_body(body: str) -> str:
+    """Deterministically fold verbose negative trials and deduplicate repeated blocks."""
+    if not isinstance(body, str) or not body.strip():
+        return body
+    raw_blocks = [block.strip() for block in re.split(r"\n\s*\n", body.strip()) if block.strip()]
+    kept_blocks: list[str] = []
+    seen_blocks: set[str] = set()
+    table_rows: list[tuple[str, str, str, str]] = []
+    seen_branches: set[tuple[str, str]] = set()
+    existing_table_idx: int | None = None
+    changed = False
+
+    for block in raw_blocks:
+        lower = block.lower()
+        if lower in _NEGATIVE_HEADINGS:
+            changed = True
+            continue
+        match = _NEGATIVE_PARAGRAPH_RE.match(block)
+        if match:
+            branch, cond, detail = match.group(1).strip(), " ".join(match.group(2).split()), match.group(3)
+            reason, paired = _split_negative_detail(detail)
+            key = (branch.lower(), cond.lower())
+            if key not in seen_branches:
+                seen_branches.add(key)
+                table_rows.append((branch, cond, reason, paired))
+            changed = True
+            continue
+        if block.startswith("| Branch | Conditions | Physical reason | Paired data |"):
+            lines = [line.strip() for line in block.splitlines() if line.strip()]
+            for line in lines[2:]:
+                cells = [cell.strip() for cell in line.strip("|").split("|")]
+                if len(cells) == 4:
+                    key = (cells[0].lower(), cells[1].lower())
+                    if key not in seen_branches:
+                        seen_branches.add(key)
+                        table_rows.append((cells[0], cells[1], cells[2], cells[3]))
+            if existing_table_idx is None:
+                existing_table_idx = len(kept_blocks)
+                kept_blocks.append("__EXCLUSION_TABLE__")
+            else:
+                changed = True
+            continue
+        if block in seen_blocks:
+            changed = True
+            continue
+        seen_blocks.add(block)
+        kept_blocks.append(block)
+
+    if not changed:
+        return body
+
+    if table_rows:
+        table_lines = [
+            "| Branch | Conditions | Physical reason | Paired data |",
+            "| --- | --- | --- | --- |",
+            *[f"| {b} | {c} | {r} | {p} |" for b, c, r, p in table_rows],
+        ]
+        table_block = "\n".join(table_lines)
+        has_heading = any(b.lower() == "## verified exclusion branches" for b in kept_blocks)
+        if existing_table_idx is not None:
+            if not has_heading and (
+                existing_table_idx == 0
+                or kept_blocks[existing_table_idx - 1].lower() != "## verified exclusion branches"
+            ):
+                kept_blocks[existing_table_idx] = "## Verified exclusion branches\n\n" + table_block
+            else:
+                kept_blocks[existing_table_idx] = table_block
+        else:
+            if not has_heading:
+                kept_blocks.append("## Verified exclusion branches")
+            kept_blocks.append(table_block)
+
+    return "\n\n".join(kept_blocks).strip() + "\n"
 
 
 def _related_units(value):
@@ -48,10 +169,15 @@ def _related_units(value):
     for item in value:
         if not isinstance(item, dict) or set(item) - set(COMPACT_UNIT_FIELDS):
             raise ValueError("related_units items contain unsupported fields")
+        normalized = dict(item)
+        if "tier" not in normalized and normalized.get("category") in CATEGORY_TO_TIER:
+            normalized["tier"] = CATEGORY_TO_TIER[normalized["category"]]
         for key in ("id", "revision", "tier", "category", "title", "body_excerpt"):
-            if key not in item:
+            if key not in normalized:
                 raise ValueError(f"related_units item requires {key}")
-        compact.append({key: item[key] for key in COMPACT_UNIT_FIELDS if key in item})
+        if "body_complete" in normalized and type(normalized["body_complete"]) is not bool:
+            raise ValueError("related_units body_complete must describe actual body visibility")
+        compact.append({key: normalized[key] for key in COMPACT_UNIT_FIELDS if key in normalized})
     return compact
 
 
@@ -232,6 +358,29 @@ def build_prompt(request):
         "If related_units are supplied, compare the new evidence with every listed unit. "
         "Prefer merge_into_existing (or noop when the listed unit already covers the conclusion) over creating a duplicate unit; "
         "state which new condition, mechanism, branch, or counter-evidence justifies any change. "
+        "A related unit's body_excerpt is the full body only when body_complete is true. "
+        "If body_complete is false or absent, do not reconstruct or replace unseen text; "
+        "use propose_semantic_merge_review or noop instead of merge_into_existing. "
+        "Silent background anti-bloat applies to every proposal. Fold multiple negative trials on the same operator "
+        "or subgraph into one compact conditional exclusion table inside the existing L3 unit via merge_into_existing; "
+        "never create a separate unit per failed trial. "
+        "When revising a unit (U@k -> U@k+1), use rewrite-to-compact rather than append-only: rewrite the whole body "
+        "to remove duplication and superseded text, keeping markdown_body within "
+        f"{UNIT_BODY_SOFT_BUDGET_BYTES} UTF-8 bytes as the soft target and never exceeding "
+        f"{UNIT_BODY_HARD_BUDGET_BYTES} UTF-8 bytes as the hard limit. "
+        "Preserve existing supported branches and rare conditions when revising a complete unit. "
+        "For reusable decision experience, keep the known facts, competing explanations, chosen discriminating action, "
+        "expected versus observed result, changed judgment and its limits in the body where recorded. "
+        "Missing reasoning stays missing; do not invent a successful causal story or require every source to fill a template. "
+        "Keep conditional counter-evidence, unresolved alternatives, human corrections and superseded plans with their sources. "
+        "A correction is evidence of a changed instruction or claim, not independent proof of its technical truth. "
+        "Do not revive superseded recommendations or turn a scoped refutation into a permanent ban. "
+        "When relevant, preserve first-divergence alignment, producer/consumer ownership and lifetime, "
+        "initial state and request sequence, observer effects, independent oracle and actual execution-path evidence. "
+        "Instrumentation making a failure disappear, or two paths agreeing through a shared defect, does not prove a fix. "
+        "A branch that was not executed cannot explain an observed improvement. "
+        "Distinguish valid subtarget results, invalid execution, partial findings and inconclusive causality. "
+        "Repeated summaries or commit recaps of the same run are not independent replications. "
         "Put only actual environment and workload applicability premises in conditions. "
         "Plain condition lists mean alternatives. For a measured group of workloads, use "
         "workload: {exact_set: [...]} with each member binding its input_shape and workload_case_sha256; "
@@ -411,16 +560,29 @@ def validate_decision(decision, request):
     blocked = value_gate(request)
     if blocked:
         raise ValueError(f"distillation value gate requires noop: {blocked}")
+    related = {item["id"]: item for item in request.get("related_units", [])}
     units = []
     for row in rows:
+        if isinstance(row.get("markdown_body"), str):
+            row["markdown_body"] = compact_unit_body(row["markdown_body"])
         unit = GradedUnit.from_parts(row["frontmatter"], row["markdown_body"])
+        if len(unit.body.encode("utf-8")) > UNIT_BODY_HARD_BUDGET_BYTES:
+            raise ValueError("graded unit body exceeds 8 KiB anti-bloat budget; compact branches before admission")
         metadata = unit.metadata
+        if row.get("target_tier") is None and metadata.get("tier") is not None:
+            row["target_tier"] = metadata["tier"]
+        if isinstance(row.get("frontmatter"), dict) and row["frontmatter"].get("tier") is None:
+            row["frontmatter"]["tier"] = metadata["tier"]
         mirrors = {"target_unit_id": "id", "target_tier": "tier", "category": "category",
                    "evidence_strength": "evidence_strength", "domain_path": "domain_path"}
         if any(row.get(left) != metadata[right] for left, right in mirrors.items()):
             raise ValueError("decision target fields disagree with graded frontmatter")
         if row.get("operation") not in {"create", "merge_into_existing", "propose_semantic_merge_review"}:
             raise ValueError("unsupported unit operation")
+        comparison = related.get(unit.id)
+        if (row["operation"] == "merge_into_existing" and comparison is not None
+                and comparison.get("body_complete") is not True):
+            raise ValueError("merge requires the complete related unit body; use semantic merge review")
         provenance = metadata["provenance"]
         usable = [item for item in inputs if item["outcome"] != "in_flight"]
         bound = [item for item in usable

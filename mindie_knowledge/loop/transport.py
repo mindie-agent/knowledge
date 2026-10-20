@@ -284,7 +284,7 @@ class Service:
             threading.Thread(target=self.close, daemon=True).start()
             return dict(status="stopping")
         work = method in {
-            "query", "explain", "feedback", "capture", "sync", "distill",
+            "query", "explain", "explore", "feedback", "capture", "sync", "distill",
         }
         operation = self.engine.operations.begin("capability", method) if work else None
         if work and operation is None:
@@ -311,7 +311,7 @@ class Service:
         session = None
         if method in {"feedback", "capture", "distill"}:
             args, session, lease = self._identify(args, capture=method in {"capture", "distill"})
-        elif method in {'query', 'explain'}:
+        elif method in {'query', 'explain', 'explore'}:
             # Host identity is verified without creating or consulting a
             # capture lease for ordinary public knowledge reads.
             args, session, lease = self._identify(args, read_only=True)
@@ -334,6 +334,11 @@ class Service:
                 include_archived=args.get("include_archived", False),
                 navigation_only=args.get("navigation_only", False),
                 run_id=args.get("run_id"),
+                mode=args.get("mode", "reuse"),
+                ledger_entries=args.get("ledger_entries"),
+                bottleneck_summary=args.get("bottleneck_summary"),
+                native_subcontext=args.get("native_subcontext", False),
+                goal=args.get("goal", ""),
             )
             stale = [source for source in sources if source["status"] == "stale"]
             if stale:
@@ -353,15 +358,53 @@ class Service:
                 raise ValueError("selected evidence is outside current contribution authorization")
             authorization = dict(session=session, generation=settings.generation, scope=scope,
                                  activation_epoch=activation_epoch(lease["token"]))
+            proposal = args.get("proposal")
+            if isinstance(proposal, dict) and proposal.get("session_digest") in (None, ""):
+                proposal = {**proposal, "session_digest": session_key(session)}
             return self.engine.distill_selected(args["inputs"], session_digest=session_key(session),
                                                task_state=args["task_state"], authorization=authorization,
                                                cancel=cancel, related_refs=args.get("related_refs"),
-                                               proposal=args.get("proposal"))
+                                               proposal=proposal)
         if method == "explain":
-            allowed = {"ref", "refs", "conditions", "known_refs", "token_budget", "run_id"}
+            allowed = {"ref", "refs", "conditions", "known_refs", "token_budget", "run_id",
+                       "mode", "ledger_entries", "bottleneck_summary",
+                       "native_subcontext", "goal"}
             if not set(args) <= allowed or (args.get("ref") is None and args.get("refs") is None):
                 raise ValueError("explain accepts only ref or refs plus optional conditions/known_refs/token_budget")
             return self.store.explain(**args)
+        if method == "explore":
+            from ..graded.explore import (assess_stagnation, build_exploration_context,
+                                          evaluate_exploration_candidate)
+            action = args.pop("action", None)
+            if action is None:
+                if "candidate" in args or {"compile_ok", "speedup"} <= set(args):
+                    action = "evaluate"
+                elif "units" in args or "retrieved_units" in args:
+                    action = "context"
+                else:
+                    action = "stagnation"
+            if action == "stagnation":
+                entries = args.pop("ledger_entries", args.pop("attempts", []))
+                limit = args.pop("consecutive_limit", args.pop("max_stalled_attempts", 3))
+                if args:
+                    raise ValueError(f"stagnation rejects {sorted(args)}")
+                return assess_stagnation(entries, consecutive_limit=limit)
+            if action == "context":
+                units = args.pop("units", args.pop("retrieved_units", []))
+                result = build_exploration_context(units, **args)
+                result["stagnation"] = assess_stagnation(args.get("failed_attempts") or [])
+                return result
+            if action == "evaluate":
+                candidate = args.pop("candidate", None)
+                allowed = {"target_speedup", "require_reusable_scope",
+                           "preserve_subtarget_evidence", "max_workspace_delta_bytes"}
+                options = {key: args.pop(key) for key in list(args) if key in allowed}
+                if candidate is None:
+                    return evaluate_exploration_candidate(**args, **options)
+                if args:
+                    raise ValueError(f"evaluate rejects {sorted(args)}")
+                return evaluate_exploration_candidate(candidate, **options)
+            raise ValueError("explore action must be stagnation, context or evaluate")
         if method == "feedback":
             settings = self.engine._settings()
             if settings.capture_block_kind() == 'fault':
