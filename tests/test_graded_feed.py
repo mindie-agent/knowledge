@@ -184,7 +184,7 @@ def test_snapshot_validates_supported_derived_data_against_units(tmp_path):
     assert parsed.files["index/routing-manifest.json"] == hashlib.sha256(files["index/routing-manifest.json"].encode()).hexdigest()
 
     manifest["unit_count"] = 2
-    (repo / "index/routing-manifest.json").write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
+    (repo / "index/routing-manifest.json").write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
     bad = commit(repo, "lying manifest")
     with pytest.raises(ValueError, match="unit_count"):
         snapshot(repo, bad, tmp_path)
@@ -228,7 +228,7 @@ def test_inconsistent_feedback_is_rejected_before_readable_feed_switch(tmp_path)
                     content_digest=value.metadata["content_digest"], rating="up", reason="Fixture observation.")
         path = repo / "feedback/votes.json"
         path.parent.mkdir()
-        path.write_text(render_feedback([vote]), encoding="utf-8")
+        path.write_text(render_feedback([vote]), encoding="utf-8", newline="\n")
         bad = commit(repo, "contradictory feedback identity")
         with pytest.raises(ValueError, match="contradict"):
             validate(repo, bad, DOMAIN)
@@ -285,6 +285,7 @@ def test_feed_sync_v2_invalid_candidate_keeps_previous_corpus(tmp_path):
         (remote / parent.path).write_text(
             parent.render().replace("content_digest: sha256:", "content_digest: sha256:" + "b" * 64 + " #"),
             encoding="utf-8",
+            newline="\n",
         )
         second = commit(remote, "tampered unit")
         receipt = feed.sync(force=True)

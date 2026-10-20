@@ -142,20 +142,20 @@ def test_v2_derived_data_is_validated_but_units_remain_authoritative(tmp_path):
 
     # A supported derived document cannot invent a unit or hide one.
     lying = dict(manifest, unit_count=2)
-    (repo / "index/routing-manifest.json").write_text(json.dumps(lying, sort_keys=True) + "\n", encoding="utf-8")
+    (repo / "index/routing-manifest.json").write_text(json.dumps(lying, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
     sha = commit(repo, "lying manifest")
     with pytest.raises(ValueError, match="unit_count|manifest"):
         validate(repo, sha, DOMAIN)
 
     unsupported = dict(manifest, schema_version="mindie-routing-manifest/9")
-    (repo / "index/routing-manifest.json").write_text(json.dumps(unsupported, sort_keys=True) + "\n", encoding="utf-8")
+    (repo / "index/routing-manifest.json").write_text(json.dumps(unsupported, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
     sha = commit(repo, "unsupported manifest")
     with pytest.raises(ValueError, match="unsupported derived schema"):
         validate(repo, sha, DOMAIN)
 
     (repo / "index/routing-manifest.json").unlink()
     (repo / "index/shard-topology.json").write_text(
-        json.dumps({"schema": "mindie-shard-topology/9"}, sort_keys=True) + "\n", encoding="utf-8")
+        json.dumps({"schema": "mindie-shard-topology/9"}, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
     sha = commit(repo, "unsupported topology")
     with pytest.raises(ValueError, match="unsupported derived schema"):
         validate(repo, sha, DOMAIN)
