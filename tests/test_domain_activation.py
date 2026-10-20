@@ -1,6 +1,7 @@
 """Explicit native domain binding reuses target consent and Admission storage."""
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 import threading
@@ -114,19 +115,38 @@ def test_native_deactivation_revokes_registered_domains_after_scope_change_witho
     assert repeated["status"] == "inactive" and not repeated["changed"]
 
 
-def test_native_deactivation_real_sqlite_lock_is_partial_and_preserves_lease(tmp_path):
+def test_native_deactivation_real_sqlite_lock_is_partial_and_preserves_lease(tmp_path, monkeypatch):
     default, first_path = engine_config(tmp_path, "vllm-ascend")
     first = Admission(first_path)
     first.activate("current", project_root=str(tmp_path))
     with first._database() as locked:
         locked.execute("BEGIN IMMEDIATE")
-        started = time.monotonic()
+        statements = []
+        original_database = Admission._database
+
+        def traced_database(self, *args, **kwargs):
+            db = original_database(self, *args, **kwargs)
+            if db is not None:
+                db.set_trace_callback(statements.append)
+            return db
+
+        monkeypatch.setattr(Admission, "_database", traced_database)
         result = deactivate_registered_domains(default, session="current", timeout=0.2)
-        elapsed = time.monotonic() - started
         locked.rollback()
-    assert result["status"] == "partial" and elapsed < 0.8 and not result["changed"]
+    assert result["status"] == "partial" and not result["changed"]
     outcomes = {item["domain"]: item for item in result["domains"]}
     assert outcomes["vllm-ascend"]["status"] == "unavailable"
+    busy = []
+    busy_index = begin_index = None
+    for index, statement in enumerate(statements):
+        match = re.search(r"PRAGMA\s+busy_timeout=(\d+)", statement, re.I)
+        if match:
+            busy.append(int(match.group(1)))
+            busy_index = index
+        if "BEGIN IMMEDIATE" in statement.upper() and begin_index is None:
+            begin_index = index
+    assert len(busy) == 1 and 0 < busy[0] <= 200
+    assert busy_index is not None and begin_index is not None and busy_index < begin_index
     assert first.active_lease("current")["enabled"]
 
 
