@@ -90,8 +90,8 @@ def _condition_value(value: Any) -> bool:
     return False
 
 
-# Reopening a Store parses every visible unit. Use PyYAML's installed safe
-# parser backend while retaining the same strict mapping constructor below.
+# Source admission and legacy-state upgrades parse frontmatter. Use PyYAML's
+# installed safe backend with the same strict mapping constructor below.
 class _UniqueLoader(yaml.CSafeLoader if yaml.__with_libyaml__ else yaml.SafeLoader):
     pass
 

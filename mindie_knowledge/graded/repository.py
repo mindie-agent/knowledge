@@ -3,7 +3,8 @@
 [Invariants] SQLite selects one validated graded corpus. Existing task data is
 preserved; a removed unit is unreadable even through an earlier pinned ref.
 [Timeouts & Locks] Uses Store's existing WAL connection and write transaction.
-[Side-Effect Policy] Local content-addressed files and one catalog row only.
+[Side-Effect Policy] Local content-addressed files; catalog and derived index
+rows are updated together in the existing SQLite write transaction.
 No remote publication, model calls, history scan or new service state machine.
 """
 from __future__ import annotations
