@@ -70,12 +70,18 @@ def locator_parts(value):
     """Recognize a C5 Git locator so redaction does not mistake it for SSH."""
     if not isinstance(value, str):
         return None
-    match = re.fullmatch(r"([A-Za-z0-9][A-Za-z0-9._/-]*)@([0-9a-f]{7,40}):([^:]+)", value)
+    match = re.fullmatch(
+        r"([A-Za-z0-9][A-Za-z0-9._/-]*)@([0-9a-f]{7,64}|worktree-snapshot-\d{8}):([^:]+)",
+        value,
+    )
     if not match:
         return None
     repository, revision, path = match.groups()
-    relative_path(repository)
-    relative_path(path)
+    try:
+        relative_path(repository)
+        relative_path(path.split("#", 1)[0])
+    except ValueError:
+        return None
     return {"repository": repository, "revision": revision, "path": path}
 
 

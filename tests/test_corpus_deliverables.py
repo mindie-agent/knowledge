@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -15,15 +16,16 @@ from mindie_knowledge.graded.maintenance import build_routing_index
 from mindie_knowledge.graded.repository import GradedRepository
 from mindie_knowledge.graded.units import GradedUnit
 
+_DEFAULT_WORKSPACE = Path(__file__).resolve().parents[2]
 CORPORA = {
     "operators": {
-        "root": Path("/Volumes/data/code/knowledge-operators"),
+        "root": Path(os.environ.get("MINDIE_OPERATORS_ROOT") or (_DEFAULT_WORKSPACE / "knowledge-operators")),
         "new": "unit-vectorized-bf16-fp32-accumulation-cast-fusion-mutator",
         "l4": 4,
         "unit_count": 21,
     },
     "vllm-ascend": {
-        "root": Path("/Users/maoxx241/code/mindie-transcript-20261004/content"),
+        "root": Path(os.environ.get("MINDIE_VLLM_CORPUS_ROOT") or (_DEFAULT_WORKSPACE / "knowledge-vllm-ascend")),
         "new": "unit-vllm-ascend-dspark-mtp-aclgraph-d2h-elimination-mutator",
         "l4": 3,
         "unit_count": 22,

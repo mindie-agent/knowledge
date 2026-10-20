@@ -42,6 +42,7 @@ def _git_env():
 
 _CHECKPOINT_EVERY=64
 _STATE_NAME='mindie-validator-state.json'
+PUBLICATION_GIT_TIMEOUT_SECONDS = 300.0
 
 def _graded_feedback_schema():
     try:
@@ -114,7 +115,7 @@ def _save_checkpoint(path,revision,context,verified):
     os.replace(tmp,target)
 
 def _git(repo,args,maximum):
-    result=run_argv([git_executable(),'-C',str(repo),*args],timeout=None,max_output=maximum,input_bytes=b'',
+    result=run_argv([git_executable(),'-C',str(repo),*args],timeout=PUBLICATION_GIT_TIMEOUT_SECONDS,max_output=maximum,input_bytes=b'',
                     env=_git_env())
     if result.code:raise ValueError('Cannot read the candidate Git publication')
     return result.out
@@ -246,7 +247,7 @@ def _validate_graded_tree(repo, revision, domain, state_path, context, verified,
     try:
         run_stdout_to_file(
             [git_executable(), '-C', str(repo), 'ls-tree', '-r', '-z', '--long', revision],
-            listing_file, timeout=None, env=_git_env(),
+            listing_file, timeout=PUBLICATION_GIT_TIMEOUT_SECONDS, env=_git_env(),
         )
         reader = None
         pending = 0
@@ -351,7 +352,7 @@ def _validate_tree(repo,revision,domain,state_path,context,verified,stats):
     try:
         run_stdout_to_file(
             [git_executable(),'-C',str(repo),'ls-tree','-r','-z','--long',revision],
-            listing_file,timeout=None,
+            listing_file,timeout=PUBLICATION_GIT_TIMEOUT_SECONDS,
             env=_git_env())
         reader=None
         pending=0
@@ -449,7 +450,7 @@ def classify_changes(repo, base_revision, revision, *, schema=SCHEMA):
         listing = Path(directory) / "paths"
         run_stdout_to_file(
             [git_executable(), "-C", str(repo), "diff", "--no-renames", "--name-status", "-z", base_revision, revision, "--"],
-            listing, timeout=None, env=_git_env(),
+            listing, timeout=PUBLICATION_GIT_TIMEOUT_SECONDS, env=_git_env(),
         )
         count, development = 0, []
         # A rejected transition may leave unread records. Close the generator

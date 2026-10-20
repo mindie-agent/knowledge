@@ -34,7 +34,8 @@ def _legacy_excerpt(row, budget):
 
 
 def mixed_query(store, legacy, query, *, limit, conditions, domain_path, token_budget,
-                include_unknown, navigation_only=False, run_id=None, mode="reuse",
+                include_unknown, include_archived=False, navigation_only=False,
+                run_id=None, mode="reuse",
                 ledger_entries=None, bottleneck_summary=None, native_subcontext=False,
                 goal=""):
     if type(token_budget) is not int or not 1 <= token_budget <= 16000:
@@ -49,7 +50,8 @@ def mixed_query(store, legacy, query, *, limit, conditions, domain_path, token_b
         1, token_budget * min(limit, graded_limit + len(legacy["results"])) // limit)
     graded = store.graded.query(query, limit=graded_limit, conditions=conditions,
                                 domain_path=domain_path, token_budget=graded_budget,
-                                include_unknown=include_unknown, navigation_only=navigation_only,
+                                include_unknown=include_unknown, include_archived=include_archived,
+                                navigation_only=navigation_only,
                                 run_id=run_id, mode=mode, ledger_entries=ledger_entries,
                                 bottleneck_summary=bottleneck_summary,
                                 native_subcontext=native_subcontext, goal=goal)

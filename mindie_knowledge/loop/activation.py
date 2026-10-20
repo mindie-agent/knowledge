@@ -87,7 +87,7 @@ class Admission:
 
     # ------------------------------------------------------------- internals
 
-    def _database(self, *, initialize_missing=False, timeout=2.0):
+    def _database(self, *, initialize_missing=False, timeout=5.0):
         """Use the shared authority contract; absence is valid only before use."""
         try:
             return open_database(
@@ -321,7 +321,7 @@ class Admission:
             )
         return lease
 
-    def capture_authorization(self, session, token, *, timeout=2.0):
+    def capture_authorization(self, session, token, *, timeout=5.0):
         """Read one lease for a Stop handoff.
 
         Returns ``state`` of ``admitted``, ``inactive``, or ``schema``. A
@@ -391,7 +391,7 @@ class Admission:
         finally:
             db.close()
 
-    def resolve_capture_lease(self, session, *, timeout=2.0):
+    def resolve_capture_lease(self, session, *, timeout=5.0):
         """Read one live lease for an internal Stop that did not pass a token.
 
         The stored token is used only to compute the activation epoch and is

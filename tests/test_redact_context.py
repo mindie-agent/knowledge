@@ -26,10 +26,34 @@ class PinnedSourceUrlEntropyTests(unittest.TestCase):
         urls = (
             'https://github.com/obra/superpowers/blob/b7a8f76985f1e93e75dd2f2a3b424dc731bd9d37/skills/requesting-code-review/SKILL.md#L8-L22',
             'https://gitcode.com/Ascend/msprof-analyze/blob/639eb8702c1884813dfab59ddb371f7838caab6d/msprof_analyze/cluster_analyse/operator_mfu.py#L41-L170',
+            'https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/920beta2/maintenref/troubleshooting/docs/zh/error_codes/EI0002-Communication_Error_Timeout.md',
+            'https://gitcode.com/cann/ops-transformer/blob/master/attention/fused_infer_attention_score/docs/aclnnFusedInferAttentionScoreV5.md',
         )
         for url in urls:
             self.assertNotIn('credential-high-entropy', rules_hit(url))
             self.assertNotIn('credential-high-entropy', rules_hit('[source](' + url + ')'))
+
+    def test_graded_metadata_locators_and_public_ascend_symbols_remain_clean(self):
+        from mindie_knowledge.graded.privacy import metadata_findings
+
+        meta = {
+            "path": "0day/Qwen3_5/unit-vllm-ascend-gdn-idle-dp-zero-pad-workspace-mutator",
+            "id_path": {
+                "unit-vector-reduction-fp32-accumulator-and-ub-alignment-sop":
+                "Reduction/unit-vector-reduction-fp32-accumulator-and-ub-alignment-sop",
+            },
+            "conditions": {"qualification_gates": ["G3_contract_c4_sequential_ablation"]},
+            "provenance": {
+                "source_locator": "https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/80RC3alpha003/opdevg/Ascendcopdevg/atlas_ascendc_10_0001.html",
+                "evidence_refs": [
+                    "cannbot-skills@1fa2cbbc9fdddb4377ca26734e9b94d91c42b975:tools/asys-toolkit/SKILL.md#L71-L107",
+                    "mindie-003-execution@9204f6be8c973adc88c0238456ec60872cc18c072866c85d6c4ad9bbbb797dbd:agy-dsh-waves/wave7/inputs/offline_transcript_digest.md",
+                    "knowledge-operators@worktree-snapshot-20261021:Reduction/unit-vectorized-bf16-fp32-accumulation-cast-fusion-mutator.md",
+                ],
+            },
+        }
+        self.assertEqual(metadata_findings(meta, "index/routing-manifest.json"), [])
+        self.assertNotIn("credential-high-entropy", rules_hit("aclnnFusedInferAttentionScoreV2+ and aclnnFusedInferAttentionScoreV2/V5"))
 
     def test_source_url_does_not_hide_secret_segments_parameters_or_userinfo(self):
         base = 'https://github.com/obra/superpowers/blob/' + 'b7a8f76985f1e93e75dd2f2a3b424dc731bd9d37/'
