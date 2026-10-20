@@ -1,0 +1,22 @@
+tests/test_capture_handoff.py
+  s_d737ad21458d6c::t_9cbfed2bb40655 3,178-208
+  s_d737ad21458d6c::t_b7be5d011da132 209-210
+mindie_knowledge/loop/handoff.py
+  s_d737ad21458d6c::t_9cbfed2bb40655 459,462-463
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "cf69dd45331b455092427158bde7d8f3de7325b2",
+  "prompts": {},
+  "sessions": {
+    "s_d737ad21458d6c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a15708-c6bc-7b41-a0c4-4c573d98441e",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "fan2956 <zhoufan53@huawei.com>"
+    }
+  }
+}
