@@ -284,6 +284,42 @@ def _rows(kind: str, groups: dict, metrics: dict) -> list[dict]:
     return rows
 
 
+def _status(unit: GradedUnit) -> str:
+    status = unit.metadata.get("status", "active")
+    return status if status in {"active", "archived", "superseded"} else "active"
+
+
+def growth_metrics(units, *, completed_milestones: int = 0, previous_units=None,
+                   loaded_tokens_delta: int | None = None) -> dict:
+    """Measure knowledge growth per completed milestone; revisions are not new units."""
+    if type(completed_milestones) is not int or completed_milestones < 0:
+        raise ValueError("completed_milestones must be a nonnegative integer")
+    if loaded_tokens_delta is not None and type(loaded_tokens_delta) is not int:
+        raise ValueError("loaded_tokens_delta must be an integer or None")
+    current = list(units)
+    if isinstance(previous_units, dict):
+        previous = list(previous_units.values())
+    else:
+        previous = list(previous_units or ())
+    active = {unit.id for unit in current if _status(unit) == "active"}
+    archived = {unit.id for unit in current if _status(unit) == "archived"}
+    superseded = {unit.id for unit in current if _status(unit) == "superseded"}
+    previous_active = {unit.id for unit in previous if _status(unit) == "active"}
+    body_tokens = sum(token_estimate(unit.body) for unit in current)
+    previous_body_tokens = sum(token_estimate(unit.body) for unit in previous)
+    delta_active = len(active) - len(previous_active)
+    net_body = body_tokens - previous_body_tokens
+    return {
+        "active_units": len(active),
+        "archived_units": len(archived),
+        "superseded_units": len(superseded),
+        "delta_active_units": delta_active,
+        "g_units": delta_active / completed_milestones if completed_milestones > 0 else None,
+        "g_body": net_body / completed_milestones if completed_milestones > 0 else None,
+        "g_read": loaded_tokens_delta,
+    }
+
+
 def shard_plan(units: Iterable[GradedUnit]) -> dict:
     """Return review-only split candidates; nothing here applies a split."""
     units = list(units)

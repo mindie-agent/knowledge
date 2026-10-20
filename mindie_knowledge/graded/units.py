@@ -2,6 +2,7 @@
 
 [Invariants] Stable unit IDs are independent of paths and content revisions.
 Tier describes use; evidence strength and source provenance remain separate.
+Optional status/superseded_by describe lifecycle without rewriting evidence.
 [Timeouts & Locks] Pure parsing and hashing; no I/O, locks or model calls.
 [Side-Effect Policy] Reject invalid claims; never promote or rewrite evidence.
 """
@@ -20,7 +21,8 @@ SCHEMA = "mindie-graded-unit/1"
 UNIT_ID = re.compile(r"unit-[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 SHA256 = re.compile(r"[a-f0-9]{64}\Z")
 TIER_CATEGORIES = {"L1": {"axiom", "measurement"}, "L2": {"sop"}, "L3": {"workflow"}, "L4": {"mutator"}}
-STRENGTHS = {"hardware_spec", "reproduced_empirical", "single_observation", "hypothesis"}
+STRENGTHS = {"hardware_spec", "software_contract", "reproduced_empirical", "single_observation", "hypothesis"}
+STATUSES = {"active", "archived", "superseded"}
 
 
 def canonical(value: Any) -> str:
@@ -133,6 +135,14 @@ class GradedUnit:
     def revision(self) -> int:
         return self.metadata["revision"]
 
+    @property
+    def status(self) -> str:
+        return self.metadata.get("status", "active")
+
+    @property
+    def superseded_by(self):
+        return self.metadata.get("superseded_by")
+
     @classmethod
     def from_parts(cls, frontmatter: dict, body: str, path: str = "") -> "GradedUnit":
         if not isinstance(frontmatter, dict):
@@ -146,8 +156,22 @@ class GradedUnit:
         if category not in TIER_CATEGORIES.get(tier, set()):
             raise ValueError("tier/category do not describe the same use")
         strength = metadata.get("evidence_strength")
-        if strength not in STRENGTHS or (tier == "L1" and strength not in {"hardware_spec", "reproduced_empirical"}):
-            raise ValueError("L1 requires hardware_spec or reproduced_empirical evidence; tier is not confidence")
+        if strength not in STRENGTHS or (tier == "L1" and strength not in {"hardware_spec", "software_contract", "reproduced_empirical"}):
+            raise ValueError("L1 requires hardware_spec, software_contract or reproduced_empirical evidence; tier is not confidence")
+        # Status is optional in the persisted schema. Omission keeps earlier
+        # units byte-for-byte stable: it is not injected into metadata, so the
+        # semantic digest and render() output do not change for active units.
+        status = metadata.get("status")
+        if "status" in metadata:
+            if not isinstance(status, str) or status not in STATUSES:
+                raise ValueError("status must be active, archived or superseded")
+        superseded_by = metadata.get("superseded_by")
+        if "superseded_by" in metadata:
+            if (not isinstance(superseded_by, str) or not UNIT_ID.fullmatch(superseded_by)
+                    or superseded_by == metadata["id"]):
+                raise ValueError("superseded_by requires another stable unit ID")
+        if status == "superseded" and superseded_by is None:
+            raise ValueError("superseded units require a superseded_by pointer")
         for key in ("title", "domain_path"):
             if not isinstance(metadata.get(key), str) or not metadata[key].strip():
                 raise ValueError(f"{key} is required")

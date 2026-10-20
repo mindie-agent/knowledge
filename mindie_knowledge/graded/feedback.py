@@ -7,6 +7,9 @@
   existing state row and known_revisions table. A feed import never observes.
 - Votes live in the existing votes/grants tables keyed by stable unit ID and
   integer revision, so an older observation stays distinct and locally votable.
+- Usage events are append-only for an observed revision and deduplicate by
+  (root opaque, unit_id, revision, event_type, run_id). Evaluated outcomes are
+  supported/refuted/inconclusive; inconclusive never increases either side.
 - Public feedback uses the existing id/revision identity. No caller computes or
   passes content, source, contract or closure digests.
 
@@ -27,11 +30,16 @@ from .units import UNIT_ID, GradedUnit, canonical
 from ..materials.references import ReadReferenceError
 
 SCHEMA_FEEDBACK = "mindie-graded-feedback/1"
+EVENT_TYPES = ("discovered", "loaded", "applied", "evaluated")
+EVAL_OUTCOMES = ("supported", "refuted", "inconclusive")
 RATINGS = ("up", "down")
 PUBLIC_VOTE_FIELDS = ("vote_id", "root_id", "unit_id", "revision", "rating", "reason")
 MAX_FEEDBACK_VOTES = 500
 MAX_IDENTITY_CHARS = 256
 OBSERVED_PREFIX = "graded:observed:"
+EVENT_PREFIX = "graded:event:"
+_EVENT_FIELDS = frozenset({"event_id", "root_id", "unit_id", "revision", "event_type",
+                           "run_id", "outcome", "step_id", "reason"})
 
 _DOMAIN = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
 _REF = re.compile(
@@ -274,6 +282,117 @@ def _read_observed(store, unit_id: str, revision: int) -> dict:
     return observed
 
 
+def _event_type(value: Any) -> str:
+    if value not in EVENT_TYPES:
+        raise FeedbackError(f"event_type must be one of {EVENT_TYPES}")
+    return value
+
+
+def _optional_text(value: Any, name: str) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str) or len(value.strip()) > MAX_IDENTITY_CHARS:
+        raise FeedbackError(f"{name} must be bounded text")
+    return value.strip()
+
+
+def _eval_outcome(value: Any) -> str:
+    if value not in EVAL_OUTCOMES:
+        raise FeedbackError(f"evaluated usage requires outcome in {EVAL_OUTCOMES}")
+    return value
+
+
+def _event_id(opaque: str, unit_id: str, revision: int, event_type: str, run_id: str) -> str:
+    return hashlib.sha256(canonical(
+        ["usage_event", opaque, unit_id, revision, event_type, run_id]
+    ).encode("utf-8")).hexdigest()
+
+
+def _event_key(unit_id: str, revision: int, event_id: str) -> str:
+    return f"{EVENT_PREFIX}{unit_id}:{revision}:{event_id}"
+
+
+def _decode_event(raw: Any) -> dict:
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        raise FeedbackError("stored usage event is unreadable") from None
+    if not isinstance(value, dict) or set(value) != _EVENT_FIELDS:
+        raise FeedbackError("stored usage event is not a compact identity")
+    outcome = value["outcome"]
+    if outcome is not None:
+        outcome = _eval_outcome(outcome)
+    return {"event_id": _identity_text(value["event_id"], "event_id"),
+            "root_id": _identity_text(value["root_id"], "root_id"),
+            "unit_id": _unit_id(value["unit_id"]),
+            "revision": _stored_revision(value["revision"]),
+            "event_type": _event_type(value["event_type"]),
+            "run_id": _optional_text(value["run_id"], "run_id"),
+            "outcome": outcome,
+            "step_id": _optional_text(value["step_id"], "step_id"),
+            "reason": _reason(value["reason"])}
+
+
+def _write_usage_event(store, *, opaque: str, observed: dict, event_type: str,
+                       run_id: str, outcome: str | None, step_id: str, reason: str) -> dict:
+    unit_id, revision = observed["unit_id"], observed["revision"]
+    event_id = _event_id(opaque, unit_id, revision, event_type, run_id)
+    key = _event_key(unit_id, revision, event_id)
+    row = store.db.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
+    if row is not None:
+        return {**_decode_event(row[0]), "duplicate": True}
+    event = {"event_id": event_id, "root_id": opaque, "unit_id": unit_id,
+             "revision": revision, "event_type": event_type, "run_id": run_id,
+             "outcome": outcome, "step_id": step_id, "reason": reason}
+    store.db.execute("INSERT INTO state VALUES(?,?)", (key, canonical(event)))
+    return {**event, "duplicate": False}
+
+
+def record_usage_event(store, *, root_hash: str, ref: str, event_type: str,
+                       run_id: str = "", outcome: str | None = None,
+                       step_id: str = "", reason: str = "") -> dict:
+    """Append one idempotent 4-stage usage/evaluation event for an observed unit."""
+    root = _identity_text(root_hash, "root_hash")
+    event_type = _event_type(event_type)
+    run_id = _optional_text(run_id, "run_id")
+    step_id = _optional_text(step_id, "step_id")
+    reason = _reason(reason)
+    if event_type == "evaluated":
+        outcome = _eval_outcome(outcome)
+        if not run_id:
+            raise FeedbackError("evaluated usage requires a nonempty run_id")
+    elif outcome is not None:
+        raise FeedbackError("outcome is only valid for an evaluated usage event")
+    parsed = parse_feedback_ref(ref, store.domain)
+    with store._write_txn():
+        observed = _read_observed(store, parsed["unit_id"], parsed["revision"])
+        opaque = store.opaque_for(root)
+        return _write_usage_event(store, opaque=opaque, observed=observed,
+                                  event_type=event_type, run_id=run_id, outcome=outcome,
+                                  step_id=step_id, reason=reason)
+
+
+def summarize_usage_events(store, unit_id: str, revision: int | None = None) -> dict:
+    """Derive counts from deduplicated events; inconclusive never becomes evidence."""
+    unit_id = _unit_id(unit_id)
+    if revision is not None:
+        revision = _revision(revision)
+    counts = {event_type: 0 for event_type in EVENT_TYPES}
+    outcomes = {outcome: 0 for outcome in EVAL_OUTCOMES}
+    with store.lock:
+        rows = store.db.execute(
+            "SELECT value FROM state WHERE key LIKE ?", (f"{EVENT_PREFIX}{unit_id}:%",)
+        ).fetchall()
+        for row in rows:
+            event = _decode_event(row[0])
+            if revision is not None and event["revision"] != revision:
+                continue
+            counts[event["event_type"]] += 1
+            if event["event_type"] == "evaluated":
+                outcomes[event["outcome"]] += 1
+    return {"unit_id": unit_id, "revision": revision, **counts, **outcomes}
+
+
 def observe(store, unit: GradedUnit) -> dict:
     unit_id, revision = _unit_fields(unit)
     identity = {"unit_id": unit_id, "revision": revision}
@@ -301,22 +420,45 @@ def _vote_id(root: str, unit_id: str, revision: int) -> str:
     return hashlib.sha256(canonical(["vote", root, unit_id, revision]).encode("utf-8")).hexdigest()
 
 
-def record_vote(store, *, root_hash: str, ref: str, rating: str, reason: str,
-                publishable: bool, generation: str | None = None) -> dict:
-    rating, reason = _rating(rating), _reason(reason)
+def record_vote(store, *, root_hash: str, ref: str, rating: str | None = None,
+                reason: str = "", publishable: bool = False, generation: str | None = None,
+                event_type: str | None = None, run_id: str = "",
+                outcome: str | None = None, step_id: str = "") -> dict:
+    """Record a rating and/or one usage event; both are atomically idempotent."""
+    if rating is None and event_type is None:
+        raise FeedbackError("feedback requires rating or event_type")
+    reason = _reason(reason)
     if type(publishable) is not bool:
         raise FeedbackError("publishable must be a boolean")
     if generation is not None and publishable and (
             not isinstance(generation, str) or not generation.strip()):
         raise FeedbackError("generation must be a nonempty sharing generation")
+    if rating is not None:
+        rating = _rating(rating)
+        if publishable:
+            _scan_publishable_reason(reason)
     root = _identity_text(root_hash, "root_hash")
     parsed = parse_feedback_ref(ref, store.domain)
     unit_id, revision = parsed["unit_id"], parsed["revision"]
-    if publishable:
-        _scan_publishable_reason(reason)
+    if event_type is not None:
+        event_type = _event_type(event_type)
+        run_id, step_id = _optional_text(run_id, "run_id"), _optional_text(step_id, "step_id")
+        if event_type == "evaluated":
+            outcome = _eval_outcome(outcome)
+            if not run_id:
+                raise FeedbackError("evaluated usage requires a nonempty run_id")
+        elif outcome is not None:
+            raise FeedbackError("outcome is only valid for an evaluated usage event")
     with store._write_txn():
         observed = _read_observed(store, unit_id, revision)
         opaque = store.opaque_for(root)
+        event = None
+        if event_type is not None:
+            event = _write_usage_event(store, opaque=opaque, observed=observed,
+                                       event_type=event_type, run_id=run_id,
+                                       outcome=outcome, step_id=step_id, reason=reason)
+        if rating is None:
+            return event
         store.db.execute("INSERT OR REPLACE INTO votes VALUES(?,?,?,?,?,?,NULL,?)",
                          (opaque, unit_id, str(revision), rating, reason,
                           1 if publishable else 0, time.time()))
@@ -327,6 +469,8 @@ def record_vote(store, *, root_hash: str, ref: str, rating: str, reason: str,
         vote = {"vote_id": _vote_id(opaque, unit_id, revision), "root_id": opaque,
                 "unit_id": unit_id, "revision": observed["revision"],
                 "rating": rating, "publishable": publishable}
+    if event is not None:
+        vote["usage_event"] = event
     return vote
 
 
@@ -386,7 +530,8 @@ def summarize_votes(votes: Iterable[Mapping[str, Any]], unit: GradedUnit) -> dic
 
 
 __all__ = [
-    "FeedbackError", "FeedbackReferenceError", "SCHEMA_FEEDBACK", "merge_votes",
-    "observe", "outbound_votes", "parse_feedback_ref", "record_vote",
-    "render_feedback", "summarize_votes", "validate_feedback",
+    "EVAL_OUTCOMES", "EVENT_TYPES", "FeedbackError", "FeedbackReferenceError",
+    "SCHEMA_FEEDBACK", "merge_votes", "observe", "outbound_votes",
+    "parse_feedback_ref", "record_usage_event", "record_vote", "render_feedback",
+    "summarize_usage_events", "summarize_votes", "validate_feedback",
 ]

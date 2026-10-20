@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import inspect
 import json
 import math
 import re
@@ -61,6 +62,19 @@ _STATE_COLUMNS = {
     'material_streams': 'stream_key entry_id source_cursor source_identity redaction_state generation authorization updated'.split(),
     'material_batches': 'batch_id stream_key entry_id block_ids status detail authorization created'.split(),
 }
+
+def _option_kwargs(function, name, value):
+    """Forward a staged option only when the callee accepts it and it is nondefault."""
+    if value in (False, None):
+        return {}
+    try:
+        parameters = inspect.signature(function).parameters
+    except (TypeError, ValueError):
+        return {}
+    accepts = name in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+    return {name: value} if accepts else {}
+
 
 def _initialize_state(db):
     db.executescript("""
@@ -715,15 +729,35 @@ class Store:
                 raise ValueError("unknown reference in this domain")
             return self._withdrawn(row)
 
-    def explain(self, ref):
-        """Current task navigation or one immutable, currently admitted block.
+    def explain(self, ref=None, **kwargs):
+        """Current task navigation, one admitted block, or a graded unit set.
 
         Block identity binds file bytes, independently of changing task
         navigation. No full-document assembly, historical package or old
         offset-based reading path is reachable through this interface.
         """
-        if isinstance(ref, str) and "/units/" in ref:
-            return self.graded.explain(ref)
+        supported = {"refs", "conditions", "known_refs", "token_budget"}
+        unknown = set(kwargs) - supported
+        if unknown:
+            raise TypeError(f"explain() got an unexpected keyword argument {sorted(unknown)[0]!r}")
+        refs = kwargs.get("refs")
+        if ref is None and refs is None:
+            raise ValueError("explain requires ref or refs")
+        if refs is not None or (isinstance(ref, str) and "/units/" in ref):
+            values = {"ref": ref, "refs": refs, "conditions": kwargs.get("conditions"),
+                      "known_refs": kwargs.get("known_refs"),
+                      "token_budget": kwargs.get("token_budget")}
+            try:
+                parameters = inspect.signature(self.graded.explain).parameters
+            except (TypeError, ValueError):
+                parameters = {"ref": None}
+            accepts_any = any(parameter.kind is inspect.Parameter.VAR_KEYWORD
+                              for parameter in parameters.values())
+            if refs is not None and "refs" not in parameters and not accepts_any:
+                raise ValueError("installed graded repository does not support batch explain")
+            call = {key: value for key, value in values.items()
+                    if value is not None and (key in parameters or accepts_any)}
+            return self.graded.explain(**call)
         parsed = parse_read_ref(ref, domain=self.domain)
         entry_id = parsed["task_id"]
         navigation_ref = task_ref(self.domain, entry_id)
@@ -1163,7 +1197,8 @@ class Store:
     # ---------------------------------------------------------------- search
 
     def query(self, query=None, limit=5, conditions=None, continuation=None,
-              domain_path=None, token_budget=800, include_unknown=False):
+              domain_path=None, token_budget=800, include_unknown=False,
+              include_archived=False):
         if continuation is not None or not self.graded.available():
             return self._query_materials(query, limit, conditions, continuation)
         legacy = self._query_materials(query, limit, conditions)
@@ -1171,10 +1206,12 @@ class Store:
             from ..graded.retrieval import mixed_query
             return mixed_query(self, legacy, query, limit=limit, conditions=conditions,
                                domain_path=domain_path, token_budget=token_budget,
-                               include_unknown=include_unknown)
+                               include_unknown=include_unknown,
+                               **_option_kwargs(mixed_query, "include_archived", include_archived))
         return self.graded.query(query, limit=limit, conditions=conditions,
                                  domain_path=domain_path, token_budget=token_budget,
-                                 include_unknown=include_unknown)
+                                 include_unknown=include_unknown,
+                                 **_option_kwargs(self.graded.query, "include_archived", include_archived))
 
     def _query_materials(self, query=None, limit=5, conditions=None, continuation=None):
         from ..materials.provenance import QueryContinuationError, query_request
@@ -1394,17 +1431,23 @@ class Store:
             )
             return opaque
 
-    def record_vote(self, *, root_hash, ref, rating, reason, publishable,
-                    generation=None):
+    def record_vote(self, *, root_hash, ref, rating=None, reason="", publishable=False,
+                    generation=None, event_type=None, run_id="", outcome=None,
+                    step_id=""):
         """One current vote per opaque root and entry; a new vote on the same
         entry replaces it (including its revision and reason). A publishable
         vote's free-text reason is privacy-scanned at admission, so a single
         unsafe reason can never block unrelated material at batch time; local
-        (non-publishable) votes are never scanned and never leave the store."""
+        (non-publishable) votes are never scanned and never leave the store.
+        Graded usage events are idempotent and may accompany a vote."""
         if isinstance(ref, str) and "/units/" in ref:
             from ..graded.feedback import record_vote
             return record_vote(self, root_hash=root_hash, ref=ref, rating=rating, reason=reason,
-                               publishable=publishable, generation=generation)
+                               publishable=publishable, generation=generation,
+                               event_type=event_type, run_id=run_id, outcome=outcome,
+                               step_id=step_id)
+        if event_type is not None or run_id or outcome is not None or step_id:
+            raise ValueError("usage events require a graded unit reference")
         if rating not in RATINGS:
             raise ValueError("rating must be up or down")
         if not isinstance(reason, str) or len(reason) > MAX_VOTE_REASON:
