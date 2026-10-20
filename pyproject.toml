@@ -19,7 +19,7 @@ dependencies = [
   "reme-ai[as] @ git+https://github.com/agentscope-ai/ReMe@4c54c2b650038eff2a5d0d77aaa61b3e836f1b18",
   "langmem==0.0.30",
   "pywin32==312; sys_platform == 'win32'",
-  "mindie-diagnostics @ git+https://github.com/mindie-agent/diagnostics@6460cde3a50a7f91c9ded38557a7f921654f0c6a",
+  "mindie-diagnostics @ git+https://github.com/mindie-agent/diagnostics@c32a2a0d5b3a593cb2e68fc40b37fe3c8ca02be6",
 ]
 
 [project.optional-dependencies]

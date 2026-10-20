@@ -16,6 +16,8 @@ def windows_context_semantics(monkeypatch):
     from mindie_knowledge.loop import service_host
     monkeypatch.setattr(context, "_windows", lambda: True)
     monkeypatch.setattr(service_host, "platform_backend", lambda: host)
+    for key in context.NETWORK_ENV:
+        monkeypatch.delenv(key, raising=False)
 
 
 def test_context_projects_only_declared_present_values_and_consumes_once(tmp_path, monkeypatch):
