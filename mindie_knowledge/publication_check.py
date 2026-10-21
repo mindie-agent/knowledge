@@ -37,7 +37,7 @@ from .graded.units import SCHEMA as GRADED_UNIT_SCHEMA
 from .graded.units import GradedUnit, relative_path
 
 def _git_env():
-    return with_windows_longpaths({'GIT_TERMINAL_PROMPT':'0','GIT_CONFIG_COUNT':'1',
+    return with_windows_longpaths({'GIT_TERMINAL_PROMPT':'0','GCM_INTERACTIVE':'never','GIT_CONFIG_COUNT':'1',
         'GIT_CONFIG_KEY_0':'core.hooksPath','GIT_CONFIG_VALUE_0':os.devnull})
 
 _CHECKPOINT_EVERY=64

@@ -13,7 +13,9 @@ def _scan_locator(value):
     parts = locator_parts(value)
     if parts is None:
         return value
-    return {**parts, "path": parts["path"].split("/")}
+    if "path" in parts:
+        return {**parts, "path": parts["path"].split("/")}
+    return parts
 
 
 def _scan_unit_path(value):
@@ -29,7 +31,7 @@ def metadata_findings(value, path):
             for key, member in item.items():
                 if key == "source_locator" and isinstance(member, str):
                     out[key] = _scan_locator(member)
-                elif key == "evidence_refs" and isinstance(member, list):
+                elif key in ("evidence_refs", "validated_revisions") and isinstance(member, list):
                     out[key] = [_scan_locator(ref) if isinstance(ref, str) else visit(ref) for ref in member]
                 elif key == "path" and isinstance(member, str):
                     out[key] = _scan_unit_path(member)

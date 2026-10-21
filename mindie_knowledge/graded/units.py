@@ -71,7 +71,7 @@ def locator_parts(value):
     if not isinstance(value, str):
         return None
     match = re.fullmatch(
-        r"([A-Za-z0-9][A-Za-z0-9._/-]*)@([0-9a-f]{7,64}|worktree-snapshot-\d{8}):([^:]+)",
+        r"([A-Za-z0-9][A-Za-z0-9._/-]*)@([0-9a-f]{7,64}|worktree-snapshot-\d{8})(?::([^:]+))?",
         value,
     )
     if not match:
@@ -79,10 +79,14 @@ def locator_parts(value):
     repository, revision, path = match.groups()
     try:
         relative_path(repository)
-        relative_path(path.split("#", 1)[0])
+        if path is not None:
+            relative_path(path.split("#", 1)[0])
     except ValueError:
         return None
-    return {"repository": repository, "revision": revision, "path": path}
+    out = {"repository": repository, "revision": revision}
+    if path is not None:
+        out["path"] = path
+    return out
 
 
 def _condition_value(value: Any) -> bool:

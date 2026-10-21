@@ -116,3 +116,16 @@ def test_feed_missing_git_surfaces_unavailable_with_the_remedy(tmp_path, monkeyp
         instance._git("fetch", "--quiet", "origin", "main")
     assert "bounded git fetch failed" in str(caught.value)
     assert gitbin.ENV_NAME in str(caught.value)
+
+
+def test_ensure_git_on_path_prepends_pinned_git_dir_for_gh(tmp_path, monkeypatch):
+    from mindie_knowledge.gitbin import ensure_git_on_path
+    git_dir = tmp_path / "git-bash" / "bin"
+    git_dir.mkdir(parents=True)
+    pinned = git_dir / "git.exe"
+    pinned.write_text("")
+    monkeypatch.setenv(gitbin.ENV_NAME, str(pinned))
+    monkeypatch.setenv("PATH", r"C:\Windows\System32")
+    env = ensure_git_on_path({"GH_TOKEN": "tok"})
+    assert env["GH_TOKEN"] == "tok"
+    assert env["PATH"].split(os.pathsep)[0] == str(git_dir)

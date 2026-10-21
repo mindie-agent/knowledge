@@ -22,6 +22,7 @@ from .common import (
     lf_bytes,
     run_argv,
 )
+from mindie_knowledge.gitbin import ensure_git_on_path
 from mindie_knowledge.gitread import with_windows_longpaths
 from mindie_knowledge.filesystem import filesystem_path, git_path
 from mindie_knowledge.git_layout import UnsupportedGitLayout, validate_git_directory
@@ -65,6 +66,7 @@ def _is_transient_git_error(detail: str) -> bool:
 # itself never appears in argv, URLs or logs.
 _GIT_BASE = {
     "GIT_TERMINAL_PROMPT": "0",
+    "GCM_INTERACTIVE": "never",
     "GIT_CONFIG_COUNT": "3",
     "GIT_CONFIG_KEY_0": "credential.helper",
     "GIT_CONFIG_VALUE_0": "",
@@ -83,7 +85,7 @@ def _resolve_git_env(env: Mapping[str, str] | None) -> dict[str, str]:
     Windows long paths are command-local. ``{}`` matches the old
     ``env or GIT_ENV`` fallback, so credential helpers and hooksPath stay.
     """
-    return with_windows_longpaths(env or _GIT_BASE)
+    return ensure_git_on_path(with_windows_longpaths(env or _GIT_BASE))
 
 
 def git_env(settings: Mapping[str, Any] | None = None, token_env: str | None = None) -> dict[str, str]:

@@ -35,10 +35,13 @@ def test_longpaths_is_command_local_and_windows_only(monkeypatch):
     assert with_windows_longpaths(windows)["GIT_CONFIG_COUNT"] == "4"
 
     clone_env = _feed_git_env()
+    assert clone_env["GCM_INTERACTIVE"] == "never"
     assert clone_env["GIT_CONFIG_KEY_0"] == "core.hooksPath"
     assert clone_env["GIT_CONFIG_VALUE_0"] == os.devnull
-    assert clone_env["GIT_CONFIG_KEY_1"] == "core.longpaths"
-    assert clone_env["GIT_CONFIG_VALUE_1"] == "true"
+    assert clone_env["GIT_CONFIG_KEY_1"] == "credential.helper"
+    assert clone_env["GIT_CONFIG_VALUE_1"] == ""
+    assert clone_env["GIT_CONFIG_KEY_2"] == "core.longpaths"
+    assert clone_env["GIT_CONFIG_VALUE_2"] == "true"
 
     gitops_env = gitops._resolve_git_env(None)
     assert gitops_env["GIT_CONFIG_KEY_2"] == "core.hooksPath"
