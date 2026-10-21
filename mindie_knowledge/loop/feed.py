@@ -37,12 +37,15 @@ from mindie_knowledge.git_layout import feed_repository_path, validate_git_direc
 
 
 def _feed_git_env():
-    """hooksPath suppression, plus Windows long paths before clone exists."""
+    """hooksPath and credential-helper suppression, plus Windows long paths."""
     return with_windows_longpaths({
         "GIT_TERMINAL_PROMPT": "0",
-        "GIT_CONFIG_COUNT": "1",
+        "GCM_INTERACTIVE": "never",
+        "GIT_CONFIG_COUNT": "2",
         "GIT_CONFIG_KEY_0": "core.hooksPath",
         "GIT_CONFIG_VALUE_0": os.devnull,
+        "GIT_CONFIG_KEY_1": "credential.helper",
+        "GIT_CONFIG_VALUE_1": "",
     })
 
 # Repeated discovery failure defers ordinary calls for one hour, the

@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from mindie_knowledge.filesystem import filesystem_path, git_path
+from mindie_knowledge.gitbin import ensure_git_on_path
 
 from .common import (
     CommunityError,
@@ -108,6 +109,7 @@ class GhTransport(Transport):
             token = os.environ.get(self.token_env)
             if token:
                 env = {"GH_TOKEN": token}
+            env = ensure_git_on_path(env)
             result = run_argv(
                 argv,
                 timeout=remaining,
