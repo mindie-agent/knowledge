@@ -1,21 +1,25 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/mindie-agent/mindie-agent/main/assets/brand/mindie-agent-logo.png" alt="MindIE Agent logo" width="128" height="128">
+</p>
+
 <h1 align="center">MindIE Knowledge</h1>
 
 <p align="center">
-  <strong>Verifiable Domain Memory for AI Coding Agents — Sub-Second Local BM25 Retrieval, Double Fail-Closed Redaction & Self-Evolving Experience Loop</strong><br>
+  <strong>Verifiable Domain Memory for AI Coding Agents — L1–L4 Graded Knowledge Units, Hierarchical Shard Routing, Condition-Matched Local BM25 Retrieval, Double Fail-Closed Redaction & Self-Evolving Experience Loop</strong><br>
   <sub>Part of <a href="https://github.com/mindie-agent/mindie-agent">MindIE Agent</a> · Python package <code>mindie-knowledge</code> (module <code>mindie_knowledge</code>)</sub>
 </p>
 
 <p align="center">
   <a href="https://github.com/mindie-agent/mindie-agent"><img src="https://img.shields.io/badge/MindIE%20Agent-Core%20Runtime-7045f5.svg" alt="MindIE Agent Core Runtime"></a>
   <a href="pyproject.toml"><img src="https://img.shields.io/badge/python-3.11%2B-0284c7.svg" alt="Python 3.11+"></a>
-  <a href="https://github.com/mindie-agent/knowledge-vllm-ascend"><img src="https://img.shields.io/badge/feed-vllm--ascend-0f766e.svg" alt="vLLM-Ascend Feed"></a>
+  <a href="https://github.com/mindie-agent/knowledge-vllm-ascend"><img src="https://img.shields.io/badge/feed-vllm--ascend%20%2B%206%20domains-0f766e.svg" alt="7 Domain Knowledge Feeds"></a>
   <a href="mindie_knowledge/redact.py"><img src="https://img.shields.io/badge/redaction-gitleaks%20%2B%20r3-d97757.svg" alt="Redaction Gitleaks + r3"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-0d9488.svg" alt="License MIT"></a>
   <a href="LICENSE-CORPUS"><img src="https://img.shields.io/badge/corpus-CC--BY--4.0-0d9488.svg" alt="Corpus License CC-BY-4.0"></a>
 </p>
 
 <p align="center">
-  <a href="README.md">中文</a> · <strong>English</strong> · <a href="#-one-sentence-agent-native-install">⚡ One-Sentence Install</a> · <a href="#-what-problem-does-it-solve">✨ Why It Exists</a> · <a href="#️-architecture--two-way-experience-flywheel">🏗️ Architecture</a> · <a href="#-inside-a-redacted-task-package">📦 Package Anatomy</a> · <a href="#️-cli--loopback-rpc-reference">🛠️ CLI & RPC</a> · <a href="docs/README.en.md">📚 Docs</a>
+  <a href="README.md">中文</a> · <strong>English</strong> · <a href="#-one-sentence-agent-native-install">⚡ One-Sentence Install</a> · <a href="#-what-problem-does-it-solve">✨ Why It Exists</a> · <a href="#-official-public-domain-knowledge-repositories">🌐 7 Domain Feeds</a> · <a href="#️-architecture--two-way-experience-flywheel">🏗️ Architecture</a> · <a href="#-inside-a-redacted-task-package">📦 Package Anatomy</a> · <a href="#️-cli--loopback-rpc-reference">🛠️ CLI & RPC</a> · <a href="docs/README.en.md">📚 Docs</a>
 </p>
 
 ---
@@ -24,19 +28,19 @@
 
 ### Option 1: Install via Your Coding Agent in One Sentence (Recommended ✨)
 
-`mindie-knowledge` is the shared knowledge runtime inside [MindIE Agent](https://github.com/mindie-agent/mindie-agent). You don't need to manually configure background services or databases—just open **Claude Code**, **OpenAI Codex CLI**, or **Kimi Code** and send this single sentence to your Agent:
+`mindie-knowledge` is the shared knowledge runtime inside [MindIE Agent](https://github.com/mindie-agent/mindie-agent). You don't need to manually configure background services or databases—just open **Claude Code**, **OpenAI Codex CLI**, **Kimi Code**, or **DeepSeek Harness (`mindie-agent-dsh`)** and send this single sentence to your Agent:
 
 ```text
 帮我安装一下这个 https://github.com/mindie-agent/mindie-agent
 ```
 
-Your Agent will automatically install the matching native plugin, provision the pinned `mindie-knowledge` runtime, and sync the public [`knowledge-vllm-ascend`](https://github.com/mindie-agent/knowledge-vllm-ascend) troubleshooting corpus in the background.
+Your Agent will automatically install the matching native plugin (`mindie-agent-cc`, `mindie-agent-codex`, `mindie-agent-kimi`, or `mindie-agent-dsh`), provision the pinned `mindie-knowledge` runtime, and sync the public [`knowledge-vllm-ascend`](https://github.com/mindie-agent/knowledge-vllm-ascend), [`knowledge-operators`](https://github.com/mindie-agent/knowledge-operators), and companion domain corpora in the background.
 
 <details>
 <summary>🤖 <b>AI Agent Auto-Install & Configuration Guide (Instructions for AI Agents)</b></summary>
 
 > **Instructions for AI Agents**:
-> 1. **Full MindIE Agent Setup in Claude Code / Codex / Kimi Code**:
+> 1. **Full MindIE Agent Setup in Claude Code / Codex / Kimi Code / DeepSeek Harness (`mindie-agent-dsh`)**:
 >    Read the main repository homepage at [`https://github.com/mindie-agent/mindie-agent`](https://github.com/mindie-agent/mindie-agent), detect your host client environment, and run the corresponding plugin installation commands. The host plugin automatically manages the `mindie-knowledge` virtual environment, service lifecycle, and local search index.
 > 2. **Standalone Developer / CI Installation of `mindie-knowledge`**:
 >    Ensure Python 3.11+ and Git are installed, then run:
@@ -76,11 +80,29 @@ When working on Ascend NPU inference engineering (such as `vLLM-Ascend` operator
 
 | Core Capability | How It Works in Plain English |
 | --- | --- |
-| **🔍 Sub-Second Local BM25 Search (Zero LLM Cost)** | Uses an embedded ReMe Markdown chunker, file citation graph, and **BM25 lexical index** to search [`knowledge-vllm-ascend`](https://github.com/mindie-agent/knowledge-vllm-ascend) and local drafts in milliseconds—**zero model calls, zero network requests, and no resident search daemon**. |
-| **📖 Browse the Outline First, Read Exact Blocks on Demand** | Every task consists of a lightweight `index.md` navigation manifest plus lossless 16 KiB material blocks (`blocks/<block_id>.md`). Agents inspect summaries first and open only the blocks they actually need. |
+| **📐 L1–L4 Graded Knowledge Units (`mindie-graded-unit/1`)** | Organizes engineering knowledge into four structured tiers: **`L1 canonical-fact`** (hardware/framework invariants), **`L2 sop`** (standard troubleshooting & verification procedures), **`L3 workflow`** (multi-stage development & tuning workflows with Hermes convergence), and **`L4 optimization-pattern`** (verified optimization patterns with de-biased exploration), complete with parent-rule inheritance and explicit `applicability` predicates. |
+| **🧭 Hierarchical Shard Routing & Condition-Matched Retrieval** | Combines `routing-manifest.json` and `shard-topology.json` hierarchical shard routing with `applicability` condition matching and a local **BM25 + exact-identifier lexical index** to retrieve matching units in milliseconds—**zero model calls, zero network requests, and no resident search daemon**. |
+| **📖 Browse the Outline First, Read Exact Units or Blocks on Demand** | Supports both `mindie-graded-unit/1` graded units and `state-v4` task packages (`index.md` navigation manifest plus lossless 16 KiB material blocks `blocks/<block_id>.md`). Agents inspect summaries and applicability first and open only the units or blocks they actually need. |
+| **⚗️ Evidence-Driven Distillation (`knowledge_distill`) & Sync (`knowledge_sync`)** | Distills verified debugging and optimization evidence into structured graded units via `knowledge_distill`, incrementally syncs upstream corpora via `knowledge_sync`, and enforces schema, shard-topology, and privacy gates in CI via `publication_check`. |
 | **🛡️ Double Fail-Closed Privacy Redaction** | Community sharing is **off by default (Opt-in)**. When enabled, only user prompts and visible assistant replies are extracted (stripping tool noise and hidden reasoning), then scanned by **Gitleaks + `mindie_knowledge.redact` (`r3`)** before storage and before export—never letting an LLM rewrite body text. |
-| **📮 Deterministic Outbox & Read-Only Reconciliation** | Packs indexed local drafts and publishable feedback votes into `mindie-contribution/1` batches for GitHub PR delivery. If a network call times out or leaves an `unknown` result, it reconciles via read-only remote checks—**never blindly replaying writes or repeating paid model calls**. |
+| **📮 Deterministic Outbox & Read-Only Reconciliation** | Packs indexed local drafts, graded units, and publishable feedback votes into `mindie-contribution/1` batches for GitHub PR delivery. If a network call times out or leaves an `unknown` result, it reconciles via read-only remote checks—**never blindly replaying writes or repeating paid model calls**. |
 | **👍 Revision-Bound Usefulness Feedback** | After using an entry in real work, Agents can record an `up` or `down` vote bound to the exact observed revision (`@<observed-revision>`), helping surface proven fixes without treating votes as blind authority. |
+
+---
+
+## 🌐 Official Public Domain Knowledge Repositories
+
+`mindie-knowledge` powers **7 official public domain knowledge repositories** under `@mindie-agent`, each governed by `routing-manifest.json`, `shard-topology.json`, and `publication_check` CI validation for `L1–L4` graded units (`mindie-graded-unit/1`):
+
+| Repository | Domain ID (`domain`) | Scope & Coverage |
+| --- | --- | --- |
+| **[`knowledge-vllm-ascend`](https://github.com/mindie-agent/knowledge-vllm-ascend)** | `vllm-ascend` | `vLLM-Ascend` 0-day model adaptation (DeepSeek / Qwen / Kimi, etc.), ACLGraph/TorchAir graph compilation, MoE EP/MC2, quantization, and accuracy/performance tuning |
+| **[`knowledge-operators`](https://github.com/mindie-agent/knowledge-operators)** | `operators` | Ascend 910B / 910C (A3) / 950 (A5) operator engineering: `AscendC`, `Triton-Ascend`, `CATLASS`/`TileLang`, FIA/FlashMLA, and fused kernel optimization |
+| **[`knowledge-infer-core`](https://github.com/mindie-agent/knowledge-infer-core)** | `infer-core` | Core inference engine scheduling, Continuous Batching, PagedAttention / KV Cache management, Speculative Decoding, and prefix caching |
+| **[`knowledge-infer-distributed`](https://github.com/mindie-agent/knowledge-infer-distributed)** | `infer-distributed` | Multi-node / multi-card distributed inference, TP/PP/DP/EP parallelism, PD disaggregation, HCCL/RoCE troubleshooting, and collective communication tuning |
+| **[`knowledge-infer-observability`](https://github.com/mindie-agent/knowledge-infer-observability)** | `infer-observability` | Inference observability & profiling: `msprof` trace analysis, Host-Device bottleneck attribution, memory breakdown, and Roofline modeling |
+| **[`knowledge-infer-ops-compat`](https://github.com/mindie-agent/knowledge-infer-ops-compat)** | `infer-ops-compat` | CANN / driver / firmware / PyTorch (`torch_npu`) cross-version compatibility matrices, Ascend environment setup, container images, and build toolchains |
+| **[`knowledge-agent-engineering`](https://github.com/mindie-agent/knowledge-agent-engineering)** | `agent-engineering` | AI Coding Agent engineering practices, Harness plugin boundaries, benchmark design, progressive context disclosure, and self-evolving knowledge workflows |
 
 ---
 
@@ -90,8 +112,8 @@ When working on Ascend NPU inference engineering (such as `vLLM-Ascend` operator
 
 ```mermaid
 flowchart TB
-  subgraph Clients["🧑‍💻 Host Plugin Adapters (Claude Code / OpenAI Codex / Kimi Code)"]
-    MCP["Authenticated Local Loopback RPC<br/>knowledge_query · knowledge_explain · knowledge_feedback"]
+  subgraph Clients["🧑‍💻 Host Plugin Adapters (Claude Code / OpenAI Codex / Kimi Code / DeepSeek Harness)"]
+    MCP["Authenticated Local Loopback RPC<br/>knowledge_query · knowledge_explain · knowledge_distill · knowledge_feedback · knowledge_sync"]
     Hook["Turn Stop Hook / Explicit Historical Import (import_transcript)"]
   end
 
@@ -99,16 +121,16 @@ flowchart TB
     direction TB
     Gate["🔐 Live Authority Gate<br/>(Re-verifies mindie-consent/1 & project scope before every read, model call, or write)"]
     Proj["✂️ Public Message Projection & Double Redaction<br/>(Strips tool/reasoning noise · Gitleaks 8.30.1 + redact r3 scan)"]
-    Mat["📂 Private Local Layer (materials/ + state-v4.sqlite3)<br/>(Lossless 16 KiB Markdown blocks · LangMem navigation indexing · ReMe BM25 cache)"]
+    Mat["📂 Private Local Layer (materials/ + state-v4.sqlite3)<br/>(L1–L4 Graded Knowledge Units · Lossless 16 KiB blocks · BM25 + Condition Match Index)"]
     Out["📮 Deterministic Outbox (outbox/)<br/>(Frozen hash-bound views · second redaction check · read-only PR reconciliation)"]
-    FeedCache["📥 Public Feed Layer (feed/)<br/>(Streaming git cat-file --batch verification · atomic local view switch)"]
+    FeedCache["📥 Public Feed & Routing Layer (feed/)<br/>(routing-manifest.json + shard-topology.json · streaming git cat-file --batch switch)"]
 
     Gate --> Proj --> Mat --> Out
   end
 
-  subgraph Upstream["🌐 Public Knowledge Repository (mindie-agent/knowledge-vllm-ascend)"]
-    Contract["📜 publication-contract.json<br/>(Pinned schemas & validator commit)"]
-    Tasks[("📚 Canonical Tasks & Feedback<br/>tasks/&lt;task-id&gt;/index.md + blocks/*.md<br/>feedback/votes-*.json")]
+  subgraph Upstream["🌐 7 Public Domain Knowledge Repositories (knowledge-vllm-ascend / knowledge-operators, etc.)"]
+    Contract["📜 publication-contract.json + routing-manifest.json + shard-topology.json"]
+    Tasks[("📚 L1–L4 Graded Units & Canonical Tasks<br/>mindie-graded-unit/1 · tasks/&lt;task-id&gt;/ · feedback/votes-*.json")]
   end
 
   MCP --> Mat & FeedCache
@@ -207,11 +229,15 @@ python3 -m mindie_knowledge.redact --profile
 
 ### 4. Authenticated Local Loopback RPC & Library Surface
 
+Host plugins (Claude Code, OpenAI Codex, Kimi Code, and DeepSeek Harness `mindie-agent-dsh`) dispatch native tool calls to the authenticated local loopback RPC surface of `mindie-knowledge`:
+
 | Entry Point | Purpose |
 | --- | --- |
-| **`knowledge_query(query, limit?, conditions?, continuation?)`** | Searches current blocks and folds single-source citation chains (`limit` 1–20), returning block `ref`, `task_ref`, `feedback_ref`, original excerpts, and `related_next` pagination tokens. |
-| **`knowledge_explain(ref)`** | For `mindie://DOMAIN/TASK`, returns task navigation and `first_block_ref`; for `mindie://DOMAIN/TASK/blocks/<block-id>@<file-sha256>`, verifies the manifest SHA-256 and returns the block's full content plus adjacent block refs. |
+| **`knowledge_query(query, limit?, conditions?, continuation?)`** | Uses `routing-manifest.json` + `shard-topology.json` hierarchical shard routing and `applicability` predicate matching to search `L1–L4` graded units (`mindie-graded-unit/1`) and task blocks (`limit` 1–20), returning `ref`, `task_ref`, `feedback_ref`, excerpts, and `related_next` pagination tokens. |
+| **`knowledge_explain(ref)`** | Resolves an `L1–L4` graded knowledge unit (including inherited parent rules and applicability predicates), a task navigation outline (`mindie://DOMAIN/TASK`), or a hash-verified material block (`mindie://DOMAIN/TASK/blocks/<block-id>@<file-sha256>`). |
+| **`knowledge_distill(...)`** | Distills verified troubleshooting or optimization evidence into a structured graded knowledge unit (`L1 canonical-fact`, `L2 sop`, `L3 workflow`, or `L4 optimization-pattern`) after deterministic redaction and schema validation. |
 | **`knowledge_feedback(ref, rating, reason?)`** | Records an `up` or `down` vote (with an optional single-line reason up to 1000 chars) bound to `mindie://DOMAIN/<task-id>@<observed-revision>`. |
+| **`knowledge_sync(...)`** | Runs an on-demand, model-free incremental sync against upstream public knowledge repositories, verifying blobs via `git cat-file --batch` before atomically switching the local view. |
 | **`mindie_knowledge.loop.history_import.import_transcript`** | Imports explicitly selected historical transcripts through the same deterministic redaction, chunking, and admission pipeline as live capture. |
 | **`mindie_knowledge.releases`** | Parses `mindie-plugin-release.json` assets and `mindie-harness-compatibility/1` registries so updaters select the highest compatible stable release. |
 
