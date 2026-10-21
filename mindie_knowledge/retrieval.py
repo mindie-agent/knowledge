@@ -22,24 +22,81 @@ _DIGIT_ALPHA = re.compile(r"[0-9][a-z]")
 _SUBWORDS = re.compile(
     r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[0-9]+[A-Za-z][A-Za-z0-9]*"
 )
+_ASCEND_COMPOUND_SPLITS: dict[str, tuple[str, ...]] = {
+    "aclgraph": ("acl", "graph"),
+    "npugraph": ("npu", "graph"),
+    "npugraph_ex": ("npugraph", "npu", "graph", "ex"),
+    "torchair": ("torch", "air"),
+    "modelslim": ("model", "slim"),
+    "msmodelslim": ("ms", "modelslim", "model", "slim"),
+    "dspark": ("ds", "spark"),
+    "dflash": ("df", "flash"),
+    "xlite": ("xl", "lite"),
+    "eplb": ("ep", "lb"),
+    "mrv2": ("mr", "v2"),
+    "hixl": ("hi", "xl"),
+    "lmcache": ("lm", "cache"),
+    "mooncake": ("moon", "cake"),
+    "sfa_v1": ("sfa", "v1"),
+    "sfav1": ("sfa", "v1"),
+    "dsa_v1": ("dsa", "v1"),
+    "dsav1": ("dsa", "v1"),
+    "mla_v1": ("mla", "v1"),
+    "mlav1": ("mla", "v1"),
+    "fa3": ("fa",),
+    "fa3_v1": ("fa3", "fa", "v1"),
+    "fa3v1": ("fa3", "fa", "v1"),
+    "qli_v2": ("qli", "v2"),
+    "qliv2": ("qli", "v2"),
+    "quarot": ("qua", "rot"),
+    "teacache": ("tea", "cache"),
+    "memscope": ("mem", "scope"),
+    "msmemscope": ("ms", "memscope", "mem", "scope"),
+    "msprof": ("ms", "prof"),
+    "msprobe": ("ms", "probe"),
+    "serving_cast": ("serving", "cast"),
+    "servingcast": ("serving", "cast"),
+    "tensor_cast": ("tensor", "cast"),
+    "tensorcast": ("tensor", "cast"),
+}
+_ASCEND_COMPOUND_RE = re.compile(
+    r"(?:"
+    + "|".join(sorted((re.escape(k) for k in _ASCEND_COMPOUND_SPLITS), key=len, reverse=True))
+    + r")",
+    re.I,
+)
 
 
 def _aliases(raw: str) -> tuple[str, ...]:
-    if raw.isascii() and raw.islower() and raw.isalnum() and not _DIGIT_ALPHA.search(raw):
+    if (
+        raw.isascii()
+        and raw.islower()
+        and raw.isalnum()
+        and not _DIGIT_ALPHA.search(raw)
+        and not _ASCEND_COMPOUND_RE.search(raw)
+    ):
         return ()
     word = raw.casefold()
     aliases: list[str] = []
     for part in _PARTS.split(raw):
         if part.isidentifier() if part.isascii() else _IDENTIFIER.fullmatch(part):
-            aliases.append(part.casefold())
+            part_lower = part.casefold()
+            aliases.append(part_lower)
+            if part_lower in _ASCEND_COMPOUND_SPLITS:
+                aliases.extend(_ASCEND_COMPOUND_SPLITS[part_lower])
             for chunk in part.split("_"):
                 if not chunk:
                     continue
                 lowered = chunk.casefold()
                 aliases.append(lowered)
+                if lowered in _ASCEND_COMPOUND_SPLITS:
+                    aliases.extend(_ASCEND_COMPOUND_SPLITS[lowered])
                 if not chunk.islower() or _DIGIT_ALPHA.search(lowered):
                     for piece in _SUBWORDS.findall(chunk):
-                        aliases.append(piece.casefold())
+                        piece_lower = piece.casefold()
+                        aliases.append(piece_lower)
+                        if piece_lower in _ASCEND_COMPOUND_SPLITS:
+                            aliases.extend(_ASCEND_COMPOUND_SPLITS[piece_lower])
     return tuple(dict.fromkeys(part for part in aliases if len(part) > 1 and part != word))
 
 

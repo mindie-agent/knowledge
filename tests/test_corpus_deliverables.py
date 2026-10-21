@@ -37,14 +37,24 @@ CORPORA = {
         "root": _resolve_corpus_root("MINDIE_OPERATORS_ROOT", "knowledge-operators"),
         "new": "unit-vectorized-bf16-fp32-accumulation-cast-fusion-mutator",
         "l4": 15,
-        "unit_count": 87,
+        "unit_count": 103,
     },
     "vllm-ascend": {
         "root": _resolve_corpus_root("MINDIE_VLLM_CORPUS_ROOT", "knowledge-vllm-ascend"),
         "new": "unit-vllm-ascend-dspark-mtp-aclgraph-d2h-elimination-mutator",
         "l4": 3,
-        "unit_count": 43,
+        "unit_count": 82,
     },
+}
+
+ALL_DOMAIN_CORPORA = {
+    "vllm-ascend": (_resolve_corpus_root("MINDIE_VLLM_CORPUS_ROOT", "knowledge-vllm-ascend"), 82),
+    "infer-core": (_resolve_corpus_root("MINDIE_INFER_CORE_ROOT", "knowledge-infer-core"), 105),
+    "operators": (_resolve_corpus_root("MINDIE_OPERATORS_ROOT", "knowledge-operators"), 103),
+    "infer-distributed": (_resolve_corpus_root("MINDIE_INFER_DISTRIBUTED_ROOT", "knowledge-infer-distributed"), 37),
+    "infer-observability": (_resolve_corpus_root("MINDIE_INFER_OBSERVABILITY_ROOT", "knowledge-infer-observability"), 38),
+    "infer-ops-compat": (_resolve_corpus_root("MINDIE_INFER_OPS_COMPAT_ROOT", "knowledge-infer-ops-compat"), 33),
+    "agent-engineering": (_resolve_corpus_root("MINDIE_AGENT_ENGINEERING_ROOT", "knowledge-agent-engineering"), 32),
 }
 
 
@@ -142,3 +152,18 @@ def test_vllm_mutator_has_empty_batch_and_static_shape_fallbacks():
         "unit-vllm-ascend-verification-and-state-parity-gates",
         "unit-vllm-ascend-idle-dp-gdn-state",
     ]
+
+
+@pytest.mark.parametrize("domain,entry", sorted(ALL_DOMAIN_CORPORA.items()))
+def test_all_seven_domain_corpora_contracts_and_rebuilt_manifests(domain, entry):
+    root, expected_count = entry
+    if not root.is_dir():
+        pytest.skip(f"external corpus checkout not present: {root}")
+    report = GradedRepository(root).validate_corpus()
+    assert report["valid"] is True, f"{domain}: {report['errors']}"
+    assert report["unit_count"] == expected_count, f"{domain}: expected {expected_count}, got {report['unit_count']}"
+    checked = build_routing_index(root, check=True)
+    assert checked["ok"] is True, f"{domain}: {checked['errors']}"
+    manifest = json.loads((root / "index/routing-manifest.json").read_text(encoding="utf-8"))
+    assert manifest["unit_count"] == expected_count
+    assert manifest["generation"] == report["generation"]
