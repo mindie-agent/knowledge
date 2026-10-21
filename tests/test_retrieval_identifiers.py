@@ -47,3 +47,41 @@ def test_ascend_camel_pascal_snake_and_chip_subword_tokenization():
         {'npu_fused_infer_attention_score', 'npu', 'fused', 'infer', 'attention', 'score'},
     ):
         assert expected_group.issubset(expanded)
+
+
+def test_vllm_ascend_and_cann_compound_identifiers_expand_to_subwords():
+    sample = (
+        'npugraph_ex torchair modelslim msmodelslim dspark dflash xlite '
+        'eplb mrv2 hixl lmcache mooncake sfa_v1 dsa_v1 mla_v1 fa3_v1 '
+        'qli_v2 quarot teacache msmemscope msprof msprobe serving_cast tensor_cast'
+    )
+    expanded = set(tokens(sample))
+    counts = token_counts(sample)
+    assert counts == {term: tokens(sample).count(term) for term in counts}
+    for expected_group in (
+        {'npugraph_ex', 'npugraph', 'npu', 'graph', 'ex'},
+        {'torchair', 'torch', 'air'},
+        {'modelslim', 'model', 'slim'},
+        {'msmodelslim', 'ms', 'modelslim', 'model', 'slim'},
+        {'dspark', 'ds', 'spark'},
+        {'dflash', 'df', 'flash'},
+        {'xlite', 'xl', 'lite'},
+        {'eplb', 'ep', 'lb'},
+        {'mrv2', 'mr', 'v2'},
+        {'hixl', 'hi', 'xl'},
+        {'lmcache', 'lm', 'cache'},
+        {'mooncake', 'moon', 'cake'},
+        {'sfa_v1', 'sfa', 'v1'},
+        {'dsa_v1', 'dsa', 'v1'},
+        {'mla_v1', 'mla', 'v1'},
+        {'fa3_v1', 'fa3', 'fa', 'v1'},
+        {'qli_v2', 'qli', 'v2'},
+        {'quarot', 'qua', 'rot'},
+        {'teacache', 'tea', 'cache'},
+        {'msmemscope', 'ms', 'memscope', 'mem', 'scope'},
+        {'msprof', 'ms', 'prof'},
+        {'msprobe', 'ms', 'probe'},
+        {'serving_cast', 'serving', 'cast'},
+        {'tensor_cast', 'tensor', 'cast'},
+    ):
+        assert expected_group.issubset(expanded)

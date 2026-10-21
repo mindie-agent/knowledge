@@ -300,3 +300,71 @@ def test_evaluate_retrieval_suite_detects_forbidden_leak_and_threshold_failures(
     assert leaking_suite["forbidden_leak_rate"] == pytest.approx(0.5)
     assert set(leaking_suite["failed_case_ids"]) == {"leak-check", "missing-unit-check"}
     assert len(leaking_suite["failures"]) == 4
+
+
+def test_vllm_ascend_and_model_compound_subword_eval_suite():
+    """Verify compound subword tokenization recalls vllm-ascend & model ecosystem units."""
+    l1_soc = _make_unit(
+        "unit-vllm-ascend-soc-feature-matrix-axiom",
+        tier="L1",
+        category="axiom",
+        domain_path="_common",
+        title="Ascend310P Ascend910B Ascend910_93 SoC feature matrix and ABI axioms",
+        keywords=["Ascend910B4", "Ascend910_93", "aclgraph"],
+        conditions={"npu_model": ["Ascend910B4", "Ascend910_93"]},
+        body="Hardware capability baseline across 310P, 910B A2, and 910_93 A3.",
+    )
+    l2_npugraph = _make_unit(
+        "unit-vllm-ascend-npugraph-ex-sfa-sop",
+        tier="L2",
+        category="sop",
+        domain_path="vllm-ascend/compilation",
+        title="npugraph_ex FX fusion pass and sfa_v1 sparse flash attention routing",
+        keywords=["npugraph_ex", "sfa_v1", "torchair", "msmodelslim"],
+        conditions={"npu_model": ["Ascend910B4", "Ascend910_93"]},
+        parents=[l1_soc.id],
+        body="Configure npugraph_ex FX pass with sfa_v1 and msmodelslim W8A8 weights.",
+    )
+    l2_mooncake = _make_unit(
+        "unit-vllm-ascend-mooncake-dspark-eplb-sop",
+        tier="L2",
+        category="sop",
+        domain_path="vllm-ascend/disaggregation",
+        title="mooncake KV connector with dspark speculative proposer and eplb balancer",
+        keywords=["mooncake", "dspark", "eplb", "hixl", "msmemscope"],
+        conditions={"npu_model": ["Ascend910_93"]},
+        parents=[l1_soc.id],
+        body="Combine mooncake hixl KV transfer with dspark MTP and eplb expert balancing.",
+    )
+    index = RoutingIndex([l1_soc, l2_npugraph, l2_mooncake])
+    cases = [
+        RetrievalEvalCase(
+            case_id="subword-npu-graph-ex-sfa",
+            query="npu graph ex sfa v1 model slim",
+            conditions={"npu_model": "Ascend910B4"},
+            mode="standard",
+            expected_unit_ids=["unit-vllm-ascend-npugraph-ex-sfa-sop"],
+            forbidden_unit_ids=["unit-vllm-ascend-mooncake-dspark-eplb-sop"],
+            require_foundation_baseline=["unit-vllm-ascend-soc-feature-matrix-axiom"],
+            top_k=3,
+        ),
+        RetrievalEvalCase(
+            case_id="subword-moon-cake-ep-lb",
+            query="moon cake ep lb mem scope",
+            conditions={"npu_model": "Ascend910_93"},
+            mode="standard",
+            expected_unit_ids=["unit-vllm-ascend-mooncake-dspark-eplb-sop"],
+            require_foundation_baseline=["unit-vllm-ascend-soc-feature-matrix-axiom"],
+            top_k=3,
+        ),
+    ]
+    report = evaluate_retrieval_suite(
+        index,
+        cases,
+        min_recall_at_k=1.0,
+        min_mrr=1.0,
+        min_foundation_baseline_rate=1.0,
+        max_forbidden_leak_rate=0.0,
+    )
+    assert report["passed"] is True
+    assert report["failed_case_ids"] == []
