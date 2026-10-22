@@ -12,6 +12,7 @@ import pytest
 from mindie_knowledge.graded.explore import (
     assess_stagnation,
     build_exploration_context,
+    build_strategy_navigation_cards,
     evaluate_exploration_candidate,
 )
 from mindie_knowledge.graded.index import RoutingIndex
@@ -225,6 +226,37 @@ def test_geak_direction_budget_and_survivor_bias_free_citation_feedback():
     )
     assert void_record["cited_then_verified"] is None
     assert void_record["record_in_feedback_ledger"] is True
+
+
+def test_strategy_navigation_cards_remain_body_free_and_expose_condition_fit():
+    ready_workflow = _unit(
+        "unit-strategy-ready",
+        "L3",
+        "workflow",
+        {"soc": ["Ascend910B"], "dp": [2]},
+        body="SECRET_BODY_ALPHA that must never enter navigation cards.",
+    )
+    missing_sop = _unit(
+        "unit-strategy-missing",
+        "L2",
+        "sop",
+        {"soc": ["Ascend910B"], "graph_capture": ["aclgraph"]},
+        body="SECRET_BODY_BETA that must never enter navigation cards.",
+    )
+    cards = build_strategy_navigation_cards(
+        [ready_workflow, missing_sop],
+        [ready_workflow.id, missing_sop.id],
+        conditions={"soc": "Ascend910B", "dp": 2},
+    )
+    assert [card["id"] for card in cards] == ["unit-strategy-ready", "unit-strategy-missing"]
+    for card in cards:
+        assert "body" not in card
+        assert "SECRET_BODY" not in json.dumps(card, ensure_ascii=False)
+    assert cards[0]["ready_to_apply"] is True
+    assert cards[0]["missing_conditions"] == []
+    assert cards[1]["ready_to_apply"] is False
+    assert "graph_capture" in cards[1]["missing_conditions"]
+
 
 
 

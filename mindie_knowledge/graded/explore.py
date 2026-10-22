@@ -413,6 +413,102 @@ def evaluate_exploration_candidate(candidate=None, *, target_speedup=None,
     return legacy_evaluate(**legacy, min_speedup_ratio=minimum)
 
 
+def build_strategy_navigation_cards(
+    index,
+    candidate_ids: Sequence[str] | None = None,
+    *,
+    conditions: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Build body-free strategy navigation cards with condition/trigger cues."""
+    from .index import RoutingIndex, token_estimate
+
+    if not hasattr(index, "units"):
+        index = RoutingIndex(index)
+    observed = None if conditions is None else _mapping(conditions, "conditions")
+    if candidate_ids is None:
+        ordered_ids = [
+            ident for ident, unit in sorted(index.units.items())
+            if unit.status == "active" and unit.metadata["category"] in {"sop", "workflow"}
+        ]
+    else:
+        ordered_ids = []
+        for raw_id in candidate_ids:
+            ident = _text(raw_id, "candidate_id").split("@", 1)[0]
+            if ident not in index.units:
+                raise ValueError(f"unknown strategy candidate unit: {ident}")
+            if ident not in ordered_ids:
+                ordered_ids.append(ident)
+
+    applicability = {
+        ident: match_conditions(unit.metadata["conditions"], observed)
+        for ident, unit in index.units.items()
+    }
+    status_label = {
+        "matched": "matched",
+        "mismatch": "mismatch",
+        "unknown": "condition_unknown",
+    }
+    cards: list[dict[str, Any]] = []
+    for ident in ordered_ids:
+        unit = index.units[ident]
+        closure_ids = list(index.closure[ident])
+        unit_status = applicability[ident]
+        missing = list(_missing(unit_status))
+        mismatch_reasons = (
+            list(unit_status.reasons) if unit_status.status == "mismatch" else []
+        )
+        closure_matched = unit_status.status == "matched"
+        closure_active = unit.status == "active"
+        for parent_id in closure_ids:
+            parent_unit = index.units[parent_id]
+            parent_status = applicability[parent_id]
+            if parent_status.status != "matched":
+                closure_matched = False
+                for item in _missing(parent_status):
+                    if item not in missing:
+                        missing.append(item)
+                if parent_status.status == "mismatch":
+                    for reason in parent_status.reasons:
+                        tagged = f"{parent_id}:{reason}"
+                        if tagged not in mismatch_reasons:
+                            mismatch_reasons.append(tagged)
+            if parent_unit.status != "active":
+                closure_active = False
+        if closure_matched:
+            overall_status = "matched"
+        elif mismatch_reasons or unit_status.status == "mismatch":
+            overall_status = "mismatch"
+        else:
+            overall_status = "condition_unknown"
+        body_est = token_estimate(unit.body)
+        closure_est = body_est + sum(
+            token_estimate(index.units[parent_id].body) for parent_id in closure_ids
+        )
+        cards.append({
+            "id": ident,
+            "revision": unit.revision,
+            "ref": f"{ident}@{unit.revision}",
+            "title": unit.metadata["title"],
+            "tier": unit.metadata["tier"],
+            "category": unit.metadata["category"],
+            "domain_path": unit.metadata["domain_path"],
+            "evidence_strength": unit.metadata["evidence_strength"],
+            "triggers": {
+                "error_signatures": list(unit.metadata["triggers"]["error_signatures"]),
+                "keywords": list(unit.metadata["triggers"]["keywords"]),
+            },
+            "conditions": dict(unit.metadata["conditions"]),
+            "match_status": status_label.get(overall_status, overall_status),
+            "ready_to_apply": bool(closure_matched and closure_active),
+            "missing_conditions": missing,
+            "mismatch_reasons": mismatch_reasons,
+            "inherits_from": list(unit.metadata["inherits_from"]),
+            "body_token_estimate": body_est,
+            "closure_token_estimate": closure_est,
+        })
+    return cards
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="python -m mindie_knowledge.graded.explore")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -451,4 +547,5 @@ if __name__ == "__main__":
 
 
 __all__ = ["assess_stagnation", "build_citation_feedback_record", "build_exploration_context",
-           "enforce_direction_budget", "evaluate_exploration_candidate", "main"]
+           "build_strategy_navigation_cards", "enforce_direction_budget",
+           "evaluate_exploration_candidate", "main"]
