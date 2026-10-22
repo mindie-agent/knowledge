@@ -44,6 +44,8 @@ def _matching_related_units(store, inputs, related_refs):
         if not store.graded.available():
             return None
         index = store.graded._load()
+    except TimeoutError:
+        raise
     except (ValueError, OSError):
         return None
     ordered, seen = [], set()

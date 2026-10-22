@@ -120,11 +120,11 @@ def acquire_consumer(config_path, config):
     _, admission = _locks(config)
     consumer = StartLock(Path(config['root']) / config['domain'] / 'consumer.lock')
     while True:
-        admission.acquire(wait=None)
+        admission.acquire(wait=5.0)
         try:
             require_active(config_path, config)
             try:
-                consumer.acquire()
+                consumer.acquire(wait=0.0)
             except StartInProgress:
                 pass
             else:
@@ -142,12 +142,16 @@ def _completed_retirement(config_path, config, outcome, receipt):
     if backend is not None:
         try:
             backend.remove_owned(config_path, config)
+        except TimeoutError:
+            raise
         except (OSError, ValueError, RuntimeError) as exc:
             return dict(outcome, retirement=receipt, cleanup_failed=True,
                         cleanup_error=dict(stage='service_host', error_type=type(exc).__name__,
                                            operation_completed=True))
     try:
         connection_path(config).unlink(missing_ok=True)
+    except TimeoutError:
+        raise
     except OSError as exc:
         return dict(outcome, retirement=receipt, cleanup_failed=True,
                     cleanup_error=dict(stage='connection_discovery', error_type=type(exc).__name__,
@@ -226,6 +230,8 @@ def retire_service(config_path, *, control_timeout=None):
             receipt['status'] = 'retired'
             try:
                 _atomic_write_text(_marker(config_path), json.dumps(receipt, sort_keys=True) + '\n')
+            except TimeoutError:
+                raise
             except OSError as exc:
                 return dict(outcome, retirement=receipt, cleanup_failed=True,
                             cleanup_error=dict(stage='retirement_receipt', error_type=type(exc).__name__,
@@ -233,6 +239,8 @@ def retire_service(config_path, *, control_timeout=None):
             try:
                 while _consumer_state(config):
                     _pause(deadline, "consumer_ownership")
+            except TimeoutError:
+                raise
             except OSError as exc:
                 return dict(outcome, retirement=receipt, cleanup_failed=True,
                             cleanup_error=dict(stage='consumer_ownership', error_type=type(exc).__name__,

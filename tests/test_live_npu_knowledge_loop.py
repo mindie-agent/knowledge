@@ -82,6 +82,8 @@ def _ssh_exec(host: str, remote_command: str, *, timeout: int = 15) -> str:
         if _CONNECTED in stderr:
             pytest.fail(f"Live NPU host {host} remote command timed out after SSH connected")
         pytest.skip(f"Live NPU host {host} unreachable within {timeout}s: {exc}")
+    except TimeoutError:
+        raise
     except OSError as exc:
         pytest.skip(f"Live NPU host {host} unreachable within {timeout}s: {exc}")
     if res.returncode != 0:

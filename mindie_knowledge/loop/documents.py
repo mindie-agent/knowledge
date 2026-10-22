@@ -1,5 +1,10 @@
 """Normalized ``mindie-entry/3`` headers and explicit document helper values.
 
+[Role] Normalized `mindie-entry/3` headers and explicit document helper values.
+[Invariants] Entry identity binds the material digest and public header; invalid or withdrawn documents are never silently rewritten.
+[Timeouts & Locks] Pure parsing/rendering and bounded validation; no I/O, lock or wait.
+[Side-Effect Policy] Returns document values only; persistence belongs to the Store and material package.
+
 Public task packages are defined and verified by materials.store: index.md
 binds ordered block hashes, per-block indexes and current navigation. The
 entry revision binds the material digest and public header, while ownership

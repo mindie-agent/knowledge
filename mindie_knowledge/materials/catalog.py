@@ -1,5 +1,10 @@
 """Incremental current directory and atomic source-pointer generations.
 
+[Role] Incremental current material catalog and atomic source-pointer generations.
+[Invariants] Pointer/header commits and the `current.json` marker share one recoverable transaction window; corruption is never rebuilt as empty.
+[Timeouts & Locks] SQLite opens in WAL mode with a 5 s busy timeout; the owner file lock is acquired with a bounded wait.
+[Side-Effect Policy] Writes the local catalog database and marker file only; no external effects.
+
 Markdown holds the authoritative body and its validated manifest. Current
 source pointers and validated headers share one SQLite transaction; current.json
 is a fixed-size generation marker. A pending marker receipt recovers precisely
@@ -86,7 +91,7 @@ class CurrentCatalog:
         marker = materials.root / "current.json"
         if not existed and (marker.exists() or marker.is_symlink()):
             raise ValueError("existing current material catalog is missing")
-        self.db = sqlite3.connect(path, check_same_thread=False)
+        self.db = sqlite3.connect(path, check_same_thread=False, timeout=5.0)
         try:
             self.db.row_factory = sqlite3.Row
             if existed:
@@ -105,6 +110,7 @@ class CurrentCatalog:
                         or (pending is None and "pointer_signature" not in values)):
                     raise ValueError("existing current material catalog has invalid metadata")
             self.db.execute("PRAGMA journal_mode=WAL")
+            self.db.execute("PRAGMA busy_timeout=5000")
             if __import__("os").environ.get("MINDIE_DISABLE_FSYNC") == "1":
                 self.db.execute("PRAGMA synchronous=OFF")
             if not existed:
@@ -160,7 +166,7 @@ class CurrentCatalog:
         if not lock.acquired:
             # Another writer may be between its catalog commit and marker.
             # Recheck under the same owner lock before repairing that window.
-            lock.acquire(wait=None)
+            lock.acquire(wait=30.0)
             try:
                 return self.ensure_current()
             finally:

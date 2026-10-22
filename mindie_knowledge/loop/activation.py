@@ -125,7 +125,10 @@ class Admission:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise TimeoutError("admission write exhausted its caller budget")
-                    db.execute(f"PRAGMA busy_timeout={int(remaining * 1000)}")
+                    busy_ms = (max(3000, int(remaining * 1000))
+                               if remaining >= 3.0 else max(1, int(remaining * 1000)))
+                    db.execute(f"PRAGMA busy_timeout={busy_ms}")
+                    db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 10000)
                 self.path.parent.chmod(0o700)
                 self.path.chmod(0o600)
                 db.execute("BEGIN IMMEDIATE")
@@ -184,6 +187,8 @@ class Admission:
                 result = dict(status="active" if enabled else "inactive",
                               enabled=bool(enabled), failures=failures,
                               project_root=project_root)
+        except TimeoutError:
+            raise
         except (AdmissionUnavailable, OSError, sqlite3.Error, ValueError, TypeError) as exc:
             result = dict(status="unavailable", enabled=False, error_class=type(exc).__name__)
         finally:
@@ -343,17 +348,24 @@ class Admission:
         if db is None:
             return {"state": "inactive"}
         try:
-            db.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
-            columns = [row[1] for row in db.execute("PRAGMA table_info(leases)")]
+            busy_ms = max(3000, int(timeout * 1000)) if timeout >= 3.0 else max(1, int(timeout * 1000))
+            db.execute(f"PRAGMA busy_timeout={busy_ms}")
+            deadline = time.monotonic() + timeout
+            db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 10000)
+            try:
+                cursor = db.execute(
+                    "SELECT * FROM leases WHERE session=? LIMIT 1", (session,)
+                )
+            except sqlite3.OperationalError as exc:
+                raise AdmissionUnavailable("lease schema is missing") from exc
+            columns = [column[0] for column in cursor.description or ()]
             if not columns:
                 raise AdmissionUnavailable("lease schema is missing")
             if not BASE_COLUMNS <= set(columns):
                 raise AdmissionUnavailable("schema")
             if not CAPTURE_COLUMNS <= set(columns):
                 return {"state": "schema"}
-            row = db.execute(
-                "SELECT * FROM leases WHERE session=? LIMIT 1", (session,)
-            ).fetchone()
+            row = cursor.fetchone()
             if row is None:
                 return {"state": "inactive"}
             lease = dict(zip(columns, row))
@@ -412,19 +424,24 @@ class Admission:
         if db is None:
             return {"state": "inactive"}
         try:
-            db.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
+            busy_ms = max(3000, int(timeout * 1000)) if timeout >= 3.0 else max(1, int(timeout * 1000))
+            db.execute(f"PRAGMA busy_timeout={busy_ms}")
             deadline = time.monotonic() + timeout
             db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 10000)
-            columns = [row[1] for row in db.execute("PRAGMA table_info(leases)")]
+            try:
+                cursor = db.execute(
+                    "SELECT * FROM leases WHERE session=? LIMIT 1", (session,)
+                )
+            except sqlite3.OperationalError as exc:
+                raise AdmissionUnavailable("lease schema is missing") from exc
+            columns = [column[0] for column in cursor.description or ()]
             if not columns:
                 raise AdmissionUnavailable("lease schema is missing")
             if not BASE_COLUMNS <= set(columns):
                 raise AdmissionUnavailable("schema")
             if not CAPTURE_COLUMNS <= set(columns):
                 return {"state": "schema"}
-            row = db.execute(
-                "SELECT * FROM leases WHERE session=? LIMIT 1", (session,)
-            ).fetchone()
+            row = cursor.fetchone()
             if row is None:
                 return {"state": "inactive"}
             lease = dict(zip(columns, row))
@@ -474,6 +491,8 @@ class Admission:
                 session_key(lease["session"]) == hashed_session
                 for lease in self._rows()
             )
+        except TimeoutError:
+            raise
         except (OSError, ValueError, KeyError):
             return False
 
@@ -484,6 +503,8 @@ class Admission:
             return None
         try:
             return str(Path(lease["project_root"]).expanduser().resolve(strict=False))
+        except TimeoutError:
+            raise
         except OSError:
             return None
 

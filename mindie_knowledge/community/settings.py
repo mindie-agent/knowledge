@@ -1,5 +1,10 @@
 """Community settings: validated view of the shared local JSON config.
 
+[Role] Validated view of the shared local community configuration file.
+[Invariants] Schema, roots and token-reference fields are checked before use; read/validation failures remain visible states.
+[Timeouts & Locks] Bounded file read with a fixed byte cap; no lock is retained.
+[Side-Effect Policy] Reads the caller-selected settings file only; tokens are referenced by environment name, never stored.
+
 The file carries schema ``mindie-community-config/1``. Tokens never live in
 settings; only the *name* of an environment variable may be configured. A
 disabled sharing config stops publication. Read and validation failures remain

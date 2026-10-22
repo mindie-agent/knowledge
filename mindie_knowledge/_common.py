@@ -1,5 +1,10 @@
 """Helpers shared by the tools CLIs.
 
+[Role] Small helpers shared by the knowledge CLIs.
+[Invariants] CLI errors and configuration documents are surfaced with stable exit codes; malformed input never becomes empty success.
+[Timeouts & Locks] File reads are bounded by the caller and no long-lived lock is taken here.
+[Side-Effect Policy] Reads caller-selected configuration/corpus files and writes only requested stdout/stderr.
+
 Only CLI errors, configuration-file loading and path rendering live here.
 """
 

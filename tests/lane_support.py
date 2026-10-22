@@ -336,10 +336,14 @@ def reap(process, *, group=False):
         if group or process.poll() is None:
             try:
                 kill_owned_group(process.pid)
+            except TimeoutError:
+                raise
             except (OSError, subprocess.TimeoutExpired):
                 if process.poll() is None:
                     try:
                         process.kill()
+                    except TimeoutError:
+                        raise
                     except OSError:
                         pass
     elif group:
@@ -347,15 +351,21 @@ def reap(process, *, group=False):
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+        except TimeoutError:
+            raise
         except OSError:
             if process.poll() is None:
                 try:
                     process.kill()
+                except TimeoutError:
+                    raise
                 except OSError:
                     pass
     elif process.poll() is None:
         try:
             process.kill()
+        except TimeoutError:
+            raise
         except OSError:
             pass
     try:

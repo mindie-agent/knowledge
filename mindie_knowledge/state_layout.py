@@ -1,5 +1,10 @@
 """Development formats may restart; released state may never be reset.
 
+[Role] Domain state directory layout and released-format migration guard.
+[Invariants] Released state is never reset or silently migrated; a version mismatch raises before any mutation.
+[Timeouts & Locks] Directory preparation is bounded by the caller and takes no persistent process lock.
+[Side-Effect Policy] Creates and validates state directories with private permissions; no network or content writes.
+
 RELEASE_VERSION identifies the product release that protects this state.
 Component package versions and Git pins alone do not declare that boundary.
 FORMAT changes only when the persistent representation changes. Released

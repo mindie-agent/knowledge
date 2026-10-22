@@ -1,5 +1,10 @@
 """Typed public references: current navigation, immutable blocks and feedback.
 
+[Role] Typed canonical references for tasks, blocks, observations and feedback.
+[Invariants] Only complete identities cross the interface; an unversioned observation never selects a historical body silently.
+[Timeouts & Locks] Pure parsing/formatting with no I/O, lock or wait.
+[Side-Effect Policy] Returns immutable reference values; never mutates material or store state.
+
 Only complete canonical identities cross the reading interface. Observation
 references name a task revision for feedback; they never select a historical
 body or silently redirect a read to the current package.

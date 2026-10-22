@@ -24,7 +24,6 @@
 [Side-Effect Policy]
 - Local filesystem and SQLite state only; zero network or subprocess execution.
 """
-from functools import lru_cache
 import errno
 import os
 import sqlite3
@@ -38,21 +37,6 @@ def require_columns(db, required):
         present = {row[1] for row in sqlite3.Connection.execute(db, f'PRAGMA table_info({table})')}
         if not set(columns) <= present:
             raise ValueError(f'authoritative state table {table} is missing or incomplete; state was not rebuilt')
-
-
-@lru_cache(maxsize=None)
-def _declared_columns(initialize):
-    db = sqlite3.connect(':memory:')
-    try:
-        initialize(db)
-        tables = [row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
-        return {table: {row[1] for row in db.execute(f'PRAGMA table_info({table})')} for table in tables}
-    finally:
-        db.close()
-
-
-def require_schema(db, initialize):
-    require_columns(db, _declared_columns(initialize))
 
 
 def _present(path):
@@ -69,7 +53,16 @@ def _present(path):
 
 
 class OwnedConnection(sqlite3.Connection):
-    def assert_authority(self, *, full=False):
+    def assert_authority(self, *, full=False, trusted=False):
+        """Prove the opened authority still exists before a new transaction.
+
+        ``trusted`` lets an owner that already holds its process lock skip a
+        redundant lstat; the owning ``Store`` checks the first transaction of
+        each outer write instead of every nested frame. External callers keep
+        the filesystem check so damage remains visible.
+        """
+        if trusted:
+            return
         if hasattr(self, '_authority_path') and not self._authority_path.exists():
             raise FileNotFoundError(str(self._authority_path))
 
@@ -114,6 +107,10 @@ def open_database(path, *, schema, required, initialize, residue=(), validate=No
         if validate is not None:
             validate(db)
         db.execute('PRAGMA journal_mode=WAL')
+        # SQLite's Python `timeout` covers the initial lock, not every wait
+        # after a WAL checkpoint or a concurrent writer. Keep the 5 s floor
+        # explicit on the connection itself.
+        db.execute('PRAGMA busy_timeout=5000')
         if os.environ.get('MINDIE_DISABLE_FSYNC') == '1':
             db.execute('PRAGMA synchronous=OFF')
         if initialize_missing and not lock.prior_record:

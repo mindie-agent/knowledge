@@ -8,12 +8,15 @@ stays explicitly disabled.
 
 import json
 import os
+import sys
 import tempfile
 from pathlib import Path
 
-from lane_support import PARSER_NAMES, parser_path
-
 _REPO = Path(__file__).resolve().parents[1]
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
+
+from lane_support import PARSER_NAMES, parser_path
 _COMMITTED_PARSERS = _REPO / "tests" / "fixtures" / "production-parsers"
 _PARSER_FILES = (
     "kimi/scripts/transcript.py",
@@ -52,6 +55,8 @@ REAL_HOME = Path(os.environ.get("HOME") or str(Path.home()))
 _WATCH = [
     REAL_HOME / ".config" / "mindie-agent" / "diagnostics.json",
     REAL_HOME / ".local" / "state" / "mindie" / "diagnostics",
+    REAL_HOME / ".local" / "share" / "mindie-diagnostics",
+    REAL_HOME / ".config" / "mindie-diagnostics",
 ]
 if not _FIXTURE_ERRORS:
     for _parser_name in PARSER_NAMES:
@@ -80,12 +85,22 @@ ISOLATION_ROOT.mkdir(parents=True, exist_ok=True)
     json.dumps(ISOLATION_BEFORE, indent=2) + "\n"
 )
 
-_home = ISOLATION_ROOT / "home"
-_config = ISOLATION_ROOT / "config"
-_state = ISOLATION_ROOT / "state"
-_diag_root = ISOLATION_ROOT / "diagnostics"
-for _directory in (_home, _config, _state, _diag_root):
-    _directory.mkdir(parents=True, exist_ok=True)
+
+def _isolated_home(root):
+    """Build every per-user location products may resolve from the environment."""
+    home = root / "home"
+    config = root / "config"
+    state = root / "state"
+    data = root / "data"
+    local_appdata = root / "local-appdata"
+    appdata = root / "appdata"
+    diagnostics = root / "diagnostics"
+    for directory in (home, config, state, data, local_appdata, appdata, diagnostics):
+        directory.mkdir(parents=True, exist_ok=True)
+    return home, config, state, data, local_appdata, appdata, diagnostics
+
+
+_home, _config, _state, _data, _local_appdata, _appdata, _diag_root = _isolated_home(ISOLATION_ROOT)
 _real_gitleaks = REAL_HOME / ".cache" / "mindie-agent" / "gitleaks"
 _isolated_gitleaks = _home / ".cache" / "mindie-agent" / "gitleaks"
 if _real_gitleaks.is_dir() and not _isolated_gitleaks.exists():
@@ -97,7 +112,11 @@ os.environ["HOME"] = str(_home)
 os.environ["USERPROFILE"] = str(_home)
 os.environ["XDG_CONFIG_HOME"] = str(_config)
 os.environ["XDG_STATE_HOME"] = str(_state)
-os.environ["MINDIE_DIAGNOSTICS_ROOT"] = str(_diag_root)
+os.environ["XDG_DATA_HOME"] = str(_data)
+os.environ["LOCALAPPDATA"] = str(_local_appdata)
+os.environ["APPDATA"] = str(_appdata)
+_TEST_DIAGNOSTICS_ROOT = _diag_root
+os.environ["MINDIE_DIAGNOSTICS_ROOT"] = str(_TEST_DIAGNOSTICS_ROOT)
 _policy_path = ISOLATION_ROOT / "diagnostics.json"
 os.environ["MINDIE_DIAGNOSTICS_CONFIG"] = str(_policy_path)
 _policy_path.write_text(
@@ -144,6 +163,12 @@ def lifecycle_tests_use_explicit_process_backend(request, monkeypatch):
         )
 
     monkeypatch.setattr(backend, "request_start", direct_test_service)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Leave no synthetic diagnostics tree behind, even after a failed run."""
+    import shutil
+    shutil.rmtree(_TEST_DIAGNOSTICS_ROOT, ignore_errors=True)
 
 
 def pytest_configure(config):

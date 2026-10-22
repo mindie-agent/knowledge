@@ -1,5 +1,10 @@
 """Hash-bound file mappings that never retain a whole task's body in RAM.
 
+[Role] Hash-bound file mappings that never retain a whole task body in memory.
+[Invariants] Each access re-checks the regular-file identity, byte envelope and digest; a replaced or pruned source fails visibly.
+[Timeouts & Locks] Reads are bounded per file and honor the caller cancellation; no lock is retained between files.
+[Side-Effect Policy] Read-only access to caller-selected source files; no temp copies or network calls.
+
 Only descriptor metadata is kept. Each access opens the exact source file,
 checks its regular-file identity, byte envelope and digest, then yields one
 UTF-8 file. Replacing or pruning the source therefore fails visibly instead

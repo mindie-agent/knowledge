@@ -1,5 +1,10 @@
 """Derived citation relationships for retrieval, never evidence or authority.
 
+[Role] Derived citation relationships for retrieval, never evidence or authority.
+[Invariants] Only literal references in material bodies create relationships; historical citations never become readable current bytes.
+[Timeouts & Locks] Pure graph construction from validated headers; no I/O, lock or wait.
+[Side-Effect Policy] Returns derived metadata only; never rewrites material or provenance authority.
+
 Only literal references in material bodies create relationships. Historical
 task-revision citations can identify a current task, but are never rewritten
 into a readable reference to the old bytes. All grouping is query-specific.

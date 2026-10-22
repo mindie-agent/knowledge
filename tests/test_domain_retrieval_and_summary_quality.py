@@ -216,6 +216,23 @@ def test_ascend_domain_corpus_top1_top3_recall_and_no_crosstalk(tmp_path):
         )
         assert filtered_910c["results"][0]["entry_id"] == _domain_id(2)
 
+        # Verify natural Chinese-English bilingual queries achieve 100% Top-1 recall
+        bilingual_queries_and_expected_top1 = [
+            ("长序列预填充时报显存碎片和内存分配失败应该怎么调优", _domain_id(1)),
+            ("Atlas A3 双Die 物理ID映射 绑卡报错怎么排查", _domain_id(2)),
+            ("多机推理 集合通信超时 网卡绑定和链路状态怎么查", _domain_id(3)),
+            ("MoE 分组矩阵乘 激活融合 参数非法报错怎么解决", _domain_id(4)),
+            ("DeepSeek-V3 投机采样 草稿头 旋转位置编码 精度异常怎么修复", _domain_id(5)),
+            ("容器启动报设备挂载或驱动缺失错误怎么处理", _domain_id(6)),
+        ]
+        for query_text, expected_id in bilingual_queries_and_expected_top1:
+            response = store.query(query_text, limit=3)
+            results = response["results"]
+            assert results, f"Expected non-empty results for bilingual query: {query_text}"
+            assert results[0]["entry_id"] == expected_id, (
+                f"Bilingual Top-1 mismatch for {query_text!r}: got {results[0]['entry_id']}, expected {expected_id}"
+            )
+
 
 def test_citation_graph_groups_related_troubleshooting_blocks(tmp_path):
     """Verify StrictFileGraph groups a follow-up mitigation entry citing a root-cause entry."""

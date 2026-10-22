@@ -1,5 +1,10 @@
 """GitHub transport boundary: real ``gh`` CLI plus a file-backed dev double.
 
+[Role] GitHub transport boundary: the real `gh` CLI plus a file-backed development double.
+[Invariants] All GitHub traffic passes through one narrow surface; missing credentials and failed reads stay visible as typed errors.
+[Timeouts & Locks] Each request has an explicit deadline and bounded output; cancellation terminates the owned process tree.
+[Side-Effect Policy] Performs authenticated GitHub reads/writes through `gh`; tokens are never written to state.
+
 All GitHub traffic goes through the narrow ``Transport`` surface below, so
 tests and fault injection substitute the boundary without touching the state
 machines. The real implementation shells out to the maintainer-owned ``gh``
@@ -121,6 +126,8 @@ class GhTransport(Transport):
             if tmp is not None:
                 try:
                     os.unlink(tmp.name)
+                except TimeoutError:
+                    raise
                 except OSError:
                     pass
         header, body_text = _split_included(result.out_text)

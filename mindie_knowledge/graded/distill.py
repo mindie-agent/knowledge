@@ -399,7 +399,7 @@ def build_prompt(request):
         "does not preclude distilling a verified substantive partial milestone. An admitted in_flight "
         "request is eligible to distill that milestone even though the wider task is unfinished; admission "
         "does not require a unit. Do not return noop merely because task_state=in_flight, but return noop "
-        "with an allowed drop_reason when the evidence is already covered, insufficient for reusable "
+        f"with an allowed drop_reason ({', '.join(sorted(DROP_REASONS))}) when the evidence is already covered, insufficient for reusable "
         "knowledge, or fails the provenance/evidence rules. If admission.admitted is false, return noop with "
         "drop_reason=admission.drop_reason and no units. In an in_flight task, unverified progress and "
         "still-running inputs alone never justify a unit. In every task state, in_flight inputs cannot be "
@@ -416,9 +416,13 @@ def build_prompt(request):
         "hardware_spec requires a hardware specification; reproduced_empirical requires verified repeated evidence. "
         "L4 requires a baseline-bound ablation receipt with final combination verification. "
         "Do not invent references, measurements, provenance or applicability; prefer noop when evidence is inadequate. "
-        "Use only supplied evidence_refs. Give each proposed unit a stable ID independent of its path, "
+        "Use only supplied evidence_refs. In frontmatter.provenance, source_type, source_locator, and source_digest "
+        "must copy ONE primary sanitized_inputs item verbatim (never join multiple items with '+' or ';'); "
+        "list all supporting inputs in provenance.evidence_refs. "
+        "Give each proposed unit a stable ID independent of its path, "
         "starting with unit- followed by lowercase words separated by hyphens, for example unit-cache-readiness. "
         "Use that exact ID in target_unit_id and frontmatter.id; never substitute a tier or category prefix such as sop-. "
+        "In frontmatter.triggers.keywords, include both canonical English technical identifiers/terms and concise Chinese domain/symptom phrases so bilingual natural-language queries match directly. "
         "Return tier/category/evidence_strength/domain_path both in the unit target fields and C5 frontmatter. "
         "The runtime assigns revision; omit derived revision fields in new proposals. "
         "Return JSON only; no prose or markdown fences.\n\n"
@@ -444,7 +448,8 @@ def decision_schema():
                    "conditions": {"type": "object", "minProperties": 1},
                    "triggers": {"type": "object", "additionalProperties": False,
                                 "required": ["error_signatures", "keywords"],
-                                "properties": {"error_signatures": strings, "keywords": strings}},
+                                "properties": {"error_signatures": strings,
+                                               "keywords": {**strings, "description": "Bilingual search keywords: include both canonical English technical terms/APIs and concise Chinese domain/symptom phrases."}}},
                    "provenance": {"type": "object", "additionalProperties": False,
                                   "required": ["source_type", "source_locator", "evidence_refs", "supersedes"],
                                   "properties": {"source_type": string, "source_locator": string,
@@ -472,7 +477,7 @@ def decision_schema():
             "properties": {"schema_version": {"const": "mindie-distill-decision/1"},
                            "session_digest": string, "evidence_inputs": {"type": "array", "items": string},
                            "action": {"enum": ["noop", "propose_graded_units"]},
-                           "drop_reason": {"type": ["string", "null"]},
+                           "drop_reason": {"enum": [*sorted(DROP_REASONS), None]},
                            "units": {"type": "array", "items": {"type": "object", "additionalProperties": False,
                                       "required": list(fields), "properties": fields, "anyOf": pairs}}}}
 
@@ -556,6 +561,11 @@ def validate_decision(decision, request):
     if not isinstance(rows, list):
         raise ValueError("decision units must be a list")
     if action == "noop":
+        dr = decision.get("drop_reason")
+        if isinstance(dr, str) and dr not in DROP_REASONS:
+            low = dr.lower()
+            if any(k in low for k in ("cover", "exist", "duplicat", "redundant", "same")):
+                decision = {**decision, "drop_reason": "already_covered"}
         if rows or decision.get("drop_reason") not in DROP_REASONS:
             raise ValueError("noop requires an explicit reason and no units")
         return json.loads(canonical(decision))
@@ -565,10 +575,32 @@ def validate_decision(decision, request):
     if blocked:
         raise ValueError(f"distillation value gate requires noop: {blocked}")
     related = {item["id"]: item for item in request.get("related_units", [])}
+    usable = [item for item in inputs if item["outcome"] != "in_flight"]
     units = []
     for row in rows:
         if isinstance(row.get("markdown_body"), str):
             row["markdown_body"] = compact_unit_body(row["markdown_body"])
+        fm = row.get("frontmatter")
+        if isinstance(fm, dict) and isinstance(fm.get("provenance"), dict):
+            prov = fm["provenance"]
+            loc_str = str(prov.get("source_locator", ""))
+            dig_str = str(prov.get("source_digest", ""))
+            typ_str = str(prov.get("source_type", ""))
+            if ";" in loc_str or ";" in dig_str or "+" in typ_str:
+                locs = [p.strip() for p in loc_str.split(";") if p.strip()]
+                digs = [p.strip() for p in dig_str.split(";") if p.strip()]
+                typs = [p.strip() for p in re.split(r"[+;]", typ_str) if p.strip()]
+                matched = [
+                    item for item in usable
+                    if item["source_locator"] in locs
+                    and (not digs or item.get("source_digest") in digs)
+                    and (not typs or item["kind"] in typs)
+                ]
+                if matched and len(matched) == len(locs):
+                    primary_item = next((m for m in matched if m["kind"] == "authorized_transcript"), matched[0])
+                    prov["source_type"] = primary_item["kind"]
+                    prov["source_locator"] = primary_item["source_locator"]
+                    prov["source_digest"] = primary_item["source_digest"]
         unit = GradedUnit.from_parts(row["frontmatter"], row["markdown_body"])
         if len(unit.body.encode("utf-8")) > UNIT_BODY_HARD_BUDGET_BYTES:
             raise ValueError("graded unit body exceeds 8 KiB anti-bloat budget; compact branches before admission")

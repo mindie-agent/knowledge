@@ -1,5 +1,10 @@
 """Bind an attempt group to its core when the OS host cannot retain that group.
 
+[Role] Bind an attempt group to its core when the OS host cannot retain that group.
+[Invariants] The launcher becomes the adapter with exec; a small watcher holds only the read end of the lifetime pipe and has no result/retry duties.
+[Timeouts & Locks] Ownership handoff is bounded by explicit status pipes and caller cancellation.
+[Side-Effect Policy] Spawns one owned process group and passes the lifetime pipe; no networking or persistent state.
+
 The launcher becomes the adapter with exec, preserving PID, PGID and parent.
 A small watcher holds only the read end of the core's lifetime pipe. It has no
 result, retry, scratch or service responsibilities.
@@ -68,6 +73,8 @@ def _exec(owner, owner_fd, status_fd, command):
             raise OSError(errno.ESRCH, "owned attempt owner exited before exec")
         stage = "exec"
         os.execvpe(command[0], command, os.environ)
+    except TimeoutError:
+        raise
     except OSError as exc:
         # This message can only be written before the target exec succeeds.
         os.write(status_fd, json.dumps(
@@ -129,6 +136,8 @@ def spawn(command, *, stdin, env):
             _exec_ack(status_read)
         except LaunchError:
             raise
+        except TimeoutError:
+            raise
         except OSError as exc:
             raise LaunchError("exec_ack") from exc
         process._mindie_owner_fd = owner_write
@@ -145,6 +154,8 @@ def spawn(command, *, stdin, env):
         for stream in (process.stdout, process.stderr):
             try:
                 stream.close()
+            except TimeoutError:
+                raise
             except OSError as cleanup_error:
                 if isinstance(exc, LaunchError):
                     exc.cleanup_failed = True

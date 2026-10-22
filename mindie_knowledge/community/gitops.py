@@ -1,5 +1,10 @@
 """Real local Git writer: owned argv against a clone of the write remote.
 
+[Role] Real local Git writer against a clone of the contribution remote.
+[Invariants] Push is a fast-forward to our own contribution branch; no force push and no write to the base branch.
+[Timeouts & Locks] Every Git subprocess is bounded by the caller deadline, output cap, cancellation and process-tree cleanup.
+[Side-Effect Policy] Mutates only the local staging clone; a push targets the configured fork/upstream contribution branch.
+
 Everything here is a real ``git`` subprocess with optional caller deadlines,
 output caps, owner cancellation and process-tree cleanup. Push is always a fast-forward to our own
 contribution branch — never a force push, never a write to the base branch.

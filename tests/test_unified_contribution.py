@@ -7,16 +7,16 @@ from mindie_diagnostics.reporting import current_consent
 
 
 def test_legacy_disabled_reporting_requires_explicit_unified_choice(tmp_path):
-    consent, config = tmp_path / "consent.json", tmp_path / "diagnostics.json"
+    consent, config, root = tmp_path / "consent.json", tmp_path / "diagnostics.json", tmp_path / "logs"
     consent.write_text(json.dumps({"schema": "mindie-consent/1", "choice": "contribute",
                                    "reporting": "disabled"}))
     before = consent.read_bytes()
-    result = consent_store.activate_reporting(consent, config=config, ensure=False)
+    result = consent_store.activate_reporting(consent, config=config, roots=[str(root)], ensure=False)
     assert result["status"] == "needs_choice"
     assert consent.read_bytes() == before
     assert current_consent(config) is None
     saved = consent_store.record_choice(consent, "contribute")
-    result = consent_store.activate_reporting(consent, config=config, ensure=False)
+    result = consent_store.activate_reporting(consent, config=config, roots=[str(root)], ensure=False)
     assert result["status"] == "configured" and result["enabled"]
     assert current_consent(config) is not None
     assert consent_store.record_choice(consent, "contribute")["choice_revision"] == saved["choice_revision"]
@@ -26,8 +26,8 @@ def test_legacy_disabled_reporting_requires_explicit_unified_choice(tmp_path):
 
 
 def test_activation_calls_worker_and_preserves_failed_readiness(tmp_path, monkeypatch):
-    consent, config = tmp_path / "consent.json", tmp_path / "diagnostics.json"
-    assert consent_store.activate_reporting(consent, config=config)["status"] == "needs_choice"
+    consent, config, root = tmp_path / "consent.json", tmp_path / "diagnostics.json", tmp_path / "logs"
+    assert consent_store.activate_reporting(consent, config=config, roots=[str(root)])["status"] == "needs_choice"
     consent_store.record_choice(consent, "contribute")
     calls = []
 
@@ -36,12 +36,12 @@ def test_activation_calls_worker_and_preserves_failed_readiness(tmp_path, monkey
         return {"status": "degraded", "category": "command_unavailable"}
 
     monkeypatch.setattr(reporting_commands, "ensure", failed_worker)
-    result = consent_store.activate_reporting(consent, config=config)
+    result = consent_store.activate_reporting(consent, config=config, roots=[str(root)])
     assert calls == [config]
     assert result["status"] == "degraded"
     assert result["worker"]["category"] == "command_unavailable"
     consent_store.record_choice(consent, "disabled")
-    assert consent_store.activate_reporting(consent, config=config)["status"] == "disabled"
+    assert consent_store.activate_reporting(consent, config=config, roots=[str(root)])["status"] == "disabled"
     assert calls == [config]
 
 

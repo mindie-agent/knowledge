@@ -43,12 +43,12 @@ CORPORA = {
         "root": _resolve_corpus_root("MINDIE_VLLM_CORPUS_ROOT", "knowledge-vllm-ascend"),
         "new": "unit-vllm-ascend-dspark-mtp-aclgraph-d2h-elimination-mutator",
         "l4": 3,
-        "unit_count": 82,
+        "unit_count": 86,
     },
 }
 
 ALL_DOMAIN_CORPORA = {
-    "vllm-ascend": (_resolve_corpus_root("MINDIE_VLLM_CORPUS_ROOT", "knowledge-vllm-ascend"), 82),
+    "vllm-ascend": (_resolve_corpus_root("MINDIE_VLLM_CORPUS_ROOT", "knowledge-vllm-ascend"), 86),
     "infer-core": (_resolve_corpus_root("MINDIE_INFER_CORE_ROOT", "knowledge-infer-core"), 105),
     "operators": (_resolve_corpus_root("MINDIE_OPERATORS_ROOT", "knowledge-operators"), 103),
     "infer-distributed": (_resolve_corpus_root("MINDIE_INFER_DISTRIBUTED_ROOT", "knowledge-infer-distributed"), 37),

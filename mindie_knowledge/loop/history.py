@@ -1,5 +1,10 @@
 """Explicit local historical planning. No model, service, grant or publication.
 
+[Role] Explicit local historical planning without models, service, grants or publication.
+[Invariants] The operator names one source, native task id and adapter parser; output is bounded public-material packets plus a durable byte cursor.
+[Timeouts & Locks] Source reads and parser calls honor caller cancellation and explicit budgets.
+[Side-Effect Policy] Reads the named source and writes planning packets/cursor files only; no model or remote call.
+
 The operator must name one source, its native task id and the adapter-owned
 transcript parser module (core ships no native record parser). The output
 consists of bounded public-material packets and a durable byte cursor; it is

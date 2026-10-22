@@ -36,7 +36,7 @@ from reme.components.tokenizer import RegexTokenizer
 from reme.schema import FileNode, FileChunk
 
 from ..loop.locks import StartLock
-from ..retrieval import tokens
+from ..retrieval import query_tokens, tokens
 from .store import _canonical, _digest, _parse_block
 from .provenance import POLICY, body_tokens, citations, group_matches, page_groups
 from .references import block_ref, feedback_ref, parse_read_ref, task_ref
@@ -413,18 +413,19 @@ class ReMeIndex:
             exact_paths = self._exact_paths(tasks, eligible, query)
             # ReMe filters before ranking. Fetch all matching chunks to select
             # source anchors and preserve every related match for pagination.
+            query_terms = set(query_tokens(query))
             if exact_paths is not None:
                 matches = [self.store.file_chunks[cid] for path in exact_paths
                            for cid in self.store.file_graph._nodes[path].chunk_ids]
             elif eligible:
+                expanded_query = " ".join(query_tokens(query)) or query
                 scores = self.runner.run(self.store.keyword_index.retrieve_filtered(
-                    query, max(1, len(chunk_ids)), chunk_ids))
+                    expanded_query, max(1, len(chunk_ids)), chunk_ids))
                 matches = [self.store.file_chunks[cid].model_copy(update={"scores": {"keyword": score, "score": score}})
                            for cid, score in scores.items()]
             else:
                 matches = []
             output = {}
-            query_terms = set(tokens(query))
             for chunk in matches:
                 ident, task, block = eligible[chunk.path]
                 metadata = chunk.metadata

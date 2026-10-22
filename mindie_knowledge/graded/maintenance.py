@@ -63,6 +63,8 @@ def load_corpus(root: Path | str) -> tuple[list[GradedUnit], RoutingIndex | None
     """Use the C5 scanner/index; the first invalid unit is a visible error."""
     try:
         units = read_units(Path(root))
+    except TimeoutError:
+        raise
     except (ValueError, OSError, UnicodeError) as exc:
         return [], None, [_error("invalid_graded_entry", str(exc))]
     try:
@@ -392,6 +394,8 @@ def _stage(path: Path, payload: dict) -> str:
     except BaseException:
         try:
             os.unlink(temporary)
+        except TimeoutError:
+            raise
         except OSError:
             pass
         raise
@@ -410,6 +414,8 @@ def _write_pair(manifest_path: Path, manifest: dict, topology_path: Path, topolo
         for temporary, _ in staged:
             try:
                 os.unlink(temporary)
+            except TimeoutError:
+                raise
             except OSError:
                 pass
 
@@ -423,6 +429,8 @@ def _check_payloads(manifest_path: Path, topology_path: Path, manifest: dict, to
             continue
         try:
             existing = json.loads(path.read_text(encoding="utf-8"))
+        except TimeoutError:
+            raise
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             errors.append(f"{label} cannot be read: {exc}")
             continue
@@ -445,6 +453,8 @@ def build_routing_index(root: Path | str, *, index_dir: Path | str | None = None
         return report
     try:
         manifest, topology_doc = _payloads(units, index)
+    except TimeoutError:
+        raise
     except (ValueError, OSError, UnicodeError) as exc:
         report["errors"].append(_error("routing_build_failed", str(exc)))
         return report
@@ -457,6 +467,8 @@ def build_routing_index(root: Path | str, *, index_dir: Path | str | None = None
         return report
     try:
         _write_pair(manifest_path, manifest, topology_path, topology_doc)
+    except TimeoutError:
+        raise
     except OSError as exc:
         report["errors"].append(_error("routing_write_failed", str(exc)))
         return report
@@ -594,6 +606,8 @@ def apply_move_plan(root: Path | str, plan: dict) -> dict:
             if ident not in after_index.closure or after_index.closure[ident] != before[ident]:
                 raise ValueError(f"post-move validation changed inheritance for {ident}")
         report.update(applied=True, verified=True, unit_count=len(after_units))
+    except TimeoutError:
+        raise
     except (ValueError, OSError, UnicodeError) as exc:
         report["partial"] = bool(report["moved"])
         report["errors"].append(_error("apply_plan_rejected", str(exc)))
@@ -632,6 +646,8 @@ def auto_shard_main(argv: list[str] | None = None) -> int:
         try:
             with open(args.apply_plan, encoding="utf-8") as stream:
                 plan = json.load(stream)
+        except TimeoutError:
+            raise
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             print(f"apply plan cannot be read: {exc}", file=sys.stderr)
             return 1

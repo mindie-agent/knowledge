@@ -1,5 +1,10 @@
 """Record loop failures through diagnostics; imports perform no I/O.
 
+[Role] Record loop failures through diagnostics; imports perform no I/O.
+[Invariants] Deduplication trusts only a marker this module stored after a validated call; externally supplied diagnostics are not proof.
+[Timeouts & Locks] Diagnostic writes are bounded and never wait on a model or network operation.
+[Side-Effect Policy] Writes local diagnostic records when available and otherwise reports the logging failure explicitly.
+
 Dedup trusts only a marker this module stored after a validated call.
 An externally supplied ``diagnostic`` dict is never treated as proof.
 """

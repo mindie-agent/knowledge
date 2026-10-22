@@ -86,6 +86,8 @@ def test_wake_survives_hook_process_group_kill(tmp_path):
             if connection.is_file():
                 try:
                     status = rpc(connect(json.loads(config.read_text())), "status", timeout=0.4)
+                except TimeoutError:
+                    raise
                 except OSError:
                     status = None
                 if isinstance(status, dict) and status.get("worker_alive") is True:
@@ -119,6 +121,8 @@ def test_wake_survives_hook_process_group_kill(tmp_path):
                 if isinstance(pid, int):
                     try:
                         os.kill(pid, signal.SIGTERM)
+                    except TimeoutError:
+                        raise
                     except OSError:
                         pass
         connection = tmp_path / "root" / "test" / "connection.json"
@@ -128,5 +132,7 @@ def test_wake_survives_hook_process_group_kill(tmp_path):
                 from mindie_knowledge.loop.transport import rpc
 
                 rpc(connect(json.loads(config.read_text())), "stop", timeout=2)
+            except TimeoutError:
+                raise
             except OSError:
                 pass

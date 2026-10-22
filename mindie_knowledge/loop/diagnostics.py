@@ -186,6 +186,7 @@ def _json(path, limit=MAX_JSON):
 def _ro(path):
     db = sqlite3.connect(sqlite_file_uri(path) + "?mode=ro", uri=True, timeout=DB_SECONDS)
     deadline = time.monotonic() + DB_SECONDS
+    db.execute(f"PRAGMA busy_timeout={int(DB_SECONDS * 1000)}")
     db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
     db.row_factory = sqlite3.Row
     return db
@@ -283,12 +284,16 @@ def clear_delivery_event(config, event):
     path = _delivery_path(config)
     try:
         raw = _json(path, 8192)
+    except TimeoutError:
+        raise
     except (OSError, ValueError):
         return
     if raw.get("config_fingerprint") != _fingerprint(config) or raw.get("event") != event:
         return
     try:
         path.unlink()
+    except TimeoutError:
+        raise
     except OSError:
         pass
 
@@ -299,6 +304,8 @@ def clear_startup_failure(config_path, config):
     try:
         if _json(path, 8192).get("config_fingerprint") == _fingerprint(config):
             path.unlink()
+    except TimeoutError:
+        raise
     except (OSError, ValueError):
         pass
 
@@ -308,6 +315,8 @@ def _startup(config_path, config):
         raw = _json(_startup_path(config), 8192)
     except FileNotFoundError:
         return dict(status="absent")
+    except TimeoutError:
+        raise
     except (OSError, ValueError) as exc:
         return dict(status="unavailable", error_class=error_class(exc))
     if raw.get("config_fingerprint") != _fingerprint(config):
@@ -338,6 +347,8 @@ def _delivery(config):
         raw = _json(_delivery_path(config), 8192)
     except FileNotFoundError:
         return dict(status="absent")
+    except TimeoutError:
+        raise
     except (OSError, ValueError) as exc:
         return dict(status="unavailable", error_class=error_class(exc))
     if raw.get("config_fingerprint") != _fingerprint(config):
@@ -359,6 +370,8 @@ def _service(config):
         connection = _json(Path(config["root"]) / config["domain"] / "connection.json")
     except FileNotFoundError:
         return dict(status="not-running")
+    except TimeoutError:
+        raise
     except (OSError, ValueError) as exc:
         return dict(status="unavailable", stage="connection", error_class=error_class(exc))
     try:
@@ -389,6 +402,8 @@ def _service(config):
                     or result["background_errors"]):
                 result["status"] = "degraded"
         return result
+    except TimeoutError:
+        raise
     except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
         return dict(status="unavailable", stage="probe", error_class=error_class(exc))
 
@@ -405,6 +420,8 @@ def _task_roots(config, session):
                     roots.add(row[0])
             finally:
                 db.close()
+        except TimeoutError:
+            raise
         except (OSError, sqlite3.Error):
             # Missing/unavailable admission never broadens task scope.
             pass
@@ -516,6 +533,8 @@ def _store(config, session, result):
     except FileNotFoundError:
         result["store"] = dict(status="absent")
         return
+    except TimeoutError:
+        raise
     except OSError as exc:
         result["store"] = dict(status="unavailable", error_class=error_class(exc))
         return
@@ -592,6 +611,8 @@ def _store(config, session, result):
                 for row in rows if isinstance(row["batch_id"], str) and _SAFE_ID.fullmatch(row["batch_id"])
             ]
         result["store"] = dict(status="present")
+    except TimeoutError:
+        raise
     except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
         result["store"] = dict(status="unavailable", error_class=error_class(exc))
     finally:
@@ -615,6 +636,8 @@ def snapshot(config_path, *, session=None):
         if not isinstance(config["root"], str) or not isinstance(config["domain"], str) or not DOMAIN_RE.fullmatch(config["domain"]):
             raise ValueError("invalid diagnostic configuration")
         result["configuration"] = dict(status="ok")
+    except TimeoutError:
+        raise
     except (OSError, ValueError, TypeError) as exc:
         result["configuration"] = dict(status="absent" if isinstance(exc, FileNotFoundError) else "unavailable", error_class=error_class(exc))
         result["hints"] = ["Inspect the existing configured component or installation; continue native or independent remote work."]
@@ -623,16 +646,22 @@ def snapshot(config_path, *, session=None):
         from .activation import Admission
         try:
             result["admission"] = Admission(config["admission_path"]).inspect(session)
+        except TimeoutError:
+            raise
         except (OSError, ValueError) as exc:
             result["admission"] = dict(status="unavailable", enabled=False, error_class=error_class(exc))
     result["service"] = _service(config)
     _store(config, session, result)
     try:
         result["startup"] = _startup(config_path, config)
+    except TimeoutError:
+        raise
     except (OSError, ValueError) as exc:
         result["startup"] = dict(status="unavailable", error_class=error_class(exc))
     try:
         result["delivery"] = _delivery(config)
+    except TimeoutError:
+        raise
     except (OSError, ValueError) as exc:
         result["delivery"] = dict(status="unavailable", error_class=error_class(exc))
     if result["delivery"].get("status") == "unresolved" and result["delivery"].get("recovery"):

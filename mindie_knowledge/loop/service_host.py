@@ -1,5 +1,10 @@
 """Shared launch receipts and one-use service entry, without manager policy.
 
+[Role] Shared launch receipts and one-use service entry without manager policy.
+[Invariants] A launch attempt is consumed at most once; uncertain starts stay uncertain until read-only reconciliation.
+[Timeouts & Locks] Bounded readiness probes and lock waits; the authenticated endpoint remains the authority.
+[Side-Effect Policy] Writes local launch/operation receipts and delegates manager actions to the platform backend.
+
 Each platform retains its own registration/start/reconciliation contract. The
 consumer lock and authenticated endpoint remain the business authority.
 """
@@ -193,12 +198,16 @@ def run_owned(manifest, attempt, *, verify_owner, validate_record, binding,
             result["startup"] = startup
         try:
             _write(result_path, result)
+        except TimeoutError:
+            raise
         except (OSError, ServiceHostError):
             pass
         if "config" in locals() and isinstance(exc, (ServiceHostError, service_context.ContextError)):
             from .diagnostics import record_startup_failure
             try:
                 record_startup_failure(record["config"], config, "service_host", exc)
+            except TimeoutError:
+                raise
             except (OSError, ValueError):
                 pass
         raise
@@ -213,12 +222,16 @@ def run_owned(manifest, attempt, *, verify_owner, validate_record, binding,
         # but its encrypted values must not become a long-lived secret cache.
         try:
             (root / (attempt + ".context")).unlink(missing_ok=True)
+        except TimeoutError:
+            raise
         except OSError:
             if result is not None:
                 result["cleanup_failed"] = True
                 result["cleanup_stage"] = "context"
                 try:
                     _write(result_path, result)
+                except TimeoutError:
+                    raise
                 except (OSError, ServiceHostError):
                     pass
 

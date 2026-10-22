@@ -1,5 +1,10 @@
 """Atomic per-block checkpoints for embedded ReMe components.
 
+[Role] Atomic per-block SQLite checkpoints for embedded ReMe derived state.
+[Invariants] Chunks, graph and BM25 generation commit together; a policy or marker mismatch requires a rebuild instead of reuse.
+[Timeouts & Locks] SQLite uses WAL with a 5 s busy timeout; no additional process lock is taken.
+[Side-Effect Policy] Writes only the disposable `.reme-index` checkpoint under the material root.
+
 ReMe still chunks, maintains the graph and scores BM25. Only its whole-corpus
 JSONL/pickle persistence is replaced: one changed block writes one current row,
 and an interrupted transaction cannot expose mixed graph/chunk generations.
@@ -28,8 +33,9 @@ class ReMeCheckpoint:
         existed = path.exists()
         if existed and json.loads(self.stamp.read_text(encoding="utf-8")) != marker:
             raise ValueError("ReMe derived checkpoint policy differs; rebuild the index")
-        self.db = sqlite3.connect(path, check_same_thread=False)
+        self.db = sqlite3.connect(path, check_same_thread=False, timeout=5.0)
         self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA busy_timeout=5000")
         if not existed:
             with self.db:
                 self.db.executescript("""

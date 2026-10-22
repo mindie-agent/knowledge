@@ -31,7 +31,7 @@ from . import summary_budget
 from .dfx import failure as diagnostic_failure
 from .store import canonical, digest
 from .index_queue import SummaryWorkerPaused
-from .transcript_redaction import ScannerUnavailable, redact
+from .transcript_redaction import ScannerUnavailable, redact, redact_tree  # noqa: F401 (compat)
 from ..materials.ingest import prepare_increment
 from ..materials.summarizer import (
     SummaryLedger, MAX_RESPONSE_BYTES, make_request,
@@ -184,12 +184,20 @@ def summarize_due(engine):
         result = validate_result(response['result'], [b['block_id'] for b in selected])
         # This is local deterministic processing. The raw output/usage are
         # already durable, so scanner failure cannot cause another paid call.
-        for header in [*result['blocks'], result['navigation']]:
+        headers = [*result['blocks'], result['navigation']]
+        pending = {}
+        for index, header in enumerate(headers):
             for field in ('title', 'summary'):
-                header[field], _ = redact(header[field], executable=engine.redactor_executable,
-                                          key=store.redaction_key(),
-                                          private_paths=(authorization['scope'], str(Path.home())),
-                                          cancel=cancel)
+                pending[f'{index}:{field}'] = header[field]
+        cleaned, _ = redact_tree(
+            pending, executable=engine.redactor_executable,
+            key=store.redaction_key(),
+            private_paths=(authorization['scope'], str(Path.home())),
+            cancel=cancel,
+        )
+        for index, header in enumerate(headers):
+            for field in ('title', 'summary'):
+                header[field] = cleaned[f'{index}:{field}']
         validate_result(result, [b['block_id'] for b in selected])
         engine._gate_live()
         engine._revalidate(authorization)

@@ -165,6 +165,8 @@ def _scanner_config() -> tuple[Path, Path]:
         try:
             if temp.is_dir() and config.is_file() and config.read_text(encoding="utf-8") == GITLEAKS_CONFIG:
                 return temp, config
+        except TimeoutError:
+            raise
         except OSError:
             pass
     _CONFIG_DIR = tempfile.TemporaryDirectory(prefix="mindie-redaction-")
@@ -201,6 +203,8 @@ def _redaction_spans(text, *, executable, private_paths=(), cancel=None, timeout
             env={k: v for k, v in os.environ.items() if not k.startswith("GITLEAKS_")},
             inherit_env=False,
         )
+    except TimeoutError:
+        raise
     except (OSError, CommunityError):
         _check_cancel(cancel)
         raise ScannerUnavailable("transcript secret scanner unavailable") from None

@@ -1,5 +1,10 @@
 """Shared helpers for the community package: digests, bounds, subprocesses.
 
+[Role] Shared community helpers: digests, bounds, deadlines and owned subprocesses.
+[Invariants] Contribution text never enters a shell command; output and pipe queues stay bounded and spawn failures remain typed.
+[Timeouts & Locks] Subprocesses honor the caller deadline, cancellation and process-tree cleanup; lock waits are bounded.
+[Side-Effect Policy] Runs bounded local Git/GitHub helper processes and writes caller-selected temp files only.
+
 Every external effect in this package is an owned git or gh subprocess.
 Contribution text is never interpolated into a shell command: payloads travel
 via stdin temp files or ``--input`` body files. Pipe queues stay bounded;
@@ -253,6 +258,8 @@ def _reader(stream, tag: str, chunks: "queue.Queue", stop: threading.Event, erro
                     break
                 except queue.Full:
                     continue
+    except TimeoutError:
+        raise
     except OSError as exc:
         errors.append(exc)
     finally:
@@ -329,6 +336,8 @@ def run_argv(
         if input_file:
             input_file.close()
         raise TransientError(f"executable not found: {argv[0]}")
+    except TimeoutError:
+        raise
     except OSError as exc:
         if input_file:
             input_file.close()
@@ -407,6 +416,8 @@ def run_argv(
         for stream in (process.stdout, process.stderr):
             try:
                 stream.close()
+            except TimeoutError:
+                raise
             except OSError:
                 pass
         if input_file:

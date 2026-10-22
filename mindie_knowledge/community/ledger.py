@@ -1,5 +1,10 @@
 """Durable publication ledger (SQLite), written before any effect.
 
+[Role] Durable publication ledger written before any external effect.
+[Invariants] An intent row and step receipts exist before the first Git/GitHub mutation; interrupted writes stay `unknown` until read-only reconciliation.
+[Timeouts & Locks] SQLite uses WAL with a bounded wait; the ledger opens through the shared authoritative opener.
+[Side-Effect Policy] Writes only the local publication ledger database; no network or subprocess calls.
+
 The publication ledger is the idempotence backbone: an intent row plus
 append-only step receipts exist before the first Git mutation, so a restart
 can distinguish "never attempted" from "attempted, outcome unknown" and never
@@ -30,6 +35,8 @@ class Ledger:
         root.mkdir(parents=True, exist_ok=True)
         try:
             root.chmod(0o700)
+        except TimeoutError:
+            raise
         except OSError:
             pass
         self.lock = threading.RLock()

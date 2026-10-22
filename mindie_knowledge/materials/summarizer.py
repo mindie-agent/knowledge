@@ -478,6 +478,29 @@ def validate_outcome(value, request):
     return value
 
 
+_SUMMARY_COLUMNS = frozenset({
+    "attempt_id", "task_id", "batch_id", "body_version", "input_digest",
+    "policy_identity", "block_ids", "status", "response", "error", "created",
+    "updated",
+})
+
+
+def _initialize_ledger(db):
+    """Create the paid-attempt ledger exactly once, on a fresh authority open."""
+    db.execute("""CREATE TABLE IF NOT EXISTS material_summary_attempts (
+            attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, batch_id TEXT NOT NULL,
+            body_version TEXT NOT NULL, input_digest TEXT NOT NULL, policy_identity TEXT NOT NULL,
+            block_ids TEXT NOT NULL, status TEXT NOT NULL, response TEXT, error TEXT,
+            created REAL NOT NULL, updated REAL NOT NULL
+        )""")
+    db.execute("CREATE INDEX IF NOT EXISTS material_summary_by_task_batch "
+               "ON material_summary_attempts(task_id,batch_id,created)")
+    db.execute("CREATE INDEX IF NOT EXISTS material_summary_window "
+               "ON material_summary_attempts(created) WHERE status!='prepared'")
+    db.execute("CREATE INDEX IF NOT EXISTS material_summary_invoking "
+               "ON material_summary_attempts(updated) WHERE status='invoking'")
+
+
 class SummaryLedger:
     """Small current-stage receipts on the caller's existing SQLite connection.
 
@@ -486,31 +509,31 @@ class SummaryLedger:
     A returned output is necessary recovery state, cleared after application.
     """
 
+    _initialize = staticmethod(_initialize_ledger)
+
     def __init__(self, db: sqlite3.Connection, *, initialize=False):
         self._db = db
-        from ..owned_state import require_schema
         if initialize:
-            self._initialize(db)
-        require_schema(db, self._initialize)
+            _initialize_ledger(db)
+        # One cheap statement validates the columns from the cursor metadata.
+        # Never reflect a whole schema (or open ``:memory:``) per ledger use.
+        try:
+            cursor = db.execute("SELECT * FROM material_summary_attempts LIMIT 0")
+        except sqlite3.DatabaseError as exc:
+            raise ValueError(
+                "authoritative state table material_summary_attempts is missing or "
+                "incomplete; state was not rebuilt"
+            ) from exc
+        present = {column[0] for column in cursor.description or ()}
+        if not _SUMMARY_COLUMNS <= present:
+            raise ValueError(
+                "authoritative state table material_summary_attempts is missing or "
+                "incomplete; state was not rebuilt"
+            )
 
     @property
     def db(self):
         return self._db
-
-    @staticmethod
-    def _initialize(db):
-        db.execute("""CREATE TABLE IF NOT EXISTS material_summary_attempts (
-            attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, batch_id TEXT NOT NULL,
-            body_version TEXT NOT NULL, input_digest TEXT NOT NULL, policy_identity TEXT NOT NULL,
-            block_ids TEXT NOT NULL, status TEXT NOT NULL, response TEXT, error TEXT,
-            created REAL NOT NULL, updated REAL NOT NULL
-        )""")
-        db.execute("CREATE INDEX IF NOT EXISTS material_summary_by_task_batch "
-                   "ON material_summary_attempts(task_id,batch_id,created)")
-        db.execute("CREATE INDEX IF NOT EXISTS material_summary_window "
-                   "ON material_summary_attempts(created) WHERE status!='prepared'")
-        db.execute("CREATE INDEX IF NOT EXISTS material_summary_invoking "
-                   "ON material_summary_attempts(updated) WHERE status='invoking'")
 
     def _get(self, where, values):
         cursor = self.db.execute("SELECT * FROM material_summary_attempts WHERE " + where, values)

@@ -41,10 +41,14 @@ class FileIdentity:
     def anchor_for(self, count):
         try:
             fd = os.open(self.path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        except TimeoutError:
+            raise
         except (OSError, ValueError):
             return None
         try:
             return hashlib.sha256(os.read(fd, count)).hexdigest()
+        except TimeoutError:
+            raise
         except OSError:
             return None
         finally:
@@ -81,11 +85,15 @@ class FileIdentity:
 def identify(path):
     try:
         fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    except TimeoutError:
+        raise
     except (OSError, ValueError):
         return None
     try:
         stat = os.fstat(fd)
         anchor = os.read(fd, ANCHOR_BYTES)
+    except TimeoutError:
+        raise
     except OSError:
         return None
     finally:
@@ -248,6 +256,8 @@ def read_material(path, start, *, session_id=None, not_before=None, expected=Non
                 consumed.update(raw)
                 result["end"] = stream.tell()
             result["more"] = result["end"] < stat.st_size
+    except TimeoutError:
+        raise
     except OSError:
         result.update(status="missing", coverage_note="transcript unreadable")
         return result

@@ -1,5 +1,10 @@
 """Canonical ``mindie-entry/3`` document access for the community package.
 
+[Role] Canonical `mindie-entry/3` document access delegated to core document helpers.
+[Invariants] Parsing/rendering uses the single core definition; a missing core module is an explicit error, not a fallback format.
+[Timeouts & Locks] Pure in-memory document operations; no I/O, lock or wait.
+[Side-Effect Policy] Returns parsed/rendered documents only; never writes state or network.
+
 Core owns the single document definition in ``mindie_knowledge.loop.documents``
 (``render_entry`` / ``parse_entry`` / ``revision_of`` / ``append_observation``).
 This module only delegates. If the integrated core module is missing, that is

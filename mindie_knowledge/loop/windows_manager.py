@@ -1,5 +1,10 @@
 """Task Scheduler and ACL transport through the installed Windows APIs.
 
+[Role] Task Scheduler and ACL transport through installed Windows APIs.
+[Invariants] Launch intents and ownership validation belong to `windows_service`; this module does not retain COM objects across calls or threads.
+[Timeouts & Locks] Each manager call is bounded by the caller and returns typed service-host failures.
+[Side-Effect Policy] Creates/removes current-user scheduled tasks and reads their state; no system-wide changes.
+
 Launch intents, ownership validation and reconciliation belong to
 windows_service. This module does not retain COM objects across calls/threads.
 """

@@ -1,5 +1,10 @@
 """On-demand, current-user Windows host for one knowledge service.
 
+[Role] On-demand current-user Windows scheduler host for one knowledge service.
+[Invariants] The scheduler owns the launcher outside the application Job; the endpoint and consumer lock remain readiness/lifetime authority.
+[Timeouts & Locks] Task registration/start/reconciliation use bounded waits and preserve uncertain outcomes as receipts.
+[Side-Effect Policy] Writes current-user scheduler tasks and local receipts; no machine-wide service or ACL changes.
+
 The scheduler owns the venv launcher outside the native application's Job.
 The existing authenticated endpoint and consumer lock remain the readiness
 and lifetime authority. Task metadata is only launch/cleanup bookkeeping.
@@ -213,6 +218,8 @@ def _pid_dead(pid):
             os.kill(pid, 0)
         except ProcessLookupError:
             return True
+        except TimeoutError:
+            raise
         except (OSError, OverflowError):
             pass
         return False
@@ -389,9 +396,13 @@ def request_start(config_path, config):
     from .diagnostics import record_startup_failure
     try:
         return _request_start(config_path, config)
+    except TimeoutError:
+        raise
     except (OSError, ValueError, RuntimeError) as exc:
         try:
             record_startup_failure(config_path, config, "service_host", exc)
+        except TimeoutError:
+            raise
         except (OSError, ValueError):
             pass
         raise
@@ -476,6 +487,8 @@ def _cleanup_unstarted_context(root, record, context_path):
     # can remove it. Reconciliation/terminal exit handles the remaining case.
     try:
         operation = _read(root / "operation.json")
+    except TimeoutError:
+        raise
     except (OSError, ServiceHostError):
         return
     if operation is not None and (operation.get("attempt") != record["attempt"]
@@ -484,10 +497,14 @@ def _cleanup_unstarted_context(root, record, context_path):
         return
     try:
         context_path.unlink(missing_ok=True)
+    except TimeoutError:
+        raise
     except OSError:
         try:
             _write(root / (record["attempt"] + ".cleanup.json"),
                    dict(attempt=record["attempt"], stage="context", cleanup_failed=True))
+        except TimeoutError:
+            raise
         except (OSError, ServiceHostError):
             pass
 
@@ -505,6 +522,8 @@ def _register_new(root, record, loaded):
         if not exc.uncertain:
             try:
                 _write(root / "operation.json", dict(attempt=record["attempt"], phase="failed"))
+            except TimeoutError:
+                raise
             except (OSError, ServiceHostError):
                 pass  # Preserve the primary manager failure.
         raise
@@ -543,6 +562,8 @@ def _send_start(root, record, task):
         if not exc.uncertain:
             try:
                 _write(root / "operation.json", dict(attempt=record["attempt"], phase="failed"))
+            except TimeoutError:
+                raise
             except (OSError, ServiceHostError):
                 pass
         raise

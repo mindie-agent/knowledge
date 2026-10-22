@@ -1,5 +1,10 @@
 """Stdlib Windows subprocess ownership for shared runtime callers.
 
+[Role] Stdlib Windows subprocess ownership through an owned Job object.
+[Invariants] A child is resumed only after joining the Job; descendants remain owned after the leader exits, and cleanup failures stay visible.
+[Timeouts & Locks] Spawn/terminate operations use bounded waits and explicit cancellation; no unbounded process polling.
+[Side-Effect Policy] Creates and terminates native processes and Jobs only on the current user session; no network or registry writes.
+
 The child starts suspended, joins an owned Job, then resumes. Descendants
 remain owned after their leader exits. Used by both organizer and Git/gh
 execution so normal exit, cancellation and timeout share the same cleanup.
@@ -174,6 +179,8 @@ def terminate_owned(process, *, wait=False):
                  "/F", "/T", "/PID", str(process.pid)],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
             )
+        except TimeoutError:
+            raise
         except (OSError, subprocess.TimeoutExpired):
             pass
         if process.poll() is None:

@@ -172,6 +172,8 @@ def _probe(config, timeout, *, config_path=None):
             consumer.stat()
         except FileNotFoundError:
             pass
+        except TimeoutError:
+            raise
         except OSError:
             return 'unknown'
         else:
@@ -182,6 +184,8 @@ def _probe(config, timeout, *, config_path=None):
         connection = connect(config, config_path=config_path)
     except FileNotFoundError:
         return "starting" if owner is True else "absent"
+    except TimeoutError:
+        raise
     except (OSError, ValueError):
         return "unknown"
     try:
@@ -215,12 +219,12 @@ def _wake_file(config):
 def _read_wake(config):
     try:
         raw = json.loads(_wake_file(config).read_text() or "{}")
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return {}
     return raw if isinstance(raw, dict) else {}
 
 
-def request_wake(config_path, *, session_id, event=None):
+def request_wake(config_path, *, session_id, event=None, timeout=None):
     """Spawn at most one detached service starter. Does not create a capture."""
     from . import settings as settings_mod
     from .cli import config_at
@@ -237,6 +241,8 @@ def request_wake(config_path, *, session_id, event=None):
     except ServiceRetired:
         out.update(wake='not-applicable', runtime='retired', reason='service-retired')
         return out
+    except TimeoutError:
+        raise
     except (OSError, ValueError):
         out.update(wake="failed", runtime="unavailable", reason="configuration")
         return out
@@ -255,6 +261,8 @@ def request_wake(config_path, *, session_id, event=None):
         return out
     try:
         lease = Admission(path).active_lease(session_id)
+    except TimeoutError:
+        raise
     except (OSError, ValueError, AdmissionUnavailable):
         out.update(wake="failed", runtime="unavailable", reason="admission-unreadable")
         return out
@@ -275,7 +283,9 @@ def request_wake(config_path, *, session_id, event=None):
         return out
     lock = StartLock(_store_path(config).with_name("wake.request.lock"))
     try:
-        lock.acquire()
+        # Other callers keep the historical non-blocking probe; only an
+        # explicit Stop budget may wait for the single wake starter.
+        lock.acquire(wait=0 if timeout is None else timeout)
     except StartInProgress:
         out.update(wake="coalesced", runtime="unavailable", reason="coalesced")
         return out
@@ -297,7 +307,7 @@ def request_wake(config_path, *, session_id, event=None):
                 from .cli import connection_path
                 start = StartLock(connection_path(config).with_name("start.lock"))
                 try:
-                    start.acquire()
+                    start.acquire(wait=0 if timeout is None else timeout)
                 except StartInProgress:
                     out.update(wake="coalesced", runtime="unavailable", reason="coalesced")
                     return out
@@ -317,6 +327,8 @@ def request_wake(config_path, *, session_id, event=None):
             else:
                 from .process import spawn_service
                 process = spawn_service(argv)
+        except TimeoutError:
+            raise
         except (OSError, ValueError, RuntimeError) as exc:
             out.update(wake="failed", runtime="unavailable", reason="wake-failed",
                        recovery=_RECOVERY["wake-failed"])
@@ -342,12 +354,16 @@ def run_wake(config_path, event=None):
 
     try:
         config = config_at(config_path)
+    except TimeoutError:
+        raise
     except (OSError, ValueError):
         return 0
     try:
         ensure_service(config_path, _from_detached_starter=True)
     except ServiceRetired:
         return 0  # An already-spawned old helper is expected after retirement.
+    except TimeoutError:
+        raise
     except (OSError, ValueError, RuntimeError):
         record_delivery_failure(config, stage="wake", cause="wake-failed", event=event)
         return 0
@@ -361,6 +377,8 @@ def _record(config, **kwargs):
 
     try:
         record_delivery_failure(config, **kwargs)
+    except TimeoutError:
+        raise
     except (OSError, ValueError):
         pass
 
@@ -401,6 +419,8 @@ def accept_stop(config_path, event, *, timeout=None):
         return _result(stage="rejected", reason="invalid-envelope")
     try:
         config = config_at(config_path)
+    except TimeoutError:
+        raise
     except (OSError, ValueError):
         from .dfx import failure
         failure('knowledge.capture', stage='handoff', category='configuration_unavailable')
@@ -497,7 +517,11 @@ def accept_stop(config_path, event, *, timeout=None):
     try:
         db_timeout = max(0.05, deadline - time.monotonic())
         db = sqlite3.connect(path, timeout=db_timeout)
-        db.execute(f"PRAGMA busy_timeout={int(db_timeout * 1000)}")
+        db.execute("PRAGMA journal_mode=WAL")
+        # A 3 s floor avoids sub-second thrash when the caller has budget for
+        # it; a tighter Stop budget still wins so the hook returns on time.
+        busy_ms = max(3000, int(db_timeout * 1000)) if db_timeout >= 3.0 else max(1, int(db_timeout * 1000))
+        db.execute(f"PRAGMA busy_timeout={busy_ms}")
     except sqlite3.OperationalError as exc:
         text = str(exc).lower()
         if "locked" in text or "busy" in text:
@@ -592,6 +616,7 @@ def accept_stop(config_path, event, *, timeout=None):
     if state == "absent":
         wake = request_wake(
             config_path, session_id=session, event=event_id,
+            timeout=max(0.0, deadline - time.monotonic()),
         )
     elif state == "worker-dead":
         _record(config, stage="runtime", cause="worker-unavailable", capture_id=capture_id, event=event_id)

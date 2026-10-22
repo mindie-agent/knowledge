@@ -125,7 +125,9 @@ def test_restart_restores_term_counts_without_rechunking_old_body(tmp_path, monk
     from mindie_knowledge.materials.reme_index import VerifiedMarkdownFileChunker, TechnicalTokenizerV1
     tokenize = TechnicalTokenizerV1._tokenize_one
     def no_body_tokens(self, text, **kwargs):
-        assert text == '中段证据', 'restart retokenized old full chunks'
+        # The query may be expanded into technical terms before ReMe scoring;
+        # the old full body must never be rechunked or retokenized on restart.
+        assert text in {'中段证据', '中段 段证 证据'}, 'restart retokenized old full chunks'
         return tokenize(self, text, **kwargs)
     monkeypatch.setattr(TechnicalTokenizerV1, '_tokenize_one', no_body_tokens)
     async def no_chunk(*_args):

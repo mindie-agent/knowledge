@@ -1,5 +1,10 @@
 """Temporary summary profiles share the process tree's cleanup owner.
 
+[Role] Temporary summary profiles share the process tree cleanup owner.
+[Invariants] Only the core deletes its own fresh root; a declared job/parent mismatch raises instead of adopting a foreign directory.
+[Timeouts & Locks] Ownership checks use bounded stat/pipe operations; no long-lived lock is retained.
+[Side-Effect Policy] Creates and removes a private scratch directory for one summary worker run.
+
 The declaration is an internal parent/worker protocol, never user configuration
 or a worker-provided deletion target. Only the core deletes its own fresh root.
 """
@@ -64,6 +69,8 @@ def create_profile(*, prefix):
                 or stat.S_ISLNK(info.st_mode)
                 or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
             raise ValueError
+    except TimeoutError:
+        raise
     except (OSError, ValueError, TypeError):
         raise ScratchOwnershipError("summary scratch ownership is unavailable") from None
     return tempfile.mkdtemp(prefix=prefix, dir=root), True

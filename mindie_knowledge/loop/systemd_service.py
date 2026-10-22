@@ -1,5 +1,10 @@
 """One on-demand knowledge core owned by the current user's systemd manager.
 
+[Role] On-demand knowledge core owned by the current user systemd manager.
+[Invariants] The unit owns crash cleanup of the service cgroup; local receipts bind one launch attempt and readiness still uses the authenticated endpoint.
+[Timeouts & Locks] Unit start/stop operations use bounded manager waits; the consumer/start locks remain the lifetime authority.
+[Side-Effect Policy] Writes local launch receipts and controls a transient user unit; no system-wide service changes.
+
 The unit owns crash cleanup of the whole service cgroup. Local receipts only
 bind one launch attempt; readiness and consumption still use the existing
 authenticated endpoint and OS lock.
@@ -182,6 +187,8 @@ def _accepted_process_dead(result):
         os.kill(result["pid"], 0)
     except ProcessLookupError:
         return True
+    except TimeoutError:
+        raise
     except (OSError, OverflowError):
         pass  # A denied, unsupported or out-of-range query proves nothing.
     return False
@@ -214,9 +221,13 @@ def request_start(config_path, config):
     from .diagnostics import record_startup_failure
     try:
         return _request_start(config_path, config)
+    except TimeoutError:
+        raise
     except (OSError, ValueError, RuntimeError) as exc:
         try:
             record_startup_failure(config_path, config, "service_host", exc)
+        except TimeoutError:
+            raise
         except (OSError, ValueError):
             pass
         raise
@@ -289,6 +300,8 @@ def _start(root, record, config):
             try:
                 _write(root / "operation.json", dict(attempt=record["attempt"], phase="failed"))
                 (root / (record["attempt"] + ".context")).unlink(missing_ok=True)
+            except TimeoutError:
+                raise
             except (OSError, ServiceHostError):
                 pass
         raise

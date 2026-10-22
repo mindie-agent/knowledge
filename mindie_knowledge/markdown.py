@@ -1,5 +1,10 @@
 """Small value object and atomic writes used by the current knowledge loop.
 
+[Role] Small Markdown value object and atomic text writes for the knowledge loop.
+[Invariants] Writes replace a target atomically and preserve the prior file on failure; no legacy sidecar store is created.
+[Timeouts & Locks] Atomic replacement is a single bounded filesystem operation; no lock is retained across calls.
+[Side-Effect Policy] Writes only the explicitly provided target path; no network or subprocess calls.
+
 Public entries are parsed/rendered by loop.documents. There is no parallel
 legacy Markdown/sidecar store or title-derived document identity.
 """
@@ -38,6 +43,8 @@ def _atomic_write_bytes(path: Path, raw: bytes) -> None:
     except BaseException as error:
         try:
             temporary.unlink(missing_ok=True)
+        except TimeoutError:
+            raise
         except OSError as cleanup:
             error.add_note('Atomic write cleanup also failed: ' + type(cleanup).__name__)
         raise

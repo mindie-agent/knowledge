@@ -38,7 +38,7 @@ def test_returned_response_recovers_without_current_worker(pipeline, tmp_path, m
                 engine.operations.cancel('index')
                 assert options['cancel'].is_set()
                 raise MaintenanceCancelled('scanner cancelled by owner')
-            faults.setattr('mindie_knowledge.loop.transcript_capture.redact', cancel_scanner)
+            faults.setattr('mindie_knowledge.loop.transcript_capture.redact_tree', cancel_scanner)
         elif fault == 'authority':
             original_gate, gate_calls = engine._revalidate, []
             def gate(row):

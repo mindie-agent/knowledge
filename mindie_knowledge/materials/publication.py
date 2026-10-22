@@ -1,5 +1,10 @@
 """Freeze contribution files without putting their bodies in the state database.
 
+[Role] Freeze contribution files without putting their bodies into the state database.
+[Invariants] A frozen candidate is reloaded by exact digest; a missing candidate is an error, never an empty contribution.
+[Timeouts & Locks] Freeze/reload operations are bounded filesystem work with no network wait.
+[Side-Effect Policy] Writes only the caller-designated staging directory; remote publication is out of scope.
+
 The outbox row and manifest hold identities only. A required frozen candidate
 lives as ordinary files until its remote outcome is known. Re-loading checks
 those exact bytes; a missing candidate is an error, never an empty contribution.
@@ -81,6 +86,8 @@ def freeze_batch(root: Path, batch: dict) -> dict:
         try:
             if temporary.exists():
                 shutil.rmtree(temporary)
+        except TimeoutError:
+            raise
         except OSError as cleanup:
             exc.add_note(f"incomplete staging cleanup failed: {type(cleanup).__name__}")
         raise

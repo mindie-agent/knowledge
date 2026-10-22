@@ -582,3 +582,61 @@ def test_bloated_unit_body_is_rejected_before_admission(store):
 
     with pytest.raises(ValueError, match="8 KiB anti-bloat budget"):
         validate_decision(bloated, request)
+
+
+def test_pareto_candidate_selection_filters_dominated_below_floor_and_infra_errors():
+    from mindie_knowledge.graded.explore import select_pareto_candidates
+
+    candidates = [
+        {"id": "h0_vanilla", "pass_rate": 0.70, "cost": 0.89},
+        {"id": "rho_heavy_expensive", "pass_rate": 0.74, "cost": 1.09},
+        {"id": "hp_lite", "pass_rate": 0.70, "cost": 0.40, "pass_count": 42, "total_cost": 24.0},
+        {"id": "hp_medium", "pass_rate": 0.74, "cost": 0.76, "pass_count": 45, "total_cost": 45.6},
+        {"id": "hp_heavy", "pass_rate": 0.80, "cost": 1.00, "pass_count": 48, "total_cost": 60.0},
+        {"id": "below_floor", "pass_rate": 0.62, "cost": 0.35},
+        {"id": "infra_timeout", "pass_rate": 0.0, "cost": 0.10, "status": "infra_error"},
+    ]
+    selected = select_pareto_candidates(candidates, pass_floor=0.70)
+    assert selected["below_floor_ids"] == ["below_floor"]
+    assert selected["inconclusive_ids"] == ["infra_timeout"]
+    assert "h0_vanilla" in selected["dominated_ids"]
+    assert "rho_heavy_expensive" in selected["dominated_ids"]
+    assert selected["frontier_ids"] == ["hp_lite", "hp_medium", "hp_heavy"]
+    assert selected["representatives"]["lite"]["id"] == "hp_lite"
+    assert selected["representatives"]["medium"]["id"] == "hp_medium"
+    assert selected["representatives"]["heavy"]["id"] == "hp_heavy"
+    assert selected["representatives"]["heavy"]["cost_of_pass"] == pytest.approx(60.0 / 48, rel=1e-5)
+
+
+def test_stage_budget_guidance_and_weak_oracle_direction_gate():
+    from mindie_knowledge.graded.explore import enforce_direction_budget, stage_budget_guidance
+
+    eco = stage_budget_guidance(14)
+    assert eco["stage"] == "economy"
+    assert eco["should_deny"] is False
+    assert eco["injection_target"] == "tool_result_tail"
+    assert eco["preserves_prompt_prefix_cache"] is True
+    assert "Economy stage" in eco["additional_context"]
+
+    conv = stage_budget_guidance(26)
+    assert conv["stage"] == "convergence"
+    assert "Convergence stage" in conv["additional_context"]
+
+    interactive_over = stage_budget_guidance(45, allow_hard_deny=False)
+    assert interactive_over["should_deny"] is False
+
+    unattended_over = stage_budget_guidance(45, allow_hard_deny=True)
+    assert unattended_over["should_deny"] is True
+    assert unattended_over["stage"] == "exhausted_denied"
+
+    budgeted = enforce_direction_budget(
+        [
+            {"direction_id": "d1", "hypothesis": "deep search on full 4-node e2e launch", "requires_deep_iteration": True, "learned_refs": ["u1"]},
+            {"direction_id": "d2", "hypothesis": "local single-op probe", "requires_deep_iteration": False, "learned_refs": []},
+        ],
+        oracle_strength="weak_e2e",
+        probe_cost_fraction=0.40,
+    )
+    assert budgeted["downgraded_weak_oracle_ids"] == ["d1"]
+    assert budgeted["directions"][0]["weak_oracle_downgraded"] is True
+    assert budgeted["directions"][0]["effective_profile"] == "standard_build_local_probe_first"

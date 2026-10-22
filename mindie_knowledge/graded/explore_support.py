@@ -197,19 +197,29 @@ def enforce_direction_budget(
     kb_dir_cap: int = 1,
     require_cold_direction: bool = True,
     roofline_status: str = "calibrated",
+    oracle_strength: str = "local_repeatable",
+    probe_cost_fraction: float = 0.0,
 ) -> dict[str, Any]:
-    """Enforce GEAK's KB direction cap, cold profile-only control, and roofline filter.
+    """Enforce GEAK's KB direction cap, cold profile-only control, roofline filter, and HarnessPro oracle gate.
 
     In AMD-AGI/GEAK (`kernel_lane.js`), allowing the planner to seed every direction
     from learned KB cards regressed geomean speedup by 22.7% (`4.45x -> 3.44x`).
     At most `kb_dir_cap` directions per round may retain `learned_refs`, at least
     one direction must be planned purely from the L1/L2 profile (`learned_refs=[]`),
-    and uncalibrated roofline hypotheses are filtered when `roofline_status != "calibrated"`.
+    uncalibrated roofline hypotheses are filtered when `roofline_status != "calibrated"`,
+    and directions requesting multi-iteration `deep` search without a strong local
+    repeatable oracle (`oracle_strength == "weak_e2e"` or `probe_cost_fraction > 0.25`)
+    are downgraded to construct a fast local discriminating probe first.
     """
     if type(kb_dir_cap) is not int or kb_dir_cap < 0:
         raise ValueError("kb_dir_cap must be a nonnegative integer")
+    probe_fraction = float(_number(probe_cost_fraction, "probe_cost_fraction") or 0.0)
+    if probe_fraction < 0.0:
+        raise ValueError("probe_cost_fraction must be nonnegative")
     calibrated = str(roofline_status or "").strip().lower() == "calibrated"
+    weak_oracle = str(oracle_strength or "").strip().lower() in {"weak", "weak_e2e", "binary_e2e"} or probe_fraction > 0.25
     filtered_roofline_ids: list[str] = []
+    downgraded_weak_oracle_ids: list[str] = []
     surviving: list[dict[str, Any]] = []
     for index, raw in enumerate(directions or ()):
         row = _mapping(raw, f"directions[{index}]")
@@ -223,7 +233,15 @@ def enforce_direction_budget(
             filtered_roofline_ids.append(ident)
             continue
         refs = [str(ref) for ref in (row.get("learned_refs") or row.get("kb_refs") or ()) if str(ref).strip()]
-        surviving.append({**row, "direction_id": ident, "learned_refs": refs, "kb_cap_stripped": False})
+        entry = {**row, "direction_id": ident, "learned_refs": refs, "kb_cap_stripped": False}
+        wants_deep = bool(row.get("requires_deep_iteration")) or str(row.get("profile") or "").lower() == "deep"
+        if weak_oracle and wants_deep:
+            entry["effective_profile"] = "standard_build_local_probe_first"
+            entry["weak_oracle_downgraded"] = True
+            downgraded_weak_oracle_ids.append(ident)
+        else:
+            entry["weak_oracle_downgraded"] = False
+        surviving.append(entry)
     kb_used = 0
     kb_cap_bound = False
     for row in surviving:
@@ -251,11 +269,14 @@ def enforce_direction_budget(
         "kb_dir_cap": kb_dir_cap,
         "require_cold_direction": bool(require_cold_direction),
         "roofline_status": str(roofline_status or "calibrated"),
+        "oracle_strength": str(oracle_strength or "local_repeatable"),
+        "probe_cost_fraction": probe_fraction,
         "kb_cap_bound": kb_cap_bound,
         "cold_direction_enforced": cold_enforced,
         "cold_direction_count": sum(1 for row in surviving if row["is_cold_direction"]),
         "kb_seeded_count": sum(1 for row in surviving if not row["is_cold_direction"]),
         "filtered_uncalibrated_roofline_ids": filtered_roofline_ids,
+        "downgraded_weak_oracle_ids": downgraded_weak_oracle_ids,
     }
 
 
@@ -301,4 +322,188 @@ def build_citation_feedback_record(
         "record_in_feedback_ledger": True,
         "allow_new_card_distillation": bool(became_winner and row.get("distill_ready")),
     }
+
+
+DEFAULT_PARETO_MODE_WEIGHTS: dict[str, tuple[float, float]] = {
+    "lite": (1.0, 2.0),
+    "medium": (1.0, 1.0),
+    "heavy": (2.0, 1.0),
+}
+
+
+def select_pareto_candidates(
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    pass_floor: float | None = None,
+    mode_weights: Mapping[str, tuple[float, float]] | None = None,
+) -> dict[str, Any]:
+    """Filter Pareto-dominated candidates and select lite/medium/heavy representatives (HarnessPro Eq. 7-9).
+
+    Candidates with `status` or `outcome` in `{"infra_error", "infra_failed", "unknown"}`
+    are separated into `inconclusive_ids` rather than treated as valid 0-pass runs.
+    """
+    weights = dict(DEFAULT_PARETO_MODE_WEIGHTS if mode_weights is None else mode_weights)
+    floor = None if pass_floor is None else float(_number(pass_floor, "pass_floor"))
+    valid_rows: list[dict[str, Any]] = []
+    inconclusive_ids: list[str] = []
+    below_floor_ids: list[str] = []
+
+    for index, raw in enumerate(candidates or ()):
+        row = _mapping(raw, f"candidates[{index}]")
+        ident = _text(row.get("candidate_id") or row.get("id") or row.get("arm"), f"candidates[{index}].id")
+        status = str(row.get("status") or row.get("outcome") or "ok").strip().lower()
+        if status in {"infra_error", "infra_failed", "unknown", "inconclusive"}:
+            inconclusive_ids.append(ident)
+            continue
+        pass_rate = float(_number(row.get("pass_rate"), f"candidates[{index}].pass_rate"))
+        cost = float(_number(row.get("mean_cost", row.get("cost")), f"candidates[{index}].cost"))
+        if cost < 0.0:
+            raise ValueError(f"candidates[{index}].cost must be nonnegative")
+        pass_count = row.get("pass_count")
+        total_cost = row.get("total_cost")
+        if pass_count is not None and total_cost is not None:
+            p_cnt = int(pass_count)
+            t_cost = float(_number(total_cost, f"candidates[{index}].total_cost"))
+            cop = round(t_cost / p_cnt, 6) if p_cnt > 0 else None
+        else:
+            cop = round(cost / pass_rate, 6) if pass_rate > 0.0 else None
+        entry = {
+            **row,
+            "id": ident,
+            "pass_rate": pass_rate,
+            "cost": cost,
+            "cost_of_pass": cop,
+        }
+        if floor is not None and pass_rate + 1e-12 < floor:
+            below_floor_ids.append(ident)
+            continue
+        valid_rows.append(entry)
+
+    dominated_ids: list[str] = []
+    frontier: list[dict[str, Any]] = []
+    for cand in valid_rows:
+        is_dominated = any(
+            other["id"] != cand["id"]
+            and other["pass_rate"] >= cand["pass_rate"] - 1e-12
+            and other["cost"] <= cand["cost"] + 1e-12
+            and (
+                other["pass_rate"] > cand["pass_rate"] + 1e-12
+                or other["cost"] < cand["cost"] - 1e-12
+            )
+            for other in valid_rows
+        )
+        if is_dominated:
+            dominated_ids.append(cand["id"])
+        else:
+            frontier.append(cand)
+
+    representatives: dict[str, dict[str, Any] | None] = {mode: None for mode in weights}
+    if frontier:
+        p_min = min(item["pass_rate"] for item in frontier)
+        p_max = max(item["pass_rate"] for item in frontier)
+        c_min = min(item["cost"] for item in frontier)
+        c_max = max(item["cost"] for item in frontier)
+        p_span = p_max - p_min
+        c_span = c_max - c_min
+        for item in frontier:
+            item["d_perf"] = 0.0 if p_span <= 1e-12 else (p_max - item["pass_rate"]) / p_span
+            item["d_cost"] = 0.0 if c_span <= 1e-12 else (item["cost"] - c_min) / c_span
+        for mode, (alpha, beta) in weights.items():
+            best = min(
+                frontier,
+                key=lambda item: (
+                    alpha * (item["d_perf"] ** 2) + beta * (item["d_cost"] ** 2),
+                    item["cost"],
+                    -item["pass_rate"],
+                    item["id"],
+                ),
+            )
+            score = alpha * (best["d_perf"] ** 2) + beta * (best["d_cost"] ** 2)
+            representatives[mode] = {
+                "id": best["id"],
+                "pass_rate": best["pass_rate"],
+                "cost": best["cost"],
+                "cost_of_pass": best["cost_of_pass"],
+                "weighted_squared_distance": round(score, 6),
+                "weights": {"alpha_perf": alpha, "beta_cost": beta},
+            }
+
+    return {
+        "pass_floor": floor,
+        "frontier_ids": [item["id"] for item in frontier],
+        "frontier": frontier,
+        "dominated_ids": dominated_ids,
+        "below_floor_ids": below_floor_ids,
+        "inconclusive_ids": inconclusive_ids,
+        "representatives": representatives,
+    }
+
+
+def stage_budget_guidance(
+    tool_count: int,
+    *,
+    economy_after_tools: int = 14,
+    strict_after_tools: int = 26,
+    finalize_after_tools: int = 44,
+    strict_reminder_every: int = 8,
+    allow_hard_deny: bool = False,
+) -> dict[str, Any]:
+    """Generate prefix-cache-preserving staged budget guidance for tool-result tail injection.
+
+    By default (`allow_hard_deny=False`), interactive user sessions never hard-lock
+    tool calls; `allow_hard_deny=True` is reserved for unattended benchmark or
+    bounded RSI subagent runs.
+    """
+    if type(tool_count) is not int or tool_count < 0:
+        raise ValueError("tool_count must be a nonnegative integer")
+    if not (0 < economy_after_tools < strict_after_tools < finalize_after_tools):
+        raise ValueError("stage thresholds must satisfy 0 < economy < strict < finalize")
+    reminder = max(1, int(strict_reminder_every))
+    should_deny = bool(allow_hard_deny and tool_count > finalize_after_tools)
+    if should_deny:
+        stage = "exhausted_denied"
+        message = (
+            "The task tool budget is exhausted. Preserve the current files, "
+            "stop calling tools, and give the best final answer from existing evidence."
+        )
+    elif tool_count >= finalize_after_tools and (
+        tool_count == finalize_after_tools or (tool_count - finalize_after_tools) % max(4, reminder) == 0
+    ):
+        stage = "finalization"
+        message = (
+            "Finalization stage: stop adding semantic scope. Use the remaining grace "
+            "window only for implementation completion, a focused verification check, "
+            "temporary artifact cleanup, and final contract review."
+        )
+    elif tool_count >= strict_after_tools and (
+        tool_count == strict_after_tools or (tool_count - strict_after_tools) % reminder == 0
+    ):
+        stage = "convergence"
+        message = (
+            "Convergence stage: stop broad exploration. Only run probes that distinguish "
+            "a live hypothesis or repair a concrete failure, keep temporary verification "
+            "artifacts separate from deliverables, and reserve budget for final verification."
+        )
+    elif tool_count == economy_after_tools:
+        stage = "economy"
+        message = (
+            "Economy stage: batch independent ls/rg/read/test checks, suppress process "
+            "narration, and avoid repeating unchanged reads while preserving required validation."
+        )
+    else:
+        stage = "explore" if tool_count < economy_after_tools else (
+            "economy" if tool_count < strict_after_tools else (
+                "convergence" if tool_count < finalize_after_tools else "finalization"
+            )
+        )
+        message = ""
+    return {
+        "stage": stage,
+        "tool_count": tool_count,
+        "should_deny": should_deny,
+        "additional_context": message,
+        "injection_target": "tool_result_tail",
+        "preserves_prompt_prefix_cache": True,
+    }
+
 

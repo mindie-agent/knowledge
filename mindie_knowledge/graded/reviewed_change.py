@@ -119,6 +119,8 @@ def apply_change(root, plan):
         if routing["generation"] != prepared["after"].generation:
             raise ValueError("the corpus changed during reviewed application")
         report["status"] = "applied"
+    except TimeoutError:
+        raise
     except (OSError, ValueError) as error:
         report["status"] = "partial" if report["written"] or report["removed"] else "failed"
         report["errors"].append(dict(error_class=type(error).__name__, detail=str(error)))
@@ -141,6 +143,8 @@ def main(argv=None):
                           generation=prepared["after"].generation,
                           writes=list(prepared["writes"]), removals=prepared["removals"],
                           publication="not_requested")
+    except TimeoutError:
+        raise
     except (OSError, ValueError) as error:
         result = dict(status="failed", errors=[dict(error_class=type(error).__name__, detail=str(error))])
     print(json.dumps(result, ensure_ascii=False, indent=2))

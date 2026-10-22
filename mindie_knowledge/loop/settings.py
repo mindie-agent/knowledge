@@ -1,5 +1,10 @@
 """Shared community-contribution settings (``mindie-community-config/1``).
 
+[Role] Shared community-contribution settings (`mindie-community-config/1`).
+[Invariants] Settings are re-read at every gate; missing/corrupt authority blocks capture/model/publication instead of enabling a fallback.
+[Timeouts & Locks] Bounded file reads with a fixed byte cap; no lock is held across gates.
+[Side-Effect Policy] Reads the local shared config and consent reference; never writes them.
+
 One local JSON file shared by the adapter and the knowledge runtime. It is
 re-read from disk at every gate — before transcript reading, before spawning a
 model and before any outbound write — so flipping ``enabled`` or bumping
@@ -182,6 +187,8 @@ class CommunitySettings:
             self.project_roots = [
                 Path(item) for item in normalized_roots(self.raw.get("project_roots", []))
             ]
+        except TimeoutError:
+            raise
         except (ValueError, OSError):
             self.project_roots = []
         try:
@@ -298,6 +305,8 @@ class CommunitySettings:
         from ..filesystem import path_is_within
         try:
             return any(path_is_within(candidate, root) for root in self.project_roots)
+        except TimeoutError:
+            raise
         except (OSError, ValueError):
             return False
 
@@ -365,6 +374,8 @@ def load(path) -> CommunitySettings:
         return CommunitySettings(
             path, {}, error="settings file does not exist", state="missing",
         )
+    except TimeoutError:
+        raise
     except OSError:
         return CommunitySettings(
             path, {}, error="settings file is unreadable", state="unreadable",

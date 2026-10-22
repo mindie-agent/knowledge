@@ -1,4 +1,10 @@
-"""Public, bounded GitHub Release reads for the pure eligibility selector."""
+"""Public, bounded GitHub Release reads for the pure eligibility selector.
+
+[Role] Bounded public GitHub Release reads for the pure eligibility selector.
+[Invariants] Responses are size-limited and validated before use; authentication tokens are never persisted in release metadata.
+[Timeouts & Locks] Every HTTP read has an explicit timeout and byte cap controlled by the caller.
+[Side-Effect Policy] Read-only network access to the fixed release repository; no installs, writes or token export.
+"""
 
 from __future__ import annotations
 

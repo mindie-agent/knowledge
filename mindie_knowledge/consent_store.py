@@ -141,6 +141,8 @@ class _UpdateLock:
             return
         try:
             _unlock_file(fd)
+        except TimeoutError:
+            raise
         except OSError:
             pass
         os.close(fd)
@@ -178,6 +180,8 @@ def _read_raw(path):
         raw = _read_bytes(path)
     except FileNotFoundError:
         return "missing", None
+    except TimeoutError:
+        raise
     except OSError:
         return "unreadable", None
     if len(raw) > MAX_BYTES:
@@ -280,6 +284,8 @@ def _write_document(path, data):
             temporary.unlink()
     try:
         path.chmod(0o600)
+    except TimeoutError:
+        raise
     except OSError:
         pass
 

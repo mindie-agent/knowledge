@@ -5,6 +5,7 @@ venv/
 .pytest_cache/
 .ruff_cache/
 .mindie-local/
+uv.lock
 
 # Old private state must never enter a commit.
 .vaws-local/

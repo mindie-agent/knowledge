@@ -1,4 +1,10 @@
-"""Preflight the supported Windows Git directory, not long material paths."""
+"""Preflight the supported Windows Git directory, not long material paths.
+
+[Role] Preflight the Windows Git installation without touching long material paths.
+[Invariants] A directory is accepted only when the required Git executables are regular files; long-path probing never changes repository state.
+[Timeouts & Locks] Only bounded filesystem probes and subprocess version checks with explicit timeouts; no lock is retained.
+[Side-Effect Policy] Read-only environment inspection; no writes, network calls or permanent configuration changes.
+"""
 import ntpath
 import os
 

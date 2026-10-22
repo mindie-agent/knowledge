@@ -133,13 +133,24 @@ def test_missing_facts_and_mismatch_are_discoverable_but_not_ready_to_apply():
     assert set(row["missing_conditions"]) == {"cann", "framework", "workload_scope"}
     assert advised["cards"][0]["ready_to_apply"] is False
     assert advised["cards"][0]["missing_conditions"] == row["missing_conditions"]
-    assert index.query("graph capture", conditions=partial)["results"] == []
-    assert index.query("graph capture", conditions=partial)["excluded_conditions"]["unknown"] == 1
+    default_partial = index.query("graph capture", conditions=partial)
+    assert default_partial["results"] == []
+    assert default_partial["cards"] == []
+    assert default_partial["excluded_conditions"]["unknown"] == 1
+    assert default_partial["unverified_cards"][0]["id"] == rule.id
+    assert default_partial["unverified_cards"][0]["match_status"] == "condition_unknown"
+    assert default_partial["unverified_cards"][0]["ready_to_apply"] is False
+    assert set(default_partial["unverified_cards"][0]["missing_conditions"]) == {
+        "cann", "framework", "workload_scope"}
+    assert set(default_partial["unverified_cards"][0]["required_conditions"]) == {
+        "cann", "framework", "workload_scope"}
 
     unknown = index.explain_closure([rule.id], conditions=partial)
     assert unknown["units"] == []
     assert unknown["unresolved"][0]["status"] == "condition_unknown"
     assert set(unknown["unresolved"][0]["missing_conditions"]) == {
+        "cann", "framework", "workload_scope"}
+    assert set(unknown["unresolved"][0]["required_conditions"]) == {
         "cann", "framework", "workload_scope"}
 
     mismatch = index.explain_closure([rule.id], conditions={**OBSERVED, "soc": "Ascend910C"})

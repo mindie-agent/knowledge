@@ -1,5 +1,10 @@
 """Executable community CLI: submit / reconcile.
 
+[Role] Contributor-side community CLI for submit and reconcile operations.
+[Invariants] Each command validates configuration and surfaces typed publication status; unknown outcomes are never retried blindly.
+[Timeouts & Locks] Commands inherit the publication Deadline and bounded Git/GitHub waits.
+[Side-Effect Policy] Reads local settings/batches and performs the selected publication or read-only reconciliation.
+
 Contributor-side publication only. Repository-side review and Skill
 consolidation are performed by the EXTERNAL Grok Bot software under the
 maintainer's own deployment — see docs/repository-bot-contract.md; this

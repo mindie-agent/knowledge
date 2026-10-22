@@ -91,7 +91,7 @@ def _load_checkpoint(path,revision,context):
         return {}
     try:
         data=json.loads(Path(path).read_text(encoding='utf-8'))
-    except (OSError,ValueError):
+    except FileNotFoundError:
         return {}
     if not isinstance(data,dict):
         return {}
@@ -520,6 +520,8 @@ def main(argv=None):
     args=parser.parse_args(argv)
     try:result=validate(args.repo,args.revision,args.domain,state=args.state,
                         base_revision=args.base_revision)
+    except TimeoutError:
+        raise
     except (ValueError,CommunityError,OSError,UnicodeError) as exc:
         parser.exit(1,f'Invalid publication: {str(exc)[:500]}\n')
     print(json.dumps(result,sort_keys=True))

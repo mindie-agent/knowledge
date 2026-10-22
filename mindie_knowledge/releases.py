@@ -1,5 +1,10 @@
 """Validate public release declarations and select without I/O or installation.
 
+[Role] Validate public release declarations and select a compatible release without I/O.
+[Invariants] Selection uses the declared harness range and immutable source identity; a manifest claim is never accepted as download proof.
+[Timeouts & Locks] Pure version arithmetic; no network, installer or lock wait occurs in this module.
+[Side-Effect Policy] Returns selected release facts only; installation, download and token use belong to the native installer.
+
 Callers fetch Release facts/metadata from their fixed official repository and
 verify the selected Git object before invoking the native installer. A manifest
 claim is not proof of its download origin or of the bytes at its source SHA.

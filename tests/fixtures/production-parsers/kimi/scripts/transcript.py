@@ -85,11 +85,15 @@ class FileIdentity:
 def identify(path) -> FileIdentity | None:
     try:
         fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    except TimeoutError:
+        raise
     except (OSError, ValueError):
         return None
     try:
         stat = os.fstat(fd)
         anchor = os.read(fd, ANCHOR_BYTES)
+    except TimeoutError:
+        raise
     except OSError:
         return None
     finally:
@@ -371,6 +375,8 @@ def read_material(
                 consumed.update(raw)
                 result["end"] = stream.tell()
             result["more"] = result["end"] < stat.st_size
+    except TimeoutError:
+        raise
     except OSError:
         result.update(status="missing", coverage_note="transcript unreadable")
         return result

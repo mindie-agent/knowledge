@@ -244,6 +244,8 @@ def _reader(stream, tag, chunks, cancel, errors):
                 except queue.Full:
                     if cancel is not None and cancel.is_set():
                         return
+    except TimeoutError:
+        raise
     except OSError as exc:
         errors.append(exc)
     finally:
@@ -268,6 +270,8 @@ def bounded_run(command, payload, *, timeout=None, max_output, cancel=None,
             if on_result is not None:
                 scratch = summary_scratch.create_root()
             process = _spawn(command, input_file, scratch, child_env)
+        except TimeoutError:
+            raise
         except (OSError, posix_owner.LaunchError) as exc:
             if not hasattr(exc, "mindie_execution"):
                 exc.mindie_execution = 'not_started'
@@ -277,6 +281,8 @@ def bounded_run(command, payload, *, timeout=None, max_output, cancel=None,
             elif scratch is not None:
                 try:
                     shutil.rmtree(scratch)
+                except TimeoutError:
+                    raise
                 except OSError as cleanup_error:
                     failure("organizer.process", stage="scratch-cleanup", category="cleanup",
                             exception=cleanup_error)

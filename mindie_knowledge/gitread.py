@@ -1,5 +1,10 @@
 """Bounded blob reads through one persistent ``git cat-file --batch``.
 
+[Role] Bounded blob reads through one persistent `git cat-file --batch` process.
+[Invariants] Protocol records are size-checked and desynchronization fails visibly; a missing blob is distinct from a read failure.
+[Timeouts & Locks] Reads honor the caller deadline and cancellation; the batch process is always terminated on close.
+[Side-Effect Policy] Spawns a read-only Git process in the selected repository and never writes repository objects.
+
 Spawning a fresh Git process per blob repeats initialization as a knowledge
 base grows; one owned batch process per validation operation keeps each read
 a bounded single-record operation
@@ -130,6 +135,8 @@ def run_stdout_to_file(argv, target, *, timeout=None, env=None, cancel=None):
         out_handle.close()
         try:
             os.unlink(err_name)
+        except TimeoutError:
+            raise
         except OSError:
             pass
 
@@ -142,7 +149,7 @@ def _bounded_tail(path, limit=64 * 1024):
             if size > limit:
                 handle.seek(size - limit)
             return handle.read().decode("utf-8", "replace").strip()[:300]
-    except OSError:
+    except FileNotFoundError:
         return ""
 
 
@@ -206,6 +213,8 @@ class CatFileBatch:
                 with self._cond:
                     self._buffer.extend(chunk)
                     self._cond.notify_all()
+        except TimeoutError:
+            raise
         except OSError:
             pass
         finally:
@@ -278,6 +287,8 @@ class CatFileBatch:
     def close(self):
         try:
             self._process.stdin.close()
+        except TimeoutError:
+            raise
         except OSError:
             pass
         terminate_tree(self._process)

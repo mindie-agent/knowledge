@@ -116,6 +116,8 @@ class _BoundedHTTPServer(ThreadingHTTPServer):
             if not self.slots.acquire(timeout=self.slot_wait):
                 request.close()
                 return
+        except TimeoutError:
+            raise
         except OSError:
             return
         try:
@@ -456,6 +458,8 @@ class Service:
                 self._config_missing_since = now
             elif now - self._config_missing_since >= 30.0:
                 self._config_retired = self._stop_if_idle().get("idle", False)
+        except TimeoutError:
+            raise
         except OSError:
             self._config_missing_since = None
         else:

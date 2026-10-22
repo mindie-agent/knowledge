@@ -1,5 +1,10 @@
 """Bounded delivery projection over existing full diagnostic records.
 
+[Role] Bounded delivery projection over existing full diagnostic records.
+[Invariants] The projection contains labels/counts only, never task text, stderr or exception messages; a missing schema is not rebuilt on read.
+[Timeouts & Locks] SQLite uses WAL with a 5 s busy timeout; no unbounded retry or lock is held.
+[Side-Effect Policy] Writes the local agent-delivery projection for enqueue/acknowledge; read paths do not create or chmod state.
+
 Vendored unchanged into the adapter bootstrap so a broken runtime can still
 leave an Agent-visible incident. No task text, stderr or exception messages.
 """
@@ -39,6 +44,9 @@ def _present(path):
         return False
 
 
+_PENDING_COLUMNS = {'key', 'generation', 'delivered', 'value'}
+
+
 def _open(create=False):
     path = root() / 'agent-delivery.sqlite3'
     existed = _present(path)
@@ -46,21 +54,23 @@ def _open(create=False):
         return None
     if path.is_symlink() or (existed and not path.is_file()):
         raise ValueError('diagnostic projection must be a regular local file')
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if create:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     db = sqlite3.connect(path, timeout=5.0)
     try:
         db.row_factory = sqlite3.Row
-        db.execute('BEGIN IMMEDIATE')
-        columns = {row[1] for row in db.execute('PRAGMA table_info(pending)')}
-        if not columns:
-            if existed:
-                raise ValueError('diagnostic delivery schema is missing; pending incidents were not rebuilt')
-            db.execute('CREATE TABLE pending (key TEXT PRIMARY KEY, generation INTEGER NOT NULL, delivered INTEGER NOT NULL, value TEXT NOT NULL)')
-            columns = {'key', 'generation', 'delivered', 'value'}
-        if not {'key', 'generation', 'delivered', 'value'} <= columns:
-            raise ValueError('diagnostic delivery schema or constraints are incomplete')
-        db.commit()
-        path.chmod(0o600)
+        db.execute('PRAGMA busy_timeout=5000')
+        if create:
+            # WAL is enabled only when this call owns creation. A read of an
+            # existing projection must not rewrite a damaged file or its mode.
+            db.execute('PRAGMA journal_mode=WAL')
+            # CREATE IF NOT EXISTS keeps normal enqueue on one statement path;
+            # no schema reflection is needed for an already valid projection.
+            with db:
+                db.execute('CREATE TABLE IF NOT EXISTS pending '
+                           '(key TEXT PRIMARY KEY, generation INTEGER NOT NULL, '
+                           'delivered INTEGER NOT NULL, value TEXT NOT NULL)')
+            path.chmod(0o600)
         return db
     except BaseException:
         db.close()
@@ -98,7 +108,15 @@ def pending(limit=8):
     if db is None:
         return None
     try:
-        rows = db.execute('SELECT * FROM pending WHERE generation>delivered ORDER BY key LIMIT ?', (limit,)).fetchall()
+        try:
+            cursor = db.execute('SELECT * FROM pending WHERE generation>delivered ORDER BY key LIMIT ?', (limit,))
+        except sqlite3.DatabaseError as exc:
+            raise ValueError('diagnostic delivery schema is missing or damaged; '
+                             'pending incidents were not rebuilt') from exc
+        present = {column[0] for column in cursor.description or ()}
+        if not _PENDING_COLUMNS <= present:
+            raise ValueError('diagnostic delivery schema or constraints are incomplete')
+        rows = cursor.fetchall()
         total = db.execute('SELECT coalesce(sum(generation-delivered),0) FROM pending').fetchone()[0]
         if not rows:
             return None

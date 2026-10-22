@@ -77,10 +77,14 @@ class FileIdentity:
         """SHA256 of the first ``count`` bytes read on one fresh handle."""
         try:
             fd = os.open(_resolved_path(self.path), os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        except TimeoutError:
+            raise
         except (OSError, ValueError):
             return None
         try:
             return hashlib.sha256(os.read(fd, count)).hexdigest()
+        except TimeoutError:
+            raise
         except OSError:
             return None
         finally:
@@ -119,11 +123,15 @@ def identify(path) -> FileIdentity | None:
     """Stat + anchor read bound to one opened handle; None if unreadable."""
     try:
         fd = os.open(_resolved_path(path), os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    except TimeoutError:
+        raise
     except (OSError, ValueError):
         return None
     try:
         stat = os.fstat(fd)
         anchor = os.read(fd, ANCHOR_BYTES)
+    except TimeoutError:
+        raise
     except OSError:
         return None
     finally:
@@ -457,6 +465,8 @@ def read_material(path, start, *, session_id=None, not_before=None, expected=Non
                 consumed.update(raw)
                 result["end"] = stream.tell()
             result["more"] = result["end"] < stat.st_size
+    except TimeoutError:
+        raise
     except OSError:
         result.update(status="missing",coverage_note="transcript unreadable")
         return result

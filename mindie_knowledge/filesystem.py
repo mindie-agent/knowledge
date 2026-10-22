@@ -1,4 +1,10 @@
-"""Native Windows paths without changing the physical state location."""
+"""Native Windows paths without changing the physical state location.
+
+[Role] Native Windows path spelling while keeping physical state locations stable.
+[Invariants] Extended paths preserve the same identity as their logical spelling; comparisons resolve aliases before checking components.
+[Timeouts & Locks] Pure path arithmetic; no I/O, lock or wait is performed by these helpers.
+[Side-Effect Policy] Returns path/URI values only; never creates, renames or deletes files.
+"""
 
 import ntpath
 import os

@@ -155,6 +155,8 @@ def restore_changed(report, *, timeout=5.0):
                 receipt = result.get('retirement') if result.get('idle') else None
             result = restore_service(path, receipt, control_timeout=max(0, deadline - time.monotonic()))
             outcomes.append(dict(domain=row['domain'], **result))
+        except TimeoutError:
+            raise
         except (OSError, ValueError, RuntimeError) as exc:
             outcomes.append(dict(domain=row['domain'], status='incomplete', error_type=type(exc).__name__))
     return dict(status='incomplete' if any(row['status'] == 'incomplete' for row in outcomes) else 'restored', domains=outcomes)
@@ -192,6 +194,8 @@ def retire_changed(previous, candidate, *, timeout=30.0, include_default=False):
             if remaining <= 0:
                 raise TimeoutError('domain retirement budget expired')
             row.update(retire_service(path, control_timeout=remaining))
+        except TimeoutError:
+            raise
         except (OSError, ValueError, RuntimeError) as exc:
             row.update(idle=None, error_type=type(exc).__name__)
             if getattr(exc, 'mindie_retirement', None) is not None:

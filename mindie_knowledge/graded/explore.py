@@ -29,6 +29,8 @@ from .explore_support import (
     flagged,
     guard_regression,
     legacy_evaluate,
+    select_pareto_candidates,
+    stage_budget_guidance,
 )
 from .units import CATEGORY_TO_TIER
 
@@ -548,4 +550,5 @@ if __name__ == "__main__":
 
 __all__ = ["assess_stagnation", "build_citation_feedback_record", "build_exploration_context",
            "build_strategy_navigation_cards", "enforce_direction_budget",
-           "evaluate_exploration_candidate", "main"]
+           "evaluate_exploration_candidate", "main", "select_pareto_candidates",
+           "stage_budget_guidance"]

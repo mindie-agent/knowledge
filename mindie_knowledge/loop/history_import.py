@@ -1,5 +1,10 @@
 """Explicit source selection using the same incremental material pipeline as Stop.
 
+[Role] Explicit historical source selection through the same incremental material pipeline.
+[Invariants] No source discovery or private transcript copies; each page commits redacted blocks, cursor and scanner state together.
+[Timeouts & Locks] Page reads and redaction honor the caller deadline/cancellation; no model call is made by import itself.
+[Side-Effect Policy] Reads the explicitly named source and writes material/cursor state through the Store.
+
 No source discovery, private transcript copies or separate history organizer.
 Each page commits its redacted blocks, cursor and scanner state together. A
 repeat validates the consumed source prefix and resumes only its new suffix.

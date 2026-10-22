@@ -154,7 +154,7 @@ def ensure_service(config_path, *, _from_detached_starter=False):
     ready = False
     # Other starters retain this OS lock for their complete readiness handshake.
     # A slow initializer remains the sole owner for any duration.
-    lock.acquire(wait=None)
+    lock.acquire(wait=5.0)
     try:
         require_active(config_path, config)
         while True:
@@ -185,6 +185,8 @@ def ensure_service(config_path, *, _from_detached_starter=False):
             from .diagnostics import record_startup_failure
             try:
                 record_startup_failure(config_path, config, "service_host", exc)
+            except TimeoutError:
+                raise
             except (OSError, ValueError):
                 pass
         raise
@@ -308,16 +310,19 @@ def contribution_recovery(config, operation, batch_id):
         if ledger_path.is_file():
             import sqlite3
 
-            db = sqlite3.connect(sqlite_file_uri(ledger_path) + "?mode=ro", uri=True)
+            db = sqlite3.connect(sqlite_file_uri(ledger_path) + "?mode=ro", uri=True,
+                                 timeout=5.0)
             try:
-                names = [r[1] for r in db.execute("PRAGMA table_info(publication)")]
-                result["ledger"] = [
-                    dict(zip(names, row))
-                    for row in db.execute(
+                db.execute("PRAGMA busy_timeout=5000")
+                try:
+                    cursor = db.execute(
                         "SELECT * FROM publication WHERE batch_id=? ORDER BY created",
                         (batch_id,),
                     )
-                ]
+                except sqlite3.OperationalError as exc:
+                    raise ValueError("publication ledger schema is missing") from exc
+                names = [column[0] for column in cursor.description or ()]
+                result["ledger"] = [dict(zip(names, row)) for row in cursor]
             finally:
                 db.close()
         return result
@@ -473,11 +478,15 @@ def _serve(config_path, config):
         if service is not None:
             try:
                 published = connect(config) == service.connection
+            except TimeoutError:
+                raise
             except (OSError, ValueError):
                 pass
         if not published:
             try:
                 record_startup_failure(config_path, config, stage, exc)
+            except TimeoutError:
+                raise
             except (OSError, ValueError):
                 pass  # An unwritable state root cannot retain its own failure.
         raise
@@ -539,6 +548,8 @@ def main(argv=None):
         try:
             raw = sys.stdin.buffer.read()
             capture_hook(args.config, json.loads(raw))
+        except TimeoutError:
+            raise
         except (ValueError, TypeError, AttributeError, OSError, RecursionError):
             pass
         print("{}")
@@ -628,6 +639,8 @@ def main(argv=None):
     # stop
     try:
         result = rpc(connect(config), "stop")
+    except TimeoutError:
+        raise
     except (OSError, ValueError):
         # The endpoint is unreachable. Only a provably absent service gets
         # the not-running result; provably inert manager leftovers are
@@ -642,6 +655,8 @@ def main(argv=None):
         if backend is not None:
             try:
                 backend.remove_owned(args.config, config)
+            except TimeoutError:
+                raise
             except (OSError, ValueError, RuntimeError) as exc:
                 result.update(cleanup_failed=True, cleanup_error=dict(
                     stage="service_host", error_type=type(exc).__name__,
@@ -653,6 +668,8 @@ def main(argv=None):
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
+    except TimeoutError:
+        raise
     except (ValueError, OSError, RuntimeError) as exc:
         print(f"mindie-knowledge: {exc}", file=sys.stderr)
         raise SystemExit(2)

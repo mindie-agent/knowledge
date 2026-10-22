@@ -54,6 +54,11 @@ def _enforce_query_budget(payload, index, *, navigation_only=False):
     token_budget = payload["token_budget"]
     _finalize_usage_estimate(payload)
     if navigation_only:
+        while payload["response_token_estimate"] > token_budget and payload.get("unverified_cards"):
+            payload["unverified_cards"].pop()
+            if not payload["unverified_cards"]:
+                payload.pop("unverified_cards", None)
+            _finalize_usage_estimate(payload)
         original_cards = list(payload["cards"])
         original_foundations = {card["id"]: card for card in payload["foundation_cards"]}
         excluded = list(payload["excluded_budget"])
@@ -98,6 +103,12 @@ def _enforce_query_budget(payload, index, *, navigation_only=False):
     # Tiny synthetic unit-test budgets (< 256) exercise body-only excerpt shares.
     if token_budget < 256 or payload["response_token_estimate"] <= token_budget:
         return
+    while payload["response_token_estimate"] > token_budget and payload.get("unverified_cards"):
+        payload["unverified_cards"].pop()
+        if not payload["unverified_cards"]:
+            payload.pop("unverified_cards", None)
+        _finalize_usage_estimate(payload)
+    original_cards = list(payload.get("cards", ()))
     if payload["response_token_estimate"] > token_budget and payload["foundation_cards"]:
         payload["foundation_cards"] = []
         _finalize_usage_estimate(payload)
@@ -149,7 +160,14 @@ def _enforce_query_budget(payload, index, *, navigation_only=False):
             payload["usage"]["excluded_budget"] = list(excluded)
             payload["usage"]["has_more"] = True
             _recompute_query_body_tokens(payload)
-            _finalize_usage_estimate(payload)
+            for candidate in original_cards[:2]:
+                trial = [*payload["cards"], candidate]
+                payload["cards"] = trial
+                _finalize_usage_estimate(payload)
+                if payload["response_token_estimate"] > token_budget:
+                    payload["cards"].pop()
+                    _finalize_usage_estimate(payload)
+                    break
 
 
 class GradedRepository:
@@ -529,6 +547,11 @@ class GradedRepository:
                 card["unit_ref"] = self.ref(card["id"])
                 card["feedback_ref"] = card["ref"]
                 card.update(self._pending_local(index, local_by_id, card["id"]))
+            for card in result.get("unverified_cards", []):
+                card["ref"] = self.ref(card["id"], card["revision"])
+                card["unit_ref"] = self.ref(card["id"])
+                card["feedback_ref"] = card["ref"]
+                card.update(self._pending_local(index, local_by_id, card["id"]))
             payload = {"domain": self.store.domain, "retrieval": "graded-bm25", "page": "graded_units", **result}
             _enforce_query_budget(payload, index, navigation_only=navigation_only)
             for item in payload["results"]:
@@ -538,6 +561,8 @@ class GradedRepository:
             for card in payload.get("cards", []):
                 observe(self.store, index.units[card["id"]], delivery="query", run_id=run_id)
             for card in payload.get("foundation_cards", []):
+                observe(self.store, index.units[card["id"]], delivery="query", run_id=run_id)
+            for card in payload.get("unverified_cards", []):
                 observe(self.store, index.units[card["id"]], delivery="query", run_id=run_id)
         return payload
 

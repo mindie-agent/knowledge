@@ -357,6 +357,8 @@ def test_show_file_exact_blob_from_long_workdir_full_entry_id(tmp_path):
         decoy = work / f"{sha}:cases" / Path(path).name
         decoy.parent.mkdir(parents=True)
         decoy.write_bytes(b"not the blob\n")
+    except TimeoutError:
+        raise
     except OSError:
         pass
 

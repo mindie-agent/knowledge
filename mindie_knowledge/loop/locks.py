@@ -114,11 +114,15 @@ def lock_held(path):
     """
     try:
         fd = os.open(filesystem_path(path), os.O_RDWR)
+    except TimeoutError:
+        raise
     except OSError:
         return None
     try:
         try:
             _lock_file_nb(fd)
+        except TimeoutError:
+            raise
         except OSError as exc:
             return True if exc.errno in (errno.EACCES, errno.EAGAIN) else None
         _unlock_file(fd)
@@ -169,6 +173,8 @@ class StartLock:
                 raise
             try:
                 holder = json.loads(self.path.read_text() or "{}")
+            except TimeoutError:
+                raise
             except (OSError, ValueError):
                 holder = {}
             raise StartInProgress(
@@ -233,6 +239,8 @@ class StartLock:
         self.acquired = False
         try:
             _unlock_file(fd)
+        except TimeoutError:
+            raise
         except OSError:
             pass
         os.close(fd)

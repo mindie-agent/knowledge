@@ -1,5 +1,10 @@
 """Deterministic Skill package validation — no model, no dispatch, no PRs.
 
+[Role] Deterministic Skill package validation without model generation or dispatch.
+[Invariants] Every manifest/path/size rule is checked against bytes; an invalid package is reported, never repaired or published.
+[Timeouts & Locks] Pure bounded parsing and hashing; no subprocess, network or lock wait.
+[Side-Effect Policy] Read-only validation of caller-supplied files; no repository or Skill writes.
+
 Reusable checks for the *external* Grok Bot software's optional Skill
 proposals and for maintainers reviewing them. This module only validates
 bytes against the native package rules; it never generates content, never

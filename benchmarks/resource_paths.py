@@ -1,5 +1,10 @@
 """Synthetic, model-free audit; product source/configuration remain untouched.
 
+[Role] Synthetic, model-free resource audit for local material and database mechanisms.
+[Invariants] Each mode runs in a fresh process and measures only local mechanisms, not scanner/model/network latency.
+[Timeouts & Locks] Measurement loops are bounded by explicit iteration counts; no product lock or service is started.
+[Side-Effect Policy] Writes only temporary benchmark roots; product source and configuration remain untouched.
+
 Run each mode in a fresh process. These measurements cover local material,
 query and database mechanisms, not scanner/model/network or Windows latency.
 """
@@ -42,8 +47,10 @@ def resources():
     memory = PROCESS.memory_info()
     peak = (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss if resource is not None
             else getattr(memory, 'peak_wset', None))
-    if resource is not None and platform.system() != 'Darwin':
-        peak *= 1024
+    if resource is not None:
+        # Linux reports KiB; Darwin reports bytes. Normalize both to MiB
+        # instead of leaving Darwin's peak unmeasured or in mixed units.
+        peak = peak // (1024 * 1024) if platform.system() == 'Darwin' else peak // 1024
     return dict(rss=memory.rss, peak_rss=peak,
                 threads=PROCESS.num_threads(), python_threads=len(threading.enumerate()),
                 fds=PROCESS.num_fds() if hasattr(PROCESS, 'num_fds') else None,

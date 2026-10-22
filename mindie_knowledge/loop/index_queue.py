@@ -1,5 +1,10 @@
 """Incremental index stages on the existing material/attempt transaction.
 
+[Role] Incremental index stages on the existing material/attempt transaction.
+[Invariants] Queue readiness is derived from current block indexes and saved attempt facts; model execution never runs inside a transaction.
+[Timeouts & Locks] Applies results under the Store transaction with bounded scanner/model budgets supplied by the caller.
+[Side-Effect Policy] Updates material metadata and summary-attempt receipts only; paid model calls are delegated.
+
 Queue readiness is derived from current block indexes and saved attempt facts.
 Model execution stays outside transactions. Applying its returned result and
 completing the attempt share the body metadata transaction; promotion failures

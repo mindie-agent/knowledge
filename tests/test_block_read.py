@@ -187,6 +187,8 @@ def test_required_member_failure_is_not_normal_expiry(corpus, damage, tmp_path):
         path.unlink()
         try:
             path.symlink_to(target)
+        except TimeoutError:
+            raise
         except OSError:
             pytest.skip("host does not permit creating test symlinks")
     with pytest.raises(MaterialReadError) as caught:

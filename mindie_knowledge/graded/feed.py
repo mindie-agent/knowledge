@@ -149,6 +149,8 @@ def _scan_tree(repo, revision, prefix, listing_path, *, deadline, env, cancel):
     finally:
         try:
             listing_path.unlink()
+        except TimeoutError:
+            raise
         except OSError:
             pass
 

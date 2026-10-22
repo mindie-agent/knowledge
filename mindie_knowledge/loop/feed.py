@@ -373,12 +373,16 @@ class Feed:
             try:
                 self.store.retry_feed_cleanup()
                 receipt.pop("material_cleanup_error", None)
+            except TimeoutError:
+                raise
             except (OSError, MaterialCleanupError) as exc:
                 receipt["material_cleanup_error"] = str(exc)[:300]
         if receipt.get("material_cleanup_error"):
             errors.append("material cleanup: " + receipt["material_cleanup_error"])
         try:
             self._clear_staging()
+        except TimeoutError:
+            raise
         except OSError as exc:
             errors.append("staging cleanup: " + str(exc)[:300])
         if errors:
@@ -447,6 +451,8 @@ class Feed:
                     raise OSError("remote ref did not resolve to a commit")
                 self._retain_tip(commit, deadline)
             except InterruptedError:
+                raise
+            except TimeoutError:
                 raise
             except (OSError, TimeoutError) as exc:
                 self.store.feed_set(receipt_key, dict(
@@ -529,10 +535,14 @@ class Feed:
                     result.update(error_code=exc.code, failed_stage="publication-contract")
                 try:
                     self._clear_staging()
+                except TimeoutError:
+                    raise
                 except OSError as cleanup:
                     result.update(cleanup_status="failed", cleanup_error=str(cleanup)[:300])
                 return result
             except InterruptedError:
+                raise
+            except TimeoutError:
                 raise
             except (OSError, TimeoutError) as exc:
                 if getattr(exc, "metadata_committed", False):

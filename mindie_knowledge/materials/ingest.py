@@ -1,5 +1,10 @@
 """One deterministic material preparation path for live capture and explicit import.
 
+[Role] One deterministic material preparation path for live capture and explicit import.
+[Invariants] Input is redacted before splitting; every byte is assigned to exactly one bounded block and no omitted remainder is accepted.
+[Timeouts & Locks] Redaction and splitting honor caller cancellation and timeout budgets; no model call is made here.
+[Side-Effect Policy] Pure transformation of authorized source text into block descriptors; filesystem writes belong to the store.
+
 Native source records stay with the Harness. Only the authorized projection is
 redacted here, then divided without omission into stable bounded UTF-8 blocks.
 The small scanner state commits with the cursor, never in a second scheduler.

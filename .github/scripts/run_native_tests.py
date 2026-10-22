@@ -1,4 +1,10 @@
-"""Partition independent test modules without changing their cases or limits."""
+"""Partition independent test modules without changing their cases or limits.
+
+[Role] Partition independent test modules without changing cases or limits.
+[Invariants] Every collected module is assigned exactly once; shard order is deterministic and failures are not hidden by partitioning.
+[Timeouts & Locks] Pure file/argument processing; no test execution, lock or wait occurs here.
+[Side-Effect Policy] Reads test paths and writes the requested shard plan to stdout only.
+"""
 
 import argparse
 import json
