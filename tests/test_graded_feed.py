@@ -335,6 +335,24 @@ def test_feed_sync_reads_only_changed_blobs_and_revalidates_full_graph(tmp_path,
         store.close()
 
 
+def test_feed_sync_revalidates_invalid_candidate_recorded_under_older_schema_set(tmp_path):
+    parent = unit("unit-parent")
+    remote, sha = publish(tmp_path, unit_files(parent))
+    store, feed = _store_feed(tmp_path, remote)
+    try:
+        store.feed_set(f"feed-candidate:{feed.ident}", {
+            "commit": sha, "attempts": 1, "status": "invalid",
+            "detail": "publication contract schema or domain does not match",
+            "error_code": "contract_mismatch",
+            "schemas": [SCHEMA],
+        })
+        receipt = feed.sync()
+        assert receipt["status"] == "synced"
+        assert receipt["commit"] == sha
+    finally:
+        store.close()
+
+
 def test_feed_sync_v2_wrong_contract_never_silently_uses_v1(tmp_path):
     parent = unit("unit-parent")
     remote, _sha = publish(tmp_path, unit_files(parent), schema=SCHEMA)

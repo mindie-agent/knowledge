@@ -30,7 +30,7 @@ from mindie_knowledge.community.common import CommunityError, run_argv
 from mindie_knowledge.gitbin import GitUnavailableError, resolve_git
 from mindie_knowledge.gitread import with_windows_longpaths, _check_cancel
 from mindie_knowledge.publication_contract import (
-    DATA_FORMAT_V2, data_format, read_git_contract,
+    DATA_FORMAT_V2, FORMATS_BY_SCHEMA, data_format, read_git_contract,
 )
 from mindie_knowledge.filesystem import filesystem_path, git_path
 from mindie_knowledge.git_layout import feed_repository_path, validate_git_directory
@@ -466,8 +466,11 @@ class Feed:
                 self.store.feed_set(receipt_key, cleaned)
                 return cleaned
             candidate = self._candidate()
-            if candidate.get("commit") != commit:
-                candidate = {"commit": commit, "attempts": 0, "status": "new"}
+            supported_schemas = sorted(FORMATS_BY_SCHEMA)
+            if (candidate.get("commit") != commit
+                    or candidate.get("schemas") != supported_schemas):
+                candidate = {"commit": commit, "attempts": 0, "status": "new",
+                             "schemas": supported_schemas}
             if candidate.get("status") == "invalid":
                 result = dict(status="invalid", repository=self.repository,
                               commit=commit, detail=candidate.get("detail", ""),
