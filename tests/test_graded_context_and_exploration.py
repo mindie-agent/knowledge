@@ -89,9 +89,13 @@ def test_explore_mode_strips_l3_but_keeps_l1_premises_and_fact_pack(store):
                      parents=[procedure.id], body="Old workflow alpha recommendation.")
     mutator = _unit("unit-explore-l4", "L4", "mutator",
                     {"soc": ["Ascend910B"], "dtype": "bf16"},
-                    body="Apply the runtime scalar mutator.")
+                    body="Apply the runtime scalar mutator for workflow alpha.")
     index = RoutingIndex([premise, procedure, workflow, mutator])
     conditions = {"soc": "Ascend910B", "dtype": "bf16"}
+    reuse_res = index.query("workflow alpha", conditions=conditions, mode="reuse",
+                            limit=1, token_budget=16000)
+    assert [row["id"] for row in reuse_res["results"]] == [workflow.id]
+
     result = index.query("workflow alpha", conditions=conditions, mode="explore",
                          token_budget=16000, goal="remove recompiles",
                          ledger_entries=[{"run_id": "run-1", "verdict": "refuted",
@@ -102,8 +106,10 @@ def test_explore_mode_strips_l3_but_keeps_l1_premises_and_fact_pack(store):
     assert result["mode"] == "explore"
     assert result["stripped_l3_ids"] == [workflow.id]
     assert workflow.id not in {row["id"] for row in result["results"]}
+    assert mutator.id in {row["id"] for row in result["results"]}
     assert premise.id in {row["id"] for row in result["foundation_cards"]}
     context = result["exploration_context"]
+    assert [row["id"] for row in context["l4_mutators"]] == [mutator.id]
     assert context["stagnation"]["stalled"] is False
     assert context["conditional_avoid"][0]["unit_id"] == ""
     pack = context["subagent_fact_pack"]

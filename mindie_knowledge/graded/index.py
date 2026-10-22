@@ -237,10 +237,12 @@ class RoutingIndex:
         for ident, score in scores.items():
             path = self.units[ident].metadata["domain_path"]
             preferred = bool(domain_path and (path == domain_path or path.startswith(domain_path + "/")))
+            tier = self.units[ident].metadata["tier"]
+            tier_weight = 0.55 if (mode == "reuse" and tier == "L4") else 1.0
             if score:
-                ranked.append((score * (1.1 if preferred else 1), ident,
+                ranked.append((score * (1.1 if preferred else 1) * tier_weight, ident,
                                "preferred_domain" if preferred else "cross_directory"))
-            elif (conditions is not None and self.units[ident].metadata["tier"] == "L1"
+            elif (conditions is not None and tier == "L1"
                   and (path == "_common" or path.startswith("_common/") or preferred)
                   and applicability[ident].status == "matched" and ident not in inherited_by_higher):
                 ranked.append((FOUNDATION_SCORE, ident, "foundation_baseline"))
@@ -262,9 +264,18 @@ class RoutingIndex:
                     if (parent_unit.metadata["tier"] in {"L1", "L2"}
                             and applicability[parent].status == "matched"):
                         promoted[parent] = scores.get(parent, FOUNDATION_SCORE)
-            existing = {ident for _score, ident, _route in source_selected}
-            selected = [row for row in source_selected
-                        if self.units[row[1]].metadata["tier"] != "L3"]
+            non_l3 = [
+                (
+                    row[0] * (1.35 if self.units[row[1]].metadata["tier"] == "L4" else 1.0),
+                    row[1],
+                    row[2],
+                )
+                for row in ranked
+                if self.units[row[1]].metadata["tier"] != "L3"
+            ]
+            non_l3.sort(key=lambda item: (-item[0], item[1]))
+            selected = non_l3[:limit]
+            existing = {ident for _score, ident, _route in selected}
             for parent, score in sorted(promoted.items(), key=lambda item: (-item[1], item[0])):
                 if parent not in existing:
                     selected.append((score, parent, "promoted_l3_foundation"))
@@ -325,6 +336,7 @@ class RoutingIndex:
             return card
 
         def finish(payload):
+            nonlocal stripped_l3_ids
             if not payload.get("cards") and not payload.get("results") and rejected.get("unknown", 0) > 0:
                 if not include_unknown and token_budget >= 256:
                     unknown_ranked = []
@@ -335,24 +347,43 @@ class RoutingIndex:
                             continue
                         if any(r.endswith("source applicability is unknown") for r in applicability[ident].reasons):
                             continue
-                        if mode == "explore" and unit.metadata["tier"] == "L3":
-                            continue
                         score = 0.0
                         count = self.counts[ident]
+                        headers = self.header_terms[ident]
                         for term in terms:
                             frequency = count[term]
                             if frequency:
                                 inverse = math.log(1 + (len(self.units) - self.frequencies[term] + .5) / (self.frequencies[term] + .5))
-                                score += inverse * frequency * 2.2 / (frequency + 1.2 * (.25 + .75 * self.lengths[ident] / self.average))
+                                weight = 1.25 if term in headers else 1.0
+                                score += weight * inverse * frequency * 2.2 / (frequency + 1.2 * (.25 + .75 * self.lengths[ident] / self.average))
                         if score <= 0:
                             continue
                         path = unit.metadata["domain_path"]
                         preferred = bool(domain_path and (path == domain_path or path.startswith(domain_path + "/")))
-                        unknown_ranked.append((score * (1.1 if preferred else 1), ident,
+                        tier = unit.metadata["tier"]
+                        tier_weight = 0.55 if (mode == "reuse" and tier == "L4") else 1.0
+                        unknown_ranked.append((score * (1.1 if preferred else 1) * tier_weight, ident,
                                                "preferred_domain" if preferred else "cross_directory"))
                     unknown_ranked.sort(key=lambda item: (-item[0], item[1]))
+                    cap = min(limit, 5)
+                    if mode == "explore":
+                        for u_score, ident, u_route in unknown_ranked[:cap]:
+                            if self.units[ident].metadata["tier"] == "L3":
+                                stripped_l3_ids.append(ident)
+                                source_selected.append((u_score, ident, u_route))
+                        stripped_l3_ids = sorted(set(stripped_l3_ids))
+                        unknown_ranked = [
+                            (
+                                row[0] * (1.35 if self.units[row[1]].metadata["tier"] == "L4" else 1.0),
+                                row[1],
+                                row[2],
+                            )
+                            for row in unknown_ranked
+                            if self.units[row[1]].metadata["tier"] != "L3"
+                        ]
+                        unknown_ranked.sort(key=lambda item: (-item[0], item[1]))
                     unverified_cards = []
-                    for u_score, ident, u_route in unknown_ranked[:min(limit, 5)]:
+                    for u_score, ident, u_route in unknown_ranked[:cap]:
                         missing = missing_for(ident)
                         card = card_for(ident, score=u_score, route=u_route, ready=False, missing=missing)
                         unit_conds = self.units[ident].metadata["conditions"]
@@ -382,7 +413,7 @@ class RoutingIndex:
                         for parent in self.closure[ident]
                         if self.units[parent].metadata["tier"] in {"L1", "L2"}]
                 rows.append(row)
-            for key in ("cards", "foundation_cards", "results"):
+            for key in ("cards", "foundation_cards", "results", "unverified_cards"):
                 for item in payload.get(key, ()):
                     if item["id"] in seen:
                         continue
@@ -390,8 +421,13 @@ class RoutingIndex:
                     unit = self.units[item["id"]]
                     rows.append({**unit.metadata, "body": unit.body})
             from .explore import assess_stagnation, build_exploration_context
+            norm_bottleneck = (
+                {"summary": bottleneck_summary}
+                if isinstance(bottleneck_summary, str)
+                else (bottleneck_summary or {})
+            )
             context = build_exploration_context(
-                rows, bottleneck_summary=bottleneck_summary or {},
+                rows, bottleneck_summary=norm_bottleneck,
                 failed_attempts=ledger_entries or [], native_subcontext=native_subcontext,
                 goal=goal, conditions=conditions)
             context["stagnation"] = assess_stagnation(ledger_entries or [])
