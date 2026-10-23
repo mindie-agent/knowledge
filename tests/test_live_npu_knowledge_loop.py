@@ -466,9 +466,9 @@ def test_live_s1_s2_multi_die_subcluster_topology_and_graded_routing(tmp_path):
     second = topologies["a3-second"]
     process_names = {name for names in second.processes.values() for name in names}
     if second.occupied_npus and any(name.startswith("VLLM") for name in process_names):
-        # A partially occupied .156 must expose the TP worker alongside the
+        # A partially occupied .156 must expose the vLLM worker (TP or DP) alongside the
         # engine coordinator; otherwise the idle subset is not trustworthy.
-        assert "VLLMWorker_TP" in process_names
+        assert any(name.startswith("VLLMWorker_") for name in process_names)
 
     candidates = []
     for name in ("a3-second", "a3"):

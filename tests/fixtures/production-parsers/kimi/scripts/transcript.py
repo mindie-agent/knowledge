@@ -1,10 +1,23 @@
-"""Kimi Code public-record parser (wire.jsonl). Adapter-owned.
+"""Kimi Code public-record transcript parser (`wire.jsonl`).
 
-Native probe times (`time`, `metadata.created_at`, `state.createdAt`) are
-Unix milliseconds. Core capture boundaries are seconds. Convert before
-filtering. Fork exclusion uses the fork session's state.createdAt only;
-copied metadata.created_at is the source time and must not prove a boundary.
-User role material is origin.kind == 'user' only (injection/system excluded).
+[Role]
+Reads bounded pages of Kimi's native `wire.jsonl` session transcript for the
+shared knowledge capture pipeline, verifying file identity, session ownership,
+fork timestamp boundaries (`state.createdAt`), and activation time boundaries.
+
+[Invariants]
+- Native probe timestamps (`time`, `metadata.created_at`, `state.createdAt`) are
+  Unix milliseconds and are converted to seconds before boundary comparison.
+- Fork exclusion uses the fork session's `state.createdAt` from `state.json`.
+- Only `origin.kind == "user"` user messages and non-thinking assistant text
+  parts are exported; tool inputs/results and thinking traces are excluded.
+
+[Timeouts & Locks]
+- Bounded by `max_scan_bytes` (default 16 MiB), `max_seconds` (default 2.0s),
+  `max_text_bytes` (default 48 KiB), and `MAX_RECORDS` (200).
+
+[Side-Effect Policy]
+- Purely read-only over `wire.jsonl` and parent `state.json`.
 """
 
 from __future__ import annotations
@@ -51,12 +64,7 @@ class FileIdentity:
 
     def serialize(self) -> str:
         return json.dumps(
-            dict(
-                dev=self.dev,
-                ino=self.ino,
-                anchor_len=self.anchor_len,
-                anchor_digest=self.anchor_digest,
-            ),
+            dict(dev=self.dev, ino=self.ino, anchor_len=self.anchor_len, anchor_digest=self.anchor_digest),
             sort_keys=True,
             separators=(",", ":"),
         )
@@ -74,38 +82,24 @@ class FileIdentity:
                 or len(anchor_digest) != 64
             ):
                 return None
-            return FileIdentity(
-                path, int(data["dev"]), int(data["ino"]), 0, 0,
-                anchor_len, anchor_digest,
-            )
+            return FileIdentity(path, int(data["dev"]), int(data["ino"]), 0, 0, anchor_len, anchor_digest)
         except (ValueError, KeyError, TypeError):
             return None
 
 
 def identify(path) -> FileIdentity | None:
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        with open(path, "rb") as stream:
+            st = os.fstat(stream.fileno())
+            anchor = stream.read(ANCHOR_BYTES)
     except TimeoutError:
         raise
     except (OSError, ValueError):
         return None
-    try:
-        stat = os.fstat(fd)
-        anchor = os.read(fd, ANCHOR_BYTES)
-    except TimeoutError:
-        raise
-    except OSError:
-        return None
-    finally:
-        os.close(fd)
     return FileIdentity(
         str(Path(path).resolve()),
-        stat.st_dev,
-        stat.st_ino,
-        stat.st_size,
-        stat.st_mtime_ns,
-        len(anchor),
-        hashlib.sha256(anchor).hexdigest(),
+        st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns,
+        len(anchor), hashlib.sha256(anchor).hexdigest(),
     )
 
 
@@ -113,9 +107,7 @@ def to_seconds(raw):
     if type(raw) not in (int, float) or raw <= 0:
         return None
     value = float(raw)
-    if value >= MS_THRESHOLD:
-        value = value / 1000.0
-    return value
+    return value / 1000.0 if value >= MS_THRESHOLD else value
 
 
 def _session_in_path(path) -> str | None:
@@ -123,9 +115,7 @@ def _session_in_path(path) -> str | None:
     if "sessions" not in parts:
         return None
     index = parts.index("sessions")
-    if index + 2 < len(parts):
-        return parts[index + 2]
-    return None
+    return parts[index + 2] if index + 2 < len(parts) else None
 
 
 def _timestamp(record):
@@ -135,21 +125,16 @@ def _timestamp(record):
 def _text_parts(content):
     if not isinstance(content, list):
         return ""
-    chunks = []
-    for item in content:
-        if not isinstance(item, dict):
-            continue
-        if item.get("type") == "text" and isinstance(item.get("text"), str):
-            chunks.append(item["text"])
-    return "\n".join(chunks)
+    return "\n".join(
+        item["text"] for item in content
+        if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str)
+    )
 
 
 def _origin_kind(message):
     origin = message.get("origin") if isinstance(message, dict) else None
-    if isinstance(origin, dict):
-        kind = origin.get("kind")
-        return kind if isinstance(kind, str) else None
-    return None
+    kind = origin.get("kind") if isinstance(origin, dict) else None
+    return kind if isinstance(kind, str) else None
 
 
 def _extract(record):
@@ -172,36 +157,23 @@ def _extract(record):
         return None
     if rtype == "context.append_loop_event":
         event = record.get("event")
-        if not isinstance(event, dict):
-            return None
-        etype = event.get("type")
-        if etype == "content.part":
+        if isinstance(event, dict) and event.get("type") == "content.part":
             part = event.get("part")
-            if not isinstance(part, dict):
-                return None
-            if part.get("type") == "think":
-                return None
-            if part.get("type") == "text" and isinstance(part.get("text"), str):
+            if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
                 text = part["text"].strip()
                 return ("assistant", text) if text else None
-            return None
-        return None
     return None
 
 
 def _fork_boundary(path) -> float | None:
-    """Inherited material ends at the fork session's createdAt (seconds)."""
     try:
         state_path = Path(path).resolve().parents[2] / "state.json"
-        data = json.loads(state_path.read_text(encoding='utf-8'))
+        data = json.loads(state_path.read_text(encoding="utf-8"))
     except (OSError, ValueError, IndexError):
-        # Missing or partially written native state cannot prove that this
-        # is a root session. Keep the cursor until state is readable again.
         raise OSError("native session state unavailable; inherited material not read") from None
     if not isinstance(data, dict):
         raise OSError("native session state invalid; inherited material not read")
-    parent = data.get("forkedFrom") or data.get("forked_from")
-    if not parent:
+    if not (data.get("forkedFrom") or data.get("forked_from")):
         return None
     created = to_seconds(data.get("createdAt") or data.get("created_at"))
     if created is None:
@@ -225,28 +197,17 @@ def read_material(
         raise ValueError("start must be a nonnegative offset")
     if max_scan_bytes <= 0 or max_seconds <= 0:
         raise ValueError("invalid scan budget")
-    if scan_until is not None and (
-        type(scan_until) is not int or scan_until < start
-    ):
+    if scan_until is not None and (type(scan_until) is not int or scan_until < start):
         raise ValueError("scan_until must be an exact byte boundary at or after start")
     if max_text_bytes <= 0:
         raise ValueError("invalid text budget")
     boundary = to_seconds(not_before) if not_before is not None else None
     result = dict(
-        status="ok",
-        start=start,
-        end=start,
-        digest=hashlib.sha256(b"").hexdigest(),
-        text="",
-        records=0,
-        skipped_records=0,
-        oversize_records=0,
-        partial=False,
-        more=False,
-        timestamps_reliable=True,
-        session_match=None,
-        coverage_note=None,
-        coverage=[],
+        status="ok", start=start, end=start,
+        digest=hashlib.sha256(b"").hexdigest(), text="",
+        records=0, skipped_records=0, oversize_records=0,
+        partial=False, more=False, timestamps_reliable=True,
+        session_match=None, coverage_note=None, coverage=[],
     )
     consumed = hashlib.sha256()
     recognized = 0
@@ -260,101 +221,80 @@ def read_material(
         return result
     try:
         with open(path, "rb") as stream:
-            stat = os.fstat(stream.fileno())
+            st = os.fstat(stream.fileno())
             anchor = stream.read(ANCHOR_BYTES)
             current = FileIdentity(
                 str(Path(path).resolve()),
-                stat.st_dev,
-                stat.st_ino,
-                stat.st_size,
-                stat.st_mtime_ns,
-                len(anchor),
-                hashlib.sha256(anchor).hexdigest(),
+                st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns,
+                len(anchor), hashlib.sha256(anchor).hexdigest(),
             )
             result["identity"] = current.serialize()
-            result["snapshot_size"] = stat.st_size
+            result["snapshot_size"] = st.st_size
             if expected is not None:
                 stream.seek(0)
                 if (
                     expected.path != current.path
-                    or expected.dev != stat.st_dev
-                    or expected.ino != stat.st_ino
+                    or expected.dev != st.st_dev
+                    or expected.ino != st.st_ino
                     or not expected.anchor_len
-                    or hashlib.sha256(stream.read(expected.anchor_len)).hexdigest()
-                    != expected.anchor_digest
+                    or hashlib.sha256(stream.read(expected.anchor_len)).hexdigest() != expected.anchor_digest
                 ):
-                    result.update(
-                        status="replaced",
-                        coverage_note="transcript changed before read",
-                    )
+                    result.update(status="replaced", coverage_note="transcript changed before read")
                     return result
-            if stat.st_size < start:
+            if st.st_size < start:
                 result.update(status="replaced", coverage_note="transcript truncated")
                 return result
             owner = _session_in_path(path)
             if owner:
                 result["session_match"] = not session_id or owner == session_id
                 if session_id and owner != session_id:
-                    result.update(
-                        status="wrong-task",
-                        coverage_note="transcript belongs to another task",
-                    )
+                    result.update(status="wrong-task", coverage_note="transcript belongs to another task")
                     return result
             elif session_id:
-                result.update(
-                    status="unknown-format",
-                    coverage_note="task path identity unavailable; no public read",
-                )
+                result.update(status="unknown-format", coverage_note="task path identity unavailable; no public read")
                 return result
             stream.seek(max(0, start - 1))
-            middle = start > 0 and stream.read(1) != b"\n"
-            if middle:
+            if start > 0 and stream.read(1) != b"\n":
                 result.update(status="invalid-boundary", coverage_note="cursor is not a whole-record boundary")
                 return result
             stream.seek(start)
-            end_limit = min(stat.st_size, start + max_scan_bytes)
+            end_limit = min(st.st_size, start + max_scan_bytes)
             if scan_until is not None:
                 end_limit = min(end_limit, scan_until)
             while stream.tell() < end_limit and time.monotonic() - begun < max_seconds:
                 offset = stream.tell()
-                # Page targets apply between records; every message stays whole.
-                room = stat.st_size - offset
+                room = st.st_size - offset
                 if scan_until is not None:
                     room = min(room, scan_until - offset)
                 raw = stream.readline(room)
                 if not raw:
                     break
                 if not raw.endswith(b"\n"):
-                    result["partial"] = offset + len(raw) == stat.st_size
+                    result["partial"] = offset + len(raw) == st.st_size
                     break
                 try:
                     record = json.loads(raw)
                 except (ValueError, UnicodeDecodeError):
                     record = None
                 if not isinstance(record, dict):
-                    # A corrupt complete record is isolated, never exported.
-                    # Its byte position is retained without copying raw content.
                     result.setdefault("discarded_records", []).append(
-                        dict(start=offset, end=stream.tell(), reason="invalid record"))
+                        dict(start=offset, end=stream.tell(), reason="invalid record")
+                    )
                     consumed.update(raw)
                     result["end"] = stream.tell()
                     result["skipped_records"] += 1
                     continue
-                extracted = None
-                stamp = None
-                if isinstance(record, dict):
-                    if record.get("type") in KNOWN:
-                        recognized += 1
-                    stamp = _timestamp(record)
-                    extracted = _extract(record)
-                    if fork_time is not None and (stamp is None or stamp < fork_time):
-                        extracted = None
+                if record.get("type") in KNOWN:
+                    recognized += 1
+                stamp = _timestamp(record)
+                extracted = _extract(record)
+                if fork_time is not None and (stamp is None or stamp < fork_time):
+                    extracted = None
                 if extracted and extracted[1]:
                     if boundary is not None and stamp is None:
-                        # Without a timestamp this record is not authorized.
-                        # Omit only this record; later dated messages can proceed.
                         result.setdefault("discarded_records", []).append(
-                            dict(start=offset, end=stream.tell(), reason="missing public timestamp"))
+                            dict(start=offset, end=stream.tell(), reason="missing public timestamp")
+                        )
                         consumed.update(raw)
                         result["end"] = stream.tell()
                         result["skipped_records"] += 1
@@ -374,38 +314,20 @@ def read_material(
                     result["skipped_records"] += 1
                 consumed.update(raw)
                 result["end"] = stream.tell()
-            result["more"] = result["end"] < stat.st_size
+            result["more"] = result["end"] < st.st_size
     except TimeoutError:
         raise
     except OSError:
         result.update(status="missing", coverage_note="transcript unreadable")
         return result
-    result.update(
-        digest=consumed.hexdigest(),
-        text="\n\n".join(included),
-        records=len(included),
-    )
+    result.update(digest=consumed.hexdigest(), text="\n\n".join(included), records=len(included))
     if result["status"] != "ok":
         return result
     if result["end"] == start:
-        # A trailing half-written record is pending material, not proof of
-        # no-new-material: report partial/more and leave the cursor unmoved
-        # for a finite deferred read. Only a truly empty page is unchanged.
         if not result["partial"]:
             result["status"] = "unchanged"
     elif not recognized and start == 0 and not result["more"]:
-        # Whole-file unknown-format only with whole-file evidence: a first
-        # page scanned to EOF without one recognized record. A positive
-        # offset is not proof of recognition either, so continuation pages
-        # never judge; the cumulative verdict belongs to the core cursor.
-        result.update(
-            status="unknown-format",
-            text="",
-            coverage_note="no recognized native Kimi wire signature",
-        )
+        result.update(status="unknown-format", text="", coverage_note="no recognized native Kimi wire signature")
     elif not recognized:
-        result["coverage_note"] = (
-            "page held no recognized records while bytes remain; "
-            "format verdict deferred to the owning cursor"
-        )
+        result["coverage_note"] = "page held no recognized records while bytes remain; format verdict deferred to the owning cursor"
     return result

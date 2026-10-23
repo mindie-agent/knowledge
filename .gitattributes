@@ -1,2 +1,6 @@
+# Enforce Unix LF (\n) line endings across native Windows, WSL, macOS, and Linux.
+# Windows CRLF (\r\n) is strictly prohibited in all text files; retain Git's binary-file detection.
+* text=auto eol=lf
+
 # Exact production parser bytes. Windows checkout must not turn LF into CRLF.
 tests/fixtures/production-parsers/** text eol=lf

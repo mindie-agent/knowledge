@@ -1,18 +1,17 @@
 """Bounded incremental reader for native Codex JSONL task transcripts.
 
-This is the per-Harness version adapter the design requires: it recognizes
-only a structural signature whitelist of the Codex rollout JSONL format and
-extracts user messages and public assistant progress/final messages. Tools,
-hidden reasoning, injected system/developer instructions and other tasks'
-history are excluded. An unrecognized format is reported as ``unknown-format``;
-the public-transcript path never substitutes a model-written summary for it.
-There is no filesystem scanning: the caller names one file and byte range.
+[Role]
+Per-Harness transcript adapter (`history_source`, `capture_source`, `read_material`, `read_increment`, `identify`, `same_file`) for Codex rollout JSONL files.
 
-Byte accounting is precise: every call reports the consumed range
-``[start, end)`` and its SHA256 so the engine can durably reserve
-``(file identity, start, end, digest)`` with the saved body. Public messages are
-never clipped to a model envelope. Replacement and unsupported oversized input
-stop visibly instead of silently consuming or rereading history.
+[Invariants]
+- Extracts only whitelisted public user/assistant messages; tools, hidden reasoning, injected system instructions, and foreign task records are excluded.
+- Enforces strict profile containment (`sessions` / `archived_sessions` under `CODEX_HOME`) and exact `[start, end)` SHA-256 byte accounting with a 512-byte prefix anchor (`FileIdentity`).
+
+[Timeouts & Locks]
+- `read_material` enforces `max_scan_bytes=16 MiB` and `max_seconds=2.0s` per incremental scan window without holding locks.
+
+[Side-Effect Policy]
+- Purely read-only over the caller-specified transcript path; never scans directories or mutates files.
 """
 
 from __future__ import annotations
@@ -21,7 +20,6 @@ import hashlib
 import json
 import os
 import re
-import stat as statmod
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -243,11 +241,10 @@ def history_source(path):
     neither is inferred from a filename or the importing task's cwd.
     """
     path = _resolved_path(path)
-    fd = os.open(path, os.O_RDONLY | getattr(os, 'O_BINARY', 0) | getattr(os, 'O_NONBLOCK', 0))
-    with os.fdopen(fd, 'rb') as stream:
+    if not path.is_file():
+        raise ValueError('history source must be a regular transcript file')
+    with path.open('rb') as stream:
         info = os.fstat(stream.fileno())
-        if not statmod.S_ISREG(info.st_mode):
-            raise ValueError('history source must be a regular transcript file')
         anchor = stream.read(ANCHOR_BYTES)
         stream.seek(0)
         raw = stream.readline(info.st_size)
@@ -274,6 +271,8 @@ def capture_source(path, session_id):
     try:
         profile = _resolved_path(os.environ.get('CODEX_HOME') or Path.home() / '.codex')
         selected = _resolved_path(path, strict=True)
+    except TimeoutError:
+        raise
     except (OSError, ValueError) as exc:
         raise TranscriptSourceError('transcript_unavailable',
                                     'native transcript path is unavailable') from exc
@@ -282,13 +281,13 @@ def capture_source(path, session_id):
         raise TranscriptSourceError('transcript_outside_profile',
                                     'capture transcript is outside the active native profile')
     try:
-        fd = os.open(selected, os.O_RDONLY | getattr(os, 'O_BINARY', 0) | getattr(os, 'O_NONBLOCK', 0))
-        with os.fdopen(fd, 'rb') as stream:
-            info = os.fstat(stream.fileno())
-            if not statmod.S_ISREG(info.st_mode):
-                raise TranscriptSourceError('transcript_not_regular',
-                                            'capture source must be a regular transcript file')
+        if not selected.is_file():
+            raise TranscriptSourceError('transcript_not_regular',
+                                        'capture source must be a regular transcript file')
+        with selected.open('rb') as stream:
             header = stream.readline(1024 * 1024 + 1)
+    except TimeoutError:
+        raise
     except OSError as exc:
         raise TranscriptSourceError('transcript_unavailable',
                                     'native transcript read is unavailable') from exc

@@ -239,12 +239,10 @@ def retire_service(config_path, *, control_timeout=None):
             try:
                 while _consumer_state(config):
                     _pause(deadline, "consumer_ownership")
-            except TimeoutError:
-                raise
-            except OSError as exc:
+            except (RetirementTimeout, OSError) as exc:
                 return dict(outcome, retirement=receipt, cleanup_failed=True,
                             cleanup_error=dict(stage='consumer_ownership', error_type=type(exc).__name__,
-                                               errno=exc.errno, operation_completed=True))
+                                               errno=getattr(exc, 'errno', None), operation_completed=True))
             return _completed_retirement(config_path, config, outcome, receipt)
         except BaseException as exc:
             if receipt is not None:

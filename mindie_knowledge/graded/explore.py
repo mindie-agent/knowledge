@@ -160,10 +160,13 @@ def _compact_unit(unit: dict) -> dict | None:
     ident = unit.get("id")
     if not isinstance(ident, str) or not ident:
         raise ValueError("retrieved unit requires a stable id")
+    body = str(unit.get("body") or unit.get("content") or unit.get("excerpt") or "")
+    if len(body) > 240:
+        body = body[:240].rstrip() + "..."
     return {"id": ident, "tier": tier, "revision": unit.get("revision"),
             "category": unit.get("category"), "title": unit.get("title"),
             "conditions": unit.get("conditions"), "ref": unit.get("ref"),
-            "body": unit.get("body") or unit.get("content") or unit.get("excerpt") or ""}
+            "body": body}
 
 
 def _promoted_foundations(units: Sequence[Mapping[str, Any]]) -> dict[str, dict]:

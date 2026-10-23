@@ -35,6 +35,22 @@ from .service_host import (LIMIT, SAFE_CODES, SAFE_STAGES, ServiceHostError,
 
 
 def _private(root):
+    if os.name == "nt":
+        try:
+            import win32api
+            import win32con
+            import win32security
+            tok = win32security.OpenProcessToken(
+                win32api.GetCurrentProcess(),
+                win32con.TOKEN_QUERY | win32con.TOKEN_ADJUST_DEFAULT,
+            )
+            try:
+                user_sid = win32security.GetTokenInformation(tok, win32security.TokenUser)[0]
+                win32security.SetTokenInformation(tok, win32security.TokenOwner, user_sid)
+            finally:
+                tok.Close()
+        except Exception:
+            pass
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     return _verify_private(root)
 

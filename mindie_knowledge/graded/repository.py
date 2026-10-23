@@ -37,6 +37,14 @@ def _finalize_usage_estimate(payload):
         payload["usage"]["estimated_tokens"] = estimate
 
 
+def _budget_estimate(payload):
+    if "exploration_context" not in payload:
+        return payload["response_token_estimate"]
+    return response_token_estimate(
+        {k: v for k, v in payload.items() if k != "exploration_context"}
+    )
+
+
 def _recompute_query_body_tokens(payload):
     seen_parents = set()
     total = 0
@@ -54,7 +62,7 @@ def _enforce_query_budget(payload, index, *, navigation_only=False):
     token_budget = payload["token_budget"]
     _finalize_usage_estimate(payload)
     if navigation_only:
-        while payload["response_token_estimate"] > token_budget and payload.get("unverified_cards"):
+        while _budget_estimate(payload) > token_budget and payload.get("unverified_cards"):
             payload["unverified_cards"].pop()
             if not payload["unverified_cards"]:
                 payload.pop("unverified_cards", None)
@@ -62,7 +70,7 @@ def _enforce_query_budget(payload, index, *, navigation_only=False):
         original_cards = list(payload["cards"])
         original_foundations = {card["id"]: card for card in payload["foundation_cards"]}
         excluded = list(payload["excluded_budget"])
-        while len(payload["cards"]) > 1 and payload["response_token_estimate"] > token_budget:
+        while len(payload["cards"]) > 1 and _budget_estimate(payload) > token_budget:
             dropped = payload["cards"].pop()
             if dropped["id"] not in excluded:
                 excluded.append(dropped["id"])
@@ -82,7 +90,7 @@ def _enforce_query_budget(payload, index, *, navigation_only=False):
             payload["usage"]["excluded_budget"] = list(excluded)
             payload["usage"]["has_more"] = bool(excluded) or len(payload["cards"]) < len(original_cards)
             _finalize_usage_estimate(payload)
-        while payload["response_token_estimate"] > token_budget and payload["foundation_cards"]:
+        while _budget_estimate(payload) > token_budget and payload["foundation_cards"]:
             dropped_f = payload["foundation_cards"].pop()
             if dropped_f["id"] not in excluded and all(c["id"] != dropped_f["id"] for c in payload["cards"]):
                 excluded.append(dropped_f["id"])
@@ -90,7 +98,7 @@ def _enforce_query_budget(payload, index, *, navigation_only=False):
             payload["usage"]["excluded_budget"] = list(excluded)
             payload["usage"]["has_more"] = True
             _finalize_usage_estimate(payload)
-        while payload["response_token_estimate"] > token_budget and payload["cards"]:
+        while _budget_estimate(payload) > token_budget and payload["cards"]:
             dropped = payload["cards"].pop()
             if dropped["id"] not in excluded:
                 excluded.append(dropped["id"])
@@ -101,22 +109,22 @@ def _enforce_query_budget(payload, index, *, navigation_only=False):
         return
 
     # Tiny synthetic unit-test budgets (< 256) exercise body-only excerpt shares.
-    if token_budget < 256 or payload["response_token_estimate"] <= token_budget:
+    if token_budget < 256 or _budget_estimate(payload) <= token_budget:
         return
-    while payload["response_token_estimate"] > token_budget and payload.get("unverified_cards"):
+    while _budget_estimate(payload) > token_budget and payload.get("unverified_cards"):
         payload["unverified_cards"].pop()
         if not payload["unverified_cards"]:
             payload.pop("unverified_cards", None)
         _finalize_usage_estimate(payload)
     original_cards = list(payload.get("cards", ()))
-    if payload["response_token_estimate"] > token_budget and payload["foundation_cards"]:
+    if _budget_estimate(payload) > token_budget and payload["foundation_cards"]:
         payload["foundation_cards"] = []
         _finalize_usage_estimate(payload)
-    if payload["response_token_estimate"] > token_budget and payload["cards"]:
+    if _budget_estimate(payload) > token_budget and payload["cards"]:
         payload["cards"] = []
         _finalize_usage_estimate(payload)
     excluded = list(payload["excluded_budget"])
-    while len(payload["results"]) > 1 and payload["response_token_estimate"] > token_budget:
+    while len(payload["results"]) > 1 and _budget_estimate(payload) > token_budget:
         dropped = payload["results"].pop()
         if dropped["id"] not in excluded:
             excluded.append(dropped["id"])
@@ -125,26 +133,26 @@ def _enforce_query_budget(payload, index, *, navigation_only=False):
         payload["usage"]["has_more"] = True
         _recompute_query_body_tokens(payload)
         _finalize_usage_estimate(payload)
-    if payload["response_token_estimate"] > token_budget and len(payload["results"]) == 1:
+    if _budget_estimate(payload) > token_budget and len(payload["results"]) == 1:
         row = payload["results"][0]
-        while row["inherited_rules"] and payload["response_token_estimate"] > token_budget:
+        while row["inherited_rules"] and _budget_estimate(payload) > token_budget:
             parent = row["inherited_rules"].pop()
             row["inheritance_excluded"].append({"id": parent["id"], "status": "budget_excluded"})
             row["ready_to_apply"] = False
             _recompute_query_body_tokens(payload)
             _finalize_usage_estimate(payload)
-        if payload["response_token_estimate"] > token_budget and row["inheritance_excluded"]:
+        if _budget_estimate(payload) > token_budget and row["inheritance_excluded"]:
             row["inheritance_excluded"] = [
                 {"id": item["id"], "status": item.get("status", "budget_excluded")}
                 for item in row["inheritance_excluded"]
             ]
             _finalize_usage_estimate(payload)
-        if payload["response_token_estimate"] > token_budget:
+        if _budget_estimate(payload) > token_budget:
             row["provenance"] = {"source_type": row["provenance"].get("source_type", "")}
             row["applicability"] = {"status": row["applicability"].get("status", "")}
             _finalize_usage_estimate(payload)
-        if payload["response_token_estimate"] > token_budget and row["tier"] != "L1":
-            excess = payload["response_token_estimate"] - token_budget
+        if _budget_estimate(payload) > token_budget and row["tier"] != "L1":
+            excess = _budget_estimate(payload) - token_budget
             share = max(1, token_estimate(row["excerpt"]) - excess - 8)
             content, _used, _truncated = _excerpt(index.units[row["id"]].body, share)
             row["excerpt"] = content
@@ -152,7 +160,7 @@ def _enforce_query_budget(payload, index, *, navigation_only=False):
             row["ready_to_apply"] = False
             _recompute_query_body_tokens(payload)
             _finalize_usage_estimate(payload)
-        if payload["response_token_estimate"] > token_budget:
+        if _budget_estimate(payload) > token_budget:
             dropped = payload["results"].pop()
             if dropped["id"] not in excluded:
                 excluded.append(dropped["id"])
@@ -164,7 +172,7 @@ def _enforce_query_budget(payload, index, *, navigation_only=False):
                 trial = [*payload["cards"], candidate]
                 payload["cards"] = trial
                 _finalize_usage_estimate(payload)
-                if payload["response_token_estimate"] > token_budget:
+                if _budget_estimate(payload) > token_budget:
                     payload["cards"].pop()
                     _finalize_usage_estimate(payload)
                     break
@@ -627,7 +635,7 @@ class GradedRepository:
             result["domain"] = self.store.domain
             if "usage" in result:
                 _finalize_usage_estimate(result)
-                while result["response_token_estimate"] > token_budget and (result["units"] or result["requires"]):
+                while _budget_estimate(result) > token_budget and (result["units"] or result["requires"]):
                     bucket = "units" if result["units"] else "requires"
                     dropped = result[bucket].pop()
                     required_tokens = token_estimate(dropped.get("content", ""))

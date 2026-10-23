@@ -1,17 +1,30 @@
 """Claude Code public-record parser (session JSONL). Adapter-owned.
 
-Public records are top-level type user/assistant with camel-case sessionId
-and ISO timestamps. Thinking, redacted_thinking, isMeta, sidechains,
-attachments, system, queue-operation, atis-latch and last-prompt are
-excluded. The caller names exactly one file supplied by a trusted hook.
+[Role]
+Parses Claude Code session JSONL transcripts to extract public `user`/`assistant`
+records (`identify`, `read_material`, `capture_source`) while excluding private
+thinking, sidechains, attachments, and meta records.
+
+[Invariants]
+- `capture_source` verifies that the named file is this native profile's
+  artifact for the task and uses its first native queue record as the creation
+  boundary, preventing inherited fork `sessionId` values from spoofing ownership.
+
+[Timeouts & Locks]
+- Bounded regular-file reads (`SOURCE_HEAD_BYTES`, `SOURCE_HEAD_LINES`).
+
+[Side-Effect Policy]
+- Strictly read-only transcript parsing; mutates no files.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
+import stat as statmod
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -38,6 +51,109 @@ COMMAND_BLOCK = re.compile(
 SESSION_FILE = re.compile(
     r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.jsonl\Z"
 )
+
+# The native queue header is small even when a fork inherits a large history.
+# Fork scope is established by SessionStart in the existing Admission store.
+SOURCE_HEAD_BYTES = 1024 * 1024
+SOURCE_HEAD_LINES = 64
+
+
+def native_config_dir():
+    """The selected native profile directory (adapter config, env, or default)."""
+    from paths import load_adapter_config
+
+    selected = load_adapter_config().get("claude_config_dir")
+    if selected is not None and (not isinstance(selected, str) or not os.path.isabs(selected)):
+        raise ValueError("selected native profile must be an absolute directory")
+    env = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(selected or env or Path.home() / ".claude")
+
+
+def capture_path(path, session_id, *, must_exist=True):
+    """Validate one exact native artifact, including a not-yet-written fork."""
+    if (not isinstance(session_id, str)
+            or not SESSION_FILE.fullmatch(session_id + ".jsonl")):
+        raise ValueError("native session identity is missing")
+    if not isinstance(path, (str, Path)) or not Path(path).is_absolute():
+        raise ValueError("capture transcript must be absolute")
+    try:
+        selected = Path(path).resolve(strict=must_exist)
+    except TimeoutError:
+        raise
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("capture transcript is unavailable") from exc
+    projects = (native_config_dir() / "projects").resolve()
+    if not selected.is_relative_to(projects):
+        raise ValueError("capture transcript is outside the active native profile")
+    if selected.name != session_id + ".jsonl":
+        raise ValueError("capture transcript does not name this task")
+    return selected
+
+
+def capture_source(path, session_id, *, binding=None):
+    """Read bounded native attribution, never inherited fork scope.
+
+    The first enqueue is retained across ordinary resume and compaction.
+    Existing Admission bindings retain their original scope and boundary as
+    the transcript grows; the named artifact and queue identity are still
+    verified on every Stop. Without a binding, missing own metadata is an
+    explicit failure rather than permission to adopt inherited parent cwd.
+    """
+    selected = capture_path(path, session_id)
+    if not selected.is_file():
+        raise ValueError("capture source must be a regular transcript file")
+    with selected.open("rb") as stream:
+        head = stream.read(SOURCE_HEAD_BYTES)
+    lines = head.split(b"\n")[:SOURCE_HEAD_LINES]
+    created = None
+    for raw in lines:
+        if not raw.strip():
+            continue
+        try:
+            record = json.loads(raw)
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        record_session = record.get("sessionId") or record.get("session_id")
+        if record_session is None:
+            continue
+        if record_session != session_id:
+            raise ValueError("capture transcript belongs to another task")
+        if created is None:
+            if record.get("type") != "queue-operation":
+                if to_seconds(record.get("timestamp")) is not None:
+                    raise ValueError("native creation queue must precede dated history")
+                continue
+            if record.get("operation") != "enqueue":
+                raise ValueError("native task creation queue is invalid")
+            created = to_seconds(record.get("timestamp"))
+            if created is None or not math.isfinite(created):
+                raise ValueError("native task creation boundary is unavailable")
+            if binding is not None:
+                scope = binding.get("project_root")
+                boundary = binding.get("activated_at")
+                if (binding.get("session") != session_id
+                        or type(binding.get("enabled")) not in (bool, int)
+                        or binding["enabled"] != 1
+                        or not isinstance(scope, str) or not os.path.isabs(scope)
+                        or type(boundary) not in (int, float)
+                        or not math.isfinite(boundary) or boundary < 0):
+                    raise ValueError("native task binding is invalid")
+                return dict(session_id=session_id, project_root=scope,
+                            created_at=created, transcript_path=str(selected))
+            continue
+        cwd = record.get("cwd")
+        stamp = to_seconds(record.get("timestamp"))
+        if (isinstance(cwd, str) and os.path.isabs(cwd)
+                and stamp is not None and math.isfinite(stamp) and stamp >= created):
+            return dict(
+                session_id=session_id,
+                project_root=str(Path(cwd).resolve()),
+                created_at=created,
+                transcript_path=str(selected),
+            )
+    raise ValueError("native task scope or creation boundary is unavailable")
 
 
 @dataclass(frozen=True)

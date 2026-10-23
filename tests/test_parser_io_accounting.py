@@ -174,19 +174,19 @@ def test_fork_identity_read_keeps_the_tail_increment_bounded(tmp_path, parser_na
 
 _DECLARED_PARSERS = {
     "kimi": (
-        "9f59aac9ba79ea95b391ca5590d1786e5129f943",
+        "d6cd12f158de1b0fce34e2e625f2c31132beca1e",
         "scripts/transcript.py",
-        "abc7e1849d715769e552b9bd7f696d10e1a45b02da898f3aca9687fb59cc981c",
+        "96f2581c65ecb5ea73d0adf4043f8465ae84b98c07b56766a63167d0d0f838d7",
     ),
     "cc": (
-        "372cf1698a5d156dd0166f24529fd2e6d12932c9",
+        "d29acfbec500e3b2f1a471f4f66f8625ef3b996c",
         "scripts/transcript.py",
-        "92daa12f74ad494da386b12e931cdbbc80139163241e50bb58061ed7b17fc2b1",
+        "d96a093178e23d1bc672fcdf5eea12a60b8170a3204b66649aa8a18212f54cb3",
     ),
     "codex": (
-        "52966a915a23bf76bb52d1c1415d702c22afc267",
+        "655ee08cddeb4dc8bbaccc1eaa96320dac0694c1",
         "plugins/mindie-agent/scripts/codex_transcript.py",
-        "7420fe832bf0832a41cb135f4adfb99ddc6414feef1419c9ba78c552f47b3e0e",
+        "f400458fa58d8a5108eeeddad3fe33701c1358296b610be4765ae2ba5f6adb6d",
     ),
 }
 

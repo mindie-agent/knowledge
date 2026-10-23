@@ -474,8 +474,8 @@ def test_stage_and_commit_many_paths_exceeding_argv_limit(tmp_path):
     # into one conversion warning per file and exhaust the bounded subprocess.
     git(["config", "core.autocrlf", "true"], cwd=work)
 
-    stem = "n" * 240
-    paths = [f"wide/{i:04d}-{stem}" for i in range(4300)]
+    stem = "n" * 160
+    paths = [f"wide/{i:04d}-{stem}" for i in range(6200)]
     assert sum(len(path.encode()) + 1 for path in paths) > 1_048_576
     paths.append("wide/name with space.txt")
     for path in paths:

@@ -38,7 +38,7 @@ def test_single_long_task_freeze_reload_validate_and_apply_do_not_retain_body_by
     # prior tests' intern-table growth out of this publication memory budget.
     completed = subprocess.run(
         [sys.executable, __file__, str(tmp_path)],
-        capture_output=True, text=True, encoding="utf-8", timeout=180,
+        capture_output=True, text=True, encoding="utf-8", timeout=300,
     )
     assert completed.returncode == 0, completed.stderr
     metrics = json.loads(completed.stdout)

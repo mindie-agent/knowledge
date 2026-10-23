@@ -53,7 +53,9 @@ def test_vllm_ascend_and_cann_compound_identifiers_expand_to_subwords():
     sample = (
         'npugraph_ex torchair modelslim msmodelslim dspark dflash xlite '
         'eplb mrv2 hixl lmcache mooncake sfa_v1 dsa_v1 mla_v1 fa3_v1 '
-        'qli_v2 quarot teacache msmemscope msprof msprobe serving_cast tensor_cast'
+        'qli_v2 quarot teacache msmemscope msprof msprobe serving_cast tensor_cast '
+        'mindiesd vllm_omni rainfusion rf_v2 rf_v3 ada_bsa eagleqbsa '
+        'ditcache cache_dit taylorseer code2wav token2wav llm2tts flashgen taehv yuanrong'
     )
     expanded = set(tokens(sample))
     counts = token_counts(sample)
@@ -83,6 +85,22 @@ def test_vllm_ascend_and_cann_compound_identifiers_expand_to_subwords():
         {'msprobe', 'ms', 'probe'},
         {'serving_cast', 'serving', 'cast'},
         {'tensor_cast', 'tensor', 'cast'},
+        {'mindiesd', 'mindie', 'sd'},
+        {'vllm_omni', 'vllm', 'omni'},
+        {'rainfusion', 'rain', 'fusion'},
+        {'rf_v2', 'rf', 'v2', 'rainfusion'},
+        {'rf_v3', 'rf', 'v3', 'rainfusion'},
+        {'ada_bsa', 'ada', 'bsa'},
+        {'eagleqbsa', 'eagle', 'qbsa', 'bsa'},
+        {'ditcache', 'dit', 'cache'},
+        {'cache_dit', 'cache', 'dit'},
+        {'taylorseer', 'taylor', 'seer'},
+        {'code2wav', 'code', 'wav'},
+        {'token2wav', 'token', 'wav'},
+        {'llm2tts', 'llm', 'tts'},
+        {'flashgen', 'flash', 'gen'},
+        {'taehv', 'tae', 'hv'},
+        {'yuanrong', 'yuan', 'rong'},
     ):
         assert expected_group.issubset(expanded)
 
@@ -97,6 +115,13 @@ def test_bilingual_query_tokens_expand_cjk_domain_concepts_and_strip_filler_bigr
     expanded_op = set(query_tokens(q_op))
     assert {'datacopypad', 'alignment', 'conflict', 'setflag', 'waitflag', 'deadlock'}.issubset(expanded_op)
     assert not {'怎么', '解决', '算子'}.intersection(expanded_op)
+
+    q_omni_sd = '扩散模型 文生视频 雨融 块缓存 与 语音合成 声码器 首包时延 实时率 异步分块 潜帧切分'
+    expanded_omni_sd = set(query_tokens(q_omni_sd))
+    assert {
+        'dit', 'mindiesd', 'vllm_omni', 'rainfusion', 'rf_v2', 'cache_dit',
+        'qwen3_tts', 'code2wav', 'ttfp', 'rtf', 'async_chunk', 'sliced_state_decode',
+    }.issubset(expanded_omni_sd)
 
 
 def test_graded_routing_index_bilingual_natural_language_recall_and_noise_immunity():
