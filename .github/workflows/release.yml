@@ -12,7 +12,7 @@ jobs:
     uses: mindie-agent/mindie-bench/.github/workflows/publish-release.yml@484b80621aaf9293c559786d0ef2174c79a0dbb4
     with:
       benchmark-ref: 484b80621aaf9293c559786d0ef2174c79a0dbb4
-      release-notes-path: docs/releases/knowledge-0.13.3.md
+      release-notes-path: docs/releases/knowledge-0.13.4.md
       setup-command: |
         uv venv --python 3.13 && uv pip install -e ".[test]"
       test-command: |

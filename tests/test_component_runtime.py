@@ -10,6 +10,34 @@ from mindie_knowledge.runtime_inventory import verify_lock
 from test_component_releases import CapturedCatalog
 
 
+@pytest.mark.parametrize("tls", [{}, {"UV_SYSTEM_CERTS": "false"}, {"UV_NATIVE_TLS": "false"}])
+def test_component_download_keeps_enterprise_trust_and_failure_unpublished(tmp_path, monkeypatch, tls):
+    import mindie_knowledge.component_runtime as runtime
+
+    source = tmp_path / "adapter"
+    source.mkdir()
+    (source / "pyproject.toml").write_bytes(b'[project]\nname="adapter"\nversion="0.1.2"\n')
+    targets = {"mindie-knowledge": CapturedCatalog().latest("mindie-knowledge")}
+    baseline = dict(source_sha256=source_identity(source), runtime={name: row["revision"] for name, row in targets.items()})
+    environment = dict(tls, SSL_CERT_FILE="enterprise.pem", HTTPS_PROXY="http://enterprise-proxy:8080")
+    observed = {}
+
+    def download(*args, child_env, **kwargs):
+        observed.update(child_env)
+        raise ConnectionError("component download failed")
+
+    monkeypatch.setattr(runtime.shutil, "which", lambda name: "/tools/uv")
+    monkeypatch.setattr(runtime, "bounded_run", download)
+    with pytest.raises(ConnectionError, match="component download failed"):
+        runtime.build(source, tmp_path / "generations", baseline, targets, env=environment)
+    assert observed.items() >= environment.items()
+    if not tls:
+        assert observed.get("UV_NATIVE_TLS") == "true"
+    assert environment == dict(tls, SSL_CERT_FILE="enterprise.pem", HTTPS_PROXY="http://enterprise-proxy:8080")
+    assert not list((tmp_path / "generations").rglob("components.json"))
+    assert source_identity(source) == baseline["source_sha256"]
+
+
 def test_generated_project_overrides_transitive_git_pins_and_leaves_adapter_inputs_alone(tmp_path):
     source = tmp_path / "adapter"
     source.mkdir()

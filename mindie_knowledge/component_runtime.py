@@ -161,6 +161,8 @@ def build(source, root, baseline, targets, *, python=sys.executable,
             environment.pop("PYTHONPATH", None)
             environment.update(UV_PROJECT_ENVIRONMENT=str(runtime / ".venv"), UV_NO_PROGRESS="1",
                                GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="Never")
+            if "UV_SYSTEM_CERTS" not in environment:
+                environment.setdefault("UV_NATIVE_TLS", "true")
             bounded_run([uv, "sync", "--project", str(runtime), "--no-editable", "--no-dev",
                          "--python", str(python)], "", timeout=timeout - 20,
                         max_output=256 * 1024, child_env=environment)
