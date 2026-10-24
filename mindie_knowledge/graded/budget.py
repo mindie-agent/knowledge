@@ -211,6 +211,41 @@ def _omit_navigation_body(row):
         _omit_navigation_body(child)
 
 
+def _trim_exploration_context(payload, token_budget):
+    """Keep whole premises and regenerate the sole subagent seed after removal."""
+    context = payload.get("exploration_context")
+    if context is None:
+        return
+    from .explore import refresh_exploration_mounts
+
+    priority = {"L4": 0, "L2": 1, "L1": 2}
+    while context["mounted_units"] and finalize_usage_estimate(payload) > token_budget:
+        dropped = min(context["mounted_units"], key=lambda item: priority[item["tier"]])
+        context["mounted_units"].remove(dropped)
+        omitted = {key: dropped[key] for key in ("id", "revision", "tier", "ref")}
+        omitted["status"] = "budget_excluded"
+        context.setdefault("excluded_units", []).append(omitted)
+        if "excluded_budget" in payload:
+            if dropped["id"] not in payload["excluded_budget"]:
+                payload["excluded_budget"].append(dropped["id"])
+        elif not any(item["id"] == dropped["id"] and item["status"] == "budget_excluded"
+                     for item in payload["unresolved"]):
+            payload["unresolved"].append({"id": dropped["id"], "status": "budget_excluded",
+                                          "required_tokens": token_estimate(dropped["body"])})
+        payload["usage"]["has_more"] = True
+        refresh_exploration_mounts(context)
+
+    # A row/closure may have been dropped while its whole body still reaches
+    # the caller through the fact pack. Such a unit was not budget-excluded.
+    delivered = {item["id"] for item in context["mounted_units"]}
+    if "excluded_budget" in payload:
+        payload["excluded_budget"] = [ident for ident in payload["excluded_budget"] if ident not in delivered]
+        payload["usage"]["excluded_budget"] = list(payload["excluded_budget"])
+    if "unresolved" in payload:
+        payload["unresolved"] = [item for item in payload["unresolved"]
+                                 if item["id"] not in delivered or item["status"] != "budget_excluded"]
+
+
 def enforce_query_budget(payload, index, *, navigation_only=False, derive=None):
     """Trim one assembled query payload to its whole-delivery token budget.
 
@@ -256,13 +291,15 @@ def enforce_query_budget(payload, index, *, navigation_only=False, derive=None):
         if finalize_usage_estimate(payload) > token_budget and payload["results"]:
             _drop_result(payload, excluded)
 
+    _trim_exploration_context(payload, token_budget)
+
     # Derived fields describe what survived, so they are refreshed before the
     # estimate is bound and before any floor is claimed.
     if derive is not None:
         derive(payload)
 
     # Everything trimmable is gone. A remaining overrun is the irreducible
-    # protocol envelope (and, in explore mode, the mounted fact pack); report
+    # protocol envelope (and, in explore mode, user-supplied evidence); report
     # the floor instead of claiming an impossible budget was satisfied.
     if finalize_usage_estimate(payload) > token_budget:
         _declare_unmet(payload)
@@ -311,5 +348,6 @@ def enforce_explain_budget(result, index, token_budget):
             for group in ("requires", "units") for item in result.get(group, ())
         )
         result["usage"]["has_more"] = True
+    _trim_exploration_context(result, token_budget)
     if finalize_usage_estimate(result) > token_budget:
         _declare_unmet(result)
