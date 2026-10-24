@@ -7,6 +7,8 @@
 - A healthy repeat `activate` for the same session and `project_root` preserves
   the existing token and `activated_at` boundary; a fresh activation (new session,
   post-revocation, or scope change) rotates the token and boundary.
+- Only explicit `activate` grants `entry_enabled`; automatic association and
+  legacy leases cannot authorize knowledge calls or background capture.
 - `claim(session, kind, identity)` returns `True` at most once per
   `(session, kind, identity)` and survives `deactivate` so revoking/reactivating
   never replays old turns.
@@ -60,7 +62,8 @@ CREATE TABLE IF NOT EXISTS leases(
     failures INTEGER NOT NULL,
     project_root TEXT,
     root_session TEXT,
-    activated_at REAL);
+    activated_at REAL,
+    entry_enabled INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS attempts(
     session TEXT NOT NULL,
     kind TEXT NOT NULL,
@@ -218,15 +221,22 @@ class Admission:
             raise ValueError("binding boundary must be finite Unix seconds")
 
         def op(db):
-            row = db.execute(
+            cursor = db.execute(
                 "SELECT * FROM leases WHERE session=?", (session,)
-            ).fetchone()
+            )
+            row = cursor.fetchone()
+            # Upgrade only while writing an activation. Existing leases have
+            # no proof of a manual entry and therefore keep the default 0.
+            if "entry_enabled" not in {column[0] for column in cursor.description}:
+                db.execute("ALTER TABLE leases ADD COLUMN entry_enabled INTEGER NOT NULL DEFAULT 0")
+                row = db.execute("SELECT * FROM leases WHERE session=?", (session,)).fetchone()
             now = time.time()
             if automatic and row and not row[2]:
                 raise ValueError("task binding was explicitly revoked")
             from ..filesystem import path_identity
             if (row and row[2] == 1 and isinstance(row[4], str)
-                    and path_identity(row[4]) == path_identity(scope)):
+                    and path_identity(row[4]) == path_identity(scope)
+                    and (automatic or row["entry_enabled"])):
                 # Healthy re-activation: keep the token and original boundary.
                 db.execute(
                     "UPDATE leases SET root_session=COALESCE(?, root_session) "
@@ -236,7 +246,7 @@ class Admission:
             else:
                 # Fresh activation: rotate the token and capture boundary.
                 db.execute(
-                    "INSERT OR REPLACE INTO leases VALUES(?,?,?,?,?,?,?)",
+                    "INSERT OR REPLACE INTO leases VALUES(?,?,?,?,?,?,?,?)",
                     (
                         session,
                         secrets.token_hex(32),
@@ -245,6 +255,7 @@ class Admission:
                         scope,
                         root_session or session,
                         now if not_before is None else not_before,
+                        int(not automatic),
                     ),
                 )
             return db.execute(
@@ -261,6 +272,7 @@ class Admission:
             "root_session": row[5],
             "activated_at": row[6],
             "capture_schema": True,
+            "entry_enabled": bool(row["entry_enabled"]),
         }
 
     def associate(self, session, *, project_root, not_before):
@@ -314,11 +326,22 @@ class Admission:
             raise ValueError("task binding is not active")
         return lease
 
+    def knowledge_lease(self, session):
+        """Current manual-entry grant; missing, legacy and automatic leases deny.
+
+        This reads the existing lease authority without migrating or creating
+        state. Native identity and contribution consent alone never grant use.
+        """
+        lease = self.active_lease(session)
+        return lease if lease is not None and lease.get("entry_enabled") == 1 else None
+
     def capture_lease(self, session, token):
         """Lease check for capture; fails closed on the old lease schema."""
         if not isinstance(token, str):
             raise ValueError("task binding token required")
         lease = self.check(session, token)
+        if not lease.get("entry_enabled"):
+            raise ValueError("capture requires manual /mindie-agent activation in this task")
         if not lease.get("capture_schema"):
             raise ValueError(
                 "capture requires an adapter lease with project_root, root_session "
@@ -369,7 +392,7 @@ class Admission:
             if row is None:
                 return {"state": "inactive"}
             lease = dict(zip(columns, row))
-            if lease.get("enabled") != 1:
+            if lease.get("enabled") != 1 or lease.get("entry_enabled") != 1:
                 return {"state": "inactive"}
             try:
                 matches = hmac.compare_digest(str(lease.get("token") or ""), token)
@@ -445,7 +468,7 @@ class Admission:
             if row is None:
                 return {"state": "inactive"}
             lease = dict(zip(columns, row))
-            if lease.get("enabled") != 1:
+            if lease.get("enabled") != 1 or lease.get("entry_enabled") != 1:
                 return {"state": "inactive"}
             failures = int(lease.get("failures") or 0)
             token = lease.get("token")
@@ -488,7 +511,7 @@ class Admission:
     def allows_hash(self, hashed_session):
         try:
             return any(
-                session_key(lease["session"]) == hashed_session
+                lease.get("entry_enabled") == 1 and session_key(lease["session"]) == hashed_session
                 for lease in self._rows()
             )
         except TimeoutError:
