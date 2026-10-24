@@ -9,6 +9,7 @@ import pytest
 
 from graded_fixture import OBSERVED, decision, request, unit
 from mindie_knowledge.graded.distill import apply_decision, prepare_request, result_view
+from mindie_knowledge.graded.index import response_token_estimate
 from mindie_knowledge.graded.units import GradedUnit
 from mindie_knowledge.loop.engine import Engine
 from mindie_knowledge.materials.references import ReadReferenceError
@@ -271,10 +272,11 @@ def test_cli_selected_evidence_uses_live_native_lease_and_real_rpc(store, tmp_pa
         revoked = run(payload)
         assert revoked.returncode == 2 and calls.read_text() == "1"
         found = service.call("query", {"query": "graph", "conditions": {"soc": "Ascend910B"},
-                                      "domain_path": "wrong-route", "token_budget": 16,
+                                      "domain_path": "wrong-route", "token_budget": 4000,
                                       "_session_id": "manual-A", "_session_verified": True})
         assert found["results"][0]["id"] == "unit-fixture-native"
-        assert found["body_token_estimate"] <= 16
+        assert found["budget_met"] is True
+        assert found["usage"]["estimated_tokens"] == response_token_estimate(found) <= 4000
     finally:
         service.http.shutdown()
         service.http.server_close()

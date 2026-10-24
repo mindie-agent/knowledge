@@ -5,7 +5,8 @@ import hashlib
 import pytest
 
 from graded_fixture import unit
-from mindie_knowledge.graded.index import token_estimate
+from mindie_knowledge.graded.feedback import summarize_usage_events
+from mindie_knowledge.graded.index import response_token_estimate, token_estimate
 from mindie_knowledge.graded.units import GradedUnit
 from mindie_knowledge.materials import MaterialStore
 from mindie_knowledge.materials.references import ReadReferenceError
@@ -15,6 +16,137 @@ from mindie_knowledge.redact import scan_text
 def body_cost(row):
     return token_estimate(row.get("excerpt", "")) + sum(body_cost(item) for item in row.get("related", [])) + sum(
         token_estimate(item["content"]) for item in row.get("inherited_rules", []))
+
+
+def mixed_corpus(store, tmp_path, *, name="mixed"):
+    """One real legacy material feed plus one installed graded unit."""
+    task = "a" * 64
+    with closing(MaterialStore(tmp_path / name, store.domain)) as author:
+        blocks = [dict(block_id=hashlib.sha256(str(index).encode()).hexdigest(),
+                       text="Legacy graph probe material. " * 30, source_range={"part": index},
+                       title="Legacy graph observation", summary="Legacy graph navigation.")
+                  for index in range(5)]
+        author.append_batch(task, blocks, "Legacy graph investigation.", title="Legacy graph",
+                            status="complete", promote=True)
+        store.install_feed([author.export_task(task)], feed_ident=f"{name}-source")
+    graded = unit(conditions={"soc": ["Ascend910B"]}, body="Graded graph probe. " * 100)
+    store.graded.install([graded])
+    return graded
+
+
+def test_mixed_navigation_trims_legacy_payload_before_claiming_a_floor(store, tmp_path):
+    """Legacy excerpts are removable, so they can never form an irreducible floor."""
+    mixed_corpus(store, tmp_path)
+
+    nav = store.query("graph", conditions={"soc": "Ascend910B"}, limit=4,
+                      token_budget=800, navigation_only=True)
+
+    # A navigation page delivers cards; the inline legacy row yields first.
+    assert nav["cards"]
+    assert nav["source_results"] == {"graded": 0, "legacy_material": 0}
+    assert nav["budget_met"] is True
+    assert "minimum_tokens" not in nav
+    assert nav["usage"]["estimated_tokens"] == response_token_estimate(nav) <= 800
+    assert nav["usage"]["has_more"] is True
+    assert nav["excluded_budget"]
+
+
+def test_roomy_mixed_navigation_keeps_legacy_references_without_inline_bodies(store, tmp_path):
+    """Adding a graded unit cannot hide legacy matches from navigation."""
+    mixed_corpus(store, tmp_path)
+
+    for budget in (2400, 16000):
+        nav = store.query("graph", conditions={"soc": "Ascend910B"}, limit=4,
+                          token_budget=budget, navigation_only=True)
+        assert nav["cards"], budget
+        legacy = [row for row in nav["results"] if row["source"] == "legacy_material"]
+        assert legacy, budget
+        assert all(not row.get("excerpt") for row in nav["results"])
+        assert all(not child.get("excerpt") for row in legacy for child in row["related"])
+        assert nav["body_token_estimate"] == 0
+        assert nav["budget_met"] is True
+        assert nav["usage"]["estimated_tokens"] == response_token_estimate(nav) <= budget
+        # Every omitted preview still names readable material, and its cursor
+        # continues after exactly those previews rather than skipping them.
+        row = legacy[0]
+        assert row["excerpt_omitted"] is True
+        refs = {row["ref"], *(child["ref"] for child in row["related"])}
+        cursor = row["related_next"]
+        while cursor is not None:
+            continued = store.query(continuation=cursor, limit=4)
+            group = continued["results"][0]
+            refs.update(child["ref"] for child in group["related"])
+            cursor = group["related_next"]
+        assert len(refs) == row["related_count"] + 1
+        assert all(store.explain(ref)["kind"] == "block" for ref in refs)
+
+    # The same corpus without navigation_only still returns legacy bodies.
+    page = store.query("graph", conditions={"soc": "Ascend910B"}, limit=4, token_budget=16000)
+    assert any(row["source"] == "legacy_material" and row.get("excerpt")
+               for row in page["results"])
+
+
+def test_mixed_page_sheds_preview_text_but_keeps_every_reference_reachable(store, tmp_path):
+    """Preview text is optional; the references it carries are not.
+
+    `page_groups` anchors `related_next` after the previews it already sent, so
+    deleting those previews would strand their blocks: paging resumes past them
+    and no later page ever returns them.
+    """
+    mixed_corpus(store, tmp_path)
+
+    page = store.query("graph", conditions={"soc": "Ascend910B"}, limit=4, token_budget=2400)
+    legacy = [row for row in page["results"] if row["source"] == "legacy_material"]
+    assert legacy, page["source_results"]
+    row = legacy[0]
+
+    assert row["related_count"] == 4
+    assert row["related"], "the delivered references must survive preview shedding"
+    for preview in row["related"]:
+        assert preview["excerpt"] == ""
+        assert preview["excerpt_omitted"] is True
+        assert preview["ref"]
+    assert page["usage"]["has_more"] is True
+    assert page["usage"]["estimated_tokens"] == response_token_estimate(page) <= 2400
+
+    # Follow the real cursor to exhaustion: the anchor plus every related block
+    # must be delivered exactly once across the pages the caller can reach.
+    reachable = {row["ref"], *(preview["ref"] for preview in row["related"])}
+    cursor, pages = row["related_next"], 0
+    while cursor is not None:
+        pages += 1
+        assert pages <= 8, "related paging must terminate"
+        continued = store.query(continuation=cursor, limit=4)
+        assert continued["page"] == "related"
+        group = continued["results"][0]
+        reachable.update(preview["ref"] for preview in group["related"])
+        cursor = group.get("related_next")
+
+    assert len(reachable) == row["related_count"] + 1
+    for ref in reachable:
+        assert store.explain(ref)["kind"] == "block"
+
+
+def test_graded_delivery_is_counted_only_when_the_unit_survives_composition(store, tmp_path):
+    """A mixed page trims after the graded sub-page, so it owns the receipt."""
+    graded = mixed_corpus(store, tmp_path)
+
+    def deliveries():
+        return summarize_usage_events(store, graded.id,
+                                      include_delivery=True)["query_deliveries"]
+
+    # Too tight for any graded card or row: nothing graded reaches the caller.
+    before = deliveries()
+    dropped = store.query("graph", conditions={"soc": "Ascend910B"}, limit=4, token_budget=400)
+    assert [row for row in dropped["results"] if row["source"] == "graded"] == []
+    assert dropped["cards"] == [] and dropped["foundation_cards"] == []
+    assert deliveries() == before
+
+    # The same page with room for the graded card does count exactly one.
+    delivered = store.query("graph", conditions={"soc": "Ascend910B"}, limit=4,
+                            token_budget=800, navigation_only=True)
+    assert graded.id in {card["id"] for card in delivered["cards"]}
+    assert deliveries() == before + 1
 
 
 def test_local_c5_preserves_legacy_results_reference_reads_and_one_budget(store, tmp_path):
@@ -28,12 +160,27 @@ def test_local_c5_preserves_legacy_results_reference_reads_and_one_budget(store,
     before = store.query("graph", limit=4)
     legacy_ref = before["results"][0]["ref"]
     store.graded.install([unit(conditions={"soc": ["Ascend910B"]}, body="Graded graph probe. " * 100)])
-    result = store.query("graph", conditions={"soc": "Ascend910B"}, limit=4, token_budget=60, domain_path="unrelated")
+    result = store.query("graph", conditions={"soc": "Ascend910B"}, limit=4, token_budget=6000, domain_path="unrelated")
     assert result["retrieval"] == "mixed-bm25"
     assert {row["source"] for row in result["results"]} == {"legacy_material", "graded"}
     assert legacy_ref in {row["ref"] for row in result["results"]}
     assert len(result["results"]) <= 4
-    assert sum(body_cost(row) for row in result["results"]) == result["body_token_estimate"] <= 60
+    # One budget covers both sources: the declared body total counts graded
+    # excerpts, premises and nested legacy related excerpts alike, and the
+    # declared delivery estimate describes the mixed payload actually returned.
+    assert sum(body_cost(row) for row in result["results"]) == result["body_token_estimate"]
+    assert result["usage"]["body_token_estimate"] == result["body_token_estimate"]
+    assert result["usage"]["estimated_tokens"] == response_token_estimate(result) <= 6000
+    assert result["budget_met"] is True
+
+    # The same mixed page under a budget that cannot hold both sources reports
+    # the shortfall instead of silently returning an over-budget response.
+    tight = store.query("graph", conditions={"soc": "Ascend910B"}, limit=4, token_budget=700)
+    assert response_token_estimate(tight) == tight["usage"]["estimated_tokens"]
+    assert tight["usage"]["has_more"] is True
+    assert tight["budget_met"] is (tight["usage"]["estimated_tokens"] <= 700)
+    if not tight["budget_met"]:
+        assert tight["minimum_tokens"] == tight["usage"]["estimated_tokens"] > 700
     assert store.explain(legacy_ref)["kind"] == "block"
     cursors = [row["related_next"] for row in result["results"] if row.get("related_next")]
     assert cursors
@@ -49,7 +196,7 @@ def test_only_returned_inherited_parent_is_observed_for_feedback(store):
     child = unit("unit-graph-child", conditions={"soc": ["Ascend910B"]}, parents=[parent.id], body="Graph child rule.")
     unrelated = unit("unit-unseen", conditions={"soc": ["Ascend910C"]})
     store.graded.install([parent, child, unrelated])
-    found = store.query("graph", conditions={"soc": "Ascend910B"}, limit=1, token_budget=100)["results"][0]
+    found = store.query("graph", conditions={"soc": "Ascend910B"}, limit=1, token_budget=4000)["results"][0]
     inherited = found["inherited_rules"][0]
     vote = store.record_vote(root_hash="fixture-parent-reader", ref=inherited["feedback_ref"], rating="up",
                              reason="Parent premise applied.", publishable=False)
@@ -152,7 +299,7 @@ def test_graded_only_query_skips_legacy_engine_until_visible_material_arrives(st
                        source_range={"part": index}) for index in range(5)]
         author.append_batch("a" * 64, blocks, "Legacy graph.", title="Legacy graph", status="complete", promote=True)
         store.install_feed([author.export_task("a" * 64)], feed_ident="arriving-feed")
-    mixed = store.query("graph", conditions={"soc": "Ascend910B"}, limit=4)
+    mixed = store.query("graph", conditions={"soc": "Ascend910B"}, limit=4, token_budget=6000)
     assert {row["source"] for row in mixed["results"]} == {"graded", "legacy_material"}
     cursor = next(row["related_next"] for row in mixed["results"] if row.get("related_next"))
     assert searches == [None]

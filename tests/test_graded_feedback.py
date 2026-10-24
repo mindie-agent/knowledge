@@ -14,6 +14,7 @@ from mindie_knowledge.graded.feedback import (
     parse_feedback_ref,
     record_vote,
     render_feedback,
+    summarize_usage_events,
     summarize_votes,
     validate_feedback,
 )
@@ -106,6 +107,64 @@ def test_observe_is_explicit_idempotent_and_stores_only_identity(store):
     assert store.db.execute(
         "SELECT count(*) FROM known_revisions WHERE entry_id=?", (item.id,)
     ).fetchone()[0] == 1
+
+
+def test_one_query_writes_one_transaction_and_counts_each_unit_once(store):
+    """A delivered unit reaches the caller as a result row and its own card.
+
+    That is one delivery, so its counter advances once per query, and the whole
+    receipt batch commits in a single SQLite write transaction.
+    """
+    from graded_fixture import OBSERVED, unit as graded_unit
+
+    premise = graded_unit("unit-batch-premise", tier="L1", category="axiom",
+                          evidence_strength="hardware_spec", domain_path="_common",
+                          body="Batch premise for graph capture.")
+    child = graded_unit("unit-batch-child", parents=[premise.id],
+                        body="Graph capture child step. " * 4)
+    store.graded.install([premise, child])
+
+    statements = []
+    store.db.set_trace_callback(statements.append)
+    try:
+        found = store.query("graph capture", conditions=OBSERVED, token_budget=4000)
+    finally:
+        store.db.set_trace_callback(None)
+
+    # The same unit is delivered both as a result and as its navigation card.
+    assert child.id in {row["id"] for row in found["results"]}
+    assert child.id in {card["id"] for card in found["cards"]}
+    assert sum(1 for text in statements if text.strip().upper().startswith("BEGIN")) == 1
+
+    assert summarize_usage_events(store, child.id, include_delivery=True)["query_deliveries"] == 1
+    store.query("graph capture", conditions=OBSERVED, token_budget=4000)
+    assert summarize_usage_events(store, child.id, include_delivery=True)["query_deliveries"] == 2
+
+    # An inherited premise is registered as readable without being counted as
+    # its own query delivery.
+    premise_summary = summarize_usage_events(store, premise.id, include_delivery=True)
+    assert premise_summary["query_deliveries"] >= 1
+    assert store.db.execute(
+        "SELECT count(*) FROM known_revisions WHERE entry_id=?", (premise.id,)
+    ).fetchone()[0] == 1
+
+
+def test_distinct_revisions_keep_separate_delivery_receipts(store):
+    item = make_unit("unit-revision-receipt")
+    revised = make_unit("unit-revision-receipt", body="Revised feedback probe rule.\n",
+                        revision=2)
+
+    observe(store, item, delivery="query")
+    observe(store, revised, delivery="query")
+
+    rows = store.db.execute(
+        "SELECT key FROM state WHERE key LIKE 'graded:observed:unit-revision-receipt:%'"
+    ).fetchall()
+    assert len(rows) == 2
+    assert summarize_usage_events(store, item.id, revision=1,
+                                  include_delivery=True)["query_deliveries"] == 1
+    assert summarize_usage_events(store, revised.id, revision=2,
+                                  include_delivery=True)["query_deliveries"] == 1
 
 
 def test_vote_requires_an_actually_observed_revision(store):
