@@ -68,7 +68,8 @@ def test_healthy_association_reuses_boundary_and_receipts_after_restart(tmp_path
     assert repeated['token'] == lease['token']
     assert repeated['activated_at'] == 12.0
     assert not restarted.claim('native', 'capture', 'once', lease['token'])
-    assert restarted.resolve_capture_lease('native', timeout=.1)['state'] == 'admitted'
+    # Association retains identity/receipts but cannot grant the manual flywheel.
+    assert restarted.resolve_capture_lease('native', timeout=.1)['state'] == 'inactive'
     assert restarted.deactivate('native')
     with pytest.raises(ValueError, match='explicitly revoked'):
         restarted.associate('native', project_root=str(tmp_path), not_before=1000.0)

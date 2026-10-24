@@ -2,7 +2,7 @@
 
 [中文](public-transcript-capture.zh.md) | **English** · [Back to Documentation Center](README.en.md)
 
-This guide explains how `mindie-knowledge` extracts visible conversation turns from native host transcripts when community sharing is enabled, applies double fail-closed privacy redaction, splits messages into lossless Markdown blocks, and builds retrieval navigation incrementally.
+This guide explains how `mindie-knowledge` extracts visible conversation turns from native host transcripts in manually `/mindie-agent`-enabled sessions when community sharing is enabled, applies double fail-closed privacy redaction, splits messages into lossless Markdown blocks, and builds retrieval navigation incrementally.
 
 ---
 
@@ -21,6 +21,7 @@ flowchart LR
 ## 2. Deterministic Public-Message Projection
 
 `public-transcript` is the single capture pipeline. Each host plugin supplies its own deterministic `transcript_adapter`:
+- **Requires an Explicit Manual Session Lease (`entry_enabled = 1`)**: Live `Stop` capture runs only for sessions explicitly activated via `/mindie-agent` (`Admission.activate(..., automatic=False)`). Unactivated sessions and legacy automatic associations (`entry_enabled = 0`) short-circuit before opening transcripts.
 - **Reads Only the Bound Session Transcript**: The background worker reads only the exact transcript path forwarded by the Stop Hook—never scanning historical session folders or guessing neighboring files.
 - **Strips Internal Noise**: Only authorized **user inputs**, **visible assistant progress**, and **final answers** are kept. Tool call arguments/results, hidden reasoning traces, system/developer prompt injections, and foreign task history are deterministically excluded.
 - **No Truncation of Long Messages**: Paging bounds memory between records without truncating large messages; a complete public turn is always read whole. Malformed records or unverifiable ownership leave the cursor unchanged and surface an explicit error.
