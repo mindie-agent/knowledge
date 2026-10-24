@@ -53,10 +53,10 @@ def mixed_query(store, legacy, query, *, limit, conditions, domain_path, token_b
         1, token_budget * min(limit, graded_limit + len(legacy["results"])) // limit)
     # The graded sub-page is not what the caller receives; this page composes
     # and trims it further, so its delivery receipt is recorded below, once.
-    graded = store.graded.query(query, limit=graded_limit, conditions=conditions,
+    graded, index = store.graded.query(query, limit=graded_limit, conditions=conditions,
                                 domain_path=domain_path, token_budget=graded_budget,
                                 include_unknown=include_unknown, include_archived=include_archived,
-                                navigation_only=navigation_only, observe_delivery=False,
+                                navigation_only=navigation_only, defer_delivery=True,
                                 run_id=run_id, mode=mode, ledger_entries=ledger_entries,
                                 bottleneck_summary=bottleneck_summary,
                                 native_subcontext=native_subcontext, goal=goal)
@@ -107,7 +107,8 @@ def mixed_query(store, legacy, query, *, limit, conditions, domain_path, token_b
     # One owner charges the delivered graded + legacy material, so `usage` can
     # never describe only the graded half of what the caller receives.
     recompute_body_tokens(payload)
-    index = store.graded.routing_index()
+    # The source objects used for trimming and receipts are the same immutable
+    # index that assembled the sub-page, even if another Store installs a feed.
     enforce_query_budget(payload, index, navigation_only=navigation_only,
                          derive=count_sources)
     # Only the graded units that survived composition are counted as delivered.
