@@ -369,14 +369,14 @@ class GradedRepository:
     def ref(self, unit_id, revision=None):
         return f"mindie://{self.store.domain}/units/{unit_id}" + ("@" + str(revision) if revision is not None else "")
 
-    def routing_index(self):
-        """The installed routing index, for callers that assemble their own page."""
-        with self.store.lock:
-            return self._load()
-
     def query(self, query, *, navigation_only=False, run_id=None, mode="reuse",
               ledger_entries=None, bottleneck_summary=None, native_subcontext=False,
-              goal="", observe_delivery=True, **kwargs):
+              goal="", defer_delivery=False, **kwargs):
+        """Assemble a page from one index; deferred composition retains that index.
+
+        Mixed reads get the in-memory (payload, index) pair and own the final
+        budget/receipt. The index never enters the serialized response.
+        """
         with self.store.lock:
             index = self._load()
             result = index.query(
@@ -415,9 +415,9 @@ class GradedRepository:
             enforce_query_budget(payload, index, navigation_only=navigation_only)
             # A mixed page composes and trims after this call, so it records the
             # delivery itself once its own outward payload is final.
-            if observe_delivery:
+            if not defer_delivery:
                 self.observe_delivered(index, payload, delivery="query", run_id=run_id)
-        return payload
+        return (payload, index) if defer_delivery else payload
 
     @staticmethod
     def _delivered_units(payload, delivery):

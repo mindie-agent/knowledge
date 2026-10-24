@@ -5,7 +5,8 @@ import hashlib
 import pytest
 
 from graded_fixture import unit
-from mindie_knowledge.graded.feedback import summarize_usage_events
+from mindie_knowledge.graded.feedback import record_vote, summarize_usage_events
+from mindie_knowledge.loop.store import Store
 from mindie_knowledge.graded.index import response_token_estimate, token_estimate
 from mindie_knowledge.graded.units import GradedUnit
 from mindie_knowledge.materials import MaterialStore
@@ -310,3 +311,38 @@ def test_graded_only_query_skips_legacy_engine_until_visible_material_arrives(st
     with pytest.raises(QueryContinuationError):
         store.query(continuation=cursor, limit=1)
     assert searches == [None, cursor]
+
+
+@pytest.mark.parametrize("change", ["revise", "remove"])
+def test_mixed_delivery_keeps_source_revision_across_concurrent_install(store, tmp_path, monkeypatch, change):
+    """A feed writer between sub-page and composition cannot rename delivered bytes."""
+    original = mixed_corpus(store, tmp_path)
+    query = store.graded.query
+    with closing(Store(tmp_path, store.domain)) as writer:
+        # Both connections must see the same installed source before the writer
+        # replaces it; no synthetic index or receipt is injected.
+        assert writer.graded.explain(store.graded.ref(original.id))["revision"] == 1
+
+        def install_after_query(*args, **kwargs):
+            prepared = query(*args, **kwargs)
+            if change == "revise":
+                writer.graded.install([unit(conditions={"soc": ["Ascend910B"]},
+                                           body="Revised graph content. " * 100)])
+            else:
+                writer.graded.install([unit("unit-replacement-probe", body="Replacement rule.")])
+            return prepared
+
+        monkeypatch.setattr(store.graded, "query", install_after_query)
+        page = store.query("graph", conditions={"soc": "Ascend910B"}, limit=4, token_budget=6000)
+
+    rows = [row for row in page["results"] if row.get("source") == "graded"]
+    assert len(rows) == 1 and rows[0]["revision"] == 1
+    assert "Graded graph probe." in rows[0]["excerpt"]
+    assert summarize_usage_events(store, original.id, revision=1,
+                                  include_delivery=True)["query_deliveries"] == 1
+    assert summarize_usage_events(store, original.id, revision=2,
+                                  include_delivery=True)["query_deliveries"] == 0
+    # Feedback is about what this caller received, even if the current catalog
+    # has moved on. It must not require loading the replacement revision.
+    vote = record_vote(store, root_hash="a" * 64, ref=rows[0]["feedback_ref"], event_type="applied")
+    assert vote["revision"] == 1
