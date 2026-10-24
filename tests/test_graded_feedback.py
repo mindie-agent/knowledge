@@ -149,6 +149,29 @@ def test_one_query_writes_one_transaction_and_counts_each_unit_once(store):
     ).fetchone()[0] == 1
 
 
+@pytest.mark.parametrize("operation", ["query", "explain"])
+def test_explore_context_counts_units_after_result_rows_are_trimmed(store, operation):
+    item = make_unit("unit-context-delivery", body="Graph feedback bottleneck evidence.")
+    store.graded.install([item])
+    conditions = {"soc": "Ascend910B", "workload_scope": "decode"}
+    if operation == "query":
+        delivered = store.query("graph feedback", conditions=conditions, mode="explore", token_budget=800)
+        assert delivered["results"] == [] and delivered["cards"] == []
+    else:
+        delivered = store.explain(refs=[ref(item)], conditions=conditions, mode="explore", token_budget=800)
+        assert delivered["units"] == [] and delivered["requires"] == []
+    assert [row["id"] for row in delivered["exploration_context"]["mounted_units"]] == [item.id]
+    assert summarize_usage_events(store, item.id, include_delivery=True)[operation + "_deliveries"] == 1
+    if operation == "query":
+        roomy = store.query("graph feedback", conditions=conditions, mode="explore", token_budget=4000)
+        assert roomy["results"]
+    else:
+        roomy = store.explain(refs=[ref(item)], conditions=conditions, mode="explore", token_budget=4000)
+        assert roomy["units"]
+    assert roomy["exploration_context"]["mounted_units"]
+    assert summarize_usage_events(store, item.id, include_delivery=True)[operation + "_deliveries"] == 2
+
+
 def test_distinct_revisions_keep_separate_delivery_receipts(store):
     item = make_unit("unit-revision-receipt")
     revised = make_unit("unit-revision-receipt", body="Revised feedback probe rule.\n",

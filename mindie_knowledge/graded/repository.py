@@ -434,8 +434,14 @@ class GradedRepository:
             delivered.append((item["id"], delivery))
             delivered.extend((parent["id"], None)
                              for parent in item.get("inherited_rules", ()) or ())
-        for key in ("cards", "foundation_cards", "unverified_cards"):
+        for key in ("cards", "foundation_cards", "unverified_cards", "units", "requires"):
             delivered.extend((card["id"], delivery) for card in payload.get(key, []))
+        # A trimmed result can still be delivered in the compact exploration
+        # context. Its `units`/foundation/mutator views alias mounted_units;
+        # read that canonical collection once and let revision deduplication
+        # combine it with any surviving rows or cards.
+        context = payload.get("exploration_context") or {}
+        delivered.extend((unit["id"], delivery) for unit in context.get("mounted_units", ()))
         return delivered
 
     def observe_delivered(self, index, payload, *, delivery="query", run_id=None):
@@ -524,8 +530,6 @@ class GradedRepository:
                 item["id"]: item
                 for bucket in ("requires", "units") for item in result.get(bucket, [])
             }
-            self.observe_delivered(
-                index, {"cards": list(loaded.values())}, delivery="explain", run_id=run_id)
             if isinstance(ref, str):
                 parts = _ref_parts(ref)
                 if (parts is not None and (parts[0] is None or parts[0] == self.store.domain)
@@ -536,6 +540,7 @@ class GradedRepository:
                     # payload rather than left as the pre-merge estimate.
                     if "usage" in result:
                         reconcile_budget_truth(result, token_budget)
+            self.observe_delivered(index, result, delivery="explain", run_id=run_id)
             return result
 
 
