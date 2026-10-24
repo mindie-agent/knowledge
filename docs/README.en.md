@@ -39,7 +39,7 @@ These guides explain how `mindie-knowledge` coordinates file locks, background s
 
 | English Guide | 中文文档 | What You Will Learn |
 | --- | --- | --- |
-| **[Release Compatibility & File Locks](release-compatibility.md)** | **[版本兼容与跨平台文件锁](release-compatibility.zh.md)** | How `mindie-plugin-release.json` declares supported Harness version intervals, and how `locks.py` provides shared/exclusive OS file locking on POSIX and Windows. |
+| **[Release Compatibility, Component Updates & File Locks](release-compatibility.md)** | **[版本兼容、组件更新与跨平台文件锁](release-compatibility.zh.md)** | How `mindie-plugin-release.json` selects compatible plugin releases, how `component_runtime` and `runtime_inventory` discover and build side-by-side `uv` runtimes across the 8 official components, and how `locks.py` provides shared/exclusive OS file locking. |
 | **[Service & Attempt Process Lifetime](service-process-lifetime.md)** | **[服务与单次操作生命周期](service-process-lifetime.zh.md)** | How Windows Task Scheduler, Linux `systemd` (254+), and macOS `owner-pipe` watchers contain background services and per-attempt subprocess trees. |
 | **[Summary Process & Scratch Ownership](summary-process-ownership.md)** | **[摘要进程与临时目录回收](summary-process-ownership.zh.md)** | The `MINDIE_SUMMARY_SCRATCH` contract and the strict 4-step teardown order: persist result first, terminate process tree second, drain pipes third, delete temporary directory last. |
 | **[Windows Knowledge Service Host](windows-service-host.md)** | **[Windows 知识服务宿主](windows-service-host.zh.md)** | How native Windows uses Task Scheduler COM APIs + one-use DPAPI context transfer so the knowledge service outlives short-lived Hook processes. |

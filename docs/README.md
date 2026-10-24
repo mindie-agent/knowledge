@@ -39,7 +39,7 @@ flowchart LR
 
 | 中文文档 | English | 核心内容导读 |
 | --- | --- | --- |
-| **[版本兼容与跨平台文件锁](release-compatibility.zh.md)** | **[Release Compatibility & Locks](release-compatibility.md)** | `mindie-plugin-release.json` 如何声明宿主版本区间以挑选最高兼容正式版，以及 `locks.py` 如何在 POSIX/Windows 上实现共享/排他文件锁。 |
+| **[版本兼容、组件更新与跨平台文件锁](release-compatibility.zh.md)** | **[Release Compatibility & Locks](release-compatibility.md)** | `mindie-plugin-release.json` 宿主版本区间选择、8 个官方组件的独立 GitHub Release 发现与并排 `uv` 运行时构建（`component_runtime` / `runtime_inventory`），以及 POSIX/Windows 共享/排他文件锁。 |
 | **[服务与单次操作生命周期](service-process-lifetime.zh.md)** | **[Service & Attempt Lifetime](service-process-lifetime.md)** | Windows 计划任务、Linux `systemd`（254+）与 macOS `owner-pipe` 如何实现后台服务与模型子进程树的跨平台容器化隔离。 |
 | **[摘要进程与临时目录回收](summary-process-ownership.zh.md)** | **[Summary Process Ownership](summary-process-ownership.md)** | `MINDIE_SUMMARY_SCRATCH` 内部契约：为什么必须严格遵循“先持久化结果 -> 再关停进程树 -> 最后删除临时目录”的三步顺序。 |
 | **[Windows 知识服务宿主](windows-service-host.zh.md)** | **[Windows Service Host](windows-service-host.md)** | 原生 Windows 下如何用 Task Scheduler COM 接口 + DPAPI 一次性加密上下文，让后台知识服务跨越短生命周期的 Hook 进程安全存活。 |

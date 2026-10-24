@@ -243,7 +243,7 @@ python3 -m mindie_knowledge.redact --profile
 | **`knowledge_feedback(ref, rating, reason?)`** | 针对精确观测修订 `mindie://DOMAIN/<task-id>@<observed-revision>` 记录 `up` / `down` 评价及可选单行原因（最多 1000 字符）。 |
 | **`knowledge_sync(...)`** | 按需执行一次零大模型调用的上游公开知识库增量同步，通过 `git cat-file --batch` 流式校验后原子切换本地可见视图。 |
 | **`mindie_knowledge.loop.history_import.import_transcript`** | 显式导入用户指定的历史会话快照，复用与实时采集完全一致的脱敏、分块与准入管线。 |
-| **`mindie_knowledge.releases`** | 解析插件正式版资产 `mindie-plugin-release.json` 与 `mindie-harness-compatibility/1`，供更新器挑选兼容当前宿主版本的最高正式版。 |
+| **`mindie_knowledge.releases` / `component_runtime` / `runtime_inventory`** | 解析插件 `mindie-plugin-release.json`（含 `release_http` 有界 `ETag`/TTL 缓存），直接发现 8 个官方组件的独立正式 GitHub Release（`component_releases`）、核验不可变 Tag 与 `benchmark-results.json` 门禁，并构建并排隔离 `uv` 运行时。 |
 
 ---
 
@@ -259,7 +259,7 @@ python3 -m mindie_knowledge.redact --profile
 | **显式历史会话导入** | [history-import.zh.md](docs/history-import.zh.md) | [history-import.md](docs/history-import.md) | 如何把以前跑过的有价值会话安全导入知识闭环，且支持断点续导 |
 | **社区共享与发件箱对账** | [community-sharing.zh.md](docs/community-sharing.zh.md) | [community-sharing.md](docs/community-sharing.md) | 贡献者端如何隔离凭据、幂等提交 PR 以及在网络中断后只读对账 |
 | **仓库审核 Bot 规范** | [repository-bot-contract.zh.md](docs/repository-bot-contract.zh.md) | [repository-bot-contract.md](docs/repository-bot-contract.md) | `mindie-content-review/2` 机器人如何自动审核纯内容 PR、做有限脱敏修正与处理撤下 |
-| **版本兼容与跨平台文件锁** | [release-compatibility.zh.md](docs/release-compatibility.zh.md) | [release-compatibility.md](docs/release-compatibility.md) | 插件如何挑选兼容当前宿主的正式版，以及 POSIX/Windows 共享与排他文件锁 |
+| **版本兼容、组件更新与跨平台文件锁** | [release-compatibility.zh.md](docs/release-compatibility.zh.md) | [release-compatibility.md](docs/release-compatibility.md) | 插件兼容版本选择、8 组件独立 GitHub Release 发现与并排 `uv` 运行时构建，以及 POSIX/Windows 文件锁 |
 | **服务与子进程生命周期** | [service-process-lifetime.zh.md](docs/service-process-lifetime.zh.md) | [service-process-lifetime.md](docs/service-process-lifetime.md) | Windows 计划任务、Linux systemd 254+ 与 macOS 管道守卫如何管理后台服务与子进程寿命 |
 | **摘要进程与临时目录回收** | [summary-process-ownership.zh.md](docs/summary-process-ownership.zh.md) | [summary-process-ownership.md](docs/summary-process-ownership.md) | 为什么先落盘结果、再关进程树、最后删临时目录，彻底消除并发清理竞态 |
 | **Windows 知识服务宿主** | [windows-service-host.zh.md](docs/windows-service-host.zh.md) | [windows-service-host.md](docs/windows-service-host.md) | 原生 Windows 下如何用 Task Scheduler + DPAPI 让知识服务跨越短 Hook 存活 |

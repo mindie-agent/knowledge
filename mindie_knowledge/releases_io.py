@@ -62,21 +62,16 @@ class _OfficialRedirects(urllib.request.HTTPRedirectHandler):
 
 
 def _get(url, *, maximum, timeout, accept):
-    request = urllib.request.Request(url, headers={
-        "Accept": accept, "User-Agent": "mindie-release-reader",
-        "X-GitHub-Api-Version": "2022-11-28",
-    })
+    from .release_http import ReleaseResponseTooLarge, read
     try:
-        with urllib.request.build_opener(_OfficialRedirects()).open(
-                request, timeout=timeout) as response:
-            if response.status != 200:
-                raise ReleaseFetchError("release_http_error", status=response.status)
-            body = response.read(maximum + 1)
-            if len(body) > maximum:
-                raise ReleaseFetchError("release_response_too_large")
-            return body, dict(response.headers)
+        return read(url, maximum=maximum, timeout=timeout, accept=accept,
+                    redirects=_OfficialRedirects())
     except urllib.error.HTTPError as exc:
         raise ReleaseFetchError("release_http_error", status=exc.code) from None
+    except ReleaseResponseTooLarge:
+        raise ReleaseFetchError("release_response_too_large") from None
+    except TimeoutError:
+        raise
     except (urllib.error.URLError, OSError, http.client.HTTPException):
         raise ReleaseFetchError("release_transport_unavailable") from None
 
@@ -158,7 +153,7 @@ def _metadata(row, *, repository, timeout):
     return _json(body)
 
 
-def fetch_releases(repository, *, timeout=10.0):
+def fetch_releases(repository, *, timeout=10.0, minimum_version=None):
     """Read every public Release page and its official metadata asset.
 
     No authentication files, local index, state write or installation is used.
@@ -170,6 +165,8 @@ def fetch_releases(repository, *, timeout=10.0):
         raise ReleaseValidationError("untrusted_repository")
     if (type(timeout) not in (int, float) or not 0 < timeout <= 60):
         raise ReleaseFetchError("invalid_release_read_timeout")
+    from semantic_version import Version
+    minimum = Version(minimum_version) if minimum_version is not None else None
     result, seen = [], set()
     for page in range(1, MAX_PAGES + 1):
         url = (f"https://api.github.com/repos/{repository}/releases"
@@ -192,7 +189,11 @@ def fetch_releases(repository, *, timeout=10.0):
             seen.add(ident)
             record = {key: row.get(key) for key in ("id", "tag_name", "draft", "prerelease")}
             if not row["draft"] and not row["prerelease"]:
-                record["metadata"] = _metadata(row, repository=repository, timeout=timeout)
+                try:
+                    old = minimum is not None and Version(str(row.get("tag_name", "")).removeprefix("v")) < minimum
+                except ValueError:
+                    old = False
+                record["metadata"] = None if old else _metadata(row, repository=repository, timeout=timeout)
             result.append(record)
         if not more and len(rows) < 100:
             return result

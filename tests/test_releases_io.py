@@ -15,6 +15,13 @@ from mindie_knowledge.releases import ReleaseValidationError, select_release
 from test_releases import REPO, release
 
 
+@pytest.fixture(autouse=True)
+def isolated_release_cache(monkeypatch, tmp_path):
+    from mindie_knowledge import release_http
+    monkeypatch.setenv("MINDIE_RELEASE_CACHE", str(tmp_path / "release-cache"))
+    monkeypatch.setattr(release_http, "token", lambda: None)
+
+
 def public_release(ident=1, version="0.0.1"):
     record = release(version, ident)
     body = json.dumps(record.pop("metadata")).encode()
@@ -66,6 +73,18 @@ def test_complete_pagination_selects_highest_not_first_page(monkeypatch):
                             harness_version="0.153.4")
     assert result["candidate"]["metadata"]["version"] == "0.0.2"
     assert len(seen) == 4
+
+
+def test_updater_does_not_download_obsolete_plugin_metadata(monkeypatch):
+    old, _ = public_release(1, "0.0.1")
+    current, body = public_release(2, "0.0.2")
+    seen = serve(monkeypatch, [([old, current], {})], {
+        current["assets"][0]["browser_download_url"]: body,
+    })
+    records = reader.fetch_releases(REPO, minimum_version="0.0.2")
+    assert records[0]["metadata"] is None
+    assert records[1]["metadata"]["version"] == "0.0.2"
+    assert old["assets"][0]["browser_download_url"] not in seen
 
 
 def test_full_page_without_link_requires_next_read(monkeypatch):

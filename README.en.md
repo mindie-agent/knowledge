@@ -239,7 +239,7 @@ Host plugins (Claude Code, OpenAI Codex, Kimi Code, and DeepSeek Harness `mindie
 | **`knowledge_feedback(ref, rating, reason?)`** | Records an `up` or `down` vote (with an optional single-line reason up to 1000 chars) bound to `mindie://DOMAIN/<task-id>@<observed-revision>`. |
 | **`knowledge_sync(...)`** | Runs an on-demand, model-free incremental sync against upstream public knowledge repositories, verifying blobs via `git cat-file --batch` before atomically switching the local view. |
 | **`mindie_knowledge.loop.history_import.import_transcript`** | Imports explicitly selected historical transcripts through the same deterministic redaction, chunking, and admission pipeline as live capture. |
-| **`mindie_knowledge.releases`** | Parses `mindie-plugin-release.json` assets and `mindie-harness-compatibility/1` registries so updaters select the highest compatible stable release. |
+| **`mindie_knowledge.releases` / `component_runtime` / `runtime_inventory`** | Parses `mindie-plugin-release.json` assets (with `release_http` bounded `ETag`/TTL caching), discovers independent formal GitHub Releases across the 8 official components (`component_releases`), verifies immutable tags and `benchmark-results.json` gates, and builds side-by-side isolated `uv` runtimes. |
 
 ---
 
@@ -255,7 +255,7 @@ All architecture and engineering guides under [`docs/`](docs/README.en.md) are w
 | **Explicit Historical Transcript Import** | [history-import.md](docs/history-import.md) | [history-import.zh.md](docs/history-import.zh.md) | Importing selected past sessions safely with prefix verification and resumable intake |
 | **Community Sharing & Outbox** | [community-sharing.md](docs/community-sharing.md) | [community-sharing.zh.md](docs/community-sharing.zh.md) | Contributor credential isolation, idempotent PR submission, and read-only reconciliation |
 | **Repository Review Bot Contract** | [repository-bot-contract.md](docs/repository-bot-contract.md) | [repository-bot-contract.zh.md](docs/repository-bot-contract.zh.md) | How the `mindie-content-review/2` bot validates, redacts, merges, or withdraws content PRs |
-| **Release Compatibility & File Locks** | [release-compatibility.md](docs/release-compatibility.md) | [release-compatibility.zh.md](docs/release-compatibility.zh.md) | Selecting compatible plugin releases and coordinating shared/exclusive OS file locks |
+| **Release Compatibility, Component Updates & File Locks** | [release-compatibility.md](docs/release-compatibility.md) | [release-compatibility.zh.md](docs/release-compatibility.zh.md) | Selecting compatible plugin releases, discovering/building side-by-side component runtimes, and coordinating OS file locks |
 | **Service & Attempt Process Lifetime** | [service-process-lifetime.md](docs/service-process-lifetime.md) | [service-process-lifetime.zh.md](docs/service-process-lifetime.zh.md) | Process containment across Windows Task Scheduler, Linux systemd 254+, and macOS owner pipes |
 | **Summary Process & Scratch Ownership** | [summary-process-ownership.md](docs/summary-process-ownership.md) | [summary-process-ownership.zh.md](docs/summary-process-ownership.zh.md) | Persisting results before tree teardown and scratch cleanup to eliminate race conditions |
 | **Windows Knowledge Service Host** | [windows-service-host.md](docs/windows-service-host.md) | [windows-service-host.zh.md](docs/windows-service-host.zh.md) | Running the background service via Windows Task Scheduler + DPAPI across short Hook lifetimes |
