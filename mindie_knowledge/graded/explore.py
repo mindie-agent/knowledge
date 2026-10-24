@@ -161,8 +161,6 @@ def _compact_unit(unit: dict) -> dict | None:
     if not isinstance(ident, str) or not ident:
         raise ValueError("retrieved unit requires a stable id")
     body = str(unit.get("body") or unit.get("content") or unit.get("excerpt") or "")
-    if len(body) > 240:
-        body = body[:240].rstrip() + "..."
     return {"id": ident, "tier": tier, "revision": unit.get("revision"),
             "category": unit.get("category"), "title": unit.get("title"),
             "conditions": unit.get("conditions"), "ref": unit.get("ref"),
@@ -228,21 +226,53 @@ def _normalized_avoid(entries: Sequence[Mapping[str, Any]], *, conditions, bottl
     return avoid
 
 
-def _prompt_brief(goal: str, foundations, bottleneck, mutators, avoid) -> str:
+def _prompt_brief(goal: str, foundations, evidence, bottleneck, mutators, avoid) -> str:
     lines = ["# RSI subagent brief", f"**Goal:** {goal or '(not supplied)'}", "",
              "## L1 hard constraints"]
-    lines.extend(f"- {unit['id']}: {unit.get('title') or unit.get('body', '')[:120]}"
-                 for unit in foundations) if foundations else lines.append("- none mounted")
-    lines += ["", "## L2 bottleneck evidence", json.dumps(bottleneck or {}, sort_keys=True)[:600],
-              "", "## L4 allowed mutators"]
-    lines.extend(f"- {unit['id']}: {unit.get('title') or unit.get('body', '')[:120]}"
-                 for unit in mutators) if mutators else lines.append("- none mounted")
+
+    def append_units(units):
+        if not units:
+            lines.append("- none mounted")
+        for unit in units:
+            reference = unit.get("ref") or unit["id"]
+            lines.extend([f"### {reference}: {unit.get('title') or unit['id']}",
+                          "Conditions: " + json.dumps(unit.get("conditions") or {}, sort_keys=True),
+                          unit["body"]])
+
+    append_units(foundations)
+    lines += ["", "## L2 bottleneck evidence", json.dumps(bottleneck or {}, sort_keys=True)]
+    append_units(evidence)
+    lines += ["", "## L4 allowed mutators"]
+    append_units(mutators)
     lines += ["", "## Conditional avoid"]
-    lines.extend(f"- {item['unit_id'] or item['avoid']}: {item['failure_reason']} "
-                 f"(scope: {item['scope_note']})" for item in avoid) if avoid else lines.append("- none")
+    lines.extend(json.dumps(item, sort_keys=True) for item in avoid) if avoid else lines.append("- none")
     lines += ["", "Do not replay prior L3 workflow steps; derive the next experiment "
               "from the mounted L1/L2 facts and L4 mutators only."]
-    return "\n".join(lines)[:1199]
+    return "\n".join(lines)
+
+
+def refresh_exploration_mounts(context: dict) -> None:
+    """Derive every exploration view from the bodies actually being delivered.
+
+    Repository reference binding and the single response-budget owner call
+    this after changing mounts. No field has an independent truncation budget.
+    """
+    mounted = context["mounted_units"]
+    l1 = [unit for unit in mounted if unit["tier"] == "L1"]
+    l2 = [unit for unit in mounted if unit["tier"] == "L2"]
+    l4 = [unit for unit in mounted if unit["tier"] == "L4"]
+    context.update(units=mounted, l1_foundation=l1, l4_mutators=l4)
+    pack = context["subagent_fact_pack"]
+    pack["l1_foundation_ids"] = [unit["id"] for unit in l1]
+    pack["l4_mutator_ids"] = [unit["id"] for unit in l4]
+    pack["prompt_brief"] = _prompt_brief(
+        context["goal"], l1, l2, context["l2_bottleneck"], l4, context["conditional_avoid"])
+    if context.get("excluded_units"):
+        pack["excluded_units"] = context["excluded_units"]
+        pack["prompt_brief"] += (
+            "\n\n## Not mounted: response budget\n"
+            "These bodies were withheld; read the exact refs before applying their constraints or steps.\n"
+            + "\n".join(item.get("ref") or item["id"] for item in context["excluded_units"]))
 
 
 def build_exploration_context(units=None, *, bottleneck_summary=None, failed_attempts=None,
@@ -294,9 +324,8 @@ def build_exploration_context(units=None, *, bottleneck_summary=None, failed_att
             "stripped_tiers": ["L3"], "stripped_l3_ids": stripped,
             "l1_foundation_ids": [unit["id"] for unit in l1],
             "l2_bottleneck": bottleneck, "l4_mutator_ids": [unit["id"] for unit in l4],
-            "conditional_avoid": avoid, "direction_budget_policy": budget_policy,
-            "prompt_brief": _prompt_brief(goal, l1, bottleneck, l4, avoid)}
-    return {"schema": CONTEXT_SCHEMA, "schema_version": CONTEXT_SCHEMA, "mode": "explore",
+            "conditional_avoid": avoid, "direction_budget_policy": budget_policy}
+    context = {"schema": CONTEXT_SCHEMA, "schema_version": CONTEXT_SCHEMA, "mode": "explore",
             "goal": goal, "isolation_mode": isolation, "native_subcontext": bool(native_subcontext),
             "requires_fresh_subcontext": not bool(native_subcontext),
             "mounted_units": mounted, "units": mounted,
@@ -309,6 +338,8 @@ def build_exploration_context(units=None, *, bottleneck_summary=None, failed_att
                       "L1/L2 foundations carried by stripped L3 units are promoted before stripping.",
                       "Deleting an L3 key does not remove visible history; only native_subcontext claims isolation.",
                       "Conditional avoidance is conditional evidence, not a permanent ban."]}
+    refresh_exploration_mounts(context)
+    return context
 
 
 def _gates(candidate, target):

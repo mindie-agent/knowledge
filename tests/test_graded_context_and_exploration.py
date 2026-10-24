@@ -281,3 +281,74 @@ def test_knowledge_operators_has_two_l4_mutators_and_stable_index():
         "unit-msprof-aicore-pipe-bottleneck-triage"]
     tiers = [unit for unit in index.units.values() if unit.metadata["tier"] == "L4"]
     assert len(tiers) == 2
+
+
+@pytest.mark.parametrize("operation", ["query", "explain"])
+def test_exploration_seed_preserves_complete_premise_and_exact_reference(store, operation):
+    from graded_fixture import OBSERVED, unit
+    body = "Graph capture premise detail. " * 50 + "FINAL CONSTRAINT: preserve 64-byte alignment."
+    premise = unit("unit-complete-explore-premise", tier="L1", category="axiom",
+                   evidence_strength="software_contract", body=body)
+    store.graded.install([premise])
+    exact_ref = store.graded.ref(premise.id, 1)
+    if operation == "query":
+        page = store.query("graph capture", conditions=OBSERVED, mode="explore",
+                           native_subcontext=True, token_budget=16000)
+    else:
+        page = store.explain(refs=[exact_ref], conditions=OBSERVED, mode="explore",
+                             native_subcontext=True, token_budget=16000)
+    context = page["exploration_context"]
+    mounted, = context["mounted_units"]
+    assert mounted["body"] == premise.body
+    assert mounted["ref"] == exact_ref
+    seed = context["subagent_fact_pack"]["prompt_brief"]
+    assert premise.body in seed and exact_ref in seed
+    assert "Do not replay prior L3 workflow steps" in seed
+    assert page["budget_met"] is True
+    assert not any(item["id"] == premise.id and item["status"] == "budget_excluded"
+                   for item in page.get("unresolved", []))
+    assert premise.id not in page.get("excluded_budget", [])
+
+
+@pytest.mark.parametrize("operation", ["query", "explain"])
+def test_exploration_budget_omits_whole_premise_without_claiming_delivery(store, operation):
+    from graded_fixture import OBSERVED, unit
+    from mindie_knowledge.graded.feedback import summarize_usage_events
+    from mindie_knowledge.graded.index import response_token_estimate
+    premise = unit("unit-excluded-explore-premise", tier="L1", category="axiom",
+                   evidence_strength="software_contract", body="Graph capture guard. " * 400)
+    store.graded.install([premise])
+    exact_ref = store.graded.ref(premise.id, 1)
+    if operation == "query":
+        page = store.query("graph capture", conditions=OBSERVED, mode="explore", token_budget=1000)
+    else:
+        page = store.explain(refs=[exact_ref], conditions=OBSERVED, mode="explore", token_budget=1000)
+    context = page["exploration_context"]
+    assert context["mounted_units"] == [] and context["l1_foundation"] == []
+    omitted, = context["excluded_units"]
+    assert omitted["ref"] == exact_ref and omitted["status"] == "budget_excluded"
+    seed = context["subagent_fact_pack"]["prompt_brief"]
+    assert exact_ref in seed and "These bodies were withheld" in seed
+    assert "Graph capture guard." not in seed
+    assert summarize_usage_events(store, premise.id, include_delivery=True)[operation + "_deliveries"] == 0
+    assert page["usage"]["estimated_tokens"] == response_token_estimate(page)
+    if not page["budget_met"]:
+        assert page["minimum_tokens"] == response_token_estimate(page)
+
+
+def test_exploration_seed_keeps_l2_facts_scoped_avoidance_and_tail_instruction():
+    units = [{"id": f"unit-seed-l1-{i}", "tier": "L1", "title": "A short title",
+              "body": f"Complete foundation {i}. " * 30} for i in range(4)]
+    units += [{"id": "unit-seed-l2", "tier": "L2", "body": "Measured bottleneck: DMA serialization."},
+              {"id": "unit-seed-l4", "tier": "L4", "body": "Mutate only the launch-grid extent."}]
+    context = build_exploration_context(
+        units, bottleneck_summary={"summary": "Measured trace. " * 80 + "FINAL MEASUREMENT: 17 us"},
+        failed_attempts=[{"run_id": "observed-run", "verdict": "refuted",
+                          "conditions": {"soc": "Ascend910B"}, "mutation_summary": "remove barrier",
+                          "failure_reason": "corrupts partial tiles"}],
+        conditions={"soc": "Ascend910B"}, native_subcontext=True)
+    seed = context["subagent_fact_pack"]["prompt_brief"]
+    assert all(item["body"] in seed for item in units)
+    assert "FINAL MEASUREMENT: 17 us" in seed
+    assert "remove barrier" in seed and "corrupts partial tiles" in seed and "Ascend910B" in seed
+    assert "Do not replay prior L3 workflow steps" in seed

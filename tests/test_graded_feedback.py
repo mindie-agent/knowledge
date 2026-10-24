@@ -155,10 +155,10 @@ def test_explore_context_counts_units_after_result_rows_are_trimmed(store, opera
     store.graded.install([item])
     conditions = {"soc": "Ascend910B", "workload_scope": "decode"}
     if operation == "query":
-        delivered = store.query("graph feedback", conditions=conditions, mode="explore", token_budget=800)
+        delivered = store.query("graph feedback", conditions=conditions, mode="explore", token_budget=1000)
         assert delivered["results"] == [] and delivered["cards"] == []
     else:
-        delivered = store.explain(refs=[ref(item)], conditions=conditions, mode="explore", token_budget=800)
+        delivered = store.explain(refs=[ref(item)], conditions=conditions, mode="explore", token_budget=1000)
         assert delivered["units"] == [] and delivered["requires"] == []
     assert [row["id"] for row in delivered["exploration_context"]["mounted_units"]] == [item.id]
     assert summarize_usage_events(store, item.id, include_delivery=True)[operation + "_deliveries"] == 1

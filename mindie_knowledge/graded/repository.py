@@ -369,6 +369,24 @@ class GradedRepository:
     def ref(self, unit_id, revision=None):
         return f"mindie://{self.store.domain}/units/{unit_id}" + ("@" + str(revision) if revision is not None else "")
 
+    def _bind_exploration_refs(self, payload, index):
+        context = payload.get("exploration_context")
+        if context is None:
+            return
+        from .explore import refresh_exploration_mounts
+        for item in context["mounted_units"]:
+            item["ref"] = self.ref(item["id"], item["revision"])
+        mounted = {item["id"] for item in context["mounted_units"]}
+        for item in payload.get("unresolved", ()):
+            if item["status"] != "budget_excluded" or item["id"] in mounted:
+                continue
+            unit = index.units.get(item["id"])
+            if unit is not None and unit.metadata["tier"] != "L3":
+                context.setdefault("excluded_units", []).append({
+                    "id": unit.id, "revision": unit.revision, "tier": unit.metadata["tier"],
+                    "ref": self.ref(unit.id, unit.revision), "status": "budget_excluded"})
+        refresh_exploration_mounts(context)
+
     def query(self, query, *, navigation_only=False, run_id=None, mode="reuse",
               ledger_entries=None, bottleneck_summary=None, native_subcontext=False,
               goal="", defer_delivery=False, **kwargs):
@@ -412,6 +430,7 @@ class GradedRepository:
                 card["feedback_ref"] = card["ref"]
                 card.update(self._pending_local(index, local_by_id, card["id"]))
             payload = {"domain": self.store.domain, "retrieval": "graded-bm25", "page": "graded_units", **result}
+            self._bind_exploration_refs(payload, index)
             enforce_query_budget(payload, index, navigation_only=navigation_only)
             # A mixed page composes and trims after this call, so it records the
             # delivery itself once its own outward payload is final.
@@ -524,6 +543,7 @@ class GradedRepository:
                     item["feedback_ref"] = item["ref"]
                     item.update(self._pending_local(index, local_by_id, item["id"]))
             result["domain"] = self.store.domain
+            self._bind_exploration_refs(result, index)
             if "usage" in result:
                 enforce_explain_budget(result, index, token_budget)
             loaded = {
