@@ -141,14 +141,13 @@ class Store(MaterialMixin, OutboxMixin, QueryMixin):
     def _write_txn(self):
         """Serialize read-modify-write across processes sharing this root."""
         with self.lock, self.materials.validated_headers():
-            if self.db.in_transaction:
-                yield
-                return
             # A nested _write_txn shares the outer transaction's proven
             # authority; only the first frame of a transaction pays the path
             # check. This keeps lock-held hot paths from repeating lstat.
-            if not self.db.in_transaction:
-                self.db.assert_authority()
+            if self.db.in_transaction:
+                yield
+                return
+            self.db.assert_authority()
             self.db.execute("BEGIN IMMEDIATE")
             try:
                 yield
@@ -389,17 +388,11 @@ class Store(MaterialMixin, OutboxMixin, QueryMixin):
         if ref is None and refs is None:
             raise ValueError("explain requires ref or refs")
         if refs is not None or (isinstance(ref, str) and "/units/" in ref):
-            values = {"ref": ref, "refs": refs, "conditions": kwargs.get("conditions"),
-                      "known_refs": kwargs.get("known_refs"),
-                      "token_budget": kwargs.get("token_budget"),
-                      "run_id": kwargs.get("run_id"),
-                      "mode": kwargs.get("mode"),
-                      "ledger_entries": kwargs.get("ledger_entries"),
-                      "bottleneck_summary": kwargs.get("bottleneck_summary"),
-                      "native_subcontext": kwargs.get("native_subcontext"),
-                      "goal": kwargs.get("goal")}
-            call = {key: value for key, value in values.items() if value is not None}
-            return self.graded.explain(**call)
+            # An omitted or explicitly null argument keeps `graded.explain`'s own
+            # default rather than forwarding None into its validated signature.
+            values = {"ref": ref, "refs": refs, **{key: kwargs.get(key) for key in supported}}
+            return self.graded.explain(
+                **{key: value for key, value in values.items() if value is not None})
         parsed = parse_read_ref(ref, domain=self.domain)
         entry_id = parsed["task_id"]
         navigation_ref = task_ref(self.domain, entry_id)

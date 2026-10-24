@@ -266,6 +266,35 @@ def test_repository_closure_attaches_refs_and_keeps_single_ref_fields(store):
     assert [item["id"] for item in compacted["units"]] == [step.id]
 
 
+def test_single_ref_explain_budget_truth_includes_the_merged_compat_body(store):
+    """A single-ref read merges the whole-body view onto an already-trimmed
+    closure, so its budget verdict must describe that final merged payload."""
+    premise = unit("unit-merge-premise", body="Merge premise for graph capture. " * 10)
+    step = unit("unit-merge-step", parents=[premise.id],
+                body="Merge graph capture step. " * 40)
+    store.graded.install([premise, step])
+
+    roomy = store.graded.explain(step.id, conditions=OBSERVED, token_budget=16000)
+    assert roomy["content"] == step.body
+    assert roomy["budget_met"] is True
+    assert roomy["usage"]["estimated_tokens"] == response_token_estimate(roomy) <= 16000
+    assert "minimum_tokens" not in roomy
+
+    # A budget that holds the trimmed closure but not the duplicated compat
+    # body must report the real floor, never a false budget_met=True. The floor
+    # is a self-consistent fixed point of the delivered payload (writing it in
+    # lengthens the payload), so it converges on the actual estimate rather than
+    # the smaller met-case estimate.
+    requested = roomy["usage"]["estimated_tokens"] - 100
+    tight = store.graded.explain(step.id, conditions=OBSERVED, token_budget=requested)
+    assert tight["content"] == step.body
+    assert tight["budget_met"] is False
+    assert tight["usage"]["budget_met"] is False
+    assert tight["minimum_tokens"] == tight["usage"]["estimated_tokens"]
+    assert tight["usage"]["estimated_tokens"] == response_token_estimate(tight) > requested
+    assert tight["usage"]["has_more"] is True
+
+
 def test_store_query_enforces_outer_response_token_budget(store):
     premise, procedure, left, right = shared_workflows()
     extra = [
@@ -288,6 +317,54 @@ def test_store_query_enforces_outer_response_token_budget(store):
     assert response_token_estimate(full) <= 800
     assert full["usage"]["has_more"] is True
     assert full["excluded_budget"]
+    assert full["budget_met"] is True
+    assert "minimum_tokens" not in full
+
+
+def test_unsatisfiable_budget_is_reported_not_advertised_as_met(store):
+    """Any budget is a legal request, so an unreachable one must say so."""
+    premise, procedure, left, right = shared_workflows()
+    store.graded.install([premise, procedure, left, right])
+
+    # The protocol envelope alone exceeds this request; nothing is trimmable
+    # down to it, and the response must not claim the budget was honoured.
+    tiny = store.query("graph capture", conditions=OBSERVED, token_budget=20)
+    assert tiny["budget_met"] is False
+    assert tiny["usage"]["budget_met"] is False
+    assert tiny["minimum_tokens"] == tiny["usage"]["estimated_tokens"] > 20
+    assert tiny["usage"]["estimated_tokens"] == response_token_estimate(tiny)
+    assert tiny["usage"]["has_more"] is True
+    assert tiny["results"] == [] and tiny["cards"] == []
+    assert left.body not in json.dumps(tiny, ensure_ascii=False)
+
+    roomy = store.query("graph capture", conditions=OBSERVED, token_budget=16000)
+    assert roomy["budget_met"] is True
+    assert roomy["response_token_estimate"] == response_token_estimate(roomy) <= 16000
+
+
+def test_explore_budget_charges_the_mounted_exploration_context(store):
+    """`budget_scope` claims the context is charged, so it must really be."""
+    premise, procedure, left, right = shared_workflows()
+    mutator = unit("unit-explore-mutator", tier="L4", category="mutator",
+                   body="Vectorize the graph capture tail.")
+    store.graded.install([premise, procedure, left, right, mutator])
+
+    explored = store.query("graph capture", conditions=OBSERVED, mode="explore",
+                           token_budget=16000, goal="remove recompiles")
+    assert explored["exploration_context"]["subagent_fact_pack"]["stripped_l3_ids"]
+    assert "exploration_context" in explored["budget_scope"]
+    # The declared estimate covers the mounted fact pack, not just the rows.
+    assert explored["usage"]["estimated_tokens"] == response_token_estimate(explored)
+    assert explored["budget_met"] is True
+
+    context_tokens = response_token_estimate(explored["exploration_context"])
+    assert context_tokens > 0
+    squeezed = store.query("graph capture", conditions=OBSERVED, mode="explore",
+                           token_budget=max(1, context_tokens // 2), goal="remove recompiles")
+    assert squeezed["budget_met"] is False
+    assert squeezed["minimum_tokens"] == squeezed["usage"]["estimated_tokens"]
+    assert squeezed["exploration_context"]["subagent_fact_pack"]["schema_version"] == (
+        "mindie-rsi-subagent-pack/1")
 
 
 def test_response_estimate_uses_canonical_utf8_bytes():

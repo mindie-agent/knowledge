@@ -17,165 +17,12 @@ import time
 
 from ..markdown import _atomic_write_bytes
 from ..materials.references import ReadReferenceError
-from .index import RoutingIndex, _excerpt, _ref_parts, response_token_estimate, token_estimate
+from .budget import enforce_explain_budget, enforce_query_budget, reconcile_budget_truth
+from .index import RoutingIndex, _ref_parts
 from .units import GradedUnit, canonical
 
 CATALOG_KEY = "graded:current"
 INDEX_KEY = "graded:index"
-
-
-def _finalize_usage_estimate(payload):
-    """Bind the outer delivery estimate and its own field to one fixed point."""
-    payload["usage"]["estimated_tokens"] = 0
-    payload["response_token_estimate"] = 0
-    for _ in range(8):
-        estimate = response_token_estimate(payload)
-        if (payload["response_token_estimate"] == estimate
-                and payload["usage"]["estimated_tokens"] == estimate):
-            break
-        payload["response_token_estimate"] = estimate
-        payload["usage"]["estimated_tokens"] = estimate
-
-
-def _budget_estimate(payload):
-    if "exploration_context" not in payload:
-        return payload["response_token_estimate"]
-    return response_token_estimate(
-        {k: v for k, v in payload.items() if k != "exploration_context"}
-    )
-
-
-def _recompute_query_body_tokens(payload):
-    seen_parents = set()
-    total = 0
-    for row in payload["results"]:
-        total += token_estimate(row.get("excerpt", ""))
-        for parent in row.get("inherited_rules", ()):
-            if not parent.get("deduplicated") and "content" in parent and parent["id"] not in seen_parents:
-                seen_parents.add(parent["id"])
-                total += token_estimate(parent["content"])
-    payload["body_token_estimate"] = total
-    payload["usage"]["body_token_estimate"] = total
-
-
-def _enforce_query_budget(payload, index, *, navigation_only=False):
-    token_budget = payload["token_budget"]
-    _finalize_usage_estimate(payload)
-    if navigation_only:
-        while _budget_estimate(payload) > token_budget and payload.get("unverified_cards"):
-            payload["unverified_cards"].pop()
-            if not payload["unverified_cards"]:
-                payload.pop("unverified_cards", None)
-            _finalize_usage_estimate(payload)
-        original_cards = list(payload["cards"])
-        original_foundations = {card["id"]: card for card in payload["foundation_cards"]}
-        excluded = list(payload["excluded_budget"])
-        while len(payload["cards"]) > 1 and _budget_estimate(payload) > token_budget:
-            dropped = payload["cards"].pop()
-            if dropped["id"] not in excluded:
-                excluded.append(dropped["id"])
-            keep_foundations = set()
-            for card in payload["cards"]:
-                if card["tier"] == "L1" or card["route"] == "foundation_baseline":
-                    keep_foundations.add(card["id"])
-                keep_foundations.update(
-                    parent for parent in index.closure[card["id"]]
-                    if index.units[parent].metadata["tier"] == "L1"
-                )
-            payload["foundation_cards"] = [
-                original_foundations[ident] for ident in original_foundations
-                if ident in keep_foundations
-            ]
-            payload["excluded_budget"] = excluded
-            payload["usage"]["excluded_budget"] = list(excluded)
-            payload["usage"]["has_more"] = bool(excluded) or len(payload["cards"]) < len(original_cards)
-            _finalize_usage_estimate(payload)
-        while _budget_estimate(payload) > token_budget and payload["foundation_cards"]:
-            dropped_f = payload["foundation_cards"].pop()
-            if dropped_f["id"] not in excluded and all(c["id"] != dropped_f["id"] for c in payload["cards"]):
-                excluded.append(dropped_f["id"])
-            payload["excluded_budget"] = excluded
-            payload["usage"]["excluded_budget"] = list(excluded)
-            payload["usage"]["has_more"] = True
-            _finalize_usage_estimate(payload)
-        while _budget_estimate(payload) > token_budget and payload["cards"]:
-            dropped = payload["cards"].pop()
-            if dropped["id"] not in excluded:
-                excluded.append(dropped["id"])
-            payload["excluded_budget"] = excluded
-            payload["usage"]["excluded_budget"] = list(excluded)
-            payload["usage"]["has_more"] = True
-            _finalize_usage_estimate(payload)
-        return
-
-    # Tiny synthetic unit-test budgets (< 256) exercise body-only excerpt shares.
-    if token_budget < 256 or _budget_estimate(payload) <= token_budget:
-        return
-    while _budget_estimate(payload) > token_budget and payload.get("unverified_cards"):
-        payload["unverified_cards"].pop()
-        if not payload["unverified_cards"]:
-            payload.pop("unverified_cards", None)
-        _finalize_usage_estimate(payload)
-    original_cards = list(payload.get("cards", ()))
-    if _budget_estimate(payload) > token_budget and payload["foundation_cards"]:
-        payload["foundation_cards"] = []
-        _finalize_usage_estimate(payload)
-    if _budget_estimate(payload) > token_budget and payload["cards"]:
-        payload["cards"] = []
-        _finalize_usage_estimate(payload)
-    excluded = list(payload["excluded_budget"])
-    while len(payload["results"]) > 1 and _budget_estimate(payload) > token_budget:
-        dropped = payload["results"].pop()
-        if dropped["id"] not in excluded:
-            excluded.append(dropped["id"])
-        payload["excluded_budget"] = excluded
-        payload["usage"]["excluded_budget"] = list(excluded)
-        payload["usage"]["has_more"] = True
-        _recompute_query_body_tokens(payload)
-        _finalize_usage_estimate(payload)
-    if _budget_estimate(payload) > token_budget and len(payload["results"]) == 1:
-        row = payload["results"][0]
-        while row["inherited_rules"] and _budget_estimate(payload) > token_budget:
-            parent = row["inherited_rules"].pop()
-            row["inheritance_excluded"].append({"id": parent["id"], "status": "budget_excluded"})
-            row["ready_to_apply"] = False
-            _recompute_query_body_tokens(payload)
-            _finalize_usage_estimate(payload)
-        if _budget_estimate(payload) > token_budget and row["inheritance_excluded"]:
-            row["inheritance_excluded"] = [
-                {"id": item["id"], "status": item.get("status", "budget_excluded")}
-                for item in row["inheritance_excluded"]
-            ]
-            _finalize_usage_estimate(payload)
-        if _budget_estimate(payload) > token_budget:
-            row["provenance"] = {"source_type": row["provenance"].get("source_type", "")}
-            row["applicability"] = {"status": row["applicability"].get("status", "")}
-            _finalize_usage_estimate(payload)
-        if _budget_estimate(payload) > token_budget and row["tier"] != "L1":
-            excess = _budget_estimate(payload) - token_budget
-            share = max(1, token_estimate(row["excerpt"]) - excess - 8)
-            content, _used, _truncated = _excerpt(index.units[row["id"]].body, share)
-            row["excerpt"] = content
-            row["excerpt_truncated"] = True
-            row["ready_to_apply"] = False
-            _recompute_query_body_tokens(payload)
-            _finalize_usage_estimate(payload)
-        if _budget_estimate(payload) > token_budget:
-            dropped = payload["results"].pop()
-            if dropped["id"] not in excluded:
-                excluded.append(dropped["id"])
-            payload["excluded_budget"] = excluded
-            payload["usage"]["excluded_budget"] = list(excluded)
-            payload["usage"]["has_more"] = True
-            _recompute_query_body_tokens(payload)
-            for candidate in original_cards[:2]:
-                trial = [*payload["cards"], candidate]
-                payload["cards"] = trial
-                _finalize_usage_estimate(payload)
-                if _budget_estimate(payload) > token_budget:
-                    payload["cards"].pop()
-                    _finalize_usage_estimate(payload)
-                    break
 
 
 class GradedRepository:
@@ -522,9 +369,14 @@ class GradedRepository:
     def ref(self, unit_id, revision=None):
         return f"mindie://{self.store.domain}/units/{unit_id}" + ("@" + str(revision) if revision is not None else "")
 
+    def routing_index(self):
+        """The installed routing index, for callers that assemble their own page."""
+        with self.store.lock:
+            return self._load()
+
     def query(self, query, *, navigation_only=False, run_id=None, mode="reuse",
               ledger_entries=None, bottleneck_summary=None, native_subcontext=False,
-              goal="", **kwargs):
+              goal="", observe_delivery=True, **kwargs):
         with self.store.lock:
             index = self._load()
             result = index.query(
@@ -532,7 +384,6 @@ class GradedRepository:
                 ledger_entries=ledger_entries, bottleneck_summary=bottleneck_summary,
                 native_subcontext=native_subcontext, goal=goal, **kwargs)
             local_by_id = {item["id"]: item for item in self._catalog()["local"]}
-            from .feedback import observe
             for item in result["results"]:
                 item["ref"] = self.ref(item["id"], item["revision"])
                 item["unit_ref"] = self.ref(item["id"])
@@ -561,18 +412,59 @@ class GradedRepository:
                 card["feedback_ref"] = card["ref"]
                 card.update(self._pending_local(index, local_by_id, card["id"]))
             payload = {"domain": self.store.domain, "retrieval": "graded-bm25", "page": "graded_units", **result}
-            _enforce_query_budget(payload, index, navigation_only=navigation_only)
-            for item in payload["results"]:
-                observe(self.store, index.units[item["id"]], delivery="query", run_id=run_id)
-                for parent in item["inherited_rules"]:
-                    observe(self.store, index.units[parent["id"]])
-            for card in payload.get("cards", []):
-                observe(self.store, index.units[card["id"]], delivery="query", run_id=run_id)
-            for card in payload.get("foundation_cards", []):
-                observe(self.store, index.units[card["id"]], delivery="query", run_id=run_id)
-            for card in payload.get("unverified_cards", []):
-                observe(self.store, index.units[card["id"]], delivery="query", run_id=run_id)
+            enforce_query_budget(payload, index, navigation_only=navigation_only)
+            # A mixed page composes and trims after this call, so it records the
+            # delivery itself once its own outward payload is final.
+            if observe_delivery:
+                self.observe_delivered(index, payload, delivery="query", run_id=run_id)
         return payload
+
+    @staticmethod
+    def _delivered_units(payload, delivery):
+        """Name every graded unit in one final outward payload, once each.
+
+        A counted delivery is the unit the caller actually received; an
+        inherited premise is registered as readable without being counted as
+        its own delivery.
+        """
+        delivered = []
+        for item in payload.get("results", ()):
+            if item.get("source") not in (None, "graded"):
+                continue
+            delivered.append((item["id"], delivery))
+            delivered.extend((parent["id"], None)
+                             for parent in item.get("inherited_rules", ()) or ())
+        for key in ("cards", "foundation_cards", "unverified_cards", "units", "requires"):
+            delivered.extend((card["id"], delivery) for card in payload.get(key, []))
+        # A trimmed result can still be delivered in the compact exploration
+        # context. Its `units`/foundation/mutator views alias mounted_units;
+        # read that canonical collection once and let revision deduplication
+        # combine it with any surviving rows or cards.
+        context = payload.get("exploration_context") or {}
+        delivered.extend((unit["id"], delivery) for unit in context.get("mounted_units", ()))
+        return delivered
+
+    def observe_delivered(self, index, payload, *, delivery="query", run_id=None):
+        """Record one receipt per delivered (unit_id, revision) in one transaction.
+
+        The same unit reaches a caller as both a result row and its navigation
+        card; that is one delivery, so its counter advances once. `observe`
+        reuses this already-open write transaction instead of opening its own.
+        """
+        from .feedback import observe
+
+        selected = {}
+        for ident, kind in self._delivered_units(payload, delivery):
+            unit = index.units[ident]
+            key = (unit.id, unit.revision)
+            # A counted delivery outranks a bare inherited-premise registration.
+            if kind is not None or key not in selected:
+                selected[key] = (unit, kind)
+        if not selected:
+            return
+        with self.store._write_txn():
+            for unit, kind in selected.values():
+                observe(self.store, unit, delivery=kind, run_id=run_id)
 
     def _legacy_view(self, index, ident):
         unit = index.units[ident]
@@ -623,7 +515,6 @@ class GradedRepository:
                 domain=self.store.domain, token_budget=token_budget, mode=mode,
                 ledger_entries=ledger_entries, bottleneck_summary=bottleneck_summary,
                 native_subcontext=native_subcontext, goal=goal)
-            from .feedback import observe
             local_by_id = {item["id"]: item for item in self._catalog()["local"]}
             for bucket in ("requires", "units"):
                 for item in result.get(bucket, []):
@@ -634,46 +525,22 @@ class GradedRepository:
                     item.update(self._pending_local(index, local_by_id, item["id"]))
             result["domain"] = self.store.domain
             if "usage" in result:
-                _finalize_usage_estimate(result)
-                while _budget_estimate(result) > token_budget and (result["units"] or result["requires"]):
-                    bucket = "units" if result["units"] else "requires"
-                    dropped = result[bucket].pop()
-                    required_tokens = token_estimate(dropped.get("content", ""))
-                    if bucket == "units" and result["requires"]:
-                        still_needed = {
-                            parent for item in result["units"]
-                            for parent in index.closure[item["id"]]
-                        }
-                        kept_requires = []
-                        for req in result["requires"]:
-                            if req["id"] in still_needed:
-                                kept_requires.append(req)
-                            else:
-                                required_tokens += token_estimate(req.get("content", ""))
-                        result["requires"] = kept_requires
-                    result["unresolved"].append({
-                        "id": dropped["id"], "status": "budget_excluded",
-                        "required_tokens": max(1, required_tokens),
-                    })
-                    result["usage"]["body_token_estimate"] = sum(
-                        token_estimate(item.get("content", ""))
-                        for group in ("requires", "units") for item in result.get(group, ())
-                    )
-                    result["usage"]["has_more"] = True
-                    _finalize_usage_estimate(result)
+                enforce_explain_budget(result, index, token_budget)
             loaded = {
                 item["id"]: item
                 for bucket in ("requires", "units") for item in result.get(bucket, [])
             }
-            for item in loaded.values():
-                observe(self.store, index.units[item["id"]], delivery="explain", run_id=run_id)
             if isinstance(ref, str):
                 parts = _ref_parts(ref)
                 if (parts is not None and (parts[0] is None or parts[0] == self.store.domain)
                         and parts[1] in loaded):
                     result.update(self._legacy_view(index, parts[1]))
+                    # Merging the whole-body view enlarges an already-trimmed
+                    # closure, so the budget verdict is re-decided on the final
+                    # payload rather than left as the pre-merge estimate.
                     if "usage" in result:
-                        _finalize_usage_estimate(result)
+                        reconcile_budget_truth(result, token_budget)
+            self.observe_delivered(index, result, delivery="explain", run_id=run_id)
             return result
 
 
