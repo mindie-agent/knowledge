@@ -2,7 +2,7 @@
 
 **中文** | [English](public-transcript-capture.md) · [返回文档中心](README.md)
 
-本文详细说明当用户开启社区共享后，`mindie-knowledge` 如何从宿主客户端的原生会话记录中提取公开对话、执行双层确定性隐私脱敏、切分为无损 Markdown 分块，并通过轻量级小模型增量生成检索导航。
+本文详细说明在已手动调用 `/mindie-agent` 启用且用户开启社区共享的会话中，`mindie-knowledge` 如何从宿主客户端的原生会话记录中提取公开对话、执行双层确定性隐私脱敏、切分为无损 Markdown 分块，并通过轻量级小模型增量生成检索导航。
 
 ---
 
@@ -21,6 +21,7 @@ flowchart LR
 ## 2. 确定性公开消息筛选（不猜格式、不收噪音）
 
 `public-transcript` 是唯一的采集管线，由各宿主插件提供对应的确定性解析器（`transcript_adapter`）：
+- **必须具备显式手动会话租约（`entry_enabled = 1`）**：实时 `Stop` 采集仅对当前会话已通过 `/mindie-agent` 显式激活（`Admission.activate(..., automatic=False)`）的任务生效；未激活的普通会话或历史自动关联记录（`entry_enabled = 0`）在打开 Transcript 前即直接短路返回。
 - **只读当前绑定的会话文件**：后台工作器仅读取 Stop Hook 传入的原生 Transcript 路径，绝不扫描历史会话目录或猜测相邻会话。
 - **精准剥离内部噪音**：解析器只提取经过授权的**用户输入（User Input）**、**助手可见进展（Visible Assistant Progress）**与**最终回答（Final Answer）**；工具调用参数与返回值、隐藏思维链（Reasoning）、系统/开发者提示词注入以及非当前任务的历史记录一律被确定性剔除。
 - **长消息完整保留**：分页读取仅用于控制单次内存开销，哪怕单条公开消息超过分页大小也会完整读取，绝不会做首尾截断或丢弃中间段落。若遇到损坏记录或无法验证归属的条目，游标保持不动并显式报错。

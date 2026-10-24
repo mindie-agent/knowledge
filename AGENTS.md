@@ -19,7 +19,7 @@
   - [`summarizer.py`](mindie_knowledge/materials/summarizer.py): Bounded LangMem incremental block-indexing contract (`mindie-summary-request/1`, `mindie-summary-outcome/1`) and `SummaryLedger`.
   - [`ingest.py`](mindie_knowledge/materials/ingest.py) & [`publication.py`](mindie_knowledge/materials/publication.py): Deterministic 16 KB block splitter and frozen outbox batch staging.
 - **Capture, Indexing & Service Loop (`mindie_knowledge/loop/`)**:
-  - [`activation.py`](mindie_knowledge/loop/activation.py): Per-session task lease and idempotent event-attempt store (`admission.sqlite3`, `mindie-admission/1`).
+  - [`activation.py`](mindie_knowledge/loop/activation.py): Per-session task lease (`entry_enabled = 1` manual entry vs. `entry_enabled = 0` automatic association), read-only `knowledge_lease`, `capture_lease` authorization, and idempotent event-attempt store (`admission.sqlite3`, `mindie-admission/1`).
   - [`handoff.py`](mindie_knowledge/loop/handoff.py): Fast Stop-hook capture admission (`commit_capture`) and single-flight detached service wake (`WAKE_PROBE_SECONDS = 2.0`).
   - [`store.py`](mindie_knowledge/loop/store.py): `state-v4.sqlite3` (`mindie-store/4`) transaction coordinator for `entries`, `captures`, `cursors`, `material_streams`, `material_batches`, `votes`, and `outbox`.
   - [`engine.py`](mindie_knowledge/loop/engine.py): Background orchestrator (`Engine`) driving `mindie-capture`, `mindie-summary`, and `mindie-outbox` loops under `OperationOwner` cancellation scopes.
@@ -40,7 +40,8 @@
    - **Two-Phase Pointer Promotion (`current.json`)**:
      - New revisions stage under `candidates/<revision>/` first; SQLite commits queue/header metadata inside `Store._write_txn()`; `MaterialStore.retain_current(task_id, {"draft": rev, "feed": rev})` atomically promotes `current.json` pointers and retires unreferenced candidate directories.
      - `.reme-index/` is a disposable derived BM25 + file-graph checkpoint bound to `catalog.generation`; it never stores authoritative state that cannot be rebuilt from `current.json` and `tasks/`.
-2. **Incremental Transcript Capture & Redaction**:
+2. **Incremental Transcript Capture, Manual Session Entry (`entry_enabled = 1`) & Redaction**:
+   - `Admission.activate(..., automatic=False)` sets `entry_enabled = 1` on the session lease in `admission.sqlite3`; Fresh `Admission.associate(...)` bindings do not grant manual entry (`entry_enabled = 0`); an existing manual grant is preserved, and legacy leases upgraded in place default to `entry_enabled = 0`. `knowledge_lease` (read-only; never creates the DB or migrates schema on read), `capture_lease`, `capture_authorization`, `resolve_capture_lease`, and `allows_hash` all require `enabled == 1` and `entry_enabled == 1`.
    - Stop hooks call `handoff.handoff()` to record lightweight `captures` rows without opening transcripts or calling models.
    - `transcript_capture.capture()` reads complete transcript increments, carries open PEM private-key state (`{'private_key': ...}`) across chunk boundaries, unions Gitleaks + `redact.scan_text` + private path spans, and commits redacted blocks with `model_calls=0`.
 3. **External Write Receipts (`completed` / `failed` / `unknown`)**:

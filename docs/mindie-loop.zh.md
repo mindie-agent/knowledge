@@ -16,18 +16,18 @@ sequenceDiagram
   participant Core as mindie-knowledge 本地核心
   participant Remote as 公共知识库 (GitHub)
 
-  Note over Dev,Remote: 阶段 A：日常检索与使用（零模型开销，社区共享关闭时同样可用）
-  Dev->>Host: 提出昇腾 / vLLM-Ascend 排障或开发问题
-  Host->>Core: knowledge_query(query)
+  Note over Dev,Remote: 阶段 A：日常检索与使用（需当前会话手动 /mindie-agent 启用；零模型开销，社区共享关闭时同样可用）
+  Dev->>Host: 输入 /mindie-agent + 昇腾 / vLLM-Ascend 排障或开发问题
+  Host->>Core: Admission.activate (entry_enabled=1) -> knowledge_query(query)
   Core-->>Host: 返回 BM25 命中的分块摘录、引用链分组与导航引用
   Host->>Core: knowledge_explain(ref) 按需读取指定分块原文
   Core-->>Host: 校验 SHA-256 后返回完整脱敏分块正文
   Host-->>Dev: 结合实机验证给出解决方案
   Host->>Core: (可选) knowledge_feedback(feedback_ref, "up"|"down", reason)
 
-  Note over Dev,Remote: 阶段 B：经验沉淀与社区外发（仅在用户显式开启 Opt-in 且项目在授权范围内触发）
+  Note over Dev,Remote: 阶段 B：经验沉淀与社区外发（仅在已手动 /mindie-agent 启用且用户显式开启 Opt-in、项目在授权范围内触发）
   Host->>Core: 回合结束触发 Stop Hook (携带会话身份与 Transcript 路径)
-  Core->>Core: 1. 重验 mindie-consent/1 与项目范围门禁
+  Core->>Core: 1. 重验手动会话租约 (entry_enabled=1)、mindie-consent/1 与项目范围门禁
   Core->>Core: 2. 提取公开可见消息 + Gitleaks & redact(r3) 双重脱敏 + 切分 16 KiB 分块
   Core->>Core: 3. 调用轻量原生小模型生成分块标题与 index.md 导航大纲
   Core->>Remote: 4. 发件箱二次脱敏复检，打包 mindie-contribution/1 提交 PR（网络超时则只读对账）
@@ -35,20 +35,21 @@ sequenceDiagram
 
 ---
 
-## 2. 一次显式选择，跨会话持久生效
+## 2. 按会话手动启用（`/mindie-agent`）与一次持久化授权（`mindie-consent/1`）
 
-用户不需要在每次启动会话时都回答一遍“是否开启社区贡献”：
-- **单次引导**：插件安装后首次进入原生入口（Claude Code / Kimi 中的 `/mindie-agent` 或 Codex 中的 `$mindie-agent`）时，仅询问一次贡献意愿，并将选择保存在 `mindie-consent/1` 配置文件中。
-- **默认零采集（Opt-in）**：默认状态下社区共享处于关闭状态（`enabled=false`）。关闭时，Stop Hook 直接短路返回，**不读取任何对话记录、不运行脱敏扫描、不调用摘要模型、也不产生任何外发草稿**；同时只读检索（`knowledge_query` / `knowledge_explain`）与公共知识库同步（`sync`）依然完全可用。
-- **随时可改，绝不回溯**：用户可随时通过同一入口开启或关闭共享。中途关闭会立即取消正在排队或运行的采集与未发送批次，但保留已落盘草稿；重新开启后只采集新产生的对话，**绝不会偷偷回填关闭期间的历史记录**。
+`mindie-knowledge` 将**单次会话飞轮激活**与**安装级持久化贡献授权**严格区分：
+- **单次会话手动 `/mindie-agent` 准入（`entry_enabled = 1`）**：整个知识飞轮（`knowledge_query`、`knowledge_explain`、`knowledge_feedback`、`knowledge_distill`、宿主内 `knowledge_sync` 以及后台 `Stop` 对话采集）均要求当前会话显式调用过一次 `/mindie-agent`（`Admission.activate(..., automatic=False)`，在 `admission.sqlite3` 中记录 `entry_enabled = 1`）。同一会话的后续轮次自动保留该准入，直至显式停用（`Admission.deactivate`）。自动会话关联（`Admission.associate`，`entry_enabled = 0`）、新聊天、Fork、子代理、话题匹配与已保存的贡献开关本身都不会自动激活知识工具或后台采集。
+- **单次引导，跨会话持久保存**：插件安装后首次进入原生入口（Claude Code / Kimi / DSH 中的 `/mindie-agent` 或 Codex 中的 `/mindie-agent` / `$mindie-agent`）时，仅询问一次贡献意愿，并将选择保存在 `mindie-consent/1` 配置文件中；后续新会话输入 `/mindie-agent` 时直接复用已保存偏好，不再重复询问。
+- **默认零采集（Opt-in）**：默认状态下社区共享处于关闭状态（`enabled=false`）。在共享关闭期间——或任何未手动调用 `/mindie-agent` 的常规会话中——Stop Hook 直接短路返回，**不读取任何对话记录、不运行脱敏扫描、不调用摘要模型、也不产生任何外发草稿**；而在已手动启用 `/mindie-agent` 的会话中，即使关闭了社区共享，只读检索（`knowledge_query` / `knowledge_explain`）与公共知识库同步（`sync`）依然完全可用。
+- **随时可改，绝不回溯**：用户可随时通过同一入口开启或关闭共享。中途关闭会立即取消正在排队或运行的采集与未发送批次，但保留已落盘草稿；重新开启后只采集已启用会话中新产生的对话，**绝不会偷偷回填关闭期间的历史记录**。
 
 ---
 
 ## 3. 实时授权门禁（The Gate）
 
-为了防止配置文件被意外篡改或损坏时发生误外发，`mindie-knowledge` 在**每次读取 Transcript 前、每次启动摘要小模型前、以及每次向外部写入前**，都会实时重读共享设置文件与绝对路径指向的 `mindie-consent/1`：
+为了防止未手动启用的普通会话、历史自动关联记录或被意外损坏的配置文件触发误外发，`mindie-knowledge` 在**每次读取 Transcript 前、每次启动摘要小模型前、以及每次向外部写入前**，都会核验手动会话租约（`entry_enabled = 1`）并实时重读共享设置文件与绝对路径指向的 `mindie-consent/1`：
 
-$$\text{capture\_allowed} = \text{有效插件租约} \land \text{共享已开启} \land \text{项目根目录在授权范围内} \land \text{consent 明确允许贡献}$$
+$$\text{capture\_allowed} = \text{手动启用会话租约 }(\text{entry\_enabled}=1) \land \text{共享已开启} \land \text{项目根目录在授权范围内} \land \text{consent 明确允许贡献}$$
 
 - **区分“未开启”与“配置损坏”**：如果配置文件缺失、无法读取或 JSON 格式损坏，系统会将其作为明确的**授权故障（Authority Fault）**上报，并暂停已接收的后台工作（保留已生成的模型结果，等待修复后恢复），**绝不会把配置损坏当成“首次安装”去重新弹窗或重置用户数据**。
 

@@ -23,7 +23,7 @@ flowchart LR
 ## 2. Safety & Zero-Replay Guarantees
 
 ### Dual Scope & Consent Verification
-- The requesting session must hold a valid admission token and an active `mindie-consent/1` contribution choice.
+- The requesting session must hold a valid manual-entry admission token (`entry_enabled = 1`) and an active `mindie-consent/1` contribution choice.
 - **Both the requesting project scope and every imported source session's project scope must be inside the allowed `project_roots`**. The adapter checks this before reading source metadata, and the core re-verifies it before every parser page and commit.
 - Because the user explicitly selected the historical file, its file identity and byte length define a fixed snapshot (omitting the live activation-time filter) without granting a new live lease to the historical session.
 
