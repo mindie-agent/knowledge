@@ -20,6 +20,8 @@ Real Windows tests verify descendant cleanup after leader exit for this runner
 and after an explicit inherited-pipe deadline for the community caller.
 """
 
+import ctypes
+from functools import lru_cache
 import os
 import queue
 import shutil
@@ -116,7 +118,7 @@ def _spawn(command, stdin, scratch=None, child_env=None):
             env=env,
         )
     from .service_host import process_is_contained
-    if sys.platform == "darwin" or (sys.platform.startswith("linux") and not process_is_contained()):
+    if not process_is_contained():
         return posix_owner.spawn(command, stdin=stdin, env=env)
     return subprocess.Popen(
         command,
@@ -128,22 +130,34 @@ def _spawn(command, stdin, scratch=None, child_env=None):
     )
 
 
+@lru_cache(maxsize=1)
+def _native_group_inspector():
+    # libproc metadata remains usable inside sandboxes that deny setuid ps.
+    # Probe exported capabilities once; observation failures never select ps.
+    native = ctypes.CDLL(None)
+    if all(hasattr(native, name) for name in ("proc_listpgrppids", "proc_pidinfo")):
+        from .darwin_process import group_has_writers
+        return group_has_writers
+    return None
+
+
 def _posix_group_has_writers(pgid, *, timeout):
     """Inspect only process metadata; a zombie cannot write to owned scratch."""
-    if sys.platform == "darwin":
-        from .darwin_process import group_has_writers
-        return group_has_writers(pgid, timeout=timeout)
+    inspector = _native_group_inspector()
+    if inspector is not None:
+        return inspector(pgid, timeout=timeout)
     return _ps_group_has_writers(pgid, timeout=timeout)
 
 
 def _ps_group_has_writers(pgid, *, timeout):
-    if sys.platform != "darwin" and not sys.platform.startswith("linux"):
-        raise RuntimeError("owned process group inspection is unsupported")
+    executable = shutil.which("ps")
+    if executable is None:
+        raise RuntimeError("owned process group inspection requires libproc or ps")
     # BSD -g selects a process group; Linux -g selects a numeric session.
     # Our group starts a new session, and exact PGID filtering excludes any
     # other group in that session. No command lines or environment are read.
     result = subprocess.run(
-        ["/bin/ps", "-o", "pid=,pgid=,stat=", "-g", str(pgid)],
+        [executable, "-o", "pid=,pgid=,stat=", "-g", str(pgid)],
         capture_output=True, text=True, timeout=timeout,
         # WSL reached through a Windows SSH console can inherit an invalid
         # terminal width. This metadata-only query has no terminal formatting.
@@ -183,6 +197,8 @@ def terminate_tree(process, *, wait=False):
         original_error = sys.exc_info()[1]
         try:
             posix_owner.release(process)
+        except TimeoutError:
+            raise
         except OSError as cleanup_error:
             if original_error is None:
                 raise
