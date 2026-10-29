@@ -54,6 +54,8 @@ def load_document(path: Path) -> Any:
     yaml = require_yaml()
     try:
         text = path.read_text(encoding="utf-8")
+    except TimeoutError:
+        raise
     except OSError as exc:
         raise ToolError(f"{path}: cannot read file: {exc.strerror}") from None
     try:

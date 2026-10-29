@@ -31,7 +31,7 @@ def test_metadata_requires_no_live_writer(monkeypatch, stdout, expected):
     monkeypatch.setattr(process.subprocess, "run", run)
     assert process._ps_group_has_writers(10, timeout=.5) is expected
     assert run.call_args.args[0] == [
-        "/bin/ps", "-o", "pid=,pgid=,stat=", "-g", "10",
+        process.shutil.which("ps"), "-o", "pid=,pgid=,stat=", "-g", "10",
     ]
 
 
@@ -63,6 +63,63 @@ def test_metadata_query_replaces_bogus_inherited_terminal_dimensions(monkeypatch
     assert run.call_args.kwargs["env"]["COLUMNS"] == "80"
     assert run.call_args.kwargs["env"]["LINES"] == "24"
     assert os.environ["COLUMNS"] == "131072" and os.environ["LINES"] == "1"
+
+
+def test_native_inspector_is_selected_by_exported_metadata_capabilities(monkeypatch):
+    from mindie_knowledge.loop import darwin_process
+    process._native_group_inspector.cache_clear()
+    try:
+        monkeypatch.setattr(process.sys, "platform", "unrecognized-posix")
+        monkeypatch.setattr(process.ctypes, "CDLL", lambda _: SimpleNamespace(
+            proc_listpgrppids=object(), proc_pidinfo=object()))
+        assert process._native_group_inspector() is darwin_process.group_has_writers
+        process._native_group_inspector.cache_clear()
+        monkeypatch.setattr(process.ctypes, "CDLL", lambda _: SimpleNamespace())
+        assert process._native_group_inspector() is None
+    finally:
+        process._native_group_inspector.cache_clear()
+
+
+@pytest.mark.parametrize("error", [TimeoutError("metadata deadline"), PermissionError("metadata denied")])
+def test_native_observation_failure_never_falls_back_to_ps(monkeypatch, error):
+    def inspector(*args, **kwargs):
+        raise error
+
+    def forbidden_ps(*args, **kwargs):
+        pytest.fail("a failed native observation must not be replaced")
+
+    monkeypatch.setattr(process, "_native_group_inspector", lambda: inspector)
+    monkeypatch.setattr(process, "_ps_group_has_writers", forbidden_ps)
+    with pytest.raises(type(error)) as raised:
+        process._posix_group_has_writers(10, timeout=.5)
+    assert raised.value is error
+
+
+def test_available_ps_runs_on_an_unrecognized_platform_with_the_cleanup_budget(monkeypatch):
+    observed = []
+
+    def run(command, **kwargs):
+        observed.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, "10 10 S\n", "")
+
+    monkeypatch.setattr(process.sys, "platform", "unrecognized-posix")
+    monkeypatch.setattr(process, "_native_group_inspector", lambda: None)
+    monkeypatch.setattr(process.shutil, "which", lambda name: "/tools/ps" if name == "ps" else None)
+    monkeypatch.setattr(process.subprocess, "run", run)
+    assert process._posix_group_has_writers(10, timeout=.25)
+    assert observed[0][0][0] == "/tools/ps"
+    assert observed[0][1]["timeout"] == .25
+
+
+def test_process_ownership_uses_verified_containment_on_any_posix_host(monkeypatch):
+    from mindie_knowledge.loop import service_host
+    monkeypatch.setattr(process.sys, "platform", "unrecognized-posix")
+    monkeypatch.setattr(service_host, "_contained_pid", None)
+    monkeypatch.setattr(process.posix_owner, "spawn", lambda *args, **kwargs: "owned-lifetime")
+    monkeypatch.setattr(process.subprocess, "Popen", lambda *args, **kwargs: "contained")
+    assert process._spawn(["fixture"], None) == "owned-lifetime"
+    monkeypatch.setattr(service_host, "_contained_pid", os.getpid())
+    assert process._spawn(["fixture"], None) == "contained"
 
 
 def test_permission_error_needs_writer_proof_and_keeps_primary_error(monkeypatch):

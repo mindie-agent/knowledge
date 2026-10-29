@@ -123,6 +123,8 @@ def consume(path, config, binding):
         value = json.loads(raw)
     except ContextError:
         raise
+    except TimeoutError:
+        raise
     except (OSError, ValueError):
         raise ContextError("service_context_unavailable") from None
     declaration = validate(config)
@@ -136,6 +138,8 @@ def consume(path, config, binding):
     # No service is admitted if the one-use secret transfer cannot be removed.
     try:
         path.unlink()
+    except TimeoutError:
+        raise
     except OSError:
         raise ContextError("service_context_cleanup_failed") from None
     return {**value["environment"], **value["paths"]}

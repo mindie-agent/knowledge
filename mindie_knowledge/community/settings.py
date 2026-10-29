@@ -51,6 +51,8 @@ def load_settings_file(path: Path) -> dict[str, Any]:
 
     try:
         raw = consent_store._read_bytes(path)
+    except TimeoutError:
+        raise
     except OSError as exc:
         raise CommunityError(f"cannot read community config: {exc.strerror or exc}")
     if len(raw) > MAX_CONFIG_BYTES:

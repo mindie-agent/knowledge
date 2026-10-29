@@ -185,6 +185,8 @@ def scan_file(path: Path, allow: Allowlist | None = None) -> list[Finding]:
     if path.suffix.lower() in {".md", ".markdown"}:
         try:
             text = path.read_text(encoding="utf-8")
+        except TimeoutError:
+            raise
         except OSError as exc:
             raise ToolError(f"{path}: cannot read file: {exc}") from exc
         findings = scan_text(text, allow)

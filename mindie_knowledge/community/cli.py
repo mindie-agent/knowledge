@@ -45,6 +45,8 @@ def _read_json_arg(value: str):
         path = Path(value)
         try:
             raw = path.read_bytes()
+        except TimeoutError:
+            raise
         except OSError as exc:
             raise ToolError(f"{path}: cannot read: {exc.strerror}") from None
         if len(raw) > limit:
