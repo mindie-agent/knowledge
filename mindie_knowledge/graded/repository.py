@@ -11,13 +11,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-from pathlib import Path
 import re
 import time
+from pathlib import Path
 
 from ..markdown import _atomic_write_bytes
 from ..materials.references import ReadReferenceError
-from .budget import enforce_explain_budget, enforce_query_budget, reconcile_budget_truth
+from .budget import enforce_explain_budget, enforce_query_budget
 from .index import RoutingIndex, _ref_parts
 from .units import GradedUnit, canonical
 
@@ -501,36 +501,23 @@ class GradedRepository:
                 bottleneck_summary=None, native_subcontext=False, goal=""):
         if mode not in {"reuse", "diagnose", "explore"}:
             raise ValueError("mode must be one of ['diagnose', 'explore', 'reuse']")
-        # Single-ref reads keep their historical contract and errors. Batch,
-        # condition-aware and explore reads use the closure assembler instead.
-        if (isinstance(ref, str) and refs is None and conditions is None and known_refs is None
-                and mode != "explore"):
-            prefix = f"mindie://{self.store.domain}/units/"
-            if not ref.startswith(prefix):
-                raise ReadReferenceError("outside_domain", "The graded reference is outside the selected domain.")
-            ident, _, revision_text = ref[len(prefix):].partition("@")
-            revision = int(revision_text) if revision_text else None
-            with self.store.lock:
-                index = self._load()
-                unit = index.units.get(ident)
-                if unit is None:
-                    raise ReadReferenceError("removed_or_superseded", "The graded unit is absent from the current collection.")
-                if revision is not None and revision != unit.revision:
-                    raise ReadReferenceError("removed_or_superseded", "The observed graded revision was replaced; no other bytes were substituted.")
-                local_by_id = {item["id"]: item for item in self._catalog()["local"]}
-                from .feedback import observe
-                observe(self.store, unit, delivery="explain", run_id=run_id)
-                view = self._legacy_view(index, ident)
-                view.update(self._pending_local(index, local_by_id, ident))
-                view["mode"] = mode
-                return view
         requested = [] if refs is None else (list(refs) if not isinstance(refs, str) else [refs])
         if ref is not None and ref not in requested:
             requested.insert(0, ref)
+        known = [known_refs] if isinstance(known_refs, str) else list(known_refs or ())
         with self.store.lock:
             index = self._load()
+            parts = _ref_parts(ref) if isinstance(ref, str) else None
+            if isinstance(ref, str) and refs is None:
+                if parts is None or parts[0] not in (None, self.store.domain):
+                    raise ReadReferenceError("outside_domain", "The graded reference is outside the selected domain.")
+                unit = index.units.get(parts[1])
+                if unit is None:
+                    raise ReadReferenceError("removed_or_superseded", "The graded unit is absent from the current collection.")
+                if parts[2] is not None and parts[2] != unit.revision:
+                    raise ReadReferenceError("removed_or_superseded", "The observed graded revision was replaced; no other bytes were substituted.")
             result = index.explain_closure(
-                requested, conditions=conditions, known_refs=known_refs,
+                requested, conditions=conditions, known_refs=known,
                 domain=self.store.domain, token_budget=token_budget, mode=mode,
                 ledger_entries=ledger_entries, bottleneck_summary=bottleneck_summary,
                 native_subcontext=native_subcontext, goal=goal)
@@ -544,22 +531,43 @@ class GradedRepository:
                     item.update(self._pending_local(index, local_by_id, item["id"]))
             result["domain"] = self.store.domain
             self._bind_exploration_refs(result, index)
-            if "usage" in result:
-                enforce_explain_budget(result, index, token_budget)
-            loaded = {
-                item["id"]: item
-                for bucket in ("requires", "units") for item in result.get(bucket, [])
+            single_view = {}
+            if (parts is not None and parts[0] in (None, self.store.domain)
+                    and any(item["id"] == parts[1]
+                            for bucket in ("requires", "units") for item in result[bucket])):
+                single_view = self._legacy_view(index, parts[1])
+                single_view.update(self._pending_local(index, local_by_id, parts[1]))
+
+            def derive_single_view(payload):
+                # Existing single-ref consumers read top-level content and
+                # frontmatter. Charge that view before trimming, and remove it
+                # with its unit so an excluded body cannot escape the budget.
+                for key in single_view:
+                    if key != "domain":
+                        payload.pop(key, None)
+                if single_view and any(item["id"] == single_view["id"]
+                                       for bucket in ("requires", "units")
+                                       for item in payload[bucket]):
+                    payload.update(single_view)
+
+            visible = {
+                (parsed[1], parsed[2]) for value in known
+                if (parsed := _ref_parts(value)) is not None
+                and parsed[0] in (None, self.store.domain) and parsed[2] is not None
             }
-            if isinstance(ref, str):
-                parts = _ref_parts(ref)
-                if (parts is not None and (parts[0] is None or parts[0] == self.store.domain)
-                        and parts[1] in loaded):
-                    result.update(self._legacy_view(index, parts[1]))
-                    # Merging the whole-body view enlarges an already-trimmed
-                    # closure, so the budget verdict is re-decided on the final
-                    # payload rather than left as the pre-merge estimate.
-                    if "usage" in result:
-                        reconcile_budget_truth(result, token_budget)
+            visible_requires = set()
+            for value in requested:
+                parsed = _ref_parts(value)
+                if parsed is None or parsed[0] not in (None, self.store.domain):
+                    continue
+                unit = index.units.get(parsed[1])
+                if (unit is not None and parsed[2] in (None, unit.revision)
+                        and (unit.id, unit.revision) in visible):
+                    # A visible requested body still needs its missing premises,
+                    # even after another requested body's closure is removed.
+                    visible_requires.update(index.closure[unit.id])
+            enforce_explain_budget(result, index, token_budget, derive=derive_single_view,
+                                   visible_requires=visible_requires)
             self.observe_delivered(index, result, delivery="explain", run_id=run_id)
             return result
 

@@ -7,12 +7,12 @@ an adapter's original dependency lock. Only fixed first-party repositories count
 """
 from __future__ import annotations
 
-import importlib.metadata
 import hashlib
+import importlib.metadata
 import json
-from pathlib import Path
 import re
 import sys
+from pathlib import Path
 
 COMPONENTS = {
     "mindie-knowledge": "mindie-agent/knowledge",
@@ -41,6 +41,16 @@ def inventory():
                 or not isinstance(revision, str) or SHA.fullmatch(revision) is None):
             raise ValueError(f"{name} has no official immutable installation receipt")
         result[name] = dict(repository=repository, version=distribution.version, revision=revision)
+    return result
+
+
+def versions(names):
+    """Read version floors only; local wheels do not establish source identity."""
+    result = {}
+    for name in names:
+        if name not in COMPONENTS:
+            raise ValueError(f"unsupported component version request: {name}")
+        result[name] = importlib.metadata.version(name)
     return result
 
 
@@ -76,7 +86,9 @@ def verify_lock(components, root=None):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
+    if len(sys.argv) > 1 and sys.argv[1] == "--versions":
+        value = versions(sys.argv[2:])
+    elif len(sys.argv) > 1:
         manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
         verify_lock(manifest)
         value = verify(manifest["runtime"])

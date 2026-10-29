@@ -6,9 +6,13 @@ what remains unresolved, and whether a body can be silently shortened.
 import json
 
 import pytest
-
 from graded_fixture import OBSERVED, unit
-from mindie_knowledge.graded.index import RoutingIndex, response_token_estimate, token_estimate
+
+from mindie_knowledge.graded.index import (
+    RoutingIndex,
+    response_token_estimate,
+    token_estimate,
+)
 from mindie_knowledge.graded.units import GradedUnit
 
 
@@ -266,9 +270,8 @@ def test_repository_closure_attaches_refs_and_keeps_single_ref_fields(store):
     assert [item["id"] for item in compacted["units"]] == [step.id]
 
 
-def test_single_ref_explain_budget_truth_includes_the_merged_compat_body(store):
-    """A single-ref read merges the whole-body view onto an already-trimmed
-    closure, so its budget verdict must describe that final merged payload."""
+def test_single_ref_explain_charges_compat_body_before_admitting_the_closure(store):
+    """Existing top-level fields must fit along with the complete closure."""
     premise = unit("unit-merge-premise", body="Merge premise for graph capture. " * 10)
     step = unit("unit-merge-step", parents=[premise.id],
                 body="Merge graph capture step. " * 40)
@@ -280,19 +283,96 @@ def test_single_ref_explain_budget_truth_includes_the_merged_compat_body(store):
     assert roomy["usage"]["estimated_tokens"] == response_token_estimate(roomy) <= 16000
     assert "minimum_tokens" not in roomy
 
-    # A budget that holds the trimmed closure but not the duplicated compat
-    # body must report the real floor, never a false budget_met=True. The floor
-    # is a self-consistent fixed point of the delivered payload (writing it in
-    # lengthens the payload), so it converges on the actual estimate rather than
-    # the smaller met-case estimate.
+    # Metadata and the compatibility view count toward admission, not just
+    # the body-only estimate used by the inner closure assembler.
     requested = roomy["usage"]["estimated_tokens"] - 100
     tight = store.graded.explain(step.id, conditions=OBSERVED, token_budget=requested)
-    assert tight["content"] == step.body
-    assert tight["budget_met"] is False
-    assert tight["usage"]["budget_met"] is False
-    assert tight["minimum_tokens"] == tight["usage"]["estimated_tokens"]
-    assert tight["usage"]["estimated_tokens"] == response_token_estimate(tight) > requested
+    assert tight["units"] == [] and tight["requires"] == []
+    assert "content" not in tight
+    assert step.body not in json.dumps(tight)
+    assert tight["unresolved"][0]["status"] == "budget_excluded"
+    assert tight["budget_met"] is True
+    assert tight["usage"]["estimated_tokens"] == response_token_estimate(tight) <= requested
     assert tight["usage"]["has_more"] is True
+
+
+@pytest.mark.parametrize("single_ref", [True, False], ids=["single-ref", "batch"])
+def test_explain_without_conditions_obeys_budget_and_keeps_complete_prerequisites(store, single_ref):
+    premise = unit("unit-budget-premise", body="Required graph allocation contract. " * 12)
+    step = unit("unit-budget-step", parents=[premise.id],
+                body="Read the capture state before replacing its graph. " * 80)
+    store.graded.install([premise, step])
+    ref = store.graded.ref(step.id, step.revision)
+    selection = {"ref": ref} if single_ref else {"refs": [ref]}
+
+    narrow = store.explain(**selection, token_budget=400)
+    assert narrow["units"] == [] and narrow["requires"] == []
+    assert step.body not in json.dumps(narrow)
+    assert narrow["unresolved"][0]["status"] == "budget_excluded"
+    assert narrow["usage"]["estimated_tokens"] == response_token_estimate(narrow) <= 400
+
+    complete = store.explain(**selection, token_budget=16000)
+    assert [item["id"] for item in complete["requires"]] == [premise.id]
+    assert complete["units"][0]["content"] == step.body
+    assert complete["requires"][0]["content"] == premise.body
+    assert complete["units"][0]["ref"] == ref
+    assert complete["requires"][0]["ref"] == store.graded.ref(premise.id, premise.revision)
+    assert complete["units"][0]["ready_to_apply"] is False
+    assert complete["usage"]["estimated_tokens"] == response_token_estimate(complete) <= 16000
+    if single_ref:
+        assert complete["content"] == step.body
+        assert complete["frontmatter"] == step.metadata
+
+
+def test_single_ref_known_versions_do_not_reload_or_hide_a_revised_premise(store):
+    premise = unit("unit-single-visible-parent", revision=2, body="Current allocation contract.")
+    step = unit("unit-single-visible-step", parents=[premise.id], body="Capture the current graph.")
+    store.graded.install([premise, step])
+    ref = store.graded.ref(step.id, step.revision)
+    parent_ref = store.graded.ref(premise.id, premise.revision)
+
+    visible = store.explain(ref, known_refs=[ref, parent_ref], token_budget=400)
+    assert visible["units"] == [] and visible["requires"] == []
+    assert "content" not in visible
+    assert visible["unresolved"] == []
+
+    stale_parent = store.explain(ref, known_refs=[ref, store.graded.ref(premise.id, 1)])
+    assert stale_parent["units"] == []
+    assert stale_parent["requires"][0]["ref"] == parent_ref
+    assert stale_parent["requires"][0]["content"] == premise.body
+    assert "content" not in stale_parent
+
+
+@pytest.mark.parametrize("shared_parent", [False, True])
+def test_outer_budget_keeps_premises_needed_by_a_visible_requested_body(store, shared_parent):
+    premise = unit("unit-retained-premise", revision=2, body="Required allocation contract.")
+    visible = unit("unit-retained-visible", parents=[premise.id], body="Previously read procedure.")
+    other = unit("unit-retained-other", parents=[premise.id] if shared_parent else [],
+                 body="Another requested procedure.")
+    store.graded.install([premise, visible, other])
+    visible_ref = store.graded.ref(visible.id, visible.revision)
+    other_ref = store.graded.ref(other.id, other.revision)
+    known = [visible_ref, store.graded.ref(premise.id, 1)]
+    selection = {"refs": [visible_ref, other_ref], "known_refs": known, "conditions": OBSERVED}
+
+    roomy = store.explain(**selection, token_budget=16000)
+    retained = store.explain(**selection, token_budget=roomy["usage"]["estimated_tokens"] - 32)
+    assert retained["units"] == []
+    assert [item["ref"] for item in retained["requires"]] == [
+        store.graded.ref(premise.id, premise.revision)]
+    assert retained["requires"][0]["content"] == premise.body
+    assert retained["requires"][0]["ready_to_apply"] is True
+    assert [item["id"] for item in retained["unresolved"]] == [other.id]
+    assert retained["budget_met"] is True
+
+    premise_only = store.explain(visible_ref, known_refs=known, conditions=OBSERVED,
+                                 token_budget=16000)
+    excluded = store.explain(
+        **selection, token_budget=premise_only["usage"]["estimated_tokens"] - 32)
+    assert excluded["units"] == [] and excluded["requires"] == []
+    assert any(item["id"] == premise.id and item["status"] == "budget_excluded"
+               for item in excluded["unresolved"])
+    assert premise.body not in json.dumps(excluded)
 
 
 def test_store_query_enforces_outer_response_token_budget(store):

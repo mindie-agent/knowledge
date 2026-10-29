@@ -110,16 +110,6 @@ def test_failed_exec_is_proven_not_started_and_group_is_closed():
 @pytest.mark.parametrize("failure_stage", ["descriptors", "fork", "watcher", "exec"])
 def test_pre_exec_failure_never_continues_without_owner(monkeypatch, failure_stage):
     writes, execs = [], []
-    monkeypatch.setattr(os, "getppid", lambda: 10)
-    monkeypatch.setattr(os, "getpid", lambda: 20)
-    monkeypatch.setattr(os, "getpgrp", lambda: 20)
-    monkeypatch.setattr(os, "fstat", lambda _: SimpleNamespace(st_mode=stat.S_IFIFO))
-    monkeypatch.setattr(os, "set_inheritable", lambda *_: None)
-    monkeypatch.setattr(os, "pipe", lambda: (50, 51))
-    monkeypatch.setattr(os, "close", lambda _: None)
-    monkeypatch.setattr(os, "fork", lambda: 30)
-    monkeypatch.setattr(os, "read", lambda *_: b"R")
-    monkeypatch.setattr(os, "write", lambda fd, data: writes.append((fd, data)))
 
     def fail(*_):
         raise OSError(errno.EACCES, "synthetic private details")
@@ -128,14 +118,26 @@ def test_pre_exec_failure_never_continues_without_owner(monkeypatch, failure_sta
         execs.append(True)
         fail()
 
-    monkeypatch.setattr(os, "execvpe", failed_exec)
-    if failure_stage == "descriptors":
-        monkeypatch.setattr(os, "set_inheritable", fail)
-    elif failure_stage == "fork":
-        monkeypatch.setattr(os, "fork", fail)
-    elif failure_stage == "watcher":
-        monkeypatch.setattr(os, "read", lambda *_: b"")
-    assert posix_owner._exec(10, 40, 41, ["fixture"]) == 78
+    # Restore OS calls before pytest resumes its own descriptor capture.
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "getppid", lambda: 10)
+        patch.setattr(os, "getpid", lambda: 20)
+        patch.setattr(os, "getpgrp", lambda: 20)
+        patch.setattr(os, "fstat", lambda _: SimpleNamespace(st_mode=stat.S_IFIFO))
+        patch.setattr(os, "set_inheritable", lambda *_: None)
+        patch.setattr(os, "pipe", lambda: (50, 51))
+        patch.setattr(os, "close", lambda _: None)
+        patch.setattr(os, "fork", lambda: 30)
+        patch.setattr(os, "read", lambda *_: b"R")
+        patch.setattr(os, "write", lambda fd, data: writes.append((fd, data)))
+        patch.setattr(os, "execvpe", failed_exec)
+        if failure_stage == "descriptors":
+            patch.setattr(os, "set_inheritable", fail)
+        elif failure_stage == "fork":
+            patch.setattr(os, "fork", fail)
+        elif failure_stage == "watcher":
+            patch.setattr(os, "read", lambda *_: b"")
+        assert posix_owner._exec(10, 40, 41, ["fixture"]) == 78
     assert bool(execs) == (failure_stage == "exec")
     value = json.loads(writes[-1][1])
     assert value["stage"] == failure_stage

@@ -1,13 +1,136 @@
 """Independent locks override old direct and transitive pins without editing source."""
 import hashlib
-from pathlib import Path
+import importlib.metadata
+import json
 import tomllib
+from pathlib import Path
 
 import pytest
-
-from mindie_knowledge.component_runtime import project_text, source_files, source_identity
-from mindie_knowledge.runtime_inventory import verify_lock
 from test_component_releases import CapturedCatalog
+
+from mindie_knowledge.component_runtime import (
+    discover,
+    project_text,
+    source_baseline,
+    source_files,
+    source_identity,
+)
+from mindie_knowledge.runtime_inventory import inventory, verify_lock, versions
+
+REMOTE_RELEASE = {"repository": "mindie-agent/remote-dev", "version": "0.10.8",
+                  "revision": "4b1c5cab5d36cdaff79d27e4288c6d5f60667c72"}
+
+
+def test_active_integration_pins_override_bootstrap_without_rewriting_it(tmp_path):
+    requirements = tmp_path / "runtime-requirements.txt"
+    bootstrap = (
+        "mindie-knowledge @ git+https://github.com/mindie-agent/knowledge@"
+        "38a42f6f778cfa555d8918fdcacd12cee4a181f5\n"
+        "remote-dev @ git+https://github.com/mindie-agent/remote-dev@"
+        "0463a13fce9618ec9a51904869d61acb0cdb8538\n"
+    )
+    requirements.write_text(bootstrap, newline="\n")
+    overrides = tmp_path / "runtime-active-overrides.txt"
+    overrides.write_text(
+        "mindie-knowledge @ git+https://github.com/mindie-agent/knowledge@"
+        "6e921b205c00d592c25f849653cbfb72b73fe318\n", newline="\n")
+
+    baseline = source_baseline(tmp_path)
+
+    assert baseline["runtime"] == {
+        "mindie-knowledge": "6e921b205c00d592c25f849653cbfb72b73fe318",
+        "remote-dev": "0463a13fce9618ec9a51904869d61acb0cdb8538",
+    }
+    assert requirements.read_text() == bootstrap
+    overrides.write_text(
+        "mindie-knowledge @ git+https://github.com/mindie-agent/knowledge@main\n", newline="\n")
+    with pytest.raises(ValueError, match="official repository and full SHA"):
+        source_baseline(tmp_path)
+
+
+class RequiredComponentCatalog(CapturedCatalog):
+    """Keep the installed remote-dev identity; replay the captured knowledge release."""
+    def latest(self, name, *, force=False):
+        if name == "remote-dev":
+            return dict(REMOTE_RELEASE)
+        return super().latest(name, force=force)
+
+
+@pytest.mark.parametrize("minimum_version", [None, "0.13.1", "0.13.2"])
+def test_required_external_component_joins_the_verified_runtime(tmp_path, monkeypatch, minimum_version):
+    import mindie_knowledge.component_runtime as runtime
+
+    installed = {"remote-dev": dict(REMOTE_RELEASE)}
+    monkeypatch.setattr(runtime, "read_inventory", lambda python: installed)
+    catalog = RequiredComponentCatalog()
+    selection = discover("managed-python", {}, catalog=catalog,
+                         required_components={"mindie-knowledge": minimum_version})
+
+    assert selection["installed"] == installed == {"remote-dev": REMOTE_RELEASE}
+    assert selection["changed"] is True
+    assert selection["runtime"]["mindie-knowledge"] == CapturedCatalog().latest("mindie-knowledge")
+    assert selection["runtime"]["remote-dev"] == REMOTE_RELEASE
+    project = tomllib.loads(project_text(tmp_path, selection["runtime"]))
+    assert ("mindie-knowledge @ git+https://github.com/mindie-agent/knowledge@"
+            "b616a38f77ca17573e4ed22ee23c08c09adefac7") in project["project"]["dependencies"]
+
+
+def test_external_version_floor_cannot_be_silently_downgraded(monkeypatch):
+    import mindie_knowledge.component_runtime as runtime
+
+    installed = {"remote-dev": dict(REMOTE_RELEASE)}
+    monkeypatch.setattr(runtime, "read_inventory", lambda python: installed)
+    with pytest.raises(ValueError, match="older than the configured component 0.13.3"):
+        discover("managed-python", {}, catalog=RequiredComponentCatalog(),
+                 required_components={"mindie-knowledge": "0.13.3"})
+    assert installed == {"remote-dev": REMOTE_RELEASE}
+
+
+def test_required_component_still_rejects_an_incomplete_formal_release(monkeypatch):
+    import mindie_knowledge.component_runtime as runtime
+
+    monkeypatch.setattr(runtime, "read_inventory", lambda python: {"remote-dev": dict(REMOTE_RELEASE)})
+    catalog = RequiredComponentCatalog()
+    catalog.release["assets"] = []
+    with pytest.raises(ValueError, match="artifacts are incomplete"):
+        discover("managed-python", {}, catalog=catalog,
+                 required_components={"mindie-knowledge": "0.13.1"})
+
+
+def test_an_already_managed_component_keeps_its_newer_installed_floor(monkeypatch):
+    import mindie_knowledge.component_runtime as runtime
+
+    current = {"mindie-knowledge": dict(CapturedCatalog().latest("mindie-knowledge"), version="0.13.3",
+                                       revision="38a42f6f778cfa555d8918fdcacd12cee4a181f5")}
+    monkeypatch.setattr(runtime, "read_inventory", lambda python: current)
+    catalog = CapturedCatalog()
+    selected = discover("managed-python", {}, catalog=catalog,
+                        required_components={"mindie-knowledge": "0.13.2"})
+    assert selected == {"installed": current, "runtime": current, "changed": False}
+    assert sum(path.endswith("/releases/latest") for path in catalog.reads) == 1
+
+
+def test_external_wheel_metadata_is_only_a_version_floor(tmp_path, monkeypatch):
+    distribution = tmp_path / "mindie_profiler-0.5.0.dist-info"
+    distribution.mkdir()
+    (distribution / "METADATA").write_text(
+        "Metadata-Version: 2.3\nName: mindie-profiler\nVersion: 0.5.0\n", newline="\n")
+    (distribution / "direct_url.json").write_text(json.dumps({
+        "url": "file:///wheels/mindie_profiler-0.5.0-py3-none-any.whl", "archive_info": {},
+    }), newline="\n")
+    wheel = importlib.metadata.PathDistribution(distribution)
+
+    def installed(name):
+        if name != "mindie-profiler":
+            raise importlib.metadata.PackageNotFoundError(name)
+        return wheel
+
+    monkeypatch.setattr(importlib.metadata, "distribution", installed)
+    assert versions(["mindie-profiler"]) == {"mindie-profiler": "0.5.0"}
+    with pytest.raises(ValueError, match="no official immutable installation receipt"):
+        inventory()
+    with pytest.raises(importlib.metadata.PackageNotFoundError):
+        versions(["mindie-profiler", "mindie-sim"])
 
 
 @pytest.mark.parametrize("tls", [{}, {"UV_SYSTEM_CERTS": "false"}, {"UV_NATIVE_TLS": "false"}])

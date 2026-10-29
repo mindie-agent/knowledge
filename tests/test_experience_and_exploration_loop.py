@@ -477,13 +477,13 @@ def test_incomplete_related_body_cannot_overwrite_existing_branches(store, legac
         source_digest=request["sanitized_inputs"][0]["source_digest"])
     with pytest.raises(ValueError, match="complete related unit"):
         apply_decision(store, request, replacement)
-    assert store.explain(ref(existing))["content"] == existing.body
+    assert store.graded._load().units[existing.id].body == existing.body
 
     # The existing review route can retain a candidate without overwriting it.
     replacement["units"][0]["operation"] = "propose_semantic_merge_review"
     review = apply_decision(store, request, replacement)
     assert review["status"] == "review_or_unchanged"
-    assert store.explain(ref(existing))["content"] == existing.body
+    assert store.graded._load().units[existing.id].body == existing.body
 
 
 def test_negative_branch_folding_keeps_one_compacted_l3_unit(store, tmp_path, monkeypatch):
