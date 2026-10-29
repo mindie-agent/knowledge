@@ -14,17 +14,17 @@ import hashlib
 import json
 import os
 import re
-from pathlib import Path
 import shutil
 import sys
 import sysconfig
 import time
 import tomllib
+from pathlib import Path
 
 from .component_releases import runtime_identity
-from .runtime_inventory import validate_targets
 from .loop.locks import lock_file, unlock_file
 from .loop.process import bounded_run
+from .runtime_inventory import validate_targets
 
 
 def source_files(source):
@@ -78,12 +78,30 @@ def source_baseline(source):
     return dict(source_sha256=source_identity(source), runtime=pins)
 
 
-def discover(python, minimum, *, force=False, catalog=None):
+def discover(python, minimum, *, force=False, catalog=None, required_components=None):
+    """Select the runtime plus native-owner-declared external component CLIs.
+
+    An external installation's package version is only a floor, never a source
+    receipt. Newly managed components must come from verified formal releases.
+    """
+    from semantic_version import Version
+
     from .component_releases import Catalog, select
+    from .runtime_inventory import COMPONENTS
     current = read_inventory(python)
     catalog = catalog or Catalog()
     floor = {name: catalog.source(name, revision) for name, revision in minimum.items()}
     targets = select(current, lambda name: catalog.latest(name, force=force), baseline=floor)
+    for name, version in (required_components or {}).items():
+        if name not in COMPONENTS:
+            raise ValueError(f"unsupported required component: {name}")
+        if name not in targets:
+            targets[name] = catalog.latest(name, force=force)
+            validate_targets({name: targets[name]})
+        if version is not None and Version(targets[name]["version"]) < Version(version):
+            raise ValueError(
+                f"formal component {name} {targets[name]['version']} is older than "
+                f"the configured component {version}; current binding was not replaced")
     return dict(installed=current, runtime=targets, changed=targets != current)
 
 
@@ -109,6 +127,13 @@ def read_inventory(python, *, timeout=15):
     script = Path(__file__).with_name("runtime_inventory.py")
     return json.loads(bounded_run([str(python), "-I", str(script)], "", timeout=timeout,
                                   max_output=64 * 1024))
+
+
+def read_versions(python, names, *, timeout=15):
+    """Read explicitly selected external CLI versions without asserting VCS origin."""
+    script = Path(__file__).with_name("runtime_inventory.py")
+    return json.loads(bounded_run([str(python), "-I", str(script), "--versions", *names],
+                                  "", timeout=timeout, max_output=64 * 1024))
 
 
 def build(source, root, baseline, targets, *, python=sys.executable,
@@ -206,7 +231,9 @@ def main():
         raise ValueError("component update request exceeds its byte limit")
     request = json.loads(raw)
     if request["operation"] == "discover":
-        result = discover(request["python"], request.get("minimum", {}), force=request.get("force", False))
+        result = discover(request["python"], request.get("minimum", {}),
+                          force=request.get("force", False),
+                          required_components=request.get("required_components"))
     elif request["operation"] == "build":
         result = build(request["source"], request["root"], request["baseline"], request["runtime"],
                        python=request["python"], adapter_distribution=request.get("adapter_distribution"),

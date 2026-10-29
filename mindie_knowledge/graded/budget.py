@@ -305,24 +305,12 @@ def enforce_query_budget(payload, index, *, navigation_only=False, derive=None):
         _declare_unmet(payload)
 
 
-def reconcile_budget_truth(payload, token_budget):
-    """Re-decide the budget verdict after compat fields enlarge a trimmed payload.
-
-    The single-ref explain contract merges the historical whole-body view on top
-    of an already-trimmed closure, so the delivered payload is legitimately
-    larger than what `enforce_explain_budget` measured. The verdict and reported
-    floor must describe this final payload, never the pre-merge estimate.
-    """
-    if finalize_usage_estimate(payload) > token_budget:
-        _declare_unmet(payload)
-    else:
-        _declare_met(payload)
-
-
-def enforce_explain_budget(result, index, token_budget):
+def enforce_explain_budget(result, index, token_budget, *, derive=None, visible_requires=()):
     """Trim an assembled closure payload; a body is dropped, never shortened."""
     result["budget_scope"] = WHOLE_DELIVERY_SCOPE
     _declare_met(result)
+    if derive is not None:
+        derive(result)
     while finalize_usage_estimate(result) > token_budget and (result["units"] or result["requires"]):
         bucket = "units" if result["units"] else "requires"
         dropped = result[bucket].pop()
@@ -334,7 +322,7 @@ def enforce_explain_budget(result, index, token_budget):
             }
             kept_requires = []
             for req in result["requires"]:
-                if req["id"] in still_needed:
+                if req["id"] in still_needed or req["id"] in visible_requires:
                     kept_requires.append(req)
                 else:
                     required_tokens += token_estimate(req.get("content", ""))
@@ -348,6 +336,8 @@ def enforce_explain_budget(result, index, token_budget):
             for group in ("requires", "units") for item in result.get(group, ())
         )
         result["usage"]["has_more"] = True
+        if derive is not None:
+            derive(result)
     _trim_exploration_context(result, token_budget)
     if finalize_usage_estimate(result) > token_budget:
         _declare_unmet(result)
