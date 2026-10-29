@@ -11,6 +11,7 @@ from test_component_releases import CapturedCatalog
 from mindie_knowledge.component_runtime import (
     discover,
     project_text,
+    source_baseline,
     source_files,
     source_identity,
 )
@@ -18,6 +19,33 @@ from mindie_knowledge.runtime_inventory import inventory, verify_lock, versions
 
 REMOTE_RELEASE = {"repository": "mindie-agent/remote-dev", "version": "0.10.8",
                   "revision": "4b1c5cab5d36cdaff79d27e4288c6d5f60667c72"}
+
+
+def test_active_integration_pins_override_bootstrap_without_rewriting_it(tmp_path):
+    requirements = tmp_path / "runtime-requirements.txt"
+    bootstrap = (
+        "mindie-knowledge @ git+https://github.com/mindie-agent/knowledge@"
+        "38a42f6f778cfa555d8918fdcacd12cee4a181f5\n"
+        "remote-dev @ git+https://github.com/mindie-agent/remote-dev@"
+        "0463a13fce9618ec9a51904869d61acb0cdb8538\n"
+    )
+    requirements.write_text(bootstrap, newline="\n")
+    overrides = tmp_path / "runtime-active-overrides.txt"
+    overrides.write_text(
+        "mindie-knowledge @ git+https://github.com/mindie-agent/knowledge@"
+        "6e921b205c00d592c25f849653cbfb72b73fe318\n", newline="\n")
+
+    baseline = source_baseline(tmp_path)
+
+    assert baseline["runtime"] == {
+        "mindie-knowledge": "6e921b205c00d592c25f849653cbfb72b73fe318",
+        "remote-dev": "0463a13fce9618ec9a51904869d61acb0cdb8538",
+    }
+    assert requirements.read_text() == bootstrap
+    overrides.write_text(
+        "mindie-knowledge @ git+https://github.com/mindie-agent/knowledge@main\n", newline="\n")
+    with pytest.raises(ValueError, match="official repository and full SHA"):
+        source_baseline(tmp_path)
 
 
 class RequiredComponentCatalog(CapturedCatalog):

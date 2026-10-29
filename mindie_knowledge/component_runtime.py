@@ -63,11 +63,18 @@ def source_baseline(source):
     requirements = Path(source) / "runtime-requirements.txt"
     if requirements.is_file():
         pins = {}
-        for line in requirements.read_text(encoding="utf-8").splitlines():
-            match = re.fullmatch(r"([\w-]+)\s*@\s*git\+https://github.com/([\w-]+/[\w-]+)@([0-9a-f]{40})", line)
-            if match and match[1] in COMPONENTS:
-                if COMPONENTS[match[1]] != match[2]:
-                    raise ValueError("adapter declares an unofficial component source")
+        # Older controllers need the bootstrap trio; active candidates layer
+        # their exact integration pins over it without rewriting that first hop.
+        for path in (requirements, Path(source) / "runtime-active-overrides.txt"):
+            if not path.is_file():
+                continue
+            for line in path.read_text(encoding="utf-8").splitlines():
+                declared = re.match(r"([\w-]+)\s*@", line)
+                if declared is None or declared[1] not in COMPONENTS:
+                    continue
+                match = re.fullmatch(r"([\w-]+)\s*@\s*git\+https://github.com/([\w-]+/[\w-]+)@([0-9a-f]{40})", line)
+                if match is None or COMPONENTS[match[1]] != match[2]:
+                    raise ValueError("adapter component source must pin an official repository and full SHA")
                 pins[match[1]] = match[3]
     else:
         project = tomllib.loads((Path(source) / "pyproject.toml").read_text(encoding="utf-8"))
