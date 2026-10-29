@@ -351,7 +351,7 @@ class Service:
             return result
         if method == "distill":
             from .activation import activation_epoch
-            allowed = {"inputs", "task_state", "related_refs", "proposal"}
+            allowed = {"inputs", "task_state", "related_refs", "proposal", "topic", "target_signature"}
             if not set(args) <= allowed or not {"inputs", "task_state"} <= set(args):
                 raise ValueError("distill accepts explicit inputs and task_state plus optional related_refs/proposal")
             settings = self.engine._settings()
@@ -366,7 +366,8 @@ class Service:
             return self.engine.distill_selected(args["inputs"], session_digest=session_key(session),
                                                task_state=args["task_state"], authorization=authorization,
                                                cancel=cancel, related_refs=args.get("related_refs"),
-                                               proposal=proposal)
+                                               proposal=proposal, topic=args.get("topic"),
+                                               target_signature=args.get("target_signature"))
         if method == "explain":
             allowed = {"ref", "refs", "conditions", "known_refs", "token_budget", "run_id",
                        "mode", "ledger_entries", "bottleneck_summary",

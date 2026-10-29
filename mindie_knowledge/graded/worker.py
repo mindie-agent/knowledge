@@ -23,6 +23,9 @@ from ..materials.summarizer import SummaryLedger, outcome, validate_identity, va
 from .distill import (apply_decision, noop_decision, prepare_request, validate_decision,
                       result_view, value_gate, with_worker_identity)
 from .feedback import parse_feedback_ref
+from .impact import ImpactCompletenessError
+from .publication import PublicationError
+from .store import GradedStore, history_scope, record_rejection
 from .units import UNIT_ID, canonical, locator_parts
 
 
@@ -33,7 +36,9 @@ def _compact_related(unit, *, body_complete):
     return {"id": unit.id, "revision": unit.revision, "tier": unit.metadata["tier"],
             "category": unit.metadata["category"], "title": unit.metadata["title"],
             "conditions": unit.metadata["conditions"], "triggers": unit.metadata["triggers"],
-            "body_excerpt": unit.body if body_complete else "", "body_complete": body_complete}
+            "body_excerpt": unit.body if body_complete else "", "body_complete": body_complete,
+            "topic": unit.metadata.get("topic", unit.metadata["domain_path"]),
+            "target_signature": unit.metadata.get("target_signature", unit.id)}
 
 
 def _matching_related_units(store, inputs, related_refs):
@@ -88,24 +93,35 @@ def _matching_related_units(store, inputs, related_refs):
     return related or None
 
 
-def _related_snapshot(store, inputs, *, session_digest, task_state, related_refs):
-    """Bind one automatic related-unit lookup to the initial request identity."""
+def _related_snapshot(store, inputs, *, session_digest, task_state, related_refs,
+                      topic=None, target_signature=None):
+    """Bind history and related-unit lookups to the initial paid-call identity."""
     rel_key = "graded:related:" + hashlib.sha256(canonical({
         "session_digest": session_digest, "task_state": task_state,
         "inputs": inputs, "related_refs": list(related_refs or ()),
+        **({"topic": topic} if topic is not None else {}),
+        **({"target_signature": target_signature} if target_signature is not None else {}),
     }).encode()).hexdigest()
     with store.lock:
         row = store.db.execute("SELECT value FROM state WHERE key=?", (rel_key,)).fetchone()
         if row is not None:
-            return json.loads(row[0])
+            saved = json.loads(row[0])
+            # Preserve pre-history request identities when resuming a paid call.
+            return saved if isinstance(saved, dict) else {
+                "related_units": saved, "rejected_history": [], "_history_scope": {}}
         related_units = _matching_related_units(store, inputs, related_refs)
+        scope = history_scope(inputs, related_units, topic=topic, target_signature=target_signature)
+        context = {"related_units": related_units, "rejected_history": GradedStore(store).recent_rejected(**scope),
+                   "_history_scope": scope}
     with store._write_txn():
         row = store.db.execute("SELECT value FROM state WHERE key=?", (rel_key,)).fetchone()
         if row is not None:
-            return json.loads(row[0])
+            saved = json.loads(row[0])
+            return saved if isinstance(saved, dict) else {
+                "related_units": saved, "rejected_history": [], "_history_scope": {}}
         store.db.execute("INSERT OR REPLACE INTO state VALUES(?,?)",
-                         (rel_key, canonical(related_units)))
-    return related_units
+                         (rel_key, canonical(context)))
+    return context
 
 
 def _validated_decision(pending, request, engine, store, private_paths, cancel):
@@ -130,7 +146,11 @@ def _validated_decision(pending, request, engine, store, private_paths, cancel):
                 f"{ref['repository']}@{ref['revision']}:{ref['path']}" if isinstance(ref, dict) else ref
                 for ref in provenance["evidence_refs"]
             ]
-    return validate_decision(pending, request)
+    try:
+        return validate_decision(pending, request)
+    except ValueError as exc:
+        record_rejection(store, request, pending, exc)
+        raise
 
 
 def _local_failure(response, attempt, error, stage, *, recording_error=None, decision=None):
@@ -154,7 +174,7 @@ def _local_failure(response, attempt, error, stage, *, recording_error=None, dec
 
 
 def run(engine, inputs, *, session_digest, task_state, authorization=None, cancel=None,
-        related_refs=None, proposal=None):
+        related_refs=None, proposal=None, topic=None, target_signature=None):
     store = engine.store
 
     def revalidate():
@@ -164,11 +184,12 @@ def run(engine, inputs, *, session_digest, task_state, authorization=None, cance
 
     revalidate()
     private_paths = ((authorization["scope"],) if authorization else ()) + (str(Path.home()),)
-    related_units = _related_snapshot(store, inputs, session_digest=session_digest,
-                                      task_state=task_state, related_refs=related_refs)
+    context = _related_snapshot(store, inputs, session_digest=session_digest,
+                                task_state=task_state, related_refs=related_refs,
+                                topic=topic, target_signature=target_signature)
     request = prepare_request(inputs, session_digest=session_digest, task_state=task_state,
                               redactor_executable=engine.redactor_executable, redaction_key=store.redaction_key(),
-                              private_paths=private_paths, cancel=cancel, related_units=related_units)
+                              private_paths=private_paths, cancel=cancel, **context)
     gate = value_gate(request)
     if gate:
         return apply_decision(store, request, noop_decision(request, gate))
@@ -177,16 +198,20 @@ def run(engine, inputs, *, session_digest, task_state, authorization=None, cance
             raise ValueError("proposal must be a mindie-distill-decision/1 object")
         decision = _validated_decision(proposal, request, engine, store, private_paths, cancel)
         receipt_key = "graded:applied:" + request["request_digest"]
-        with store._write_txn():
-            revalidate()
-            result = apply_decision(store, request, decision,
-                                    generation=authorization.get("generation") if authorization else None)
-            receipt = {key: value for key, value in result.items() if key != "publication_plan"}
-            receipt.update(attempt_id=None, model_calls=0, usage=0,
-                           billing_status="not_applicable", model_execution="foreground_proposal",
-                           model_status="not_invoked", model_replayed=False,
-                           related_unit_ids=[item["id"] for item in request.get("related_units", [])])
-            store.db.execute("INSERT OR REPLACE INTO state VALUES(?,?)", (receipt_key, canonical(receipt)))
+        try:
+            with store._write_txn():
+                revalidate()
+                result = apply_decision(store, request, decision,
+                                        generation=authorization.get("generation") if authorization else None)
+                receipt = {key: value for key, value in result.items() if key != "publication_plan"}
+                receipt.update(attempt_id=None, model_calls=0, usage=0,
+                               billing_status="not_applicable", model_execution="foreground_proposal",
+                               model_status="not_invoked", model_replayed=False,
+                               related_unit_ids=[item["id"] for item in request.get("related_units", [])])
+                store.db.execute("INSERT OR REPLACE INTO state VALUES(?,?)", (receipt_key, canonical(receipt)))
+        except (ImpactCompletenessError, PublicationError) as exc:
+            record_rejection(store, request, decision, exc)
+            raise
         return {**result, **receipt, "decision": decision}
     if not engine.summary_command:
         raise ValueError("C6 requires a configured native summary worker")
@@ -272,6 +297,8 @@ def run(engine, inputs, *, session_digest, task_state, authorization=None, cance
     except Exception as exc:
         recording_error = None
         try:
+            if isinstance(exc, (ImpactCompletenessError, PublicationError)) and decision is not None:
+                record_rejection(store, request, decision, exc)
             with store._write_txn():
                 if ledger.get(attempt["attempt_id"])["status"] == "returned":
                     ledger.local_failure(attempt["attempt_id"], "apply_failed")

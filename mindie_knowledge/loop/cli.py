@@ -264,7 +264,7 @@ def distill_selected(config_path, payload):
     """
     from . import summary_budget
     required = {"inputs", "task_state", "_session_id", "_activation"}
-    allowed = required | {"related_refs", "proposal"}
+    allowed = required | {"related_refs", "proposal", "topic", "target_signature"}
     if not isinstance(payload, dict) or not required <= set(payload) <= allowed:
         raise ValueError("distill stdin requires inputs, task_state, _session_id and _activation")
     config = config_at(config_path)
