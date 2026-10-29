@@ -57,17 +57,20 @@ def source_identity(source):
     return digest.hexdigest()
 
 
-def source_baseline(source):
-    """For native adapters without a product receipt, retain their exact pins."""
+def source_baseline(source, *, active_overrides=False):
+    """Read bootstrap pins; native owners explicitly opt into active source floors.
+
+    Legacy owners compare these pins with a candidate built from requirements.
+    Active pins cannot imply that the candidate interpreter already has them.
+    """
     from .runtime_inventory import COMPONENTS
     requirements = Path(source) / "runtime-requirements.txt"
     if requirements.is_file():
         pins = {}
-        # Older controllers need the bootstrap trio; active candidates layer
-        # their exact integration pins over it without rewriting that first hop.
-        for path in (requirements, Path(source) / "runtime-active-overrides.txt"):
-            if not path.is_file():
-                continue
+        paths = [requirements]
+        if active_overrides:
+            paths.append(Path(source) / "runtime" / "active-overrides.txt")
+        for path in paths:
             for line in path.read_text(encoding="utf-8").splitlines():
                 declared = re.match(r"([\w-]+)\s*@", line)
                 if declared is None or declared[1] not in COMPONENTS:

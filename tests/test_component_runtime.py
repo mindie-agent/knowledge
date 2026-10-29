@@ -30,22 +30,72 @@ def test_active_integration_pins_override_bootstrap_without_rewriting_it(tmp_pat
         "0463a13fce9618ec9a51904869d61acb0cdb8538\n"
     )
     requirements.write_text(bootstrap, newline="\n")
-    overrides = tmp_path / "runtime-active-overrides.txt"
+    overrides = tmp_path / "runtime" / "active-overrides.txt"
+    overrides.parent.mkdir()
     overrides.write_text(
         "mindie-knowledge @ git+https://github.com/mindie-agent/knowledge@"
         "6e921b205c00d592c25f849653cbfb72b73fe318\n", newline="\n")
 
-    baseline = source_baseline(tmp_path)
+    bootstrap_baseline = source_baseline(tmp_path)
+    baseline = source_baseline(tmp_path, active_overrides=True)
 
+    assert bootstrap_baseline["runtime"] == {
+        "mindie-knowledge": "38a42f6f778cfa555d8918fdcacd12cee4a181f5",
+        "remote-dev": "0463a13fce9618ec9a51904869d61acb0cdb8538",
+    }
     assert baseline["runtime"] == {
         "mindie-knowledge": "6e921b205c00d592c25f849653cbfb72b73fe318",
         "remote-dev": "0463a13fce9618ec9a51904869d61acb0cdb8538",
     }
+    assert baseline["source_sha256"] == bootstrap_baseline["source_sha256"]
     assert requirements.read_text() == bootstrap
     overrides.write_text(
         "mindie-knowledge @ git+https://github.com/mindie-agent/knowledge@main\n", newline="\n")
     with pytest.raises(ValueError, match="official repository and full SHA"):
-        source_baseline(tmp_path)
+        source_baseline(tmp_path, active_overrides=True)
+
+
+@pytest.mark.parametrize("active_path", [
+    "runtime-active-overrides.txt",
+    "runtime/active-overrides.txt",
+])
+def test_legacy_candidate_decision_cannot_mistake_active_pins_for_bootstrap(
+        tmp_path, monkeypatch, active_path):
+    import mindie_knowledge.component_runtime as runtime
+
+    released = CapturedCatalog().latest("mindie-knowledge")
+    bootstrap = dict(released, version="0.13.1",
+                     revision="2e5cf79050a6634a53b9c2cff52d98ca87850e50")
+    (tmp_path / "runtime-requirements.txt").write_text(
+        "mindie-knowledge @ git+https://github.com/mindie-agent/knowledge@"
+        + bootstrap["revision"] + "\n", newline="\n")
+    overrides = tmp_path / active_path
+    overrides.parent.mkdir(exist_ok=True)
+    overrides.write_text(
+        "mindie-knowledge @ git+https://github.com/mindie-agent/knowledge@"
+        + released["revision"] + "\n", newline="\n")
+
+    class BootstrapCatalog(CapturedCatalog):
+        def source(self, name, revision):
+            assert name == "mindie-knowledge"
+            if revision == bootstrap["revision"]:
+                return bootstrap
+            return super().source(name, revision)
+
+    # The current host has newer components, but its old builder creates the
+    # candidate from runtime-requirements.txt before this selection.
+    monkeypatch.setattr(runtime, "read_inventory", lambda python: {"mindie-knowledge": released})
+    baseline = source_baseline(tmp_path)
+    selected = discover("current-python", baseline["runtime"], catalog=BootstrapCatalog())
+    selected_pins = {name: row["revision"] for name, row in selected["runtime"].items()}
+
+    assert selected["changed"] is False
+    assert selected_pins != baseline["runtime"]
+    project = tomllib.loads(project_text(tmp_path, selected["runtime"]))
+    assert project["project"]["dependencies"] == [
+        "mindie-knowledge @ git+https://github.com/mindie-agent/knowledge@"
+        + released["revision"],
+    ]
 
 
 class RequiredComponentCatalog(CapturedCatalog):
