@@ -18,10 +18,11 @@ def test_rebinding_moves_standard_modules_and_preserves_explicit_wrappers():
     components = {"mindie-profiler": {"version": "0.5.0"},
                   "mindie-sim": {"version": "0.7.1"}}
 
-    result = bindings.rebind_commands(adapter, Path("/managed/bin/python"), components)
+    candidate_python = Path("/managed/bin/python")
+    result = bindings.rebind_commands(adapter, candidate_python, components)
 
-    assert result["profiler"] == ["/managed/bin/python", "-I", "-X", "utf8", "-m", "mindie_profiler"]
-    assert result["sim"] == ["/managed/bin/python", "-I", "-X", "utf8", "-m", "mindie_sim"]
+    assert result["profiler"] == [str(candidate_python), "-I", "-X", "utf8", "-m", "mindie_profiler"]
+    assert result["sim"] == [str(candidate_python), "-I", "-X", "utf8", "-m", "mindie_sim"]
     assert result["coordinator"] == adapter["component_commands"]["coordinator"]
     assert result["diagnostics"] == adapter["component_commands"]["diagnostics"]
     assert adapter == before
