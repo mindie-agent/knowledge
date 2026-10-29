@@ -100,7 +100,7 @@ class Engine(TranscriptMixin):
         from ..graded.distill import apply_decision
         return apply_decision(self.store, request, decision)
     def distill_selected(self, inputs, *, session_digest, task_state, authorization=None, cancel=None,
-                         related_refs=None, proposal=None):
+                         related_refs=None, proposal=None, topic=None, target_signature=None):
         """Explicit verified milestone/completion; ordinary Stop does not select it."""
         from ..graded.worker import run
         from .operations import CombinedCancellation
@@ -110,7 +110,8 @@ class Engine(TranscriptMixin):
                 raise ValueError("service is not admitting distillation work")
             return run(self, inputs, session_digest=session_digest, task_state=task_state,
                        authorization=authorization, cancel=CombinedCancellation(cancel, operation.cancel),
-                       related_refs=related_refs, proposal=proposal)
+                       related_refs=related_refs, proposal=proposal,
+                       topic=topic, target_signature=target_signature)
     def _error(self, detail):
         self.errors = (self.errors + [detail])[-20:]
     def _fault(self, operation, stage, category, exception=None):

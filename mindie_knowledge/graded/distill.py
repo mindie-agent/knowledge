@@ -16,6 +16,8 @@ import re
 
 from .index import RoutingIndex
 from .conditions import match_conditions
+from .impact import IMPACT_FIELDS, check_impact_completeness
+from .store import MAX_HISTORY_BYTES, MAX_HISTORY_ITEMS, history_scope, record_rejection, scope_digest
 from .units import CATEGORY_TO_TIER, GradedUnit, SHA256, TIER_CATEGORIES, UNIT_ID, canonical, locator_parts
 
 UNIT_BODY_SOFT_BUDGET_BYTES = 4096
@@ -30,10 +32,10 @@ BASE_REQUEST_KEYS = {"schema_version", "session_digest", "task_state", "evidence
                      "redaction_rules", "redaction_completed", "model_calls", "request_digest"}
 # Optional keys participate in request_digest only when present, so requests
 # prepared before related-unit lookup keep their historical digest.
-OPTIONAL_REQUEST_KEYS = {"related_units"}
+OPTIONAL_REQUEST_KEYS = {"related_units", "history_scope", "history_scope_digest", "rejected_history"}
 DIGEST_KEYS = BASE_REQUEST_KEYS | OPTIONAL_REQUEST_KEYS
 COMPACT_UNIT_FIELDS = ("id", "revision", "tier", "category", "title", "conditions", "triggers",
-                       "body_excerpt", "body_complete")
+                       "body_excerpt", "body_complete", "topic", "target_signature")
 
 
 def _evidence_strengths():
@@ -213,7 +215,9 @@ def _sha(value):
 
 
 def prepare_request(inputs, *, session_digest, task_state, redactor_executable,
-                    redaction_key, private_paths=(), cancel=None, related_units=None):
+                    redaction_key, private_paths=(), cancel=None, related_units=None,
+                    graded_store=None, topic=None, target_signature=None, rejected_history=None,
+                    _history_scope=None):
     """Prepare selected evidence; explicit invocation is the local read scope."""
     if not isinstance(session_digest, str) or not SHA256.fullmatch(session_digest):
         raise ValueError("session_digest must be an exact SHA256")
@@ -242,11 +246,24 @@ def prepare_request(inputs, *, session_digest, task_state, redactor_executable,
     raw = canonical(selected)
     if len(raw.encode()) > 262144:
         raise ValueError("selected distillation input exceeds 256 KiB; select a smaller evidence scope")
+    scope = (_history_scope if _history_scope is not None else
+             history_scope(inputs, related_units, topic=topic, target_signature=target_signature))
+    scope_identity = scope_digest(scope)
+    history = rejected_history
+    if history is None:
+        history = graded_store.recent_rejected(**scope) if graded_store is not None else []
+    if not isinstance(history, list) or len(history) > MAX_HISTORY_ITEMS:
+        raise ValueError("rejected history must contain at most five summaries")
+    if any(len(canonical(row).encode()) > MAX_HISTORY_BYTES for row in history):
+        raise ValueError("rejected history summary exceeds 4 KiB")
     rules = []
-    if selected:
+    if selected or history:
         from ..loop.transcript_redaction import redact_tree
-        selected, rules = redact_tree(selected, executable=redactor_executable, key=redaction_key,
-                                      private_paths=private_paths, cancel=cancel)
+        cleaned, rules = redact_tree(
+            {"inputs": selected, "history": history, "scope": scope},
+            executable=redactor_executable, key=redaction_key,
+            private_paths=private_paths, cancel=cancel)
+        selected, history, scope = cleaned["inputs"], cleaned["history"], cleaned["scope"]
         for item in selected:
             locator = item["source_locator"]
             if isinstance(locator, dict):
@@ -261,6 +278,11 @@ def prepare_request(inputs, *, session_digest, task_state, redactor_executable,
                "redaction_completed": True, "model_calls": 0}
     if related_units is not None:
         request["related_units"] = _related_units(related_units)
+    if scope:
+        request["history_scope"] = scope
+        request["history_scope_digest"] = scope_identity
+    if history:
+        request["rejected_history"] = history
     request["request_digest"] = _sha(request)
     return request
 
@@ -360,6 +382,13 @@ def build_prompt(request):
         "The target and frontmatter tier/category pair must be identical. Evidence strength is independent of this use class. "
         f"L1 permits only {', '.join(l1_strengths)} evidence; a single observation cannot become an L1 measurement. "
         "If related_units are supplied, compare the new evidence with every listed unit. "
+        "rejected_history contains bounded prior rejected or rolled-back candidates as negative constraints, "
+        "not adopted strategies or proof that an entire direction is invalid. Address each applicable gate_reason, "
+        "colliding unit_id and missing_counterexample_conditions; explain whether new evidence preserves, narrows "
+        "or abandons that change. Do not repeat a rejected change without new conditions or evidence; noop is valid. "
+        "For shared underlying contracts or cross-component parameters, declare shared_contracts or "
+        "cross_component_parameters and name impact_surface consumers, validation_scope or "
+        "reverification_commands in frontmatter. These declarations are validation plans, not verified outcomes. "
         "Prefer merge_into_existing (or noop when the listed unit already covers the conclusion) over creating a duplicate unit; "
         "state which new condition, mechanism, branch, or counter-evidence justifies any change. "
         "A related unit's body_excerpt is the full body only when body_complete is true. "
@@ -428,7 +457,7 @@ def build_prompt(request):
         "Return JSON only; no prose or markdown fences.\n\n"
     )
     view = {key: request[key] for key in BASE_REQUEST_KEYS}
-    view.update({key: request[key] for key in OPTIONAL_REQUEST_KEYS if key in request})
+    view.update({key: request[key] for key in OPTIONAL_REQUEST_KEYS - {"history_scope_digest"} if key in request})
     return instruction + canonical({"admission": _admission_view(request),
                                     "output_schema": decision_schema(), "request": view})
 
@@ -460,7 +489,10 @@ def decision_schema():
               "domain_path": string, "operation": {"enum": ["create", "merge_into_existing", "propose_semantic_merge_review"]},
               "target_unit_id": unit_id, "frontmatter": {"type": "object", "additionalProperties": False,
                                                            "required": list(frontmatter),
-                                                           "properties": {**frontmatter, "revision": {"type": "integer", "minimum": 1}}},
+                                                           "properties": {**frontmatter,
+                                                                          **{key: strings for key in IMPACT_FIELDS},
+                                                                          "topic": string, "target_signature": string,
+                                                                          "revision": {"type": "integer", "minimum": 1}}},
               "markdown_body": string}
     pairs = [{"properties": {"target_tier": {"const": tier}, "category": {"const": category},
                               "frontmatter": {"properties": {"tier": {"const": tier},
@@ -485,7 +517,8 @@ def decision_schema():
 def parse_validate_result(model_text, request):
     if not isinstance(model_text, str) or len(model_text.encode()) > 131072:
         raise ValueError("C6 model output exceeds 128 KiB")
-    return validate_decision(json.loads(model_text), request)
+    # A complete native reply must be receipted before local impact admission.
+    return validate_decision(json.loads(model_text), request, check_impact=False)
 
 
 def _verified_ablation(inputs, unit):
@@ -550,7 +583,7 @@ def _verified_ablation(inputs, unit):
     return False
 
 
-def validate_decision(decision, request):
+def validate_decision(decision, request, *, check_impact=True):
     inputs = _request(request)
     if not isinstance(decision, dict) or decision.get("schema_version") != "mindie-distill-decision/1":
         raise ValueError("organizer must return mindie-distill-decision/1")
@@ -605,6 +638,8 @@ def validate_decision(decision, request):
         if len(unit.body.encode("utf-8")) > UNIT_BODY_HARD_BUDGET_BYTES:
             raise ValueError("graded unit body exceeds 8 KiB anti-bloat budget; compact branches before admission")
         metadata = unit.metadata
+        if check_impact:
+            check_impact_completeness(metadata, unit.body, inputs)
         if row.get("target_tier") is None and metadata.get("tier") is not None:
             row["target_tier"] = metadata["tier"]
         if isinstance(row.get("frontmatter"), dict) and row["frontmatter"].get("tier") is None:
@@ -649,10 +684,23 @@ def validate_decision(decision, request):
 
 def apply_decision(store, request, decision, *, generation=None):
     """Admit one C6 result locally; never initiate external publication."""
-    decision = validate_decision(decision, request)
+    _request(request)
+    try:
+        decision = validate_decision(decision, request)
+    except ValueError as exc:
+        record_rejection(store, request, decision, exc)
+        raise
     if decision["action"] == "noop":
         return {"status": "noop", "decision": decision, "publication": "not_requested"}
-    from .publication import prepare_decision
+    from .publication import PublicationError, prepare_decision
+    try:
+        return _apply_validated_decision(store, request, decision, prepare_decision, generation)
+    except PublicationError as exc:
+        record_rejection(store, request, decision, exc)
+        raise
+
+
+def _apply_validated_decision(store, request, decision, prepare_decision, generation):
     with store._write_txn():
         current = store.graded._load() if store.graded.available() else RoutingIndex([])
         plan = prepare_decision(decision, current, authorized_publication=False)

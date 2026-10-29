@@ -446,7 +446,9 @@ def outcome(request, *, status, result=None, raw_result=None, usage=None,
                 raise SummaryResultError("returned C6 decision has the wrong schema")
             if "sanitized_inputs" in request:
                 from ..graded.distill import validate_decision
-                result = validate_decision(result, request)
+                # Record the completed paid reply before local impact admission;
+                # a missing consumer declaration is not an uncertain model call.
+                result = validate_decision(result, request, check_impact=False)
         else:
             result = validate_result(result, [block["block_id"] for block in request["blocks"]])
     elif result is not None:

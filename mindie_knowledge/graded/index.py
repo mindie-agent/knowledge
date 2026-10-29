@@ -1,7 +1,9 @@
 """[Role] C8 inheritance index and condition-aware local graded retrieval.
 
 [Invariants] Resolve all stable references at build time; never truncate semantic
-inheritance by depth. Each returned parent independently matches task conditions.
+inheritance by depth. inherits_from names necessary premises, not related topics:
+each returned parent independently matches task conditions. Hardware constraints
+are never inferred from a unit's tier, corpus path or unrelated nearby axioms.
 Shared parents are charged once per response; explain_closure never truncates a
 unit body and reports every budget miss explicitly.
 [Timeouts & Locks] No model/network work; build time is separate from query time.

@@ -31,6 +31,39 @@ def shared_workflows():
     return premise, procedure, left, right
 
 
+@pytest.mark.parametrize("hardware_key", ["soc", "npu_model"])
+def test_offline_software_closure_is_independent_of_explicit_hardware_premises(hardware_key):
+    observed = {"framework": "fixture-profiler", "trace_device": "fixture:two-rank"}
+    software = unit("unit-interval-accounting", tier="L1", category="axiom",
+                    evidence_strength="software_contract", domain_path="_common",
+                    conditions={"framework": "fixture-profiler"},
+                    body="Union intervals in each declared window; do not add overlapping durations.")
+    hardware = unit("unit-ub-alignment", tier="L1", category="axiom",
+                    evidence_strength="hardware_spec", domain_path="_common",
+                    conditions={hardware_key: ["Ascend910B"]},
+                    body="The selected chip requires its declared UB alignment in device kernels.")
+    offline = unit("unit-host-parser", conditions={"framework": "fixture-profiler"},
+                   parents=[software.id], body="Parse per-rank intervals and compare exposed communication.")
+    device = unit("unit-device-kernel", conditions={"framework": "fixture-profiler"},
+                  parents=[software.id, hardware.id], body="Apply the chip alignment to the device kernel.")
+    index = RoutingIndex([software, hardware, offline, device])
+
+    answer = index.explain_closure([offline.id, device.id], conditions=observed, token_budget=16000)
+    assert [row["id"] for row in answer["units"]] == [offline.id]
+    assert [row["id"] for row in answer["requires"]] == [software.id]
+    assert all(row["ready_to_apply"] for row in answer["units"] + answer["requires"])
+    assert {row["id"]: row["status"] for row in answer["unresolved"]} == {
+        hardware.id: "condition_unknown", device.id: "condition_unknown"}
+
+    wrong = index.explain_closure([device.id], conditions={**observed, hardware_key: "Ascend910C"})
+    assert not wrong["units"] and not wrong["requires"]
+    assert {row["status"] for row in wrong["unresolved"]} == {"condition_mismatch"}
+    supported = index.explain_closure([device.id], conditions={**observed, hardware_key: "Ascend910B"})
+    assert [row["id"] for row in supported["units"]] == [device.id]
+    assert {row["id"] for row in supported["requires"]} == {software.id, hardware.id}
+    assert supported["unresolved"] == []
+
+
 def test_two_l3_units_share_parent_bodies_once_in_query_and_closure():
     premise, procedure, left, right = shared_workflows()
     index = RoutingIndex([premise, procedure, left, right])

@@ -34,6 +34,7 @@ from typing import Any
 from ..redact import REDACTION_PROFILE, scan_text
 from .distill import UNIT_BODY_HARD_BUDGET_BYTES, compact_unit_body
 from .index import RoutingIndex
+from .impact import check_impact_completeness
 from .units import CATEGORY_TO_TIER, GradedUnit, UNIT_ID, canonical
 
 DECISION_SCHEMA = "mindie-distill-decision/1"
@@ -96,8 +97,10 @@ class PublicationProposal(dict):
         return json.dumps(self.to_dict(), sort_keys=True, ensure_ascii=False, separators=(",", ":"))
 
 
-def _fail(message: str) -> None:
-    raise PublicationError(message)
+def _fail(message: str, unit_id=None) -> None:
+    error = PublicationError(message)
+    error.unit_id = unit_id
+    raise error
 
 
 def _stable_id(value: Any, field: str) -> str:
@@ -212,12 +215,13 @@ def _parse_unit(entry: dict, path: str) -> GradedUnit:
     try:
         compacted_body = compact_unit_body(_markdown_body(entry))
         unit = GradedUnit.from_parts(_frontmatter(entry), compacted_body, path)
+        check_impact_completeness(unit.metadata, unit.body)
     except (TypeError, ValueError) as exc:
         # C5 messages describe structural expectations and never echo a value.
         reason = str(exc)
         if len(reason) > 240 or not re.fullmatch(r"[A-Za-z0-9 .,;:()/'_+=>-]+", reason):
             reason = "structural validation failed"
-        _fail(f"proposed unit failed C5 validation: {reason}")
+        _fail(f"proposed unit failed C5 validation: {reason}", getattr(exc, "unit_id", None))
     if not UNIT_ID.fullmatch(unit.id):
         _fail("proposed unit id is not an exact stable unit identifier")
     return unit
@@ -433,7 +437,7 @@ def _prepare_units(decision: dict, index: RoutingIndex) -> tuple[list, list, lis
                     unchanged.append(_unchanged_entry(operation, current, path))
                     proposed_units.append(current)
                 else:
-                    _fail(f"create conflicts with existing stable unit ID {unit.id}")
+                    _fail(f"create conflicts with existing stable unit ID {unit.id}", unit.id)
                 continue
             writes.append((_write_entry(operation, unit, path, None), unit))
             proposed_units.append(unit)
