@@ -27,6 +27,19 @@ from .loop.process import bounded_run
 from .runtime_inventory import validate_targets
 
 
+_TEXT_SUFFIXES = frozenset({
+    ".py", ".json", ".md", ".toml", ".svg", ".txt", ".yml", ".yaml", ".lock", ".cjs", ".js", ".sh",
+})
+
+
+def _read_source_bytes(path: Path, limit: int | None = None) -> bytes:
+    with path.open("rb") as stream:
+        raw = stream.read() if limit is None else stream.read(limit)
+    if path.suffix in _TEXT_SUFFIXES and b"\r\n" in raw:
+        raw = raw.replace(b"\r\n", b"\n")
+    return raw
+
+
 def source_files(source):
     """Native source only; generated host bindings are mutable installation data."""
     source = Path(source)
@@ -46,8 +59,7 @@ def source_files(source):
 def source_identity(source):
     digest, size = hashlib.sha256(), 0
     for relative in source_files(source):
-        with (Path(source) / relative).open("rb") as stream:
-            raw = stream.read(16 * 1024 * 1024 - size + 1)
+        raw = _read_source_bytes(Path(source) / relative, 16 * 1024 * 1024 - size + 1)
         size += len(raw)
         if size > 16 * 1024 * 1024:
             raise ValueError("adapter runtime source exceeds 16 MiB")
@@ -179,12 +191,15 @@ def build(source, root, baseline, targets, *, python=sys.executable,
             size = 0
             for relative in files:
                 relative = Path(relative)
-                size += (source / relative).stat().st_size
+                src_file = source / relative
+                size += src_file.stat().st_size
                 if size > 16 * 1024 * 1024:
                     raise ValueError("adapter runtime source exceeds 16 MiB")
                 destination = retained / relative
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source / relative, destination)
+                shutil.copy2(src_file, destination)
+                if src_file.suffix in _TEXT_SUFFIXES:
+                    destination.write_bytes(_read_source_bytes(src_file))
             runtime.mkdir(exist_ok=True)
             (runtime / "pyproject.toml").write_text(
                 project_text(retained, targets, adapter_distribution=adapter_distribution),
@@ -196,8 +211,21 @@ def build(source, root, baseline, targets, *, python=sys.executable,
             environment.pop("PYTHONPATH", None)
             environment.update(UV_PROJECT_ENVIRONMENT=str(runtime / ".venv"), UV_NO_PROGRESS="1",
                                GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="Never")
-            if "UV_SYSTEM_CERTS" not in environment:
+            if "UV_SYSTEM_CERTS" not in environment and "UV_NATIVE_TLS" not in environment:
+                environment["UV_SYSTEM_CERTS"] = "true"
+                environment["UV_NATIVE_TLS"] = "true"
+            elif "UV_SYSTEM_CERTS" not in environment:
                 environment.setdefault("UV_NATIVE_TLS", "true")
+            if "GIT_CONFIG_COUNT" not in environment:
+                git_pairs = (
+                    ("core.longpaths", "true"),
+                    ("core.autocrlf", "false"),
+                    ("credential.https://github.com.provider", "github"),
+                )
+                environment["GIT_CONFIG_COUNT"] = str(len(git_pairs))
+                for idx, (k, v) in enumerate(git_pairs):
+                    environment[f"GIT_CONFIG_KEY_{idx}"] = k
+                    environment[f"GIT_CONFIG_VALUE_{idx}"] = v
             bounded_run([uv, "sync", "--project", str(runtime), "--no-editable", "--no-dev",
                          "--python", str(python)], "", timeout=timeout - 20,
                         max_output=256 * 1024, child_env=environment)
@@ -211,7 +239,7 @@ def build(source, root, baseline, targets, *, python=sys.executable,
         # this selection and belongs to its existing binding transaction.
         retained = generation / "source"
         for relative in files:
-            if (source / relative).read_bytes() != (retained / relative).read_bytes():
+            if _read_source_bytes(source / relative) != _read_source_bytes(retained / relative):
                 raise ValueError("retained component adapter source changed")
         remaining = timeout - (time.monotonic() - started) - 10
         if remaining <= 0:
