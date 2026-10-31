@@ -205,10 +205,28 @@ def test_component_download_keeps_enterprise_trust_and_failure_unpublished(tmp_p
         runtime.build(source, tmp_path / "generations", baseline, targets, env=environment)
     assert observed.items() >= environment.items()
     if not tls:
+        assert observed.get("UV_SYSTEM_CERTS") == "true"
         assert observed.get("UV_NATIVE_TLS") == "true"
+    assert observed.get("GIT_CONFIG_COUNT") == "3"
+    assert observed.get("GIT_CONFIG_KEY_0") == "core.longpaths"
+    assert observed.get("GIT_CONFIG_VALUE_0") == "true"
+    assert observed.get("GIT_CONFIG_KEY_1") == "core.autocrlf"
+    assert observed.get("GIT_CONFIG_VALUE_1") == "false"
     assert environment == dict(tls, SSL_CERT_FILE="enterprise.pem", HTTPS_PROXY="http://enterprise-proxy:8080")
     assert not list((tmp_path / "generations").rglob("components.json"))
     assert source_identity(source) == baseline["source_sha256"]
+
+
+def test_source_identity_normalizes_crlf_across_windows_and_unix(tmp_path):
+    lf_dir = tmp_path / "lf"
+    crlf_dir = tmp_path / "crlf"
+    lf_dir.mkdir()
+    crlf_dir.mkdir()
+    (lf_dir / "pyproject.toml").write_bytes(b'[project]\nname = "adapter"\nversion = "0.1.0"\n')
+    (crlf_dir / "pyproject.toml").write_bytes(b'[project]\r\nname = "adapter"\r\nversion = "0.1.0"\r\n')
+    (lf_dir / "script.py").write_bytes(b"print('ok')\n")
+    (crlf_dir / "script.py").write_bytes(b"print('ok')\r\n")
+    assert source_identity(lf_dir) == source_identity(crlf_dir)
 
 
 def test_generated_project_overrides_transitive_git_pins_and_leaves_adapter_inputs_alone(tmp_path):
