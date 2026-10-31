@@ -254,3 +254,25 @@ def test_v2_privacy_scan_sees_unit_metadata_and_body(tmp_path, monkeypatch):
     repo, sha = publish(tmp_path, unit_files(value))
     with pytest.raises(ValueError, match='privacy scan'):
         validate(repo, sha, DOMAIN)
+
+
+def test_v2_base_revision_requires_semantic_revision_advance_on_content_change(tmp_path):
+    value = unit("unit-parent")
+    repo, base = publish(tmp_path, unit_files(value))
+
+    unchanged_rev = GradedUnit.from_parts(
+        dict(value.metadata),
+        "Updated synthetic rule without bumping revision.\n",
+        value.path,
+    )
+    (repo / value.path).write_text(unchanged_rev.render(), encoding="utf-8", newline="\n")
+    bad_head = commit(repo, "content change without revision bump")
+    with pytest.raises(ValueError, match="does not preserve or advance its semantic revision"):
+        validate(repo, bad_head, DOMAIN, base_revision=base)
+
+    advanced = revised(value, "Updated synthetic rule without bumping revision.\n")
+    (repo / value.path).write_text(advanced.render(), encoding="utf-8", newline="\n")
+    good_head = commit(repo, "advance revision")
+    checked = validate(repo, good_head, DOMAIN, base_revision=base)
+    assert checked["entries"] == 1
+

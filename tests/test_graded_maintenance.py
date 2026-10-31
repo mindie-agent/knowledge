@@ -514,3 +514,24 @@ def test_move_rejects_unreadable_destination_before_mutating_source(tmp_path):
         assert not result['applied'] and not result['partial'] and not result['moved']
         assert source.read_bytes() == original
         assert not (tmp_path / destination).exists()
+
+
+def test_build_routing_index_auto_advances_revision_when_content_changes(tmp_path: Path) -> None:
+    value = _unit("rules/unit-auto-rev.md", ident="unit-auto-rev")
+    _make_corpus(tmp_path, value)
+    assert build_routing_index(tmp_path)["ok"] is True
+
+    edited = GradedUnit.from_parts(dict(value.metadata), "Modified rule body.\n", value.path)
+    assert edited.revision == 1
+    _write(tmp_path, edited)
+
+    checked = build_routing_index(tmp_path, check=True)
+    assert checked["ok"] is False
+    assert any(item["kind"] == "revision_not_advanced" for item in checked["errors"])
+
+    rebuilt = build_routing_index(tmp_path)
+    assert rebuilt["ok"] is True and rebuilt["written"] is True
+    reloaded = GradedUnit.from_text((tmp_path / value.path).read_text(encoding="utf-8"), value.path)
+    assert reloaded.revision == 2
+    assert build_routing_index(tmp_path, check=True)["ok"] is True
+

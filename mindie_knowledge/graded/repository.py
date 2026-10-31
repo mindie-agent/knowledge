@@ -196,7 +196,7 @@ class GradedRepository:
             previous_units = {item["id"]: self._read(item) for item in previous["units"]}
             for unit in index.units.values():
                 old = previous_units.get(unit.id)
-                if old and ((old.content_sha256 == unit.content_sha256 and old.revision != unit.revision)
+                if old and (unit.revision < old.revision
                             or (old.content_sha256 != unit.content_sha256 and unit.revision <= old.revision)):
                     raise ValueError("graded feed update does not preserve or advance its semantic revision")
                 path = unit.path or f"{unit.metadata['domain_path']}/{unit.id}.md"

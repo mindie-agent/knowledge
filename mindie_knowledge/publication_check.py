@@ -479,6 +479,57 @@ def classify_changes(repo, base_revision, revision, *, schema=SCHEMA):
             "development_paths": development}
 
 
+def _validate_graded_revision_advance(repo, base_revision, domain, current_units):
+    """Ensure every modified graded unit advances its semantic revision over base_revision."""
+    try:
+        base_contract = read_git_contract(repo, base_revision, domain, env=_git_env())
+    except Exception:
+        return
+    if data_format(base_contract['contract']) != DATA_FORMAT_V2:
+        return
+    fd, listing_name = tempfile.mkstemp(prefix='mindie-base-ls-tree-')
+    os.close(fd)
+    listing_file = Path(listing_name)
+    base_units = {}
+    reader = None
+    try:
+        run_stdout_to_file(
+            [git_executable(), '-C', str(repo), 'ls-tree', '-r', '-z', '--long', base_revision],
+            listing_file, timeout=PUBLICATION_GIT_TIMEOUT_SECONDS, env=_git_env(),
+        )
+        with closing(iter_file_records(listing_file, separator=b'\0')) as records:
+            for raw in records:
+                if not raw:
+                    continue
+                head, path = raw.decode('utf-8', 'strict').split('\t', 1)
+                _mode, _kind, sha, _size = head.split()
+                if classify_path(path) != 'unit':
+                    continue
+                if reader is None:
+                    reader = CatFileBatch(repo, env=_git_env())
+                blob = reader.read(sha, deadline=None, max_bytes=MAX_UNIT_BYTES)
+                if blob is None:
+                    raise OSError(f'{path}: base Git blob is unavailable')
+                unit = _unit_from_text(blob.decode('utf-8', 'strict'), path)
+                base_units[unit.id] = unit
+    finally:
+        if reader is not None:
+            reader.close()
+        try:
+            listing_file.unlink()
+        except OSError:
+            pass
+    for unit in current_units:
+        old = base_units.get(unit.id)
+        if old is not None and (unit.revision < old.revision
+                                or (old.content_sha256 != unit.content_sha256 and unit.revision <= old.revision)):
+            path = unit.path or f"{unit.metadata['domain_path']}/{unit.id}.md"
+            raise ValueError(
+                f"{path}: graded feed update does not preserve or advance its semantic revision "
+                f"({old.revision} -> {unit.revision})"
+            )
+
+
 def validate(repo,revision,domain,state=None,*,base_revision=None):
     if not re.fullmatch(r'[0-9a-f]{40}',revision):
         raise ValueError('revision must be a full immutable Git commit SHA')
@@ -507,6 +558,8 @@ def validate(repo,revision,domain,state=None,*,base_revision=None):
     if base_revision is not None:
         result.update(classify_changes(repo, base_revision, revision,
                                        schema=contract['contract']['schema']))
+        if selected_format == DATA_FORMAT_V2:
+            _validate_graded_revision_advance(repo, base_revision, domain, stats['graded_units'])
     return result
 
 def main(argv=None):

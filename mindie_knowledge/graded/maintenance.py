@@ -420,6 +420,29 @@ def _write_pair(manifest_path: Path, manifest: dict, topology_path: Path, topolo
                 pass
 
 
+def _previous_unit_states(manifest_path: Path, topology_path: Path) -> dict[str, tuple[int, str]]:
+    if not manifest_path.is_file() or not topology_path.is_file():
+        return {}
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        topology_doc = json.loads(topology_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(manifest, dict) or not isinstance(topology_doc, dict):
+        return {}
+    revisions = {
+        row["id"]: row["revision"]
+        for row in manifest.get("units", ())
+        if isinstance(row, dict) and isinstance(row.get("id"), str) and type(row.get("revision")) is int
+    }
+    digests = {
+        ident: row["content_sha256"]
+        for ident, row in (topology_doc.get("units") or {}).items()
+        if isinstance(ident, str) and isinstance(row, dict) and isinstance(row.get("content_sha256"), str)
+    }
+    return {ident: (revisions[ident], digests[ident]) for ident in revisions.keys() & digests.keys()}
+
+
 def _check_payloads(manifest_path: Path, topology_path: Path, manifest: dict, topology_doc: dict) -> list[str]:
     errors = []
     for label, path, expected in (("routing manifest", manifest_path, manifest),
@@ -451,6 +474,34 @@ def build_routing_index(root: Path | str, *, index_dir: Path | str | None = None
               "manifest": str(manifest_path), "topology": str(topology_path), "errors": list(errors)}
     if errors:
         return report
+    previous = _previous_unit_states(manifest_path, topology_path)
+    if previous:
+        if check:
+            for unit in units:
+                if unit.id not in previous:
+                    continue
+                old_rev, old_sha = previous[unit.id]
+                if unit.revision < old_rev or (unit.content_sha256 != old_sha and unit.revision <= old_rev):
+                    report["errors"].append(_error(
+                        "revision_not_advanced",
+                        f"{_unit_path(unit)}: graded unit content changed without advancing revision ({old_rev} -> {unit.revision})",
+                    ))
+        else:
+            advanced = False
+            for unit in units:
+                if unit.id not in previous:
+                    continue
+                old_rev, old_sha = previous[unit.id]
+                if unit.revision < old_rev or (unit.content_sha256 != old_sha and unit.revision <= old_rev):
+                    target_rev = (old_rev + 1) if unit.content_sha256 != old_sha else old_rev
+                    updated = GradedUnit.from_parts({**unit.metadata, "revision": target_rev}, unit.body, unit.path)
+                    _atomic_write_text(root / _unit_path(unit), updated.render())
+                    advanced = True
+            if advanced:
+                units, index, errors = load_corpus(root)
+                if errors:
+                    report["errors"].extend(errors)
+                    return report
     try:
         manifest, topology_doc = _payloads(units, index)
     except TimeoutError:
