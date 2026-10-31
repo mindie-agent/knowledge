@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/mindie-agent/mindie-agent/main/assets/brand/mindie-agent-logo.png" alt="MindIE Agent logo" width="128" height="128">
+  <img src="assets/brand/knowledge-logo.png" alt="mindie-knowledge logo" width="128" height="128">
 </p>
 
 <h1 align="center">MindIE Knowledge</h1>
@@ -26,19 +26,19 @@
 
 ## ⚡ One-Sentence Agent-Native Install
 
-`mindie-knowledge` is the shared knowledge runtime inside [MindIE Agent](https://github.com/mindie-agent/mindie-agent). You don't need to manually configure background services or databases—just open **Claude Code**, **OpenAI Codex CLI**, **Kimi Code**, or **DeepSeek Harness (`mindie-agent-dsh`)** and send this single sentence to your Agent:
+`mindie-knowledge` is the shared knowledge runtime inside [MindIE Agent](https://github.com/mindie-agent/mindie-agent). You don't need to manually configure background services or databases—just open **Claude Code**, **OpenAI Codex CLI**, **Kimi Code**, **DeepSeek Harness (`mindie-agent-dsh`)**, or **Google Antigravity (`mindie-agent-agy`)** and send this single sentence to your Agent:
 
 ```text
 帮我安装一下这个 https://github.com/mindie-agent/mindie-agent
 ```
 
-Your Agent will automatically install the matching native plugin (`mindie-agent-cc`, `mindie-agent-codex`, `mindie-agent-kimi`, or `mindie-agent-dsh`), provision the pinned `mindie-knowledge` runtime, and sync the public [`knowledge-vllm-ascend`](https://github.com/mindie-agent/knowledge-vllm-ascend), [`knowledge-operators`](https://github.com/mindie-agent/knowledge-operators), and companion domain corpora in the background.
+Your Agent will automatically install the matching native plugin (`mindie-agent-cc`, `mindie-agent-codex`, `mindie-agent-kimi`, `mindie-agent-dsh`, or `mindie-agent-agy`), provision the pinned `mindie-knowledge` runtime, and sync the public [`knowledge-vllm-ascend`](https://github.com/mindie-agent/knowledge-vllm-ascend), [`knowledge-operators`](https://github.com/mindie-agent/knowledge-operators), and companion domain corpora in the background.
 
 <details>
 <summary>🤖 <b>AI Agent Auto-Install & Configuration Guide (Instructions for AI Agents)</b></summary>
 
 > **Instructions for AI Agents**:
-> 1. **Full MindIE Agent Setup in Claude Code / Codex / Kimi Code / DeepSeek Harness (`mindie-agent-dsh`)**:
+> 1. **Full MindIE Agent Setup in Claude Code / Codex / Kimi Code / DeepSeek Harness (`mindie-agent-dsh`) / Google Antigravity (`mindie-agent-agy`)**:
 >    Read the main repository homepage at [`https://github.com/mindie-agent/mindie-agent`](https://github.com/mindie-agent/mindie-agent), detect your host client environment, and run the corresponding plugin installation commands. The host plugin automatically manages the `mindie-knowledge` virtual environment, service lifecycle, and local search index.
 > 2. **Standalone Developer / CI Installation of `mindie-knowledge`**:
 >    Ensure Python 3.11+ and Git are installed, then run:
@@ -110,7 +110,7 @@ When working on Ascend NPU inference engineering (such as `vLLM-Ascend` operator
 
 ```mermaid
 flowchart TB
-  subgraph Clients["🧑‍💻 Host Plugin Adapters (Claude Code / OpenAI Codex / Kimi Code / DeepSeek Harness)"]
+  subgraph Clients["🧑‍💻 Host Plugin Adapters (Claude Code / OpenAI Codex / Kimi Code / DeepSeek Harness / Google Antigravity)"]
     MCP["Authenticated Local Loopback RPC<br/>knowledge_query · knowledge_explain · knowledge_distill · knowledge_feedback · knowledge_sync"]
     Hook["Turn Stop Hook / Explicit Historical Import (import_transcript)"]
   end
@@ -227,7 +227,7 @@ python3 -m mindie_knowledge.redact --profile
 
 ### 4. Authenticated Local Loopback RPC & Library Surface
 
-Host plugins (Claude Code, OpenAI Codex, Kimi Code, and DeepSeek Harness `mindie-agent-dsh`) dispatch native tool calls to the authenticated local loopback RPC surface of `mindie-knowledge`:
+Host plugins (Claude Code, OpenAI Codex, Kimi Code, DeepSeek Harness `mindie-agent-dsh`, and Google Antigravity `mindie-agent-agy`) dispatch native tool calls to the authenticated local loopback RPC surface of `mindie-knowledge`:
 
 | Entry Point | Purpose |
 | --- | --- |

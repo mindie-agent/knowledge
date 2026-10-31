@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/mindie-agent/mindie-agent/main/assets/brand/mindie-agent-logo.png" alt="MindIE Agent logo" width="128" height="128">
+  <img src="assets/brand/knowledge-logo.png" alt="mindie-knowledge logo" width="128" height="128">
 </p>
 
 <h1 align="center">MindIE Knowledge</h1>
@@ -26,19 +26,19 @@
 
 ## ⚡ 一句话安装与接入
 
-`mindie-knowledge` 是 [MindIE Agent](https://github.com/mindie-agent/mindie-agent) 的核心知识运行时。你不需要手动配置守护进程或数据库——直接打开 **Claude Code**、**OpenAI Codex CLI**、**Kimi Code** 或 **DeepSeek Harness（`mindie-agent-dsh`）**，发送下面这句话给你的 Agent：
+`mindie-knowledge` 是 [MindIE Agent](https://github.com/mindie-agent/mindie-agent) 的核心知识运行时。你不需要手动配置守护进程或数据库——直接打开 **Claude Code**、**OpenAI Codex CLI**、**Kimi Code**、**DeepSeek Harness（`mindie-agent-dsh`）** 或 **Google Antigravity（`mindie-agent-agy`）**，发送下面这句话给你的 Agent：
 
 ```text
 帮我安装一下这个 https://github.com/mindie-agent/mindie-agent
 ```
 
-Agent 会自动安装对应的宿主插件（`mindie-agent-cc`、`mindie-agent-codex`、`mindie-agent-kimi` 或 `mindie-agent-dsh`）、拉取固定版本的 `mindie-knowledge` 运行时，并在后台同步 [`knowledge-vllm-ascend`](https://github.com/mindie-agent/knowledge-vllm-ascend)、[`knowledge-operators`](https://github.com/mindie-agent/knowledge-operators) 等官方公共工程知识库。
+Agent 会自动安装对应的宿主插件（`mindie-agent-cc`、`mindie-agent-codex`、`mindie-agent-kimi`、`mindie-agent-dsh` 或 `mindie-agent-agy`）、拉取固定版本的 `mindie-knowledge` 运行时，并在后台同步 [`knowledge-vllm-ascend`](https://github.com/mindie-agent/knowledge-vllm-ascend)、[`knowledge-operators`](https://github.com/mindie-agent/knowledge-operators) 等官方公共工程知识库。
 
 <details>
 <summary>🤖 <b>AI Agent 自动安装与配置指南（当用户让你安装本组件或 MindIE Agent 时请按此执行）</b></summary>
 
 > **给 AI Agent 的说明**：
-> 1. **如果用户希望在 Claude Code / Codex / Kimi Code / DeepSeek Harness (`mindie-agent-dsh`) 中使用完整能力**：
+> 1. **如果用户希望在 Claude Code / Codex / Kimi Code / DeepSeek Harness (`mindie-agent-dsh`) / Google Antigravity (`mindie-agent-agy`) 中使用完整能力**：
 >    请直接读取主仓库主页 [`https://github.com/mindie-agent/mindie-agent`](https://github.com/mindie-agent/mindie-agent) 中的自动安装引导，识别你所在的宿主环境并执行对应的插件安装命令。插件会自动管理 `mindie-knowledge` 的虚拟环境、服务生命周期与本地检索索引。
 > 2. **如果用户希望在独立开发环境或 CI 中单独安装 `mindie-knowledge` Python 包**：
 >    确认环境具备 Python 3.11+ 与 Git，然后执行：
@@ -110,7 +110,7 @@ Agent 会自动安装对应的宿主插件（`mindie-agent-cc`、`mindie-agent-c
 
 ```mermaid
 flowchart TB
-  subgraph Clients["🧑‍💻 宿主插件适配层 (Claude Code / OpenAI Codex / Kimi Code / DeepSeek Harness)"]
+  subgraph Clients["🧑‍💻 宿主插件适配层 (Claude Code / OpenAI Codex / Kimi Code / DeepSeek Harness / Google Antigravity)"]
     MCP["本地认证回环 RPC<br/>knowledge_query · knowledge_explain · knowledge_distill · knowledge_feedback · knowledge_sync"]
     Hook["回合结束通知 (Stop Hook) / 显式历史导入 (import_transcript)"]
   end
@@ -231,7 +231,7 @@ python3 -m mindie_knowledge.redact --profile
 
 ### 4. 给宿主插件调用的本地回环接口
 
-各客户端插件（Claude Code / Codex / Kimi Code / DeepSeek Harness `mindie-agent-dsh`）将原生工具调用转发至 `mindie-knowledge` 的本地认证回环接口：
+各客户端插件（Claude Code / Codex / Kimi Code / DeepSeek Harness `mindie-agent-dsh` / Google Antigravity `mindie-agent-agy`）将原生工具调用转发至 `mindie-knowledge` 的本地认证回环接口：
 
 | 接口名称 | 作用说明 |
 | --- | --- |

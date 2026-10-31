@@ -31,6 +31,8 @@ _COMPATIBILITY_PATHS = {
     "codex": "plugins/mindie-agent/harness-compatibility.json",
     "claude-code": "harness-compatibility.json",
     "kimi-code": "harness-compatibility.json",
+    "dsh": "harness-compatibility.json",
+    "antigravity": "harness-compatibility.json",
 }
 
 
