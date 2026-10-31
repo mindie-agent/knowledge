@@ -83,13 +83,11 @@ def _matching_related_units(store, inputs, related_refs):
             if unit.id not in seen:
                 ordered.append(unit)
                 seen.add(unit.id)
-    related, remaining = [], RELATED_BODY_BUDGET_BYTES
+    related = []
     for unit in ordered[:3]:
         size = len(unit.body.encode("utf-8"))
-        complete = size <= remaining
+        complete = size <= RELATED_BODY_BUDGET_BYTES
         related.append(_compact_related(unit, body_complete=complete))
-        if complete:
-            remaining -= size
     return related or None
 
 

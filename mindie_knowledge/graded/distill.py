@@ -389,11 +389,12 @@ def build_prompt(request):
         "For shared underlying contracts or cross-component parameters, declare shared_contracts or "
         "cross_component_parameters and name impact_surface consumers, validation_scope or "
         "reverification_commands in frontmatter. These declarations are validation plans, not verified outcomes. "
-        "Prefer merge_into_existing (or noop when the listed unit already covers the conclusion) over creating a duplicate unit; "
+        "Prefer merge_into_existing only when revising an existing related unit that shares the exact same provenance.source_locator and identical conditions (or return noop when the listed unit already covers the conclusion); "
+        "when the new finding comes from a new session source_locator, targets a specific mechanism/file not already covered, or has different conditions from the listed related_units, use operation=create with a new unit-... ID instead of merge_into_existing or propose_semantic_merge_review; "
         "state which new condition, mechanism, branch, or counter-evidence justifies any change. "
         "A related unit's body_excerpt is the full body only when body_complete is true. "
         "If body_complete is false or absent, do not reconstruct or replace unseen text; "
-        "use propose_semantic_merge_review or noop instead of merge_into_existing. "
+        "use create (for a new unit ID), propose_semantic_merge_review, or noop instead of merge_into_existing. "
         "Silent background anti-bloat applies to every proposal. Fold multiple negative trials on the same operator "
         "or subgraph into one compact conditional exclusion table inside the existing L3 unit via merge_into_existing; "
         "never create a separate unit per failed trial. "
@@ -415,10 +416,11 @@ def build_prompt(request):
         "Distinguish valid subtarget results, invalid execution, partial findings and inconclusive causality. "
         "Repeated summaries or commit recaps of the same run are not independent replications. "
         "Put only actual environment and workload applicability premises in conditions. "
+        "For L2/sop and L3/workflow units, keep conditions minimal and portable (for example framework: vllm-ascend and component/attention_backend), and omit unrecorded hardware/version/workload keys or single-test-case tensor dimensions rather than setting them to unknown. "
         "Plain condition lists mean alternatives. For a measured group of workloads, use "
         "workload: {exact_set: [...]} with each member binding its input_shape and workload_case_sha256; "
         "all members, including recorded samples_per_shape, are one complete applicability identity. "
-        "If a necessary hardware/software/workload premise was not recorded, declare its value as unknown; "
+        "For L1/measurement and L4/mutator units, if a necessary hardware/software/workload premise was not recorded, declare its value as unknown; "
         "unknown applicability never matches by default and cannot be filled from a different or later environment. "
         "Evidence bookkeeping such as repetitions, observation_scope or not_measured belongs in provenance or the body; "
         "procedure steps and readiness instructions belong in the body, not additional hard matching conditions. "
@@ -614,6 +616,14 @@ def validate_decision(decision, request, *, check_impact=True):
         if isinstance(row.get("markdown_body"), str):
             row["markdown_body"] = compact_unit_body(row["markdown_body"])
         fm = row.get("frontmatter")
+        tier_val = row.get("target_tier") or (fm.get("tier") if isinstance(fm, dict) else None)
+        if tier_val in {"L2", "L3"} and isinstance(fm, dict) and isinstance(fm.get("conditions"), dict):
+            known_conds = {
+                k: v for k, v in fm["conditions"].items()
+                if v != "unknown" and not (isinstance(v, list) and "unknown" in v)
+            }
+            if known_conds:
+                fm["conditions"] = known_conds
         if isinstance(fm, dict) and isinstance(fm.get("provenance"), dict):
             prov = fm["provenance"]
             loc_str = str(prov.get("source_locator", ""))
