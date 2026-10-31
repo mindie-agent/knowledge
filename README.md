@@ -26,8 +26,6 @@
 
 ## ⚡ 一句话安装与接入
 
-### 方式一：在日常 AI 编程客户端中一键启用（最推荐 ✨）
-
 `mindie-knowledge` 是 [MindIE Agent](https://github.com/mindie-agent/mindie-agent) 的核心知识运行时。你不需要手动配置守护进程或数据库——直接打开 **Claude Code**、**OpenAI Codex CLI**、**Kimi Code** 或 **DeepSeek Harness（`mindie-agent-dsh`）**，发送下面这句话给你的 Agent：
 
 ```text
@@ -237,11 +235,11 @@ python3 -m mindie_knowledge.redact --profile
 
 | 接口名称 | 作用说明 |
 | --- | --- |
-| **`knowledge_query(query, limit?, conditions?, known_refs?, token_budget?, continuation?)`** | 基于 `routing-manifest.json` + `shard-topology.json` 分层路由与 `applicability` 条件过滤，搜索当前可见 `L1–L4` 分级知识单元（`mindie-graded-unit/1`）与任务分块（支持传入 `known_refs` 跳过会话内已展开引用、通过 `token_budget` 控制摘要体积），返回可读引用 `ref`、`task_ref`、`feedback_ref`、原文摘录及翻页令牌 `related_next`。 |
-| **`knowledge_explain(ref / refs, known_refs?, token_budget?)`** | 按精确引用（或批量 `refs=[...]`）展开 `L1–L4` 分级知识单元（含继承的父级规则与适用条件）或任务导航大纲（`mindie://DOMAIN/TASK`）及无损分块正文（`mindie://DOMAIN/TASK/blocks/<block-id>@<file-sha256>`）。 |
-| **`knowledge_distill(...)`** | 从经过实机验证的排障/调优里程碑（`verified_milestone=True`）中结构化提炼新的分级知识单元（`L1 canonical-fact` / `L2 sop` / `L3 workflow` / `L4 optimization-pattern`），支持记录被淘汰方案历史（`rejected_history`）与跨组件影响门禁（`affected_components`），通过脱敏与 Schema 校验后进入本地复用与社区准入队列。 |
-| **`knowledge_feedback(ref / refs, rating, stage?, reason?)`** | 针对精确观测修订 `mindie://DOMAIN/<task-id>@<observed-revision>` 记录全生命周期反馈（`discovered` / `loaded` / `applied` / `evaluated`）与 `up` / `down` 评价及单行原因（最多 1000 字符）。 |
-| **`knowledge_sync(...)`** | 按需执行一次零大模型调用的上游公开知识库增量同步，通过 `git cat-file --batch` 流式校验后原子切换本地可见视图。 |
+| **`knowledge_query(query, limit?, conditions?, known_refs?, token_budget?, continuation?, domain_path?, include_unknown?, include_archived?, navigation_only?, mode?, goal?, bottleneck_summary?, ledger_entries?, native_subcontext?, run_id?)`** | 基于 `routing-manifest.json` + `shard-topology.json` 分层路由与 `applicability` 条件过滤，搜索当前可见 `L1–L4` 分级知识单元（`mindie-graded-unit/1`）与任务分块（支持传入 `known_refs` 跳过会话内已展开引用、通过 `token_budget` 控制摘要体积、在 `mode="explore"` 下开启 RSI 去偏探索），返回可读引用 `ref`、`task_ref`、`feedback_ref`、原文摘录及翻页令牌 `related_next`。 |
+| **`knowledge_explain(ref / refs, conditions?, known_refs?, token_budget?, mode?, goal?, bottleneck_summary?, ledger_entries?, native_subcontext?, run_id?)`** | 按精确引用（或批量 `refs=[...]`）展开 `L1–L4` 分级知识单元（含继承的父级规则闭包与适用条件）或任务导航大纲（`mindie://DOMAIN/TASK`）及无损分块正文（`mindie://DOMAIN/TASK/blocks/<block-id>@<file-sha256>`）。 |
+| **`knowledge_distill(inputs, task_state, related_refs?, proposal?, topic?, target_signature?)`** | 在 `task_state="verified_milestone"` 或 `"completed"` 时，从调用方已授权证据中结构化提炼新的分级知识单元（`L1 canonical-fact` / `L2 sop` / `L3 workflow` / `L4 optimization-pattern`），支持同主题既有单元比对（`related_refs`）、确定性预构建提案校验（`proposal`，`model_calls=0`）、被淘汰方案历史（`rejected_history`）与跨组件影响门禁（`affected_components`）。 |
+| **`knowledge_feedback(ref, rating?, reason?, event_type?, run_id?, outcome?, step_id?, evidence_source?)`** | 针对精确观测修订 `mindie://DOMAIN/units/<id>@<revision>`（或历史材料 `feedback_ref`）记录四阶段使用事件（`event_type`: `discovered` / `loaded` / `applied` / `evaluated`，其中 `evaluated` 关联 `run_id` 与 `outcome`: `supported` / `refuted` / `inconclusive`）以及可选 `up` / `down` 评价与单行原因（最多 1000 字符）。 |
+| **`knowledge_sync()`** | 按需执行一次零大模型调用的上游公开知识库增量同步，通过 `git cat-file --batch` 流式校验后原子切换本地可见视图。 |
 | **`mindie_knowledge.loop.history_import.import_transcript`** | 显式导入用户指定的历史会话快照，复用与实时采集完全一致的脱敏、分块与准入管线。 |
 | **`mindie_knowledge.releases` / `component_runtime` / `runtime_inventory`** | 解析插件 `mindie-plugin-release.json`（含 `release_http` 有界 `ETag`/TTL 缓存），直接发现 8 个官方组件的独立正式 GitHub Release（`component_releases`）、核验不可变 Tag 与 `benchmark-results.json` 门禁，并构建并排隔离 `uv` 运行时。 |
 
