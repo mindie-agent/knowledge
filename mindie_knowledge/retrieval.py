@@ -78,6 +78,13 @@ _ASCEND_COMPOUND_SPLITS: dict[str, tuple[str, ...]] = {
     "flashgen": ("flash", "gen"),
     "taehv": ("tae", "hv"),
     "yuanrong": ("yuan", "rong"),
+    "runtime_guard": ("runtime", "guard"),
+    "runtimeguard": ("runtime", "guard"),
+    "dump_kv": ("dump", "kv"),
+    "token_repeat": ("token", "repeat"),
+    "logits_finite": ("logits", "finite"),
+    "spec_acceptance": ("spec", "acceptance"),
+    "mrv1": ("mr", "v1"),
 }
 _ASCEND_COMPOUND_RE = re.compile(
     r"(?:"
@@ -390,6 +397,14 @@ _CJK_TECH_ALIASES: dict[str, tuple[str, ...]] = {
     "功耗封顶": ("fa_power_cap", "insertcomm", "blockattn"),
     "同窗对比": ("perf_gate", "window_ab_protocol", "engagement_check"),
     "质量门": ("accuracy_gate", "content_health_gate", "layer_bisect"),
+    "运行时守卫": ("runtime_guard", "token_repeat", "logits_finite", "dump_kv"),
+    "在线检测": ("runtime_guard", "detector", "token_repeat", "logits_finite"),
+    "复读": ("token_repeat", "repeated_ngram", "repetition"),
+    "有效槽": ("used_slots", "dump_kv", "zero_norm"),
+    "未用槽": ("unused_slots", "dump_kv"),
+    "清洁标杆": ("force_feed", "ref_kv", "dump_kv"),
+    "十问定界": ("runtime_guard", "dump_kv", "locate_first_divergence"),
+    "乱码漏检": ("detector_gap", "manual_dump", "runtime_guard"),
 }
 
 # Reverse English-to-CJK bigram index so English queries also match local

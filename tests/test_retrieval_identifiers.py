@@ -55,7 +55,8 @@ def test_vllm_ascend_and_cann_compound_identifiers_expand_to_subwords():
         'eplb mrv2 hixl lmcache mooncake sfa_v1 dsa_v1 mla_v1 fa3_v1 '
         'qli_v2 quarot teacache msmemscope msprof msprobe serving_cast tensor_cast '
         'mindiesd vllm_omni rainfusion rf_v2 rf_v3 ada_bsa eagleqbsa '
-        'ditcache cache_dit taylorseer code2wav token2wav llm2tts flashgen taehv yuanrong'
+        'ditcache cache_dit taylorseer code2wav token2wav llm2tts flashgen taehv yuanrong '
+        'runtime_guard runtimeguard dump_kv token_repeat logits_finite spec_acceptance mrv1'
     )
     expanded = set(tokens(sample))
     counts = token_counts(sample)
@@ -101,6 +102,13 @@ def test_vllm_ascend_and_cann_compound_identifiers_expand_to_subwords():
         {'flashgen', 'flash', 'gen'},
         {'taehv', 'tae', 'hv'},
         {'yuanrong', 'yuan', 'rong'},
+        {'runtime_guard', 'runtime', 'guard'},
+        {'runtimeguard', 'runtime', 'guard'},
+        {'dump_kv', 'dump', 'kv'},
+        {'token_repeat', 'token', 'repeat'},
+        {'logits_finite', 'logits', 'finite'},
+        {'spec_acceptance', 'spec', 'acceptance'},
+        {'mrv1', 'mr', 'v1'},
     ):
         assert expected_group.issubset(expanded)
 
@@ -122,6 +130,14 @@ def test_bilingual_query_tokens_expand_cjk_domain_concepts_and_strip_filler_bigr
         'dit', 'mindiesd', 'vllm_omni', 'rainfusion', 'rf_v2', 'cache_dit',
         'qwen3_tts', 'code2wav', 'ttfp', 'rtf', 'async_chunk', 'sliced_state_decode',
     }.issubset(expanded_omni_sd)
+
+    q_rg = '运行时守卫 在线检测 复读 乱码漏检 有效槽 未用槽 清洁标杆 十问定界'
+    expanded_rg = set(query_tokens(q_rg))
+    assert {
+        'runtime_guard', 'token_repeat', 'logits_finite', 'dump_kv',
+        'detector_gap', 'manual_dump', 'used_slots', 'unused_slots',
+        'force_feed', 'ref_kv', 'locate_first_divergence',
+    }.issubset(expanded_rg)
 
 
 def test_graded_routing_index_bilingual_natural_language_recall_and_noise_immunity():
