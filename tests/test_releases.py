@@ -206,3 +206,18 @@ def test_returned_objects_cannot_mutate_inputs_and_validator_has_no_repair():
     selected = select([record])
     selected["candidate"]["metadata"]["source"]["sha"] = "c" * 40
     assert record == original
+
+
+def test_workbuddy_harness_compatibility_and_release_selection():
+    import json
+    from pathlib import Path
+    from mindie_knowledge.releases import REPOSITORIES
+    from mindie_knowledge.releases_io import _COMPATIBILITY_PATHS
+
+    assert REPOSITORIES["workbuddy"] == "mindie-agent/mindie-agent-wb"
+    assert _COMPATIBILITY_PATHS["workbuddy"] == "harness-compatibility.json"
+
+    wb_compat_path = Path("/Users/maoxx241/code/mindie-agent-wb/harness-compatibility.json")
+    if wb_compat_path.is_file():
+        decl = json.loads(wb_compat_path.read_text(encoding="utf-8"))
+        assert supports_harness(decl, harness_name="workbuddy", harness_version="2.0.0")

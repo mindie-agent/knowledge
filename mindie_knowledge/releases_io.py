@@ -33,6 +33,7 @@ _COMPATIBILITY_PATHS = {
     "kimi-code": "harness-compatibility.json",
     "dsh": "harness-compatibility.json",
     "antigravity": "harness-compatibility.json",
+    "workbuddy": "harness-compatibility.json",
 }
 
 
