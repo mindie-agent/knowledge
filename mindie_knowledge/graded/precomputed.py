@@ -13,7 +13,7 @@ from .index import RoutingIndex
 from .units import GradedUnit, canonical
 
 # Change this schema when serialized fields or token expansion semantics change.
-SCHEMA = "mindie-graded-index/1"
+SCHEMA = "mindie-graded-index/2"
 
 
 def dump_index(index):
