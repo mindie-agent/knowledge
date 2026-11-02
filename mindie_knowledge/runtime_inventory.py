@@ -18,6 +18,7 @@ COMPONENTS = {
     "mindie-knowledge": "mindie-agent/knowledge",
     "remote-dev": "mindie-agent/remote-dev",
     "mindie-diagnostics": "mindie-agent/diagnostics",
+    "mindie-debugger": "mindie-agent/debugger",
     "mindie-profiler": "mindie-agent/profiler",
     "mindie-sim": "mindie-agent/sim",
     "npu-top": "mindie-agent/npu-top",

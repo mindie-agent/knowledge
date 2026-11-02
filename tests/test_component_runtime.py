@@ -15,19 +15,30 @@ from mindie_knowledge.component_runtime import (
     source_files,
     source_identity,
 )
-from mindie_knowledge.runtime_inventory import inventory, verify_lock, versions
+from mindie_knowledge.runtime_inventory import COMPONENTS, inventory, validate_targets, verify_lock, versions
 
 REMOTE_RELEASE = {"repository": "mindie-agent/remote-dev", "version": "0.10.8",
                   "revision": "4b1c5cab5d36cdaff79d27e4288c6d5f60667c72"}
 
 
 def test_active_integration_pins_override_bootstrap_without_rewriting_it(tmp_path):
+    assert COMPONENTS["mindie-debugger"] == "mindie-agent/debugger"
+    debugger_target = {
+        "mindie-debugger": {
+            "repository": "mindie-agent/debugger",
+            "version": "0.1.3",
+            "revision": "c9a3f28d541eb772be46380a957dc927a7a14f0d",
+        }
+    }
+    assert validate_targets(debugger_target) == debugger_target
     requirements = tmp_path / "runtime-requirements.txt"
     bootstrap = (
         "mindie-knowledge @ git+https://github.com/mindie-agent/knowledge@"
         "38a42f6f778cfa555d8918fdcacd12cee4a181f5\n"
         "remote-dev @ git+https://github.com/mindie-agent/remote-dev@"
         "0463a13fce9618ec9a51904869d61acb0cdb8538\n"
+        "mindie-debugger @ git+https://github.com/mindie-agent/debugger@"
+        "c9a3f28d541eb772be46380a957dc927a7a14f0d\n"
     )
     requirements.write_text(bootstrap, newline="\n")
     overrides = tmp_path / "runtime" / "active-overrides.txt"
@@ -42,10 +53,12 @@ def test_active_integration_pins_override_bootstrap_without_rewriting_it(tmp_pat
     assert bootstrap_baseline["runtime"] == {
         "mindie-knowledge": "38a42f6f778cfa555d8918fdcacd12cee4a181f5",
         "remote-dev": "0463a13fce9618ec9a51904869d61acb0cdb8538",
+        "mindie-debugger": "c9a3f28d541eb772be46380a957dc927a7a14f0d",
     }
     assert baseline["runtime"] == {
         "mindie-knowledge": "6e921b205c00d592c25f849653cbfb72b73fe318",
         "remote-dev": "0463a13fce9618ec9a51904869d61acb0cdb8538",
+        "mindie-debugger": "c9a3f28d541eb772be46380a957dc927a7a14f0d",
     }
     assert baseline["source_sha256"] == bootstrap_baseline["source_sha256"]
     assert requirements.read_text() == bootstrap

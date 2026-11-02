@@ -20,6 +20,7 @@ COMPONENT_MODULES = {
     "sim": ("mindie-sim", "mindie_sim"),
     "coordinator": ("mindie-coordinator", "mindie_coordinator.cli"),
     "diagnostics": ("mindie-diagnostics", "mindie_diagnostics.cli"),
+    "debugger": ("mindie-debugger", "mindie_debugger.cli"),
 }
 
 

@@ -79,7 +79,7 @@ if result["status"] == "candidate":
 
 ## 2. Independent Component Release Discovery & Side-by-Side Runtime Preparation
 
-`runtime_inventory.COMPONENTS` registers the 8 official first-party components (`mindie-knowledge`, `remote-dev`, `mindie-diagnostics`, `mindie-profiler`, `mindie-sim`, `npu-top`, `mindie-coordinator`, and `mindie-bench`). Host plugin updaters discover, verify, and prepare component runtime updates through `mindie_knowledge.component_releases`, `mindie_knowledge.component_runtime`, and `mindie_knowledge.runtime_inventory`:
+`runtime_inventory.COMPONENTS` registers the 9 official first-party components (`mindie-knowledge`, `remote-dev`, `mindie-diagnostics`, `mindie-debugger`, `mindie-profiler`, `mindie-sim`, `npu-top`, `mindie-coordinator`, and `mindie-bench`). Host plugin updaters discover, verify, and prepare component runtime updates through `mindie_knowledge.component_releases`, `mindie_knowledge.component_runtime`, and `mindie_knowledge.runtime_inventory`:
 
 ### 2.1 Direct GitHub Release Discovery & Benchmark Verification (`component_releases.py` & `component_runtime.discover`)
 

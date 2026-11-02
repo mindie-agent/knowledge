@@ -11,18 +11,21 @@ def test_rebinding_moves_standard_modules_and_preserves_explicit_wrappers():
     adapter = {"component_commands": {
         "profiler": ["/old/bin/python", "-I", "-m", "mindie_profiler"],
         "sim": ["/old/bin/python", "-m", "mindie_sim"],
+        "debugger": ["/old/bin/python", "-I", "-X", "utf8", "-m", "mindie_debugger.cli"],
         "coordinator": ["/custom/bin/coordinator-wrapper", "--project", "chosen"],
         "diagnostics": ["/old/bin/mindie-diagnostics"],
     }}
     before = deepcopy(adapter)
     components = {"mindie-profiler": {"version": "0.5.0"},
-                  "mindie-sim": {"version": "0.7.1"}}
+                  "mindie-sim": {"version": "0.7.1"},
+                  "mindie-debugger": {"version": "0.1.3"}}
 
     candidate_python = Path("/managed/bin/python")
     result = bindings.rebind_commands(adapter, candidate_python, components)
 
     assert result["profiler"] == [str(candidate_python), "-I", "-X", "utf8", "-m", "mindie_profiler"]
     assert result["sim"] == [str(candidate_python), "-I", "-X", "utf8", "-m", "mindie_sim"]
+    assert result["debugger"] == [str(candidate_python), "-I", "-X", "utf8", "-m", "mindie_debugger.cli"]
     assert result["coordinator"] == adapter["component_commands"]["coordinator"]
     assert result["diagnostics"] == adapter["component_commands"]["diagnostics"]
     assert adapter == before
@@ -35,11 +38,17 @@ def test_metadata_reads_share_interpreter_and_total_budget(monkeypatch):
         "profiler": ["/shared/python", "-m", "mindie_profiler"],
         "sim": ["/shared/python", "-I", "-X", "utf8", "-m", "mindie_sim"],
         "diagnostics": ["/other/python", "-I", "-B", "-X", "utf8", "-m", "mindie_diagnostics.cli"],
+        "debugger": ["/other/python", "-I", "-X", "utf8", "-m", "mindie_debugger.cli"],
         "coordinator": ["/custom/wrapper"],
     }}
     clock = [0]
     calls = []
-    versions = {"mindie-profiler": "0.5.0", "mindie-sim": "0.7.1", "mindie-diagnostics": "0.5.4"}
+    versions = {
+        "mindie-profiler": "0.5.0",
+        "mindie-sim": "0.7.1",
+        "mindie-diagnostics": "0.5.4",
+        "mindie-debugger": "0.1.3",
+    }
     monkeypatch.setattr(bindings.time, "monotonic", lambda: clock[0])
 
     def metadata(python, names, *, timeout):
@@ -51,7 +60,7 @@ def test_metadata_reads_share_interpreter_and_total_budget(monkeypatch):
     assert bindings.required_components(adapter) == versions
     assert calls == [
         ("/shared/python", ["mindie-profiler", "mindie-sim"], 15),
-        ("/other/python", ["mindie-diagnostics"], 9),
+        ("/other/python", ["mindie-diagnostics", "mindie-debugger"], 9),
     ]
 
     clock[0] = 0
