@@ -20,7 +20,7 @@ from ..retrieval import tokens
 from .references import block_ref, task_ref
 
 
-POLICY = "citation-query/1"
+POLICY = "citation-query/2"
 _ID = r"[0-9a-f]{64}"
 _REF = re.compile(
     rf"(?<![\w/])mindie://(?P<domain>[a-z][a-z0-9-]{{0,63}})/(?P<task>{_ID})"
