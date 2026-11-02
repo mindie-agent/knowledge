@@ -11,6 +11,7 @@ adapter publishes their mapping. Never activate sessions or write consent.
 from __future__ import annotations
 
 from contextlib import closing
+from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
@@ -24,20 +25,133 @@ from .settings import CommunityWriteContext, check_repository
 from .store import Store
 
 SCHEMA = "mindie-domain-catalog/1"
-DOMAINS = (
-    "operators", "vllm-ascend", "infer-core", "infer-distributed",
-    "infer-observability", "infer-ops-compat", "agent-engineering",
+
+
+@dataclass(frozen=True)
+class DomainConfig:
+    domain: str
+    repo: str
+    category: str
+    description: str
+    ref: str = "main"
+    interval_seconds: int = 300
+
+    @property
+    def repository(self) -> str:
+        return self.repo
+
+    def to_feed(self) -> dict[str, object]:
+        return dict(
+            domain=self.domain,
+            repository=self.repo,
+            ref=self.ref,
+            interval_seconds=self.interval_seconds,
+        )
+
+
+DOMAIN_CATALOG: tuple[DomainConfig, ...] = (
+    DomainConfig(
+        domain="operators",
+        repo="mindie-agent/knowledge-operators",
+        category="operator_kernel",
+        description=(
+            "AscendC, Triton-Ascend, TileLang, PyPTO, and Catlass operator kernels, "
+            "cann/ops-transformer fusion contracts, and custom operator ablation mutators."
+        ),
+    ),
+    DomainConfig(
+        domain="vllm-ascend",
+        repo="mindie-agent/knowledge-vllm-ascend",
+        category="runtime_serving",
+        description=(
+            "vLLM-Ascend runtime, ACLGraph/npugraph_ex, MLA/DSA/SFA attention backends, "
+            "ModelSlim quantization, MTP/EAGLE3 speculative decoding, EPLB, PD disaggregation, and vllm-omni."
+        ),
+    ),
+    DomainConfig(
+        domain="xllm",
+        repo="mindie-agent/knowledge-xllm",
+        category="runtime_serving",
+        description=(
+            "xLLM C++ runtime, ACLGraph, xTensor, OneRec, xllm-ops, TileLang-PTO, "
+            "and xllm-service PD/EPD/hybrid scheduling."
+        ),
+    ),
+    DomainConfig(
+        domain="mindie-sd",
+        repo="mindie-agent/knowledge-mindie-sd",
+        category="runtime_serving",
+        description=(
+            "Ascend/MindIE-SD DiT/Video/Image diffusion, RainFusion/Ada-BSA/EagleQBSA sparse attention, "
+            "DiTCache, 3D causal VAE, USP/CFG parallelism, and timestep quantization."
+        ),
+    ),
+    DomainConfig(
+        domain="infer-core",
+        repo="mindie-agent/knowledge-infer-core",
+        category="model_recipes",
+        description=(
+            "cann-recipes-infer model family optimization recipes, model-infer-* skills, "
+            "common acceleration modules, and Ascend/msagent quantization/precision workflows "
+            "(MindIE-SD diffusion is now maintained in its own dedicated mindie-sd domain)."
+        ),
+    ),
+    DomainConfig(
+        domain="infer-distributed",
+        repo="mindie-agent/knowledge-infer-distributed",
+        category="distributed_comm",
+        description=(
+            "Mooncake, dynamo, HCCL multi-node collectives, SHMEM symmetric memory, "
+            "PD/EPD disaggregation, and multi-node DP/TP/EP/PP/CP parallelism."
+        ),
+    ),
+    DomainConfig(
+        domain="infer-observability",
+        repo="mindie-agent/knowledge-infer-observability",
+        category="observability",
+        description=(
+            "msmodeling, msprof-analyze, msmemscope, mskpp, ops-test-kit (TTK), "
+            "service-level profiling, and performance/accuracy verification gates."
+        ),
+    ),
+    DomainConfig(
+        domain="infer-ops-compat",
+        repo="mindie-agent/knowledge-infer-ops-compat",
+        category="compilation_ops",
+        description=(
+            "AutoFuse, GE/TorchAir graph compilation, SuperKernel, multi-stream/prefetch, "
+            "container/driver provisioning, and Volcano/MindIE Motor deployment."
+        ),
+    ),
+    DomainConfig(
+        domain="agent-engineering",
+        repo="mindie-agent/knowledge-agent-engineering",
+        category="agent_workflow",
+        description=(
+            "Multi-agent model tuning orchestration, SOTA exploration loops, "
+            "ais_bench coreset compression, Git bisect debugging, and kb-lint."
+        ),
+    ),
 )
+
+DOMAIN_CONFIGS: dict[str, DomainConfig] = {cfg.domain: cfg for cfg in DOMAIN_CATALOG}
+DOMAINS = tuple(cfg.domain for cfg in DOMAIN_CATALOG)
 RUNTIME_KEYS = (
     "capture_mode", "transcript_adapter", "redactor_executable", "summary_command",
     "organizer_command", "worker_policy", "service_launch_context", "product_validation",
 )
 
 
+def get_domain_config(domain: str) -> DomainConfig:
+    """Return the registered DomainConfig for a canonical domain name."""
+    if domain not in DOMAIN_CONFIGS:
+        raise KeyError(f"unknown domain: {domain!r}")
+    return DOMAIN_CONFIGS[domain]
+
+
 def catalog():
     """Semantic domains can grow independently; this is the shipped starting set."""
-    return [dict(domain=domain, repository="mindie-agent/knowledge-" + domain,
-                 ref="main", interval_seconds=300) for domain in DOMAINS]
+    return [cfg.to_feed() for cfg in DOMAIN_CATALOG]
 
 
 def _absolute(value, label):

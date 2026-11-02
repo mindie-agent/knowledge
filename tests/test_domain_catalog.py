@@ -4,9 +4,38 @@ from pathlib import Path
 import sys
 
 from conftest import write_settings
-from mindie_knowledge.loop.domain_catalog import prepare
+from mindie_knowledge.loop.domain_catalog import (
+    DOMAIN_CATALOG,
+    DOMAIN_CONFIGS,
+    DOMAINS,
+    DomainConfig,
+    get_domain_config,
+    prepare,
+)
 from mindie_knowledge.loop.settings import from_engine_config
 from mindie_knowledge.loop.domain_routes import select_engine_config
+
+
+def test_domain_catalog_entries_include_xllm_and_mindie_sd_and_updated_infer_core():
+    assert "xllm" in DOMAINS
+    assert "mindie-sd" in DOMAINS
+    assert len(DOMAIN_CATALOG) == 9
+    xllm_cfg = get_domain_config("xllm")
+    assert isinstance(xllm_cfg, DomainConfig)
+    assert xllm_cfg.repo == "mindie-agent/knowledge-xllm"
+    assert xllm_cfg.category == "runtime_serving"
+    for term in ("xLLM", "ACLGraph", "xTensor", "OneRec", "xllm-ops", "TileLang-PTO", "xllm-service"):
+        assert term in xllm_cfg.description
+
+    sd_cfg = get_domain_config("mindie-sd")
+    assert isinstance(sd_cfg, DomainConfig)
+    assert sd_cfg.repo == "mindie-agent/knowledge-mindie-sd"
+    assert sd_cfg.category == "runtime_serving"
+    for term in ("MindIE-SD", "RainFusion", "Ada-BSA", "EagleQBSA", "DiTCache", "VAE", "USP/CFG", "timestep"):
+        assert term in sd_cfg.description
+
+    infer_core_cfg = DOMAIN_CONFIGS["infer-core"]
+    assert "mindie-sd" in infer_core_cfg.description
 
 
 def initial(tmp_path):
@@ -29,7 +58,7 @@ def test_catalog_creates_separate_read_domains_without_expanding_saved_consent(t
     before = {path: path.read_bytes() for path in
               (Path(engine['community_config']), Path(options['consent_config']))}
     result = prepare(adapter, engine, **options)
-    assert len(result['domain_configs']) == 7
+    assert len(result['domain_configs']) == 9
     assert result['domain_configs']['vllm-ascend'] == adapter['engine_config']
     generations, admissions, roots = set(), set(), set()
     for domain, path in result['domain_configs'].items():
@@ -48,7 +77,7 @@ def test_catalog_creates_separate_read_domains_without_expanding_saved_consent(t
         generations.add(settings.generation)
         admissions.add(value['admission_path'])
         roots.add(str(Path(value['root']) / domain))
-    assert len(generations) == len(admissions) == len(roots) == 6
+    assert len(generations) == len(admissions) == len(roots) == 8
     assert all(path.read_bytes() == raw for path, raw in before.items())
     assert 'domain_configs' not in adapter
 

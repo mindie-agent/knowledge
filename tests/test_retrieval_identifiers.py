@@ -244,3 +244,28 @@ def test_graded_routing_index_bilingual_natural_language_recall_and_noise_immuni
     bm25f_index = RoutingIndex([body_only_unit, header_unit])
     bm25f_res = bm25f_index.query("SuperKernel", include_unknown=True, limit=2)
     assert bm25f_res["cards"][0]["id"] == "unit-header-match"
+
+
+def test_xllm_and_mindie_sd_tokens_and_domain_priors():
+    from mindie_knowledge.retrieval import DOMAIN_PRIOR_KEYWORDS, infer_domain_priors
+
+    expected_xllm = {
+        "xllm", "xllm_ops", "xllm_service", "xtensor", "xlite",
+        "onerec", "tilelang", "custom_xllm_math", "mspti", "epd",
+        "decode_graph_bucket",
+    }
+    expected_sd = {
+        "mindie-sd", "mindiesd", "rainfusion", "ada_bsa",
+        "eagleqbsa", "ditcache", "cacheagent", "taehv", "wanvae",
+    }
+    assert expected_xllm.issubset(set(DOMAIN_PRIOR_KEYWORDS["xllm"]))
+    assert expected_sd.issubset(set(DOMAIN_PRIOR_KEYWORDS["mindie-sd"]))
+
+    xllm_toks = set(tokens("xllm_ops xllm_service xtensor onerec tilelang custom_xllm_math mspti decode_graph_bucket"))
+    assert {"xllm", "ops", "service", "xtensor", "tensor", "onerec", "tilelang", "custom_xllm_math", "mspti", "decode", "graph", "bucket"}.issubset(xllm_toks)
+
+    sd_toks = set(tokens("mindie-sd mindiesd rainfusion ada_bsa eagleqbsa ditcache cacheagent taehv wanvae"))
+    assert {"mindie", "sd", "rainfusion", "ada_bsa", "eagleqbsa", "ditcache", "cacheagent", "cache", "agent", "taehv", "wanvae", "wan", "vae"}.issubset(sd_toks)
+
+    assert infer_domain_priors("xllm xtensor custom_xllm_math decode_graph_bucket")[0] == "xllm"
+    assert infer_domain_priors("mindie-sd rainfusion ditcache cacheagent wanvae")[0] == "mindie-sd"

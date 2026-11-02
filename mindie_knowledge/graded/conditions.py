@@ -17,6 +17,26 @@ from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.version import InvalidVersion, Version
 
+_FRAMEWORK_MAP: dict[str, str] = {
+    "vllm-ascend": "vllm-ascend",
+    "vllmascend": "vllm-ascend",
+    "vllm-omni": "vllm-omni",
+    "vllmomni": "vllm-omni",
+    "xllm": "xllm",
+    "xllm-service": "xllm",
+    "xllmservice": "xllm",
+    "mindie-sd": "mindie-sd",
+    "mindiesd": "mindie-sd",
+    "mindie-llm": "mindie-llm",
+    "mindiellm": "mindie-llm",
+}
+
+
+def normalize_framework_name(name: str) -> str:
+    """Normalize framework aliases (e.g. xllm-service -> xllm, mindiesd -> mindie-sd)."""
+    canonical = re.sub(r"[-_.]+", "-", str(name).strip()).lower()
+    return _FRAMEWORK_MAP.get(canonical, canonical)
+
 
 @dataclass(frozen=True)
 class Applicability:
@@ -41,15 +61,31 @@ def _version(required: str, observed: Any, key: str) -> Applicability:
 
 
 def _framework(required: list[str], observed: Any) -> list[Applicability]:
-    installed = {}
+    installed: dict[str, Any] = {}
+    name_only_observed = False
     if isinstance(observed, dict):
-        installed = {re.sub(r"[-_.]+", "-", name).lower(): version for name, version in observed.items()}
+        installed = {normalize_framework_name(name): version for name, version in observed.items()}
+    elif isinstance(observed, str):
+        if not observed.strip():
+            return [Applicability("unknown", ("framework: supply observed name/version pairs",))]
+        if "==" in observed:
+            name, version = observed.split("==", 1)
+            installed[normalize_framework_name(name)] = version
+        else:
+            installed[normalize_framework_name(observed)] = None
+            name_only_observed = True
     elif isinstance(observed, list):
+        if not observed:
+            return [Applicability("unknown", ("framework: supply observed name/version pairs",))]
         for value in observed:
-            if not isinstance(value, str) or "==" not in value:
+            if not isinstance(value, str) or not value.strip():
                 return [Applicability("unknown", ("framework: supply observed name/version pairs",))]
-            name, version = value.split("==", 1)
-            installed[re.sub(r"[-_.]+", "-", name).lower()] = version
+            if "==" in value:
+                name, version = value.split("==", 1)
+                installed[normalize_framework_name(name)] = version
+            else:
+                installed[normalize_framework_name(value)] = None
+                name_only_observed = True
     else:
         return [Applicability("unknown", ("framework: supply observed name/version pairs",))]
     outcomes = []
@@ -59,13 +95,19 @@ def _framework(required: list[str], observed: Any) -> list[Applicability]:
         except InvalidRequirement:
             outcomes.append(Applicability("unknown", (f"framework: unsupported requirement {value}",)))
             continue
-        name = re.sub(r"[-_.]+", "-", requirement.name).lower()
+        name = normalize_framework_name(requirement.name)
         if requirement.marker or requirement.url or requirement.extras:
             outcomes.append(Applicability("unknown", (f"framework.{name}: conditional requirement is not evaluated",)))
         elif name not in installed:
-            outcomes.append(Applicability("unknown", (f"framework.{name}: version not supplied",)))
+            if not requirement.specifier and name_only_observed:
+                outcomes.append(Applicability("mismatch", (f"framework.{name}: outside declared conditions",)))
+            else:
+                outcomes.append(Applicability("unknown", (f"framework.{name}: version not supplied",)))
         elif requirement.specifier:
-            outcomes.append(_version(str(requirement.specifier), installed[name], f"framework.{name}"))
+            if installed[name] is None:
+                outcomes.append(Applicability("unknown", (f"framework.{name}: version not supplied",)))
+            else:
+                outcomes.append(_version(str(requirement.specifier), installed[name], f"framework.{name}"))
         else:
             outcomes.append(Applicability("matched"))
     return outcomes
@@ -105,8 +147,8 @@ def match_conditions(required: dict, observed: dict | None) -> Applicability:
             outcomes.append(Applicability("unknown", (f"{key}: not supplied",)))
         elif _unknown(observed[key]):
             outcomes.append(Applicability("unknown", (f"{key}: observed value is unknown",)))
-        elif key == "framework" and isinstance(expected, list):
-            outcomes.extend(_framework(expected, observed[key]))
+        elif key == "framework" and isinstance(expected, (list, str)):
+            outcomes.extend(_framework(expected if isinstance(expected, list) else [expected], observed[key]))
         elif isinstance(expected, dict) and set(expected) == {"exact_set"}:
             outcomes.append(_exact_set(expected["exact_set"], observed[key], key))
         elif isinstance(expected, dict):

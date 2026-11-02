@@ -59,6 +59,17 @@ _ASCEND_COMPOUND_SPLITS: dict[str, tuple[str, ...]] = {
     "tensor_cast": ("tensor", "cast"),
     "tensorcast": ("tensor", "cast"),
     "mindiesd": ("mindie", "sd"),
+    "mindie_sd": ("mindie", "sd"),
+    "xllm": ("xl", "llm"),
+    "xllm_ops": ("xllm", "ops"),
+    "xllm_service": ("xllm", "service"),
+    "xtensor": ("xt", "tensor"),
+    "onerec": ("one", "rec"),
+    "tilelang": ("tile", "lang"),
+    "custom_xllm_math": ("custom", "xllm", "math"),
+    "mspti": ("ms", "pti"),
+    "epd": ("ep", "pd"),
+    "decode_graph_bucket": ("decode", "graph", "bucket"),
     "vllm_omni": ("vllm", "omni"),
     "rainfusion": ("rain", "fusion"),
     "rf_v2": ("rf", "v2", "rainfusion"),
@@ -71,12 +82,14 @@ _ASCEND_COMPOUND_SPLITS: dict[str, tuple[str, ...]] = {
     "ditcache": ("dit", "cache"),
     "cache_dit": ("cache", "dit"),
     "cachedit": ("cache", "dit"),
+    "cacheagent": ("cache", "agent"),
     "taylorseer": ("taylor", "seer"),
     "code2wav": ("code", "wav"),
     "token2wav": ("token", "wav"),
     "llm2tts": ("llm", "tts"),
     "flashgen": ("flash", "gen"),
     "taehv": ("tae", "hv"),
+    "wanvae": ("wan", "vae"),
     "yuanrong": ("yuan", "rong"),
     "runtime_guard": ("runtime", "guard"),
     "runtimeguard": ("runtime", "guard"),
@@ -85,6 +98,86 @@ _ASCEND_COMPOUND_SPLITS: dict[str, tuple[str, ...]] = {
     "logits_finite": ("logits", "finite"),
     "spec_acceptance": ("spec", "acceptance"),
     "mrv1": ("mr", "v1"),
+}
+
+DOMAIN_PRIOR_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "xllm": (
+        "xllm",
+        "xllm_ops",
+        "xllm_service",
+        "xtensor",
+        "xlite",
+        "onerec",
+        "tilelang",
+        "custom_xllm_math",
+        "mspti",
+        "epd",
+        "decode_graph_bucket",
+    ),
+    "mindie-sd": (
+        "mindie-sd",
+        "mindiesd",
+        "rainfusion",
+        "ada_bsa",
+        "eagleqbsa",
+        "ditcache",
+        "cacheagent",
+        "taehv",
+        "wanvae",
+    ),
+    "vllm-ascend": (
+        "vllm-ascend",
+        "vllm_ascend",
+        "vllm_omni",
+        "npugraph_ex",
+        "dspark",
+        "dflash",
+        "modelslim",
+        "msmodelslim",
+    ),
+    "operators": (
+        "ascendc",
+        "datacopypad",
+        "pipebarrier",
+        "setflag",
+        "waitflag",
+        "catlass",
+        "pypto",
+        "aclnn",
+    ),
+    "infer-core": (
+        "cann-recipes-infer",
+        "msagent",
+        "model_infer",
+    ),
+    "infer-distributed": (
+        "mooncake",
+        "hccl",
+        "hccn_tool",
+        "rocev2",
+        "shmem",
+        "yuanrong",
+    ),
+    "infer-observability": (
+        "msprof",
+        "msmemscope",
+        "msmodeling",
+        "mskpp",
+        "msprobe",
+        "serving_cast",
+        "tensor_cast",
+    ),
+    "infer-ops-compat": (
+        "torchair",
+        "autofuse",
+        "superkernel",
+        "davinci_manager",
+    ),
+    "agent-engineering": (
+        "aisbench",
+        "kb_lint",
+        "coreset",
+    ),
 }
 _ASCEND_COMPOUND_RE = re.compile(
     r"(?:"
@@ -405,6 +498,10 @@ _CJK_TECH_ALIASES: dict[str, tuple[str, ...]] = {
     "清洁标杆": ("force_feed", "ref_kv", "dump_kv"),
     "十问定界": ("runtime_guard", "dump_kv", "locate_first_divergence"),
     "乱码漏检": ("detector_gap", "manual_dump", "runtime_guard"),
+    "因果vae": ("wanvae", "taehv", "vae"),
+    "时间步量化": ("timestep", "quant", "mindiesd"),
+    "虚拟内存管理": ("xtensor", "shared_vmm_allocator", "xllm"),
+    "生成式推荐": ("onerec", "xllm"),
 }
 
 # Reverse English-to-CJK bigram index so English queries also match local
@@ -435,3 +532,20 @@ def query_tokens(text: str) -> list[str]:
         if tok in _ENG_TO_CJK_BIGRAMS:
             extra.extend(_ENG_TO_CJK_BIGRAMS[tok])
     return list(dict.fromkeys([*base, *extra]))
+
+
+def infer_domain_priors(text: str) -> list[str]:
+    """Return candidate domains ranked by matched domain-prior keywords."""
+    expanded = set(query_tokens(text))
+    lowered = text.casefold()
+    scores: list[tuple[int, int, str]] = []
+    for index, (domain, keywords) in enumerate(DOMAIN_PRIOR_KEYWORDS.items()):
+        hits = sum(
+            1
+            for kw in keywords
+            if kw.casefold() in expanded or kw.casefold() in lowered
+        )
+        if hits > 0:
+            scores.append((-hits, index, domain))
+    scores.sort()
+    return [domain for _neg_hits, _idx, domain in scores]

@@ -335,3 +335,23 @@ def test_source_digest_is_optional_when_locator_binds_the_evidence():
                                   original.body, original.path)
     assert "source_digest" not in value.metadata["provenance"]
     assert value.content_sha256 and value.revision == 1
+
+
+def test_framework_map_normalizes_xllm_and_mindie_sd_aliases():
+    from mindie_knowledge.graded.conditions import _FRAMEWORK_MAP, normalize_framework_name
+
+    assert _FRAMEWORK_MAP["xllm"] == "xllm"
+    assert _FRAMEWORK_MAP["xllm-service"] == "xllm"
+    assert _FRAMEWORK_MAP["mindie-sd"] == "mindie-sd"
+    assert _FRAMEWORK_MAP["mindiesd"] == "mindie-sd"
+    assert normalize_framework_name("xllm_service") == "xllm"
+    assert normalize_framework_name("mindiesd") == "mindie-sd"
+
+    assert match_conditions({"framework": ["xllm"]}, {"framework": "xllm-service"}).status == "matched"
+    assert match_conditions({"framework": "xllm"}, {"framework": "xllm-service"}).status == "matched"
+    assert match_conditions({"framework": ["xllm>=0.1"]}, {"framework": {"xllm-service": "0.2.0"}}).status == "matched"
+    assert match_conditions({"framework": ["mindie-sd"]}, {"framework": "mindiesd"}).status == "matched"
+    assert match_conditions({"framework": "mindie-sd"}, {"framework": ["mindiesd"]}).status == "matched"
+    assert match_conditions({"framework": "xllm>=0.1"}, {"framework": "xllm-service==0.2.0"}).status == "matched"
+    assert match_conditions({"framework": ["xllm"]}, {"framework": "   "}).status == "unknown"
+    assert match_conditions({"framework": ["xllm"]}, {"framework": "vllm-ascend"}).status == "mismatch"
