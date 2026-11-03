@@ -403,10 +403,12 @@ def commit_capture(
 class QueryMixin:
 
     def query(self, query=None, limit=5, conditions=None, continuation=None,
-              domain_path=None, token_budget=1200, include_unknown=False,
+              domain_path=None, token_budget=None, include_unknown=False,
               include_archived=False, navigation_only=False, run_id=None,
               mode="reuse", ledger_entries=None, bottleneck_summary=None,
               native_subcontext=False, goal=""):
+        if token_budget is None:
+            token_budget = 24000 if mode == "explore" else 8000
         options = dict(mode=mode, ledger_entries=ledger_entries,
                        bottleneck_summary=bottleneck_summary,
                        native_subcontext=native_subcontext, goal=goal)

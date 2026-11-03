@@ -43,8 +43,8 @@ def mixed_query(store, legacy, query, *, limit, conditions, domain_path, token_b
     # `limit` is already validated by `query_request` on every path that reaches
     # here; only the caller's original `token_budget` has no other owner, since
     # the graded index below sees the derived share instead.
-    if type(token_budget) is not int or not 1 <= token_budget <= 16000:
-        raise ValueError("token_budget must be between 1 and 16000")
+    if type(token_budget) is not int or not 1 <= token_budget <= 64000:
+        raise ValueError("token_budget must be between 1 and 64000")
     # Graded units are assembled first; they receive the whole response budget
     # when no legacy row competes for it, and whatever legacy excerpts leave
     # behind otherwise. There is no fixed half-budget split.

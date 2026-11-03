@@ -81,8 +81,8 @@ class RetrievalEvalCase:
             raise ValueError(f"mode must be one of {sorted(VALID_MODES)}")
         if type(self.top_k) is not int or not 1 <= self.top_k <= 20:
             raise ValueError("top_k must be an integer between 1 and 20")
-        if type(self.token_budget) is not int or not 1 <= self.token_budget <= 16000:
-            raise ValueError("token_budget must be an integer between 1 and 16000")
+        if type(self.token_budget) is not int or not 1 <= self.token_budget <= 64000:
+            raise ValueError("token_budget must be an integer between 1 and 64000")
         if self.conditions is not None and not isinstance(self.conditions, Mapping):
             raise ValueError("conditions must be a mapping or None")
         ident = (self.case_id or self.id or "").strip()

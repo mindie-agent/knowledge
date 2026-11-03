@@ -62,6 +62,11 @@ def guard_regression(value) -> bool:
         if (row.get("regression") is True or row.get("regressed") is True
                 or row.get("guard_ok") is False):
             return True
+        reg_val, margin = row.get("regression"), row.get("noise_margin", 0.01)
+        if (isinstance(reg_val, (int, float)) and not isinstance(reg_val, bool)
+                and isinstance(margin, (int, float)) and not isinstance(margin, bool)
+                and reg_val > margin):
+            return True
         if row.get("baseline_pass") is True and row.get("candidate_pass") is False:
             return True
         baseline, candidate, margin = (row.get("baseline_ms"), row.get("candidate_ms"),
@@ -106,10 +111,10 @@ def legacy_evaluate(*, run_id, candidate_id, mutation_summary, conditions, compi
         raise ValueError("failure_reason must be text")
     if not compile_ok:
         validity, reusability = "compile_failed", "inconclusive"
-    elif not oracle_passed:
-        validity, reusability = "oracle_failed", "inconclusive"
     elif not measurement_passed:
         validity, reusability = "measurement_invalid", "inconclusive"
+    elif not oracle_passed:
+        validity, reusability = "oracle_failed", "inconclusive"
     else:
         validity, reusability = "valid", None
     if validity != "valid":
@@ -132,6 +137,8 @@ def legacy_evaluate(*, run_id, candidate_id, mutation_summary, conditions, compi
             reusability = "reusable_mutator" if target_tier == "L4" else "reusable_observation"
         elif goal_type == "speedup" and ratio is not None and ratio >= minimum:
             reusability = "inconclusive" if ablation_retained is None else "reusable_negative_boundary"
+        elif goal_type == "speedup" and ratio is not None and ratio > 1.0 + noise and ablation_retained is None:
+            reusability = "inconclusive"
         elif attainment == "attained":
             reusability = "reusable_mutator" if ablation_retained is True else "reusable_observation"
         elif ratio is None:
@@ -169,15 +176,20 @@ def legacy_evaluate(*, run_id, candidate_id, mutation_summary, conditions, compi
             "reusability": reusability}
     checks = {"G0": compile_ok, "G1": oracle_passed and measurement_passed,
               "G2": ratio is not None and ratio >= minimum,
-              "G3": ablation_retained is not False}
+              "G3": ablation_retained is True}
     gates = {name: {"passed": passed, "ok": passed,
                     "status": "passed" if passed else "failed"}
              for name, passed in checks.items()}
     reached = next((name for name in ("G0", "G1", "G2", "G3") if not gates[name]["passed"]),
                    "PASSED")
-    outcome = {"G0": "compile_failed", "G1": "correctness_failed",
-               "G2": "sub_target_valid_evidence",
-               "G3": "ablation_or_hygiene_failed"}.get(reached, "qualified_improvement")
+    if reached == "G2" and ratio is not None and ratio > 1.0 + noise and ablation_retained is None:
+        reached = "G3"
+    outcome = {
+        "G0": "compile_failed",
+        "G1": "measurement_invalid" if not measurement_passed else "correctness_failed",
+        "G2": "sub_target_valid_evidence",
+        "G3": "ablation_pending" if ablation_retained is None else "ablation_or_hygiene_failed",
+    }.get(reached, "qualified_improvement")
     return {"schema": EVALUATION_SCHEMA, "run_id": run_id, "candidate_id": candidate_id,
             "mutation_summary": mutation_summary, "conditions": current, "axes": axes,
             **axes, "verdict": verdict, "distill_ready": distill_ready,
@@ -242,6 +254,7 @@ def enforce_direction_budget(
         else:
             entry["weak_oracle_downgraded"] = False
         surviving.append(entry)
+    any_originally_cold = any(not bool(row["learned_refs"]) for row in surviving)
     kb_used = 0
     kb_cap_bound = False
     for row in surviving:
@@ -264,6 +277,11 @@ def enforce_direction_budget(
         kb_cap_bound = True
     for row in surviving:
         row["is_cold_direction"] = not bool(row["learned_refs"])
+        row["cold_control_genuine"] = (
+            not bool(row["learned_refs"])
+            and not bool(row.get("kb_cap_stripped"))
+            and not bool(row.get("cold_direction_forced"))
+        )
     return {
         "directions": surviving,
         "kb_dir_cap": kb_dir_cap,
@@ -273,6 +291,8 @@ def enforce_direction_budget(
         "probe_cost_fraction": probe_fraction,
         "kb_cap_bound": kb_cap_bound,
         "cold_direction_enforced": cold_enforced,
+        "cold_control_genuine": any_originally_cold,
+        "cold_control_missing": bool(require_cold_direction and not any_originally_cold),
         "cold_direction_count": sum(1 for row in surviving if row["is_cold_direction"]),
         "kb_seeded_count": sum(1 for row in surviving if not row["is_cold_direction"]),
         "filtered_uncalibrated_roofline_ids": filtered_roofline_ids,

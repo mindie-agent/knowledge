@@ -394,3 +394,44 @@ def test_successor_receipt_is_rejected_without_rewriting_or_starting(tmp_path):
         cli.ensure_service(path)
     assert marker.read_bytes() == before
     assert not cli.connection_path(config).exists()
+
+
+def test_recreated_config_in_place_retires_stale_owner_and_starts_new_service(tmp_path):
+    path, config = configuration(tmp_path)
+    first = cli.ensure_service(path)
+    try:
+        updated = dict(config, idle_seconds=120)
+        path.write_text(json.dumps(updated))
+        second = cli.ensure_service(path)
+        assert second['config_fingerprint'] == lifecycle.config_fingerprint(path, updated)
+        assert second['config_fingerprint'] != first['config_fingerprint']
+        assert transport.rpc(second, 'status')['worker_alive']
+    finally:
+        lifecycle.retire_service(path)
+
+
+def test_stale_connection_from_stopped_previous_config_is_cleared_before_new_spawn(tmp_path):
+    old_path, config = configuration(tmp_path)
+    new_path = tmp_path / 'new-engine.json'
+    new_path.write_text(json.dumps(config))
+    connection = cli.connection_path(config)
+    connection.parent.mkdir(parents=True, exist_ok=True)
+    connection.write_text(
+        json.dumps(
+            dict(
+                domain=config['domain'],
+                token='stale-token',
+                url='http://127.0.0.1:9',
+                config_path=str(old_path.resolve()),
+                config_fingerprint=lifecycle.config_fingerprint(old_path, config),
+            )
+        )
+    )
+    try:
+        started = cli.ensure_service(new_path)
+        assert started['config_fingerprint'] == lifecycle.config_fingerprint(new_path, config)
+        assert transport.rpc(started, 'status')['worker_alive']
+    finally:
+        lifecycle.retire_service(new_path)
+
+

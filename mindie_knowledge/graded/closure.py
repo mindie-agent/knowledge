@@ -21,7 +21,7 @@ from .index import _ref_parts, response_token_estimate, token_estimate
 
 
 def explain_closure(index, refs, *, conditions=None, known_refs=None, domain=None,
-                    token_budget=4096, mode="reuse", ledger_entries=None,
+                    token_budget=None, mode="reuse", ledger_entries=None,
                     bottleneck_summary=None, native_subcontext=False, goal=""):
     """Assemble an exact dependency closure without truncating any body.
 
@@ -31,8 +31,10 @@ def explain_closure(index, refs, *, conditions=None, known_refs=None, domain=Non
     """
     if mode not in {"reuse", "diagnose", "explore"}:
         raise ValueError("mode must be one of ['diagnose', 'explore', 'reuse']")
-    if type(token_budget) is not int or not 1 <= token_budget <= 16000:
-        raise ValueError("token_budget must be between 1 and 16000")
+    if token_budget is None:
+        token_budget = 24000 if mode == "explore" else 16000
+    if type(token_budget) is not int or not 1 <= token_budget <= 64000:
+        raise ValueError("token_budget must be between 1 and 64000")
     if conditions is not None and not isinstance(conditions, dict):
         raise ValueError("conditions must be an object of observed facts")
     if isinstance(refs, str):

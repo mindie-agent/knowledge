@@ -364,7 +364,7 @@ def _delivery(config):
     return result
 
 
-def _service(config):
+def _service(config, config_path=None):
     from .transport import rpc
     try:
         connection = _json(Path(config["root"]) / config["domain"] / "connection.json")
@@ -383,6 +383,10 @@ def _service(config):
                 or url.query or url.fragment or connection.get("domain") != config["domain"]
                 or not isinstance(connection.get("token"), str) or not 1 <= len(connection["token"]) <= 512):
             raise ValueError("invalid existing loopback connection")
+        if config_path is not None and isinstance(connection.get("config_fingerprint"), str):
+            from .lifecycle import config_fingerprint
+            if connection["config_fingerprint"] != config_fingerprint(config_path, config):
+                raise ValueError("connection is for another service configuration")
         status = rpc(connection, "status", timeout=5.0)
         if not isinstance(status, dict):
             raise ValueError("invalid knowledge service status")
@@ -650,7 +654,7 @@ def snapshot(config_path, *, session=None):
             raise
         except (OSError, ValueError) as exc:
             result["admission"] = dict(status="unavailable", enabled=False, error_class=error_class(exc))
-    result["service"] = _service(config)
+    result["service"] = _service(config, config_path=config_path)
     _store(config, session, result)
     try:
         result["startup"] = _startup(config_path, config)

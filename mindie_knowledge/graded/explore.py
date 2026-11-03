@@ -345,17 +345,29 @@ def build_exploration_context(units=None, *, bottleneck_summary=None, failed_att
 def _gates(candidate, target):
     compile_ok = bool(candidate.get("compile_ok", candidate.get("compile",
                      candidate.get("compiled", candidate.get("syntax_ok", True)))))
+    measurement_ok = (
+        candidate.get("measurement_passed", True) is not False
+        and candidate.get("run_status") not in REPAIR_OUTCOMES
+        and candidate.get("outcome") not in REPAIR_OUTCOMES
+    )
     parity = candidate.get("correctness_ok", candidate.get("parity_ok", candidate.get(
         "numerical_parity", candidate.get("oracle_passed", True))))
     hidden_bad = ("hidden_input_summary" in candidate
-                  and flagged(candidate.get("hidden_input_summary"), "opt_regression"))
+                  and (flagged(candidate.get("hidden_input_summary"), "opt_regression")
+                       or (isinstance(candidate.get("hidden_input_summary"), Mapping)
+                           and candidate["hidden_input_summary"].get("generalization_ok") is False)))
     speedup = candidate.get("speedup", candidate.get("profiler_speedup",
                candidate.get("speedup_ratio")))
     if speedup is None and isinstance(candidate.get("measurement"), Mapping):
         speedup = candidate["measurement"].get("speedup")
     speedup = _number(speedup, "speedup", optional=True)
-    ablation = candidate.get("ablation_ok", candidate.get("ablation_passed",
-               candidate.get("ablation_retained", True)))
+    ablation_raw = candidate.get("ablation")
+    ablation = (
+        ablation_raw.get("passed", ablation_raw.get("ablation_retained"))
+        if isinstance(ablation_raw, Mapping)
+        else candidate.get("ablation_ok", candidate.get("ablation_passed",
+                           candidate.get("ablation_retained", True)))
+    )
     hygiene = candidate.get("hygiene_ok", candidate.get("hygiene_passed", True))
     workspace = candidate.get("workspace_delta_bytes")
     workspace_ok = workspace is None or (
@@ -367,21 +379,28 @@ def _gates(candidate, target):
                     and candidate.get("reusable_scope") is False)
     checks = {
         "G0": (compile_ok, "compile/syntax"),
-        "G1": (bool(parity) and not hidden_bad, "numerical parity and hidden retention"),
+        "G1": (measurement_ok and bool(parity) and not hidden_bad,
+               "measurement validity, numerical parity and hidden retention"),
         "G2": (speedup is not None and speedup >= target, "profiler target speedup"),
-        "G3": (ablation is not False and hygiene is not False and workspace_ok and guard_ok
+        "G3": (ablation is True and hygiene is not False and workspace_ok and guard_ok
                and scope_ok, "ablation, hygiene, workspace and guard workload")}
     gates = {name: {"passed": passed, "ok": passed,
                     "status": "passed" if passed else "failed", "check": label}
              for name, (passed, label) in checks.items()}
     reached = next((name for name in ("G0", "G1", "G2", "G3") if not checks[name][0]), "PASSED")
-    outcome = {"G0": "compile_failed", "G1": "correctness_failed",
-               "G2": "sub_target_valid_evidence", "G3": "ablation_or_hygiene_failed"}.get(
-                   reached, "qualified_improvement")
+    if reached == "G2" and speedup is not None and speedup > 1.0 and ablation is not True:
+        reached = "G3"
+    outcome = {
+        "G0": "compile_failed",
+        "G1": "measurement_invalid" if not measurement_ok else "correctness_failed",
+        "G2": "sub_target_valid_evidence",
+        "G3": "ablation_pending" if ablation is None else "ablation_or_hygiene_failed",
+    }.get(reached, "qualified_improvement")
     return {"gates": gates, "gate_reached": reached, "outcome": outcome,
-            "compile_ok": compile_ok, "correctness_ok": bool(parity),
+            "compile_ok": compile_ok, "measurement_passed": measurement_ok,
+            "correctness_ok": bool(parity),
             "speedup": speedup, "target_speedup": target,
-            "ablation_ok": ablation is not False, "workspace_delta_bytes": workspace,
+            "ablation_ok": ablation is True, "workspace_delta_bytes": workspace,
             "guard_workloads_ok": guard_ok}
 
 
@@ -545,7 +564,26 @@ def build_strategy_navigation_cards(
     return cards
 
 
+from .experiment_ledger import (
+    append,
+    check_trials,
+    evaluate_rsi_axes,
+    evaluate_rsi_candidate_gates,
+    fingerprint,
+    fold,
+    gate,
+    judge,
+    main as _ledger_main,
+    read_ledger,
+    render_progress,
+    render_progress_file,
+)
+
+
 def main(argv=None) -> int:
+    args_list = list(sys.argv[1:] if argv is None else argv)
+    if args_list and args_list[0] in ("fingerprint", "judge", "append", "render", "gate"):
+        return _ledger_main(args_list)
     parser = argparse.ArgumentParser(prog="python -m mindie_knowledge.graded.explore")
     sub = parser.add_subparsers(dest="command", required=True)
     for name in ("stagnation", "context", "evaluate"):
@@ -582,7 +620,25 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-__all__ = ["assess_stagnation", "build_citation_feedback_record", "build_exploration_context",
-           "build_strategy_navigation_cards", "enforce_direction_budget",
-           "evaluate_exploration_candidate", "main", "select_pareto_candidates",
-           "stage_budget_guidance"]
+__all__ = [
+    "append",
+    "assess_stagnation",
+    "build_citation_feedback_record",
+    "build_exploration_context",
+    "build_strategy_navigation_cards",
+    "check_trials",
+    "enforce_direction_budget",
+    "evaluate_exploration_candidate",
+    "evaluate_rsi_axes",
+    "evaluate_rsi_candidate_gates",
+    "fingerprint",
+    "fold",
+    "gate",
+    "judge",
+    "main",
+    "read_ledger",
+    "render_progress",
+    "render_progress_file",
+    "select_pareto_candidates",
+    "stage_budget_guidance",
+]

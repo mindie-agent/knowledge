@@ -141,12 +141,14 @@ def match_conditions(required: dict, observed: dict | None) -> Applicability:
     for key, expected in required.items():
         if _unknown(expected):
             outcomes.append(Applicability("unknown", (f"{key}: source applicability is unknown",)))
-        elif expected == "any":
+        elif key in observed and _unknown(observed[key]):
+            outcomes.append(Applicability("unknown", (f"{key}: observed value is unknown",)))
+        elif expected in ("any", "general") or (
+            isinstance(expected, list) and any(item in ("any", "general") for item in expected)
+        ):
             outcomes.append(Applicability("matched"))
         elif key not in observed or observed[key] is None:
             outcomes.append(Applicability("unknown", (f"{key}: not supplied",)))
-        elif _unknown(observed[key]):
-            outcomes.append(Applicability("unknown", (f"{key}: observed value is unknown",)))
         elif key == "framework" and isinstance(expected, (list, str)):
             outcomes.extend(_framework(expected if isinstance(expected, list) else [expected], observed[key]))
         elif isinstance(expected, dict) and set(expected) == {"exact_set"}:

@@ -497,10 +497,12 @@ class GradedRepository:
                 "note": "Reading a reference does not establish applicability; compare its conditions with observed task facts."}
 
     def explain(self, ref=None, *, refs=None, conditions=None, known_refs=None,
-                token_budget=4096, run_id=None, mode="reuse", ledger_entries=None,
+                token_budget=None, run_id=None, mode="reuse", ledger_entries=None,
                 bottleneck_summary=None, native_subcontext=False, goal=""):
         if mode not in {"reuse", "diagnose", "explore"}:
             raise ValueError("mode must be one of ['diagnose', 'explore', 'reuse']")
+        if token_budget is None:
+            token_budget = 24000 if mode == "explore" else 16000
         requested = [] if refs is None else (list(refs) if not isinstance(refs, str) else [refs])
         if ref is not None and ref not in requested:
             requested.insert(0, ref)

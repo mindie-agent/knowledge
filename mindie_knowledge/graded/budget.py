@@ -218,9 +218,12 @@ def _trim_exploration_context(payload, token_budget):
         return
     from .explore import refresh_exploration_mounts
 
-    priority = {"L4": 0, "L2": 1, "L1": 2}
+    priority = {"L2": 0, "L1": 1, "L4": 2}
     while context["mounted_units"] and finalize_usage_estimate(payload) > token_budget:
-        dropped = min(context["mounted_units"], key=lambda item: priority[item["tier"]])
+        dropped = min(
+            context["mounted_units"],
+            key=lambda item: (priority[item["tier"]], -len(item.get("body", ""))),
+        )
         context["mounted_units"].remove(dropped)
         omitted = {key: dropped[key] for key in ("id", "revision", "tier", "ref")}
         omitted["status"] = "budget_excluded"

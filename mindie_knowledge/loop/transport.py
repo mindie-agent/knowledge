@@ -326,12 +326,13 @@ class Service:
                     "knowledge query unavailable: configured feed has no verified installed "
                     f"snapshot receipt ({names}); inspect its sync result; no automatic retry was performed"
                 )
+            default_budget = 24000 if args.get("mode") == "explore" else 8000
             result = self.store.query(
                 args.get("query"), limit=args.get("limit", 5),
                 conditions=args.get("conditions"),
                 continuation=args.get("continuation"),
                 domain_path=args.get("domain_path"),
-                token_budget=args.get("token_budget", 800),
+                token_budget=args.get("token_budget", default_budget),
                 include_unknown=args.get("include_unknown", False),
                 include_archived=args.get("include_archived", False),
                 navigation_only=args.get("navigation_only", False),
@@ -374,7 +375,10 @@ class Service:
                        "native_subcontext", "goal"}
             if not set(args) <= allowed or (args.get("ref") is None and args.get("refs") is None):
                 raise ValueError("explain accepts only ref or refs plus optional conditions/known_refs/token_budget")
-            return self.store.explain(**args)
+            explain_args = dict(args)
+            if "token_budget" not in explain_args:
+                explain_args["token_budget"] = 24000 if explain_args.get("mode") == "explore" else 16000
+            return self.store.explain(**explain_args)
         if method == "explore":
             from ..graded.explore import (assess_stagnation, build_exploration_context,
                                           evaluate_exploration_candidate)
@@ -439,7 +443,8 @@ class Service:
     # -------------------------------------------------------------- serving
 
     def _check_config_lifetime(self):
-        """Retire an idle detached service after its configuration disappears.
+        """Retire an idle detached service after its configuration disappears
+        or is replaced in place with a different fingerprint.
 
         Reuse the HTTP loop, with no extra worker or per-request filesystem
         reads. Two observations thirty seconds apart tolerate atomic config
@@ -452,8 +457,14 @@ class Service:
         if now < self._next_config_check:
             return
         self._next_config_check = now + 30.0
+        expected_fp = self.connection.get("config_fingerprint")
         try:
             self.config_path.stat()
+            if isinstance(expected_fp, str):
+                from .lifecycle import config_fingerprint
+                if config_fingerprint(self.config_path) != expected_fp:
+                    self._config_retired = self._stop_if_idle().get("idle", False)
+                    return
         except FileNotFoundError:
             if self._config_missing_since is None:
                 self._config_missing_since = now
@@ -461,7 +472,7 @@ class Service:
                 self._config_retired = self._stop_if_idle().get("idle", False)
         except TimeoutError:
             raise
-        except OSError:
+        except (OSError, ValueError):
             self._config_missing_since = None
         else:
             self._config_missing_since = None

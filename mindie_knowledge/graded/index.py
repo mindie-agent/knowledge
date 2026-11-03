@@ -179,7 +179,7 @@ class RoutingIndex:
                 "units": rows, "unit_count": len(rows), "build_elapsed_ms": self.build_elapsed_ms,
                 "token_estimator": "utf8_bytes_div_4_ceiling", "query_budget_excludes_build": True}
 
-    def query(self, query, *, conditions=None, domain_path=None, limit=5, token_budget=1200,
+    def query(self, query, *, conditions=None, domain_path=None, limit=5, token_budget=None,
               include_unknown=False, include_archived=False, navigation_only=False,
               mode="reuse", ledger_entries=None, bottleneck_summary=None,
               native_subcontext=False, goal=""):
@@ -187,10 +187,25 @@ class RoutingIndex:
             raise ValueError("query must be nonempty text")
         if mode not in {"reuse", "diagnose", "explore"}:
             raise ValueError("mode must be one of ['diagnose', 'explore', 'reuse']")
+        if token_budget is None:
+            token_budget = 24000 if mode == "explore" else 8000
         if conditions is not None and not isinstance(conditions, dict):
             raise ValueError("conditions must be an object of observed facts")
-        if type(token_budget) is not int or not 1 <= token_budget <= 16000:
-            raise ValueError("token_budget must be between 1 and 16000")
+        if mode == "explore":
+            merged_conds = dict(conditions) if isinstance(conditions, dict) else {}
+            if isinstance(bottleneck_summary, dict) and isinstance(bottleneck_summary.get("conditions"), dict):
+                for k, v in bottleneck_summary["conditions"].items():
+                    merged_conds.setdefault(k, v)
+            for entry in (ledger_entries or ()):
+                if isinstance(entry, dict) and isinstance(entry.get("conditions"), dict):
+                    for k, v in entry["conditions"].items():
+                        merged_conds.setdefault(k, v)
+            if merged_conds and conditions is None:
+                conditions = merged_conds
+            elif isinstance(conditions, dict) and merged_conds:
+                conditions = merged_conds
+        if type(token_budget) is not int or not 1 <= token_budget <= 64000:
+            raise ValueError("token_budget must be between 1 and 64000")
         if type(limit) is not int or not 1 <= limit <= 20:
             raise ValueError("limit must be between 1 and 20")
         started = time.perf_counter()
@@ -339,7 +354,13 @@ class RoutingIndex:
 
         def finish(payload):
             nonlocal stripped_l3_ids
-            if not payload.get("cards") and not payload.get("results") and rejected.get("unknown", 0) > 0:
+            empty_page = not payload.get("cards") and not payload.get("results")
+            has_l4 = any(
+                item.get("tier") == "L4"
+                for key in ("cards", "results")
+                for item in payload.get(key, ())
+            )
+            if (empty_page or (mode == "explore" and not has_l4)) and rejected.get("unknown", 0) > 0:
                 if not include_unknown and token_budget >= 256:
                     unknown_ranked = []
                     for ident, unit in self.units.items():
@@ -374,6 +395,7 @@ class RoutingIndex:
                                 stripped_l3_ids.append(ident)
                                 source_selected.append((u_score, ident, u_route))
                         stripped_l3_ids = sorted(set(stripped_l3_ids))
+                        allowed_tiers = {"L4"} if not empty_page else {"L1", "L2", "L4"}
                         unknown_ranked = [
                             (
                                 row[0] * (1.35 if self.units[row[1]].metadata["tier"] == "L4" else 1.0),
@@ -381,7 +403,7 @@ class RoutingIndex:
                                 row[2],
                             )
                             for row in unknown_ranked
-                            if self.units[row[1]].metadata["tier"] != "L3"
+                            if self.units[row[1]].metadata["tier"] in allowed_tiers
                         ]
                         unknown_ranked.sort(key=lambda item: (-item[0], item[1]))
                     unverified_cards = []
@@ -393,12 +415,13 @@ class RoutingIndex:
                         unverified_cards.append(card)
                     if unverified_cards:
                         payload["unverified_cards"] = unverified_cards
-                payload["note"] = (
-                    payload.get("note", "")
-                    + " No units matched the supplied conditions alone; inspect unverified_cards "
-                    "(or pass include_unknown=true) to check missing_conditions and required_conditions, "
-                    "verify those facts, or call knowledge_explain(ref=...) without conditions to inspect a unit."
-                ).strip()
+                if empty_page:
+                    payload["note"] = (
+                        payload.get("note", "")
+                        + " No units matched the supplied conditions alone; inspect unverified_cards "
+                        "(or pass include_unknown=true) to check missing_conditions and required_conditions, "
+                        "verify those facts, or call knowledge_explain(ref=...) without conditions to inspect a unit."
+                    ).strip()
             payload["mode"] = mode
             if mode != "explore":
                 return payload
@@ -610,7 +633,7 @@ class RoutingIndex:
         return finish(payload)
 
     def explain_closure(self, refs, *, conditions=None, known_refs=None, domain=None,
-                        token_budget=4096, mode="reuse", ledger_entries=None,
+                        token_budget=None, mode="reuse", ledger_entries=None,
                         bottleneck_summary=None, native_subcontext=False, goal=""):
         """Delegate exact closure assembly so this module stays focused on query."""
         from .closure import explain_closure

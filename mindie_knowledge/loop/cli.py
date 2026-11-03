@@ -132,6 +132,81 @@ def connect(config, *, config_path=None):
     return connection
 
 
+def _retire_replaced_owner_if_stale(config_path, config):
+    """Stop an idle service whose recorded config file was deleted, retired, or overwritten in place,
+    or clean up a leftover connection.json whose process and consumer.lock are already gone.
+    """
+    from .handoff import _probe
+    from .lifecycle import config_fingerprint, inspect_retirement
+    from .locks import lock_held
+    from .service_host import platform_backend
+
+    try:
+        raw_conn = connect(config)
+    except TimeoutError:
+        raise
+    except (OSError, ValueError):
+        return False
+    consumer = connection_path(config).with_name("consumer.lock")
+    if lock_held(consumer) is not True:
+        try:
+            rpc(raw_conn, "status", timeout=1.0)
+        except TimeoutError:
+            raise
+        except OSError as exc:
+            reason = getattr(exc, "reason", None)
+            if isinstance(exc, ConnectionRefusedError) or isinstance(reason, ConnectionRefusedError):
+                try:
+                    connection_path(config).unlink(missing_ok=True)
+                except OSError:
+                    return False
+                return True
+        except (ValueError, RuntimeError):
+            pass
+    owner_path_raw = raw_conn.get("config_path")
+    owner_fp = raw_conn.get("config_fingerprint")
+    if not isinstance(owner_path_raw, str) or not isinstance(owner_fp, str):
+        return False
+    owner_path = Path(owner_path_raw)
+    try:
+        if (
+            owner_path.is_file()
+            and inspect_retirement(owner_path) is None
+            and config_fingerprint(owner_path) == owner_fp
+        ):
+            return False
+    except TimeoutError:
+        raise
+    except (OSError, ValueError):
+        pass
+    try:
+        res = rpc(raw_conn, "stop_if_idle", timeout=5.0)
+    except TimeoutError:
+        raise
+    except (OSError, ValueError, RuntimeError):
+        return False
+    if not isinstance(res, dict) or not res.get("idle"):
+        return False
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if _probe(config, 0.25, config_path=config_path) == "absent":
+            backend = platform_backend()
+            if backend is not None:
+                try:
+                    backend.remove_owned(config_path, config)
+                except TimeoutError:
+                    raise
+                except (OSError, ValueError, RuntimeError):
+                    pass
+            try:
+                connection_path(config).unlink(missing_ok=True)
+            except OSError:
+                pass
+            return True
+        time.sleep(0.05)
+    return False
+
+
 def ensure_service(config_path, *, _from_detached_starter=False):
     """Own one startup until ready or a real failure; elapsed time is no fault."""
     from .handoff import _probe
@@ -147,7 +222,9 @@ def ensure_service(config_path, *, _from_detached_starter=False):
     if state == "ready":
         clear_startup_failure(config_path, config)
         return connect(config, config_path=config_path)
-    if state in {"unknown", "worker-dead"}:
+    if state == "worker-dead":
+        raise RuntimeError("knowledge service is " + state + "; not starting a second service")
+    if state == "unknown" and not _retire_replaced_owner_if_stale(config_path, config):
         raise RuntimeError("knowledge service is " + state + "; not starting a second service")
     lock = StartLock(connection_path(config).with_name("start.lock"))
     process = None
@@ -165,9 +242,15 @@ def ensure_service(config_path, *, _from_detached_starter=False):
                 ready = True
                 clear_startup_failure(config_path, config)
                 return connect(config, config_path=config_path)
+            if state == "unknown" and process is None and _retire_replaced_owner_if_stale(config_path, config):
+                state = _probe(config, None, config_path=config_path)
             if state in {"unknown", "worker-dead"}:
                 raise RuntimeError("knowledge service is " + state + "; startup failed")
             if state == "absent" and process is None:
+                try:
+                    connection_path(config).unlink(missing_ok=True)
+                except OSError:
+                    pass
                 backend = platform_backend()
                 if backend is not None:
                     process = backend.request_start(config_path, config)
@@ -622,7 +705,12 @@ def main(argv=None):
         return 0
     if args.operation == "status":
         try:
-            result = rpc(connect(config), "status", timeout=5.0)
+            raw_conn = connect(config)
+            checked = connect(
+                config,
+                config_path=args.config if isinstance(raw_conn.get("config_fingerprint"), str) else None,
+            )
+            result = rpc(checked, "status", timeout=5.0)
         except TimeoutError:
             result = dict(status="unavailable", stage="probe", error_class="TimeoutError", retryable=True)
         except (OSError, ValueError):

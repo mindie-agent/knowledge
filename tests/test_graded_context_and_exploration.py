@@ -352,3 +352,98 @@ def test_exploration_seed_keeps_l2_facts_scoped_avoidance_and_tail_instruction()
     assert "FINAL MEASUREMENT: 17 us" in seed
     assert "remove barrier" in seed and "corrupts partial tiles" in seed and "Ascend910B" in seed
     assert "Do not replay prior L3 workflow steps" in seed
+
+
+def test_evaluate_exploration_candidate_measurement_guard_and_ablation_pending():
+    from mindie_knowledge.graded import explore
+
+    invalid = explore.evaluate_exploration_candidate({
+        "candidate_id": "cand-incomplete",
+        "mutation_summary": "fuse epilogue",
+        "compile_ok": True,
+        "parity_ok": False,
+        "measurement_passed": False,
+        "speedup": 1.25,
+    })
+    assert invalid["verdict"] == "reject_invalid_evidence"
+    assert invalid["outcome"] == "measurement_invalid"
+
+    invalid_legacy = explore.evaluate_exploration_candidate(
+        run_id="r1",
+        candidate_id="cand-incomplete",
+        mutation_summary="fuse epilogue",
+        conditions={"soc": "Ascend910B"},
+        compile_ok=True,
+        oracle_passed=False,
+        measurement_passed=False,
+        speedup_ratio=1.25,
+    )
+    assert invalid_legacy["verdict"] == "measurement_invalid"
+    assert invalid_legacy["outcome"] == "measurement_invalid"
+    assert invalid_legacy["reusability"] == "inconclusive"
+
+    pending_abl = explore.evaluate_exploration_candidate({
+        "candidate_id": "cand-2factor",
+        "mutation_summary": "tile + double buffer",
+        "compile_ok": True,
+        "parity_ok": True,
+        "measurement_passed": True,
+        "speedup": 1.03,
+        "ablation": {"passed": None},
+    }, target_speedup=1.05)
+    assert pending_abl["gate_reached"] == "G3"
+    assert pending_abl["outcome"] == "ablation_pending"
+
+    pending_abl_legacy = explore.evaluate_exploration_candidate(
+        run_id="r2",
+        candidate_id="cand-2factor",
+        mutation_summary="tile + double buffer",
+        conditions={"soc": "Ascend910B"},
+        compile_ok=True,
+        oracle_passed=True,
+        measurement_passed=True,
+        speedup_ratio=1.03,
+        target_speedup=1.05,
+        ablation_retained=None,
+    )
+    assert pending_abl_legacy["verdict"] == "inconclusive"
+    assert pending_abl_legacy["outcome"] == "ablation_pending"
+
+    budget = explore.enforce_direction_budget(
+        [
+            {"direction_id": "d1", "hypothesis": "KB-guided tile", "learned_refs": ["u1"]},
+            {"direction_id": "d2", "hypothesis": "Cold profile-only control", "learned_refs": []},
+        ],
+        kb_dir_cap=1,
+        require_cold_direction=True,
+    )
+    assert budget["cold_control_genuine"] is True
+    assert budget["cold_control_missing"] is False
+
+
+def test_unified_graded_explore_ledger_and_rsi_loop(tmp_path):
+    from mindie_knowledge.graded import explore, rsi_loop
+
+    ledger_path = tmp_path / "experiment-ledger.jsonl"
+    base_ev = {
+        "exp_id": "e1", "hypothesis": "tile 128", "run_ids": ["r1", "r2"],
+        "repetitions": 2, "direction": "maximize", "compile_ok": True,
+        "correctness": "passed", "baseline_source_digest": "sha256:base",
+        "source_digest": "sha256:cand1", "scope_conditions": {"soc": "Ascend910B"},
+        "baseline": [{"status": "completed", "metric": 100.0}, {"status": "completed", "metric": 100.0}],
+        "candidate": [{"status": "completed", "metric": 120.0}, {"status": "completed", "metric": 120.0}],
+    }
+    judged = explore.judge(base_ev)
+    assert judged["verdict"] == "supported"
+    assert explore.judge(dict(base_ev, ablation_ok=False))["verdict"] == "refuted"
+    assert explore.judge(dict(base_ev, workspace_delta_bytes=9000))["verdict"] == "refuted"
+    assert explore.judge(dict(base_ev, guard_workloads=[{"regression": 0.08}]))["verdict"] == "refuted"
+    assert explore.judge(dict(base_ev, hidden_input_summary={"opt_regression": True}))["verdict"] == "refuted"
+
+    rec = dict(judged, task_id="t-unified", exp_id="e1", run_ids=["r1", "r2"], run_status="completed")
+    out = explore.append(ledger_path, rec)
+    assert out["status"] == "recorded"
+    assert explore.gate(ledger_path, task_id="t-unified", source_digest="sha256:cand1",
+                        scope={"soc": "Ascend910B"})["decision"] == "duplicate"
+    assert hasattr(rsi_loop, "init") and hasattr(rsi_loop, "complete")
+
