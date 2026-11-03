@@ -1,0 +1,17 @@
+{
+  "project": "InferRSI",
+  "repository": "https://github.com/InferMatrixLab/InferRSI",
+  "revision": "2baebf6ebb815ebf07d21c41e3b3754858c0798e",
+  "license": "Apache-2.0",
+  "copyright": "Copyright InferRSI authors",
+  "integration": "Rewritten adaptation of two functions; no InferRSI package is installed or imported",
+  "adapted_components": {
+    "mindie_knowledge/graded/experiment.py:fingerprint": "Adapted from src/inferrsi/infra/targets/git.py:repository_identity (HEAD, tracked diff, untracked files and submodules hashed into one source digest; stdlib only, bounded git calls, streamed diff, size-only identity above 512 MiB).",
+    "mindie_knowledge/graded/experiment.py:judge": "Evidence-completeness order follows src/inferrsi/harness/evaluation.py:evaluate (missing evidence outranks a failed check, which outranks a pass); complete evidence is judged by mindie_knowledge.graded.explore.evaluate_exploration_candidate."
+  },
+  "mechanism_references": {
+    "mindie_knowledge/graded/experiment.py:gate": "Duplicate-source and run/card-time budget check follows the mechanism of vllm-evolve bench/eval_pool.py (HashCache, EvalBudget), https://github.com/JiusiServe/vllm-evolve. No code was copied."
+  },
+  "origin": "Moved from mindie-agent-codex plugins/mindie-agent/scripts/experiment_ledger.py and rsi_loop.py (PR #83, commit a326b7b), which carried the same notice in THIRD_PARTY_NOTICES.md.",
+  "validation": "tests/test_graded_experiment.py and tests/test_graded_rsi_loop.py use local temporary Git repositories and synthetic trials; no device, network or model call."
+}
