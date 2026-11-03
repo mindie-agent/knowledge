@@ -435,3 +435,34 @@ def test_stale_connection_from_stopped_previous_config_is_cleared_before_new_spa
         lifecycle.retire_service(new_path)
 
 
+def test_systemd_remove_owned_and_reconcile_retire_superseded_same_chain_launch_record(tmp_path, monkeypatch):
+    from mindie_knowledge.loop import systemd_service
+
+    path, config = configuration(tmp_path)
+    root = systemd_service._paths(config)
+    uid = systemd_service._private(root)
+    record = systemd_service._record(path, config, root, uid)
+    manifest = root / 'launch.json'
+    systemd_service._write(manifest, record)
+    systemd_service._write(root / 'operation.json', dict(attempt=record['attempt'], phase='started'))
+    systemd_service._write(root / (record['attempt'] + '.result.json'), dict(attempt=record['attempt'], status='finished', exit_code=0))
+
+    monkeypatch.setattr(systemd_service, '_unit', lambda _label: None)
+    updated = dict(config, idle_seconds=120)
+    path.write_text(json.dumps(updated))
+
+    systemd_service.remove_owned(path, updated)
+    assert not manifest.exists()
+
+    # Also verify _request_start retires an inert superseded launch.json of the same ownership chain
+    systemd_service._write(manifest, record)
+    systemd_service._write(root / 'operation.json', dict(attempt=record['attempt'], phase='started'))
+    systemd_service._write(root / (record['attempt'] + '.result.json'), dict(attempt=record['attempt'], status='finished', exit_code=0))
+    monkeypatch.setattr(systemd_service, '_supported', lambda: None)
+    monkeypatch.setattr(systemd_service, '_manager', lambda *_a, **_kw: '')
+    svc = systemd_service._request_start(path, updated)
+    assert svc.record['fingerprint'] == lifecycle.config_fingerprint(path, updated)
+    assert svc.record['attempt'] != record['attempt']
+
+
+

@@ -197,11 +197,11 @@ def _retire_replaced_owner_if_stale(config_path, config):
                 except TimeoutError:
                     raise
                 except (OSError, ValueError, RuntimeError):
-                    pass
+                    return False
             try:
                 connection_path(config).unlink(missing_ok=True)
             except OSError:
-                pass
+                return False
             return True
         time.sleep(0.05)
     return False

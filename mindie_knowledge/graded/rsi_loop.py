@@ -141,7 +141,57 @@ def _state_paths(state: dict, state_path: Path | None = None) -> tuple[str, ...]
     return tuple(paths)
 
 
-def _sync_from_ledger(state: dict) -> None:
+def _initial_baseline(state: dict, live: list[dict] | None = None) -> dict:
+    init_base = state.get("initial_baseline")
+    if isinstance(init_base, dict) and init_base.get("repo") and init_base.get("source_digest"):
+        return dict(repo=init_base["repo"], source_digest=init_base["source_digest"], exp_id=None)
+    if live:
+        first_src = live[0].get("baseline_source_digest")
+        if first_src:
+            return dict(repo=state["baseline"]["repo"], source_digest=first_src, exp_id=None)
+    return dict(repo=state["baseline"]["repo"], source_digest=state["baseline"]["source_digest"], exp_id=None)
+
+
+def _expected_baseline(state: dict, live: list[dict]) -> dict:
+    init_base = _initial_baseline(state, live)
+    if not live:
+        return init_base
+    ranked = ledger._rank_supported_candidates(live)
+    if ranked:
+        best_rec, _, _ = ranked[0]
+        return dict(
+            repo=best_rec.get("candidate_repo") or init_base["repo"],
+            source_digest=best_rec.get("source_digest") or init_base["source_digest"],
+            exp_id=best_rec.get("exp_id") or best_rec.get("candidate_id"),
+        )
+    return init_base
+
+
+def _ledger_out_of_sync(state: dict, live: list[dict]) -> bool:
+    rounds = state.get("rounds") or []
+    if len(live) != len(rounds):
+        return True
+    for r_state, rec in zip(rounds, live):
+        if (r_state.get("exp_id") != rec.get("exp_id")
+                or r_state.get("verdict") != rec.get("verdict")
+                or r_state.get("outcome") != rec.get("outcome")
+                or r_state.get("speedup_ratio") != rec.get("speedup_ratio")):
+            return True
+    if live and state.get("baseline") != _expected_baseline(state, live):
+        return True
+    expected_pending = []
+    for idx, rec in enumerate(live, 1):
+        verdict = rec.get("verdict")
+        lesson = rec.get("lesson") if isinstance(rec.get("lesson"), dict) else {}
+        if verdict in KEPT and lesson.get("distill") is None:
+            expected_pending.append(dict(round=idx, exp_id=rec.get("exp_id"),
+                                         reason=lesson.get("note") or "not distilled yet"))
+    if (state.get("pending_distill") or []) != expected_pending:
+        return True
+    return False
+
+
+def _sync_from_ledger(state: dict, *, preserve_step: bool = False) -> None:
     """Reconcile state with pre-existing `experiment-ledger.jsonl` records."""
     ledger_path = Path(state["ledger"])
     if not ledger_path.is_file():
@@ -151,23 +201,23 @@ def _sync_from_ledger(state: dict) -> None:
     if not live:
         return
     stagnation = _stagnation(state)
-    ranked = ledger._rank_supported_candidates(live)
-    if ranked:
-        best_rec, _, _ = ranked[0]
-        state["baseline"] = dict(
-            repo=best_rec.get("candidate_repo") or state["baseline"]["repo"],
-            source_digest=best_rec.get("source_digest") or state["baseline"]["source_digest"],
-            exp_id=best_rec.get("exp_id") or best_rec.get("candidate_id"),
-        )
+    state["baseline"] = _expected_baseline(state, live)
+    prior_stag = {
+        r.get("exp_id"): r.get("stagnation")
+        for r in (state.get("rounds") or [])
+        if isinstance(r, dict) and r.get("exp_id")
+    }
     rounds, pending = [], []
     for idx, rec in enumerate(live, 1):
         verdict = rec.get("verdict")
-        rounds.append(dict(round=idx, exp_id=rec.get("exp_id"), verdict=verdict,
+        exp_id = rec.get("exp_id")
+        stag_status = stagnation.get("status") if idx == len(live) else (prior_stag.get(exp_id) or stagnation.get("status"))
+        rounds.append(dict(round=idx, exp_id=exp_id, verdict=verdict,
                            outcome=rec.get("outcome"), speedup_ratio=rec.get("speedup_ratio"),
-                           stagnation=stagnation.get("status")))
+                           stagnation=stag_status))
         lesson = rec.get("lesson") if isinstance(rec.get("lesson"), dict) else {}
         if verdict in KEPT and lesson.get("distill") is None:
-            pending.append(dict(round=idx, exp_id=rec.get("exp_id"),
+            pending.append(dict(round=idx, exp_id=exp_id,
                                 reason=lesson.get("note") or "not distilled yet"))
     state["rounds"] = rounds
     state["round"] = len(rounds) + 1
@@ -175,12 +225,18 @@ def _sync_from_ledger(state: dict) -> None:
     state["mode"] = "explore" if stagnation.get("stalled") else "reuse"
     if state["max_rounds"] is not None and len(rounds) >= state["max_rounds"]:
         _finish(state, f"max_rounds {state['max_rounds']} reached")
-    elif state["status"] == "running" and state.get("step") != "learn":
-        state["step"] = "consult" if (live[-1].get("verdict") not in KEPT and state["current"].get("profile_ref")) else "profile"
-        state["current"] = dict(skipped=[]) if state["step"] == "profile" else dict(
-            skipped=[], bottleneck_summary=state["current"].get("bottleneck_summary"),
-            profile_ref=state["current"].get("profile_ref"),
-            profile_reused_from=state["current"].get("profile_reused_from") or len(rounds))
+    elif not preserve_step and state["status"] == "running" and state.get("step") != "learn":
+        prof_ref = state["current"].get("profile_ref")
+        summary = state["current"].get("bottleneck_summary")
+        if live[-1].get("verdict") not in KEPT and prof_ref and summary:
+            state["step"] = "consult"
+            state["current"] = dict(
+                skipped=[], bottleneck_summary=summary,
+                profile_ref=prof_ref,
+                profile_reused_from=state["current"].get("profile_reused_from") or len(rounds))
+        else:
+            state["step"] = "profile"
+            state["current"] = dict(skipped=[])
 
 
 def init(path, *, task_id, ledger_path, baseline_repo, direction, repetitions,
@@ -192,6 +248,8 @@ def init(path, *, task_id, ledger_path, baseline_repo, direction, repetitions,
     ledger_path = Path(ledger_path).resolve()
     progress_path = Path(progress).resolve() if progress else ledger_path.parent / "PROGRESS.md"
     baseline = ledger.fingerprint(baseline_repo, exclude_paths=(path, ledger_path, progress_path))
+    initial_baseline = dict(repo=str(Path(baseline_repo).resolve()),
+                            source_digest=baseline["source_digest"], exp_id=None)
     state = dict(
         schema=SCHEMA, task_id=task_id, ledger=str(ledger_path),
         progress=str(progress_path),
@@ -201,8 +259,8 @@ def init(path, *, task_id, ledger_path, baseline_repo, direction, repetitions,
         max_rounds=_positive(max_rounds, "max_rounds", integer=True, optional=True),
         max_runs=_positive(max_runs, "max_runs", integer=True, optional=True),
         max_card_seconds=_positive(max_card_seconds, "max_card_seconds", optional=True),
-        baseline=dict(repo=str(Path(baseline_repo).resolve()),
-                      source_digest=baseline["source_digest"], exp_id=None),
+        initial_baseline=initial_baseline,
+        baseline=dict(initial_baseline),
         round=1, step="profile", mode="reuse", status="running", finish_reason=None,
         current=dict(skipped=[]), rounds=[], pending_distill=[])
     _sync_from_ledger(state)
@@ -250,8 +308,8 @@ def next_step(path) -> dict:
     if state["status"] == "running" and state["step"] != "learn":
         live, _ = ledger.fold(r for r in ledger.iter_ledger(state["ledger"], task_id=state["task_id"])
                               if r.get("task_id") == state["task_id"] and r.get("exp_id"))
-        if len(live) > len(state["rounds"]):
-            _sync_from_ledger(state)
+        if _ledger_out_of_sync(state, live):
+            _sync_from_ledger(state, preserve_step=state["step"] in ("consult", "propose", "measure"))
     return _render_step(state)
 
 
@@ -335,12 +393,13 @@ def _measure(state, body):
                                 or not math.isfinite(seconds) or seconds < 0):
         raise ValueError("card_seconds must be a nonnegative number")
     status = body.get("run_status") or "completed"
+    base_info = state["current"].get("baseline_override") or state["baseline"]
     evidence = dict(repetitions=state["repetitions"], direction=state["direction"],
                     target_speedup=state["target_speedup"],
                     baseline=body.get("baseline"), candidate=body.get("candidate"),
                     correctness=body.get("correctness"), compile_ok=body.get("compile_ok"),
                     run_status=status,
-                    baseline_source_digest=state["baseline"]["source_digest"],
+                    baseline_source_digest=base_info["source_digest"],
                     source_digest=candidate["source_digest"],
                     scope_conditions=candidate["scope_conditions"],
                     run_ids=run_ids, exp_id=candidate["exp_id"],
@@ -402,6 +461,8 @@ def _append_or_recover_learn(state: dict, record: dict) -> dict:
 def _learn(state, body):
     current = state["current"]
     candidate, entry = current["candidate"], current["entry"]
+    base_override = current.pop("baseline_override", None)
+    base_info = base_override or state["baseline"]
     distill = body.get("distill")
     if distill is not None and (not isinstance(distill, dict) or not distill):
         raise ValueError("distill must be the nonempty knowledge_distill receipt when given")
@@ -412,7 +473,7 @@ def _learn(state, body):
     record = dict(entry, task_id=state["task_id"], exp_id=candidate["exp_id"],
                   candidate_repo=candidate["repo"],
                   run_ids=current["run_ids"], source_digest=candidate["source_digest"],
-                  baseline_source_digest=state["baseline"]["source_digest"],
+                  baseline_source_digest=base_info["source_digest"],
                   run_status=current["run_status"], card_seconds=current.get("card_seconds"),
                   unit_refs=current.get("unit_refs") or [],
                   receipt_refs=dict(current.get("receipt_refs") or {},
@@ -420,8 +481,8 @@ def _learn(state, body):
                   factors=candidate.get("factors"), trials=current["trials"],
                   knowledge_skipped=current.get("knowledge_skipped"),
                   lesson=dict(distill=distill, note=note))
-    if state["baseline"].get("exp_id"):
-        record["baseline_exp_id"] = state["baseline"]["exp_id"]
+    if base_info.get("exp_id"):
+        record["baseline_exp_id"] = base_info["exp_id"]
     for key in ("new_observation", "divergent_layer_identified"):
         if type(body.get(key)) is bool:
             record[key] = body[key]
@@ -432,6 +493,37 @@ def _learn(state, body):
     effective_note = committed_lesson.get("note")
     stagnation = _stagnation(state)
     current["stagnation"] = dict(status=stagnation.get("status"), reason=stagnation.get("reason"))
+    extra = dict(progress=state["progress"], stagnation=current["stagnation"], ledger_committed=True)
+    if appended.get("recovered_append"):
+        extra["recovered_append"] = True
+    if appended.get("revised_append"):
+        extra["revised_append"] = True
+    if appended.get("progress_unconfirmed"):
+        state["progress_unconfirmed"] = True
+        state["progress_warning"] = appended["progress_warning"]
+        extra.update(progress_unconfirmed=True, progress_warning=appended["progress_warning"],
+                     receipt_unconfirmed=True, receipt_warning=appended["progress_warning"])
+    else:
+        state.pop("progress_unconfirmed", None)
+        state.pop("progress_warning", None)
+    if base_override is not None:
+        prof_ref = current.get("profile_ref")
+        summary = current.get("bottleneck_summary")
+        reused = current.get("profile_reused_from")
+        _sync_from_ledger(state)
+        if state["status"] != "running":
+            return None, extra
+        if (verdict not in KEPT and prof_ref and summary
+                and state["rounds"] and state["rounds"][-1].get("exp_id") == candidate["exp_id"]):
+            state["current"] = dict(skipped=[], bottleneck_summary=summary,
+                                    profile_ref=prof_ref,
+                                    profile_reused_from=reused or len(state["rounds"]))
+            upcoming = "consult"
+        else:
+            state["current"] = dict(skipped=[])
+            upcoming = "profile"
+        extra["next_mode"] = state["mode"]
+        return upcoming, extra
     previous = dict(state["baseline"])
     if verdict in KEPT and effective_distill is None:
         state.setdefault("pending_distill", []).append(
@@ -450,24 +542,11 @@ def _learn(state, body):
                                 speedup_ratio=record.get("speedup_ratio"),
                                 stagnation=stagnation.get("status")))
     state["mode"] = "explore" if stagnation.get("stalled") else "reuse"
-    extra = dict(progress=state["progress"], stagnation=current["stagnation"], ledger_committed=True)
-    if appended.get("recovered_append"):
-        extra["recovered_append"] = True
-    if appended.get("revised_append"):
-        extra["revised_append"] = True
-    if appended.get("progress_unconfirmed"):
-        state["progress_unconfirmed"] = True
-        state["progress_warning"] = appended["progress_warning"]
-        extra.update(progress_unconfirmed=True, progress_warning=appended["progress_warning"],
-                     receipt_unconfirmed=True, receipt_warning=appended["progress_warning"])
-    else:
-        state.pop("progress_unconfirmed", None)
-        state.pop("progress_warning", None)
     if state["max_rounds"] is not None and state["round"] >= state["max_rounds"]:
         _finish(state, f"max_rounds {state['max_rounds']} reached")
         return None, extra
     state["round"] += 1
-    if verdict not in KEPT and current.get("profile_ref"):
+    if verdict not in KEPT and current.get("profile_ref") and current.get("bottleneck_summary"):
         state["current"] = dict(skipped=[], bottleneck_summary=current["bottleneck_summary"],
                                 profile_ref=current["profile_ref"],
                                 profile_reused_from=current.get("profile_reused_from")
@@ -497,7 +576,7 @@ def _record(state, body):
         scope, factors = body.get("scope_conditions"), body.get("factors")
         repo = str(Path(_text(body, "candidate_repo")).resolve())
         digest = ledger.fingerprint(repo, exclude_paths=_state_paths(state))["source_digest"]
-        state["baseline"] = dict(
+        state["current"]["baseline_override"] = dict(
             repo=state["baseline"]["repo"],
             source_digest=existing.get("baseline_source_digest") or state["baseline"]["source_digest"],
             exp_id=existing.get("baseline_exp_id"),
@@ -507,9 +586,6 @@ def _record(state, body):
         if "unit_refs" not in body:
             state["current"].setdefault("unit_refs", existing.get("unit_refs") or [])
             state["current"].setdefault("knowledge_skipped", existing.get("knowledge_skipped"))
-        state["rounds"] = [r for r in state["rounds"] if r.get("exp_id") != exp_id]
-        state["round"] = len(state["rounds"]) + 1
-        state["pending_distill"] = [p for p in state.get("pending_distill") or [] if p.get("exp_id") != exp_id]
         state["current"]["candidate"] = dict(
             exp_id=exp_id, hypothesis=hypothesis, repo=repo,
             source_digest=digest, scope_conditions=scope, factors=factors, spent=spent)
@@ -551,11 +627,11 @@ def complete(path, step, body) -> tuple[dict, int]:
             raise ValueError(f"loop is {state['status']}: {state['finish_reason']}")
         live, _ = ledger.fold(r for r in ledger.iter_ledger(state["ledger"], task_id=state["task_id"])
                               if r.get("task_id") == state["task_id"] and r.get("exp_id"))
-        if len(live) > len(state["rounds"]) and not (
+        if _ledger_out_of_sync(state, live) and not (
             (step == "learn" and state["step"] == "learn")
             or (step == "record" and any(r.get("exp_id") == body.get("exp_id") for r in live))
         ):
-            _sync_from_ledger(state)
+            _sync_from_ledger(state, preserve_step=state["step"] in ("consult", "propose", "measure"))
             if state["status"] != "running":
                 _save(path, state)
                 return dict(_render_step(state), completed=step), 0

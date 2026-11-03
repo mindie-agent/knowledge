@@ -129,13 +129,17 @@ def _verify_unit(unit, record, manifest):
         raise ServiceHostError("foreign_task", stage="ownership")
 
 
+def _owner_prefix(uid, root):
+    return hashlib.sha256((str(uid) + "\n" + path_identity(root.parent)).encode()).hexdigest()[:16]
+
+
 def _record(config_path, config, root, uid):
     from .lifecycle import config_fingerprint
     python = Path(sys.executable).absolute()
     if not python.is_file() or not os.access(python, os.X_OK):
         raise ServiceHostError("interpreter_path_unsupported", stage="interpreter")
     attempt = uuid.uuid4().hex
-    owner = hashlib.sha256((str(uid) + "\n" + path_identity(root.parent)).encode()).hexdigest()[:16]
+    owner = _owner_prefix(uid, root)
     return dict(
         schema=MARKER, uid=uid, attempt=attempt,
         label="mindie-knowledge-" + owner + "-" + attempt + ".service",
@@ -173,6 +177,58 @@ def _validate_record(record, config_path, config, uid):
             or not re.fullmatch(r"mindie-knowledge-[a-f0-9]{16}-" + record["attempt"] + r"\.service",
                                 record.get("label", ""))):
         raise ServiceHostError("foreign_launch_record", stage="ownership")
+
+
+def _validate_superseded(record, config_path, config, uid, root):
+    from .lifecycle import config_fingerprint
+    fingerprint = record.get("fingerprint") if isinstance(record, dict) else None
+    owner = _owner_prefix(uid, root)
+    if (not isinstance(record, dict) or record.get("schema") != MARKER
+            or record.get("uid") != uid
+            or not isinstance(fingerprint, str) or not re.fullmatch(r"[a-f0-9]{64}", fingerprint)
+            or fingerprint == config_fingerprint(config_path, config)
+            or not isinstance(record.get("config"), str) or not Path(record["config"]).is_absolute()
+            or not isinstance(record.get("cwd"), str) or not Path(record["cwd"]).is_absolute()
+            or not isinstance(record.get("attempt"), str) or not isinstance(record.get("label"), str)
+            or not re.fullmatch(r"[a-f0-9]{32}", record.get("attempt", ""))
+            or record.get("label") != "mindie-knowledge-" + owner + "-" + record["attempt"] + ".service"):
+        raise ServiceHostError("foreign_launch_record", stage="ownership")
+
+
+def _attempt_inert(root, record, unit, result, operation):
+    if unit is not None and unit.get("ActiveState") in _LIVE:
+        return False
+    if result is not None and result.get("status") == "starting":
+        return _accepted_process_dead(result)
+    if result is not None and result.get("status") in {"finished", "failed"}:
+        return True
+    if unit is not None and unit.get("ActiveState") == "failed":
+        return True
+    phase = (
+        operation.get("phase")
+        if isinstance(operation, dict) and operation.get("attempt") == record.get("attempt")
+        else None
+    )
+    if phase in {"prepared", "failed", "removed"} and unit is None:
+        return True
+    return not (root / (record["attempt"] + ".claimed")).exists() and unit is None
+
+
+def _retire_record(root, record, config_path, config, uid, manifest, *, stage):
+    _validate_superseded(record, config_path, config, uid, root)
+    unit = _unit(record["label"])
+    _verify_unit(unit, record, manifest)
+    operation = _read(root / "operation.json")
+    result = read_result(root, record)
+    if not _attempt_inert(root, record, unit, result, operation):
+        raise ServiceHostError("foreign_launch_record", stage="ownership")
+    from .dfx import failure as record_failure
+    record_failure("knowledge.service", stage=stage,
+                   category="stale_launch_record_retired", reportable=False)
+    _remove_unit(root, record, unit)
+    (root / (record["attempt"] + ".context")).unlink(missing_ok=True)
+    _write(root / "operation.json", dict(attempt=record["attempt"], phase="removed"))
+    manifest.unlink()
 
 
 def _accepted_process_dead(result):
@@ -244,7 +300,14 @@ def _request_start(config_path, config):
     manifest = root / "launch.json"
     existing = _read(manifest)
     if existing:
-        _validate_record(existing, config_path, config, uid)
+        try:
+            _validate_record(existing, config_path, config, uid)
+        except ServiceHostError as exc:
+            if exc.code != "foreign_launch_record":
+                raise
+            _retire_record(root, existing, config_path, config, uid, manifest, stage="reconcile")
+            existing = None
+    if existing:
         unit = _unit(existing["label"])
         _verify_unit(unit, existing, manifest)
         operation = _read(root / "operation.json")
@@ -333,7 +396,13 @@ def remove_owned(config_path, config):
     record = _read(manifest)
     if record is None:
         return
-    _validate_record(record, config_path, config, _verify_private(root))
+    uid = _verify_private(root)
+    try:
+        _validate_record(record, config_path, config, uid)
+    except ServiceHostError as exc:
+        if exc.code != "foreign_launch_record":
+            raise
+        _validate_superseded(record, config_path, config, uid, root)
     stop = time.monotonic() + 5
     while True:
         unit = _unit(record["label"])

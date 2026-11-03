@@ -447,3 +447,126 @@ def test_unified_graded_explore_ledger_and_rsi_loop(tmp_path):
                         scope={"soc": "Ascend910B"})["decision"] == "duplicate"
     assert hasattr(rsi_loop, "init") and hasattr(rsi_loop, "complete")
 
+
+def test_rsi_loop_reconciles_superseded_verdicts_older_retries_and_refuted_recovery(tmp_path):
+    import subprocess
+    from mindie_knowledge.graded import experiment_ledger as ledger, rsi_loop as loop
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for args in (
+        ["init", "-q"],
+        ["config", "user.name", "test"],
+        ["config", "user.email", "test@example.invalid"],
+    ):
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, timeout=10)
+    (repo / "k.py").write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True, capture_output=True, timeout=10)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True, capture_output=True, timeout=10)
+
+    state = tmp_path / "s.json"
+    journal = tmp_path / "l.jsonl"
+    loop.init(state, task_id="t", ledger_path=journal, baseline_repo=repo, direction="maximize", repetitions=1)
+
+    (repo / "k.py").write_text("x = 2\n", encoding="utf-8")
+    loop.complete(
+        state,
+        "record",
+        dict(
+            exp_id="e1",
+            hypothesis="h1",
+            candidate_repo=str(repo),
+            run_ids=["r1"],
+            correctness="passed",
+            baseline=[dict(status="completed", metric=100.0)],
+            candidate=[dict(status="completed", metric=120.0)],
+        ),
+    )
+    (repo / "k.py").write_text("x = 3\n", encoding="utf-8")
+    loop.complete(
+        state,
+        "record",
+        dict(
+            exp_id="e2",
+            hypothesis="h2",
+            candidate_repo=str(repo),
+            run_ids=["r2"],
+            correctness="passed",
+            baseline=[dict(status="completed", metric=120.0)],
+            candidate=[dict(status="completed", metric=144.0)],
+        ),
+    )
+
+    # 1. Retrying an older record (e1) with delayed distillation receipt must keep baseline at e2 and rounds [e1, e2]
+    (repo / "k.py").write_text("x = 2\n", encoding="utf-8")
+    res_retry, code_retry = loop.complete(
+        state,
+        "record",
+        dict(
+            exp_id="e1",
+            hypothesis="h1",
+            candidate_repo=str(repo),
+            run_ids=["r1"],
+            correctness="passed",
+            baseline=[dict(status="completed", metric=100.0)],
+            candidate=[dict(status="completed", metric=120.0)],
+            distill={"status": "distilled", "unit_id": "u1"},
+        ),
+    )
+    assert code_retry == 0
+    assert res_retry["baseline"]["exp_id"] == "e2"
+    persisted = json.loads(state.read_text(encoding="utf-8"))
+    assert [r["exp_id"] for r in persisted["rounds"]] == ["e1", "e2"]
+    assert [p["exp_id"] for p in persisted["pending_distill"]] == ["e2"]
+
+    # 2. Superseding e2 with refuted in ledger must reconcile baseline back to e1 on next_step and complete
+    live_now, _ = ledger.fold(ledger.read_ledger(journal))
+    rec_e2 = dict(next(r for r in live_now if r["exp_id"] == "e2"))
+    rec_e2.update(supersedes_exp_id="e2", verdict="refuted", outcome="oracle_failed")
+    ledger.append(journal, rec_e2)
+    assert loop.next_step(state)["baseline"]["exp_id"] == "e1"
+    res_consult, code_consult = loop.complete(state, "consult", dict(mode="reuse", unit_refs=[]))
+    assert code_consult == 0
+    assert res_consult["baseline"]["exp_id"] == "e1"
+    assert json.loads(state.read_text(encoding="utf-8"))["baseline"]["exp_id"] == "e1"
+
+    # 3. Initializing from a ledger containing a profiled, refuted experiment and replaying its record must not crash
+    state2 = tmp_path / "s2.json"
+    journal2 = tmp_path / "l2.jsonl"
+    loop.init(state2, task_id="t2", ledger_path=journal2, baseline_repo=repo, direction="maximize", repetitions=1)
+    (repo / "k.py").write_text("x = 4\n", encoding="utf-8")
+    loop.complete(
+        state2,
+        "record",
+        dict(
+            bottleneck_summary={"op": "matmul"},
+            profile_ref="prof://1",
+            exp_id="e_ref",
+            hypothesis="h_ref",
+            candidate_repo=str(repo),
+            run_ids=["r_ref"],
+            correctness="failed",
+            baseline=[dict(status="completed", metric=100.0)],
+            candidate=[dict(status="completed", metric=120.0)],
+        ),
+    )
+    state3 = tmp_path / "s3.json"
+    loop.init(state3, task_id="t2", ledger_path=journal2, baseline_repo=repo, direction="maximize", repetitions=1)
+    res_replay, code_replay = loop.complete(
+        state3,
+        "record",
+        dict(
+            exp_id="e_ref",
+            hypothesis="h_ref",
+            candidate_repo=str(repo),
+            run_ids=["r_ref"],
+            correctness="failed",
+            baseline=[dict(status="completed", metric=100.0)],
+            candidate=[dict(status="completed", metric=120.0)],
+            note="replayed refuted record",
+        ),
+    )
+    assert code_replay == 0
+    assert res_replay["status"] == "running"
+
+
