@@ -133,6 +133,8 @@ class CurrentCatalog:
             raise
         self._seen = -1
         self.tasks = {}
+        self._unread_rows = {}
+        self._row_faults = {}
 
     def _meta(self, key):
         row = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
@@ -238,23 +240,49 @@ class CurrentCatalog:
     def changes(self, after):
         return list(self.db.execute("SELECT * FROM tasks WHERE generation>? ORDER BY generation,task_id", (after,)))
 
-    def view(self):
+    def _apply_row(self, row):
         from .store import _validate_manifest, _navigation_body
+        ident = row["task_id"]
+        if row["revision"] is None:
+            self.tasks.pop(ident, None)
+            self._unread_rows.pop(ident, None)
+            self._row_faults.pop(ident, None)
+            return
+        try:
+            header = json.loads(row["header"])
+            _validate_manifest(header, _navigation_body(header), self.materials.domain)
+            if header["task_id"] != ident or header["entry"]["revision"] != row["revision"]:
+                raise ValueError("current material catalog identity differs from its manifest")
+            signature = json.loads(row["manifest_signature"])
+        except TimeoutError:
+            raise
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            # One damaged header must not drop every other current task.
+            self.tasks.pop(ident, None)
+            self._unread_rows[ident] = dict(row)
+            self._row_faults[ident] = exc
+            return
+        self._unread_rows.pop(ident, None)
+        self._row_faults.pop(ident, None)
+        self.tasks[ident] = dict(header, source=row["source"], _manifest_signature=signature)
+
+    def view(self):
         generation = self.ensure_current()
         if generation < self._seen:
             raise ValueError("current material catalog generation moved backwards")
         if generation != self._seen:
             for row in self.changes(self._seen):
-                if row["revision"] is None:
-                    self.tasks.pop(row["task_id"], None)
-                    continue
-                header = json.loads(row["header"])
-                _validate_manifest(header, _navigation_body(header), self.materials.domain)
-                if header["task_id"] != row["task_id"] or header["entry"]["revision"] != row["revision"]:
-                    raise ValueError("current material catalog identity differs from its manifest")
-                self.tasks[row["task_id"]] = dict(header, source=row["source"],
-                    _manifest_signature=json.loads(row["manifest_signature"]))
+                self._apply_row(row)
             self._seen = generation
+        # Re-read damaged rows so a repaired header is visible without a new generation.
+        for ident in list(self._unread_rows):
+            row = self.db.execute("SELECT * FROM tasks WHERE task_id=?", (ident,)).fetchone()
+            if row is None or row["revision"] is None:
+                self._unread_rows.pop(ident, None)
+                self._row_faults.pop(ident, None)
+                self.tasks.pop(ident, None)
+                continue
+            self._apply_row(row)
         return generation, self.tasks
 
     def close(self):

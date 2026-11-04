@@ -11,6 +11,7 @@ body or silently redirect a read to the current package.
 """
 from __future__ import annotations
 
+import json
 import re
 
 _DOMAIN = r"[a-z][a-z0-9-]{0,63}"
@@ -35,9 +36,57 @@ class MaterialReadError(RuntimeError):
 
     code = "material_corrupt"
 
-    def __init__(self, message, *, read_ref=None):
+    def __init__(self, message, *, read_ref=None, faults=None):
         super().__init__(message)
         self.read_ref = read_ref
+        self.faults = list(faults or [])
+
+
+class MaterialHits(list):
+    """Ranked hits plus materials omitted because their current bytes could not be read."""
+
+    def __init__(self, items=(), faults=(), cause=None):
+        super().__init__(items)
+        self.material_faults = list(faults)
+        self.material_cause = cause
+
+
+def material_read_reason(exc):
+    """Stable fault reason. Exception text can carry a local path and is not copied."""
+    if isinstance(exc, FileNotFoundError):
+        return "missing"
+    if isinstance(exc, UnicodeDecodeError):
+        return "undecodable"
+    if isinstance(exc, json.JSONDecodeError):
+        return "manifest_unreadable"
+    if isinstance(exc, ValueError):
+        text = str(exc)
+        if "hash mismatch" in text:
+            return "block_hash_mismatch"
+        if "frontmatter" in text or "manifest" in text:
+            return "manifest_unreadable"
+        if "revision differ" in text:
+            return "revision_differs"
+        if "not in the derived index" in text:
+            return "index_missing"
+    return type(exc).__name__
+
+
+def material_fault(domain, task_id, exc, *, block_id=None):
+    """Public description of one unreadable current task. No filesystem path."""
+    reason = material_read_reason(exc)
+    fault = dict(
+        task_ref=task_ref(domain, task_id),
+        task_id=task_id,
+        error_code=MaterialReadError.code,
+        error_type="MaterialReadError",
+        cause_type=type(exc).__name__,
+        reason=reason,
+        message="Current material could not be read (" + reason + ").",
+    )
+    if block_id:
+        fault["block_id"] = block_id
+    return fault
 
 
 def _field(value, expression, name):

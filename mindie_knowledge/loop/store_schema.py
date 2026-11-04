@@ -37,6 +37,30 @@ from ..materials.references import (
 )
 
 SCHEMA = "mindie-store/4"
+_UNREADABLE_NOTE = (
+    "Some current materials could not be read and were omitted; "
+    "material_faults names each task."
+)
+
+
+def _material_search_error(faults):
+    if not faults:
+        return MaterialReadError(
+            "Current material could not be searched; inspect service diagnostics.")
+    details = "; ".join(item["message"] + " " + item["task_ref"] for item in faults)
+    read_ref = faults[0]["task_ref"] if len(faults) == 1 else None
+    return MaterialReadError(
+        "Current material could not be searched; " + details,
+        read_ref=read_ref, faults=faults)
+
+
+def _with_material_faults(result, faults):
+    if not faults:
+        return result
+    note = result.get("note", "")
+    if _UNREADABLE_NOTE not in note:
+        note = (note + " " + _UNREADABLE_NOTE).strip()
+    return dict(result, material_faults=list(faults), note=note)
 
 _STATE_COLUMNS = {
     'meta': 'key value'.split(),
@@ -412,28 +436,37 @@ class QueryMixin:
         options = dict(mode=mode, ledger_entries=ledger_entries,
                        bottleneck_summary=bottleneck_summary,
                        native_subcontext=native_subcontext, goal=goal)
-        if continuation is not None or not self.graded.available():
+        graded = continuation is None and self.graded.available()
+        if not graded:
             result = self._query_materials(query, limit, conditions, continuation)
             if mode != "reuse":
                 result["mode"] = mode
             return result
-        legacy = self._query_materials(query, limit, conditions)
+        # Graded retrieval stays available when one legacy package cannot be
+        # read. Catalog-wide pointer or checkpoint damage still raises here.
+        legacy = self._query_materials(query, limit, conditions, allow_unreadable=True)
+        faults = list(legacy.get("material_faults") or ())
         if legacy["results"]:
             from ..graded.retrieval import mixed_query
-            return mixed_query(self, legacy, query, limit=limit, conditions=conditions,
-                               domain_path=domain_path, token_budget=token_budget,
-                               include_unknown=include_unknown, include_archived=include_archived,
-                               navigation_only=navigation_only,
-                               run_id=run_id, **options)
-        return self.graded.query(query, limit=limit, conditions=conditions,
+            result = mixed_query(self, legacy, query, limit=limit, conditions=conditions,
                                  domain_path=domain_path, token_budget=token_budget,
                                  include_unknown=include_unknown, include_archived=include_archived,
                                  navigation_only=navigation_only,
                                  run_id=run_id, **options)
-    def _query_materials(self, query=None, limit=5, conditions=None, continuation=None):
+        else:
+            result = self.graded.query(query, limit=limit, conditions=conditions,
+                                       domain_path=domain_path, token_budget=token_budget,
+                                       include_unknown=include_unknown, include_archived=include_archived,
+                                       navigation_only=navigation_only,
+                                       run_id=run_id, **options)
+        return _with_material_faults(result, faults)
+
+    def _query_materials(self, query=None, limit=5, conditions=None, continuation=None, *,
+                         allow_unreadable=False):
         from ..materials.provenance import QueryContinuationError, query_request
         from ..materials.catalog import CurrentVisibility
         query_request(query, limit, conditions, continuation)
+        faults = []
         with self.lock:
             try:
                 if self._material_dirty:
@@ -463,7 +496,20 @@ class QueryMixin:
             except TimeoutError:
                 raise
             except (OSError, ValueError, TypeError, KeyError, sqlite3.Error) as exc:
-                raise MaterialReadError("Current material could not be searched; inspect service diagnostics.") from exc
+                faults = list(getattr(exc, "mindie_material_faults", ()) or ())
+                if not faults or not allow_unreadable:
+                    raise _material_search_error(faults) from exc
+                found = []
+                rows = getattr(self, "_query_rows", {})
+            else:
+                faults = list(getattr(found, "material_faults", ()) or ())
+                cause = getattr(found, "material_cause", None)
+                covered = bool(rows) and set(rows) <= {item["task_id"] for item in faults}
+                if faults and covered and not allow_unreadable:
+                    error = _material_search_error(faults)
+                    if cause is None:
+                        raise error
+                    raise error from cause
             def observable(item):
                 row = rows[item['entry_id']]
                 result = dict(item, origin='feed' if row['feed_active'] else row['origin'],
@@ -474,13 +520,14 @@ class QueryMixin:
             results = []
             for item in found:
                 results.append(observable(item))
-        return dict(domain=self.domain, retrieval='reme-bm25', results=results,
+        page = dict(domain=self.domain, retrieval='reme-bm25', results=results,
                     page='related' if continuation is not None else 'groups',
                     note='Reference material, including failed attempts and uncertainty. Citation groups are navigation, '
                          'not independent evidence or factual confidence. Current source links do not reproduce an '
                          'unavailable cited revision. Use each match ref to read its actual block. '
                          'Related excerpts are locating aids and may omit later corrections or applicability limits; '
                          'read the block when those details matter.')
+        return _with_material_faults(page, faults)
 
     # ------------------------------------------------------------ feed switch
     def feed_get(self, key):
