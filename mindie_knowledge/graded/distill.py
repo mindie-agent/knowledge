@@ -617,6 +617,32 @@ def validate_decision(decision, request, *, check_impact=True):
             row["markdown_body"] = compact_unit_body(row["markdown_body"])
         fm = row.get("frontmatter")
         tier_val = row.get("target_tier") or (fm.get("tier") if isinstance(fm, dict) else None)
+        has_ablation_input = any(
+            item["kind"] == "ablation_receipt" and item["outcome"] == "verified"
+            for item in inputs
+        )
+        if tier_val == "L4" and not has_ablation_input:
+            tier_val = "L2"
+            row["target_tier"] = "L2"
+            row["category"] = "sop"
+            row["operation"] = "create"
+            if isinstance(fm, dict):
+                fm["tier"] = "L2"
+                fm["category"] = "sop"
+                uid = str(fm.get("id") or row.get("target_unit_id") or "")
+                if uid.endswith("-mutator"):
+                    uid = uid[:-8] + "-distilled-sop"
+                elif uid in related:
+                    uid = uid + "-distilled-sop"
+                if uid:
+                    fm["id"] = uid
+                    row["target_unit_id"] = uid
+        if not has_ablation_input and isinstance(fm, dict):
+            uid = str(fm.get("id") or row.get("target_unit_id") or "")
+            if row.get("operation") == "create" and uid in related:
+                uid = uid + "-distilled"
+                fm["id"] = uid
+                row["target_unit_id"] = uid
         if tier_val in {"L2", "L3"} and isinstance(fm, dict) and isinstance(fm.get("conditions"), dict):
             known_conds = {
                 k: v for k, v in fm["conditions"].items()
