@@ -81,6 +81,9 @@ SUMMARY_FAILURE_REASONS = {
     "request_invalid": {"stage": "request-validation", "message": "the admitted worker request is invalid"},
     "dependency_unavailable": {"stage": "worker-configuration", "message": "a required worker dependency is unavailable"},
     "configuration_invalid": {"stage": "worker-configuration", "message": "the summary worker configuration is invalid"},
+    "summary_unclassified_local": {"stage": "process", "message": "the summary worker failed before a model call and did not name a reason"},
+    "summary_unclassified_failure": {"stage": "native-execution", "message": "the summary worker failed after a model call and did not name a reason"},
+    "summary_outcome_unclassified": {"stage": "native-execution", "message": "the summary worker reported an uncertain model call and did not name a reason"},
     "unknown_failure": {"stage": "unknown", "message": "the operation failed for an unknown reason"},
 }
 _DEFAULT_FAILURE_REASON = dict(configuration="configuration_invalid", deadline="native_deadline",
@@ -97,6 +100,52 @@ def failure_detail(receipt):
     if error not in _DEFAULT_FAILURE_REASON or reason not in SUMMARY_FAILURE_REASONS:
         raise ValueError("invalid summary failure diagnostic")
     return dict(error=error, reason=reason, **SUMMARY_FAILURE_REASONS[reason])
+
+
+def terminal_diagnostic(attempt_status, receipt):
+    """Stage and category for a summary attempt that did not return indexes.
+
+    A worker envelope may only be able to say ``unknown_failure``. The terminal
+    status and whether a model call was counted are still known, and those facts
+    are the diagnostic. ``stage=unknown`` is not reported. Known worker reasons
+    stay authoritative. The worker envelope on the attempt is not rewritten.
+    """
+    if not isinstance(receipt, dict):
+        receipt = {}
+    failure = None
+    if receipt.get("error") is not None or receipt.get("error_reason") is not None:
+        failure = failure_detail(receipt)
+    if failure is not None and failure["reason"] != "unknown_failure":
+        return {"stage": failure["stage"], "category": failure["reason"]}
+    status = receipt.get("status")
+    if status not in {"failed", "outcome_unknown"}:
+        status = attempt_status if attempt_status in {"failed", "outcome_unknown"} else None
+    if status == "outcome_unknown" or attempt_status == "outcome_unknown":
+        # A worker envelope that only says unknown_failure is still a terminal
+        # uncertain call. A receipt-less attempt keeps the existing category.
+        if failure is not None and failure["reason"] == "unknown_failure":
+            return {"stage": "native-execution", "category": "summary_outcome_unclassified"}
+        return {"stage": "native-execution", "category": "outcome_unknown"}
+    if status == "failed" and receipt.get("model_calls") == 0:
+        return {"stage": "process", "category": "summary_unclassified_local"}
+    if status == "failed":
+        return {"stage": "native-execution", "category": "summary_unclassified_failure"}
+    return {"stage": "native-execution", "category": "outcome_unknown"}
+
+
+def terminal_failure(attempt_status, receipt):
+    """Stored failure object for a non-returned attempt, or None without an envelope.
+
+    ``unknown_failure`` is replaced by the categorized reason. The ledger keeps
+    the worker envelope unchanged.
+    """
+    if not isinstance(receipt, dict) or (receipt.get("error") is None and receipt.get("error_reason") is None):
+        return None
+    failure = failure_detail(receipt)
+    reported = terminal_diagnostic(attempt_status, receipt)
+    if failure["reason"] == "unknown_failure" and reported["category"] in SUMMARY_FAILURE_REASONS:
+        failure = failure_detail({"error": failure["error"], "error_reason": reported["category"]})
+    return failure
 
 PROMPT = """Create retrieval indexes for every supplied new material block and update the short task navigation.
 This is a fallible reference index, not a verified case report. Retain failed attempts, uncertainty, incomplete outcomes and later corrections. Never promote a hypothesis, plan or reported check into verified success.

@@ -12,10 +12,12 @@ from mindie_knowledge.materials import summarizer as s
 
 
 def command(*, title='Public case', summary='Reported observations remain reference material.',
-            calls=None, started=None, release=None, fail=False, required=None, error_reason=None):
+            calls=None, started=None, release=None, fail=False, required=None, error_reason=None,
+            error=None, status=None, model_calls=None, fail_limit=None):
     options = dict(title=title, summary=summary, calls=str(calls) if calls else None,
                    started=str(started) if started else None, release=str(release) if release else None,
-                   fail=fail, required=required, error_reason=error_reason)
+                   fail=fail, required=required, error_reason=error_reason, error=error, status=status,
+                   model_calls=model_calls, fail_limit=fail_limit)
     return [sys.executable, str(Path(__file__).resolve()), json.dumps(options)]
 
 
@@ -46,15 +48,32 @@ if __name__ == '__main__':
     request = json.load(sys.stdin)
     if options['required']:
         assert options['required'] in ''.join(b['text'] for b in request['blocks'])
+    count = 0
     if options['calls']:
         path = Path(options['calls'])
-        path.write_text((path.read_text() if path.exists() else '') + 'x')
+        previous = path.read_text() if path.exists() else ''
+        path.write_text(previous + 'x')
+        count = len(previous) + 1
     if options['started']:
         Path(options['started']).touch()
     while options['release'] and not Path(options['release']).exists():
         time.sleep(.05)
-    response = (s.outcome(request, status='failed', error='invalid_result', model_calls=1,
-                          usage_known=True, usage={'input_tokens':120,'cached_input_tokens':0,'output_tokens':30},
-                          error_reason=options['error_reason'])
-                if options['fail'] else answer(request, options['title'], options['summary']))
+    fail = bool(options['fail'])
+    limit = options.get('fail_limit')
+    if fail and limit is not None and count > int(limit):
+        fail = False
+    if fail:
+        error = options.get('error') or 'invalid_result'
+        status = options.get('status') or 'failed'
+        model_calls = options.get('model_calls')
+        model_calls = 1 if model_calls is None else int(model_calls)
+        if error == 'unknown' or status == 'outcome_unknown':
+            usage, usage_known = None, False
+        else:
+            usage = {'input_tokens': 120, 'cached_input_tokens': 0, 'output_tokens': 30}
+            usage_known = True
+        response = s.outcome(request, status=status, error=error, model_calls=model_calls,
+                             usage_known=usage_known, usage=usage, error_reason=options.get('error_reason'))
+    else:
+        response = answer(request, options['title'], options['summary'])
     print(json.dumps(response))

@@ -10,6 +10,9 @@
   before applying headers to `MaterialStore`.
 - Any failure after worker spawn without a `not_started` marker records
   `outcome_unknown` and never automatically replays the paid model call.
+- A non-returned attempt is finished as `failed` or `outcome_unknown`. An
+  `unknown_failure` envelope is diagnosed from that status and its model-call
+  bit, never as stage `unknown`. An `invoking` attempt is not left off the queue.
 
 [Timeouts & Locks]
 - Settles `SUMMARY_SETTLE_SECONDS = 3` after capture activity; summary subprocess
@@ -35,7 +38,8 @@ from .transcript_redaction import ScannerUnavailable, redact, redact_tree  # noq
 from ..materials.ingest import prepare_increment
 from ..materials.summarizer import (
     SummaryLedger, MAX_RESPONSE_BYTES, make_request,
-    partition_blocks, validate_identity, validate_result, validate_outcome, batch_identity, failure_detail, outcome,
+    partition_blocks, validate_identity, validate_result, validate_outcome, batch_identity,
+    outcome, terminal_diagnostic, terminal_failure,
 )
 
 MODE = 'public-transcript'
@@ -173,12 +177,19 @@ def summarize_due(engine):
         attempt = ledger.get(attempt['attempt_id'])
         if attempt['status'] != 'returned':
             receipt = json.loads(attempt['response']) if attempt['response'] else {}
-            failure = failure_detail(receipt) if receipt else None
+            if not isinstance(receipt, dict):
+                receipt = {}
+            # `invoking` is not a due-queue status. Leaving the batch there drops
+            # it out of scheduling while the task still looks pending.
+            if attempt['status'] == 'invoking':
+                with store._write_txn():
+                    ledger.uncertain(attempt['attempt_id'], 'unknown')
+                attempt = ledger.get(attempt['attempt_id'])
+            failure = terminal_failure(attempt['status'], receipt)
             reason = canonical(failure) if failure else attempt['error'] or 'unknown'
+            reported = terminal_diagnostic(attempt['status'], receipt)
             engine.index_queue.finish(batch, attempt['status'], reason)
-            diagnostic_failure('index.summary',
-                stage=failure['stage'] if failure else 'native-execution',
-                category=failure['reason'] if failure else 'outcome_unknown')
+            diagnostic_failure('index.summary', stage=reported['stage'], category=reported['category'])
             return
         response = json.loads(attempt['response'])
         result = validate_result(response['result'], [b['block_id'] for b in selected])
@@ -229,6 +240,8 @@ def summarize_due(engine):
                     engine.index_queue.postpone(batch['entry_id'],
                         'local index apply failed: ' + type(exc).__name__, time.time() + 30)
                 else:
+                    if state == 'invoking':
+                        ledger.uncertain(attempt['attempt_id'], 'unknown')
                     state = 'outcome_unknown' if state in {'invoking', 'outcome_unknown'} else 'failed'
                     detail = ('configuration: summary worker is not configured'
                               if not engine.summary_command and isinstance(exc, ValueError)
