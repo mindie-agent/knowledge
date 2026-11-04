@@ -158,3 +158,121 @@ def test_identity_stage_obeys_owner_cancellation_without_execution_deadline(pipe
     assert started.exists() == (when == 'while-waiting')
     assert store.db.execute('SELECT count(*) FROM material_summary_attempts').fetchone()[0] == 0
     assert store.db.execute('SELECT summary_status FROM transcript_tasks').fetchone()[0] == 'pending'
+
+
+@pytest.mark.parametrize('shape', [
+    dict(status='failed', model_calls=0, stage='process', category='summary_unclassified_local',
+         attempt='failed', task='failed'),
+    dict(status='failed', model_calls=1, stage='native-execution', category='summary_unclassified_failure',
+         attempt='failed', task='failed'),
+    dict(status='outcome_unknown', model_calls=1, stage='native-execution',
+         category='summary_outcome_unclassified', attempt='outcome_unknown', task='outcome_unknown'),
+])
+def test_unclassified_worker_outcome_is_categorized_and_later_batch_still_indexes(
+        pipeline, tmp_path, monkeypatch, shape):
+    from mindie_knowledge.loop import agent_diagnostics
+    monkeypatch.setenv('MINDIE_DIAGNOSTICS_ROOT', str(tmp_path / 'diagnostics'))
+    engine, store, path = pipeline
+    calls = tmp_path / 'calls'
+    append(path, 'First observation whose worker cannot name the failure.')
+    process(engine, path, 'unclassified-first')
+    append(path, 'Later observation must still be indexed.')
+    process(engine, path, 'unclassified-second')
+    engine.summary_command = command(
+        calls=calls, fail=True, fail_limit=1, error='unknown', error_reason='unknown_failure',
+        status=shape['status'], model_calls=shape['model_calls'], title='Indexed after unclassified failure')
+    engine.last_activity = 0
+    with store._write_txn():
+        store.db.execute('UPDATE transcript_tasks SET summary_due=0')
+    ticks = {'n': 0}
+    def stop_after(_timeout):
+        ticks['n'] += 1
+        if ticks['n'] >= 4:
+            engine.stop.set()
+        return engine.stop.is_set()
+    monkeypatch.setattr(engine.stop, 'wait', stop_after)
+    engine._summary_loop()
+    items = agent_diagnostics.pending()['items']
+    assert any(item['operation'] == 'index.summary' and item['stage'] == shape['stage']
+               and item['code'] == shape['category'] for item in items)
+    assert not any(item['code'] == 'unknown_failure' or item['stage'] == 'unknown' for item in items)
+    assert calls.read_text() == 'xx'
+    attempts = dict(store.db.execute(
+        'SELECT status, count(*) FROM material_summary_attempts GROUP BY status').fetchall())
+    assert attempts == {shape['attempt']: 1, 'complete': 1}
+    assert store.db.execute('SELECT summary_status FROM transcript_tasks').fetchone()[0] == shape['task']
+    assert 'stopped' not in ' '.join(engine.errors)
+
+
+def test_invoking_attempt_without_receipt_becomes_outcome_unknown_without_replay(
+        pipeline, tmp_path, monkeypatch):
+    from mindie_knowledge.loop import agent_diagnostics
+    from mindie_knowledge.materials.summarizer import (
+        SummaryLedger, batch_identity, make_request, partition_blocks,
+    )
+    from material_worker_fixture import identity as worker_identity
+    monkeypatch.setenv('MINDIE_DIAGNOSTICS_ROOT', str(tmp_path / 'diagnostics'))
+    engine, store, path = pipeline
+    calls = tmp_path / 'calls'
+    append(path, 'Observation left invoking must not drop out of the summary queue.')
+    process(engine, path, 'invoking-settle')
+    engine.summary_command = command(calls=calls)
+    engine.last_activity = 0
+    with store._write_txn():
+        store.db.execute('UPDATE transcript_tasks SET summary_due=0')
+    batch = engine.index_queue.due()
+    row = store._row(batch['entry_id'])
+    task = store.materials.read_task(batch['entry_id'], revision=row['draft_revision'], source='draft')
+    wanted = set(json.loads(batch['block_ids']))
+    blocks = [store.materials.read_block(batch['entry_id'], block['block_id'], revision=row['draft_revision'])
+              for block in task['blocks'] if block['block_id'] in wanted and not block['indexed']]
+    selected = partition_blocks(blocks, None)[0]
+    prepared = make_request(task_id=batch['entry_id'], body_version=batch_identity(selected),
+                            blocks=selected, prior_navigation=None, identity=worker_identity())
+    with store._write_txn():
+        ledger = SummaryLedger(store.db)
+        attempt = ledger.prepare(prepared)
+        ledger.claim(attempt['attempt_id'])
+    summarize_due(engine)
+    summarize_due(engine)
+    assert not calls.exists()
+    stored = dict(store.db.execute('SELECT status, error FROM material_summary_attempts').fetchone())
+    assert stored['status'] == 'outcome_unknown' and stored['error'] == 'unknown'
+    assert store.db.execute('SELECT status FROM material_batches').fetchone()[0] == 'outcome_unknown'
+    items = agent_diagnostics.pending()['items']
+    assert any(item['operation'] == 'index.summary' and item['stage'] == 'native-execution'
+               and item['code'] == 'outcome_unknown' for item in items)
+    assert not any(item['stage'] == 'unknown' or item['code'] == 'unknown_failure' for item in items)
+
+
+def test_summary_loop_indexes_the_next_batch_after_a_tick_exception(pipeline, tmp_path, monkeypatch):
+    from mindie_knowledge.loop.engine import SUMMARY_FAULT_BACKOFF_SECONDS
+    from mindie_knowledge.loop import transcript_capture
+    engine, store, path = pipeline
+    calls = tmp_path / 'calls'
+    append(path, 'Later observation must still be indexed after one summary tick fails.')
+    process(engine, path, 'summary-tick-recovers')
+    engine.summary_command = command(calls=calls, title='Indexed after the tick failure')
+    engine.last_activity = 0
+    with store._write_txn():
+        store.db.execute('UPDATE transcript_tasks SET summary_due=0')
+    seen, waits = [], []
+    real = transcript_capture.summarize_due
+    def flaky(candidate):
+        seen.append(1)
+        if len(seen) == 1:
+            raise OSError('private filesystem detail')
+        return real(candidate)
+    def wait(seconds):
+        waits.append(seconds)
+        if len(seen) >= 2 and waits.count(0.5) >= 3:
+            engine.stop.set()
+        return engine.stop.is_set()
+    monkeypatch.setattr(transcript_capture, 'summarize_due', flaky)
+    monkeypatch.setattr(engine.stop, 'wait', wait)
+    engine._summary_loop()
+    assert SUMMARY_FAULT_BACKOFF_SECONDS in waits
+    assert calls.read_text() == 'x'
+    assert store.db.execute('SELECT summary_status FROM transcript_tasks').fetchone()[0] == 'complete'
+    assert engine.errors == ['summary worker failed: OSError']
+    assert engine.background_errors == {}

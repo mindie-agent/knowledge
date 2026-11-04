@@ -207,6 +207,30 @@ def test_k3_real_failure_extra_duplicate_block_is_rejected_and_schema_limits_cou
     assert caught.value.reason == 'block_count_mismatch'
 
 
+def test_unknown_failure_diagnostic_uses_terminal_facts_not_stage_unknown():
+    req = request("K3-04")
+    local = summary.outcome(req, status="failed", error="unknown", model_calls=0)
+    started = summary.outcome(req, status="failed", error="unknown", model_calls=1, usage_known=False)
+    uncertain = summary.outcome(req, status="outcome_unknown", error="unknown", model_calls=1, usage_known=False)
+    known = summary.outcome(req, status="failed", error="invalid_result", error_reason="block_identity_mismatch",
+                            model_calls=1, usage_known=False)
+    assert summary.terminal_diagnostic("failed", local) == {
+        "stage": "process", "category": "summary_unclassified_local"}
+    assert summary.terminal_diagnostic("failed", started) == {
+        "stage": "native-execution", "category": "summary_unclassified_failure"}
+    assert summary.terminal_diagnostic("outcome_unknown", uncertain) == {
+        "stage": "native-execution", "category": "summary_outcome_unclassified"}
+    assert summary.terminal_diagnostic("outcome_unknown", {})["category"] == "outcome_unknown"
+    stored = summary.terminal_failure("failed", local)
+    assert stored["reason"] == "summary_unclassified_local" and stored["stage"] == "process"
+    assert "unknown_failure" not in json.dumps(stored)
+    assert summary.terminal_diagnostic("failed", known)["category"] == "block_identity_mismatch"
+    assert summary.terminal_diagnostic("failed", known)["stage"] == "index-validation"
+    for receipt in (local, started, uncertain, {}):
+        reported = summary.terminal_diagnostic(receipt.get("status", "outcome_unknown"), receipt)
+        assert reported["stage"] != "unknown" and reported["category"] != "unknown_failure"
+
+
 def test_summary_failure_details_are_static_and_cannot_expose_source():
     import pytest
     req = request("K3-04")

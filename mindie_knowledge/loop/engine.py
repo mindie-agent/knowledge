@@ -7,6 +7,8 @@
 - `GateFault` (damaged/unreadable authority) parks queued work with bounded
   backoff; explicit user revocation (`enabled=False` or non-`contribute` consent)
   cancels unsent work; `unknown` external effects reconcile read-only without replay.
+- A summary tick that raises is categorized and delayed by
+  `SUMMARY_FAULT_BACKOFF_SECONDS`; that thread keeps running.
 
 [Timeouts & Locks]
 - Coordinates three daemon loops (`mindie-capture`, `mindie-outbox`, `mindie-summary`)
@@ -35,7 +37,6 @@ from .operations import OperationOwner
 from .index_queue import IndexQueue
 from .publication_worker import PublicationWorker
 from ..filesystem import path_aliases, resolved_path
-
 from .transcript_increment import (
     CursorConflict,
     GateFault,
@@ -43,6 +44,9 @@ from .transcript_increment import (
     TranscriptMixin,
     transcript_cursor,
 )
+
+# One escaped summary tick must not retire the thread or hot-loop the same batch.
+SUMMARY_FAULT_BACKOFF_SECONDS = 30
 
 
 class Engine(TranscriptMixin):
@@ -214,7 +218,11 @@ class Engine(TranscriptMixin):
                 break
             self.queue.task_done()
     def _summary_loop(self):
-        """Required transcript metadata runs outside the body capture worker."""
+        """Required transcript metadata runs outside the body capture worker.
+
+        A classified summary outcome returns normally. An exception is recorded
+        and the thread stays up, so one tick cannot strand every later batch.
+        """
         from .transcript_capture import summarize_due
         while not self.stop.wait(0.5):
             if self._is_frozen():
@@ -225,8 +233,11 @@ class Engine(TranscriptMixin):
                 self._fault('knowledge.summary', 'worker', 'summary_worker_failed', exc)
                 self._unexpected("knowledge.summary", "run", exc)
                 self.background_errors["summary"] = type(exc).__name__
-                self._error(f"summary worker stopped: {type(exc).__name__}")
-                return
+                self._error(f"summary worker failed: {type(exc).__name__}")
+                self.stop.wait(SUMMARY_FAULT_BACKOFF_SECONDS)
+            else:
+                self.background_errors.pop("summary", None)
+                self._clear_faults('knowledge.summary', {'worker'})
     def _cancel_unsent(self, reason, *, keep_generation=None):
         """Revoke unsent work, retaining any already admitted current generation."""
         self.operations.revoke(keep_generation=keep_generation)

@@ -168,14 +168,15 @@ def test_summary_worker_failure_is_visible_in_status(tmp_path, monkeypatch):
     from mindie_knowledge.loop import transcript_capture
     with closing(Store(tmp_path / 'store', 'test')) as store:
         engine = Engine(store)
-        monkeypatch.setattr(engine.stop, 'wait', lambda _: False)
         def broken(_):
+            engine.stop.set()
             raise OSError('private filesystem detail')
         monkeypatch.setattr(transcript_capture, 'summarize_due', broken)
+        monkeypatch.setattr(engine.stop, 'wait', lambda _timeout: engine.stop.is_set())
         engine._summary_loop()
         status = engine.status()
         assert status['background_errors'] == {'summary': 'OSError'}
-        assert status['errors'] == ['summary worker stopped: OSError']
+        assert status['errors'] == ['summary worker failed: OSError']
 
 
 def test_outbox_reports_a_new_failure_after_recovery_without_repeating_unchanged_fault(tmp_path, monkeypatch):
