@@ -410,6 +410,40 @@ def test_recreated_config_in_place_retires_stale_owner_and_starts_new_service(tm
         lifecycle.retire_service(path)
 
 
+def test_stale_connection_without_consumer_lock_is_absent(tmp_path):
+    path, config = configuration(tmp_path)
+    connection = cli.connection_path(config)
+    connection.parent.mkdir(parents=True, exist_ok=True)
+    connection.write_text(
+        json.dumps(
+            dict(
+                domain=config['domain'],
+                token='stale-token',
+                url='http://127.0.0.1:9',
+                config_path=str(path.resolve()),
+                config_fingerprint=lifecycle.config_fingerprint(path, config),
+            )
+        )
+    )
+    other = tmp_path / 'other-engine.json'
+    other.write_text(json.dumps(config))
+    assert _probe(config, .25, config_path=other) == 'absent'
+    assert connection.exists()
+
+
+def test_connection_replace_race_is_starting_while_consumer_held(tmp_path, monkeypatch):
+    path, config = configuration(tmp_path)
+    connection = cli.connection_path(config)
+    connection.parent.mkdir(parents=True, exist_ok=True)
+
+    def denied(*_args, **_kwargs):
+        raise PermissionError(13, 'private path must not appear in result')
+
+    monkeypatch.setattr(cli, 'connect', denied)
+    with StartLock(connection.with_name('consumer.lock')):
+        assert _probe(config, None, config_path=path) == 'starting'
+
+
 def test_stale_connection_from_stopped_previous_config_is_cleared_before_new_spawn(tmp_path):
     old_path, config = configuration(tmp_path)
     new_path = tmp_path / 'new-engine.json'

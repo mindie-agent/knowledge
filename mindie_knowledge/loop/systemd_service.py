@@ -1,7 +1,7 @@
 """One on-demand knowledge core owned by the current user's systemd manager.
 
 [Role] On-demand knowledge core owned by the current user systemd manager.
-[Invariants] The unit owns crash cleanup of the service cgroup; local receipts bind one launch attempt and readiness still uses the authenticated endpoint.
+[Invariants] The unit owns crash cleanup of the service cgroup; local receipts bind one launch attempt and readiness still uses the authenticated endpoint. Private launch-dir ownership uses POSIX uid/mode and fail-closes on a non-directory; Windows does not invent systemd or Win32 ACL checks.
 [Timeouts & Locks] Unit start/stop operations use bounded manager waits; the consumer/start locks remain the lifetime authority.
 [Side-Effect Policy] Writes local launch receipts and controls a transient user unit; no system-wide service changes.
 
@@ -71,12 +71,23 @@ def _private(root):
     return _verify_private(root)
 
 
+def _owner_uid():
+    getuid = getattr(os, "getuid", None)
+    return None if getuid is None else getuid()
+
+
 def _verify_private(root):
     info = root.lstat()
-    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
-            or stat.S_IMODE(info.st_mode) & 0o077):
+    if not stat.S_ISDIR(info.st_mode):
         raise ServiceHostError("unowned_directory", stage="ownership")
-    return os.getuid()
+    uid = _owner_uid()
+    if uid is None:
+        # Windows has no POSIX uid/mode. Fail closed on non-directories only;
+        # do not invent systemd user-manager or Win32 ACL semantics.
+        return 0
+    if info.st_uid != uid or stat.S_IMODE(info.st_mode) & 0o077:
+        raise ServiceHostError("unowned_directory", stage="ownership")
+    return uid
 
 
 def _paths(config):
