@@ -617,10 +617,18 @@ def validate_decision(decision, request, *, check_impact=True):
             row["markdown_body"] = compact_unit_body(row["markdown_body"])
         fm = row.get("frontmatter")
         tier_val = row.get("target_tier") or (fm.get("tier") if isinstance(fm, dict) else None)
-        has_ablation_input = any(
-            item["kind"] == "ablation_receipt" and item["outcome"] == "verified"
-            for item in inputs
-        )
+        def _has_c4_schema_ablation(item):
+            if item.get("kind") != "ablation_receipt" or item.get("outcome") != "verified":
+                return False
+            try:
+                obj = json.loads(item.get("content", ""))
+            except ValueError:
+                return False
+            return isinstance(obj, dict) and obj.get("schema_version") in {
+                "mindie-bench-ablation/1",
+                "mindie-bench-ablation/2",
+            }
+        has_ablation_input = any(_has_c4_schema_ablation(item) for item in inputs)
         if tier_val == "L4" and not has_ablation_input:
             tier_val = "L2"
             row["target_tier"] = "L2"

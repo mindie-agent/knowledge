@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from collections import Counter
 import hashlib
+import json
 import math
 import os
 from pathlib import Path
@@ -218,7 +219,7 @@ class RoutingIndex:
                     if line.strip()
                 ]
                 disk_rows = [r for r in disk_rows if isinstance(r, dict)]
-            except Exception:
+            except (OSError, ValueError):
                 disk_rows = []
         if disk_rows:
             ledger_entries = disk_rows
@@ -230,10 +231,13 @@ class RoutingIndex:
             stagnation_info = assess_stagnation(effective_entries) if effective_entries else {"stalled": False, "stalled_count": 0}
             stalled_count = int(stagnation_info.get("stalled_count", 0))
             has_prior_reuse = False
-            audit_candidates = [
+            audit_candidates = []
+            if ws_env and (Path(ws_env).parent / "profile").is_dir():
+                audit_candidates.append(Path(ws_env).parent / "profile" / "knowledge_query_audit.jsonl")
+            audit_candidates.extend([
                 cwd / "knowledge_query_audit.jsonl",
                 cwd.parent / "profile" / "knowledge_query_audit.jsonl",
-            ]
+            ])
             for audit_file in audit_candidates:
                 if audit_file.is_file():
                     try:
@@ -245,7 +249,7 @@ class RoutingIndex:
                         if any(isinstance(p, dict) and p.get("effective_mode") == "reuse" for p in prior):
                             has_prior_reuse = True
                             break
-                    except Exception:
+                    except (OSError, ValueError):
                         pass
             if workspace_gated and not has_prior_reuse:
                 mode = "reuse"
@@ -505,10 +509,16 @@ class RoutingIndex:
             payload["mode"] = mode
             def _write_query_audit(final_payload):
                 audit_targets = []
+                if ws_env and (Path(ws_env).parent / "profile").is_dir():
+                    audit_targets.append((Path(ws_env).parent / "profile" / "knowledge_query_audit.jsonl").resolve())
                 if cwd.name == "profile":
-                    audit_targets.append(cwd / "knowledge_query_audit.jsonl")
+                    p_cand = (cwd / "knowledge_query_audit.jsonl").resolve()
+                    if p_cand not in audit_targets:
+                        audit_targets.append(p_cand)
                 elif (cwd.parent / "profile").is_dir():
-                    audit_targets.append(cwd.parent / "profile" / "knowledge_query_audit.jsonl")
+                    p_cand = (cwd.parent / "profile" / "knowledge_query_audit.jsonl").resolve()
+                    if p_cand not in audit_targets:
+                        audit_targets.append(p_cand)
                 if not audit_targets:
                     return
                 mounted_l4 = [
@@ -544,7 +554,7 @@ class RoutingIndex:
                     try:
                         with target_file.open("a", encoding="utf-8") as fh:
                             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                    except Exception:
+                    except (OSError, ValueError):
                         pass
 
             if mode != "explore":
