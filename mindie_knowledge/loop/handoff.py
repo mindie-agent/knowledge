@@ -7,6 +7,8 @@
   transcripts, migrating storage, or calling any LLM.
 - Deduplicates events via `_event_hash(harness, kind, session, key)` and durable
   `Admission.claim`.
+- Service probe treats a missing or released `consumer.lock` as absent; leftover
+  `connection.json` is never live-owner proof.
 
 [Timeouts & Locks]
 - Uses `WAKE_PROBE_SECONDS = 2.0` for control-plane RPC liveness probing and
@@ -164,14 +166,15 @@ def _probe(config, timeout, *, config_path=None):
 
     # The service holds this OS lock until storage and listener are closed.
     # Windows may report a closed loopback port as a timeout for ~2 seconds;
-    # a released lifetime lock is stronger evidence than a short TCP probe.
+    # a released or missing lifetime lock is stronger evidence than a short
+    # TCP probe or a leftover connection.json fingerprint mismatch.
     consumer = filesystem_path(config["root"]) / config["domain"] / "consumer.lock"
     owner = lock_held(consumer)
     if owner is None:
         try:
             consumer.stat()
         except FileNotFoundError:
-            pass
+            owner = False
         except TimeoutError:
             raise
         except OSError:
@@ -183,6 +186,9 @@ def _probe(config, timeout, *, config_path=None):
     try:
         connection = connect(config, config_path=config_path)
     except FileNotFoundError:
+        return "starting" if owner is True else "absent"
+    except PermissionError:
+        # Windows CRT reports a concurrent atomic replace as EACCES.
         return "starting" if owner is True else "absent"
     except TimeoutError:
         raise

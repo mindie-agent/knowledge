@@ -283,6 +283,28 @@ def test_typed_query_and_unknown_state_are_strict(monkeypatch):
         host._unit("synthetic.service")
 
 
+def test_private_dir_check_is_windows_safe_without_getuid(tmp_path, monkeypatch):
+    root = tmp_path / ".systemd-service"
+    root.mkdir()
+    monkeypatch.delattr(os, "getuid", raising=False)
+    assert host._verify_private(root) == 0
+    assert host._private(root) == 0
+    (tmp_path / "not-a-dir").write_text("x")
+    with pytest.raises(host.ServiceHostError, match="unowned_directory"):
+        host._verify_private(tmp_path / "not-a-dir")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX UID/mode")
+def test_posix_private_dir_still_rejects_world_accessible(tmp_path):
+    root = tmp_path / ".systemd-service"
+    root.mkdir()
+    root.chmod(0o777)
+    with pytest.raises(host.ServiceHostError, match="unowned_directory"):
+        host._verify_private(root)
+    root.chmod(0o700)
+    assert host._verify_private(root) == os.getuid()
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX UID/mode and case semantics")
 def test_posix_transfer_is_private_one_use_and_preserves_case(tmp_path, monkeypatch):
     monkeypatch.setattr(context, "_windows", lambda: False)
