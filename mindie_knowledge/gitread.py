@@ -99,7 +99,8 @@ def run_stdout_to_file(argv, target, *, timeout=None, env=None, cancel=None):
         merged_env = with_windows_longpaths(merged_env)
     spawn = {}
     if os.name == "nt":
-        spawn["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        spawn["creationflags"] = (subprocess.CREATE_NEW_PROCESS_GROUP
+                                  | getattr(subprocess, "CREATE_NO_WINDOW", 0))
     else:
         spawn["start_new_session"] = True
     out_handle = open(target, "wb")
@@ -184,7 +185,8 @@ class CatFileBatch:
         merged_env = with_windows_longpaths(merged_env)
         spawn = {}
         if os.name == "nt":
-            spawn["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            spawn["creationflags"] = (subprocess.CREATE_NEW_PROCESS_GROUP
+                                      | getattr(subprocess, "CREATE_NO_WINDOW", 0))
         else:
             spawn["start_new_session"] = True
         try:

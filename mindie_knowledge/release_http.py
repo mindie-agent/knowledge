@@ -36,8 +36,9 @@ def token():
     value = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
     if value or not shutil.which("gh"):
         return value
+    kwargs = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if os.name == "nt" else {}
     result = subprocess.run(["gh", "auth", "token", "--hostname", "github.com"],
-                            capture_output=True, timeout=5, check=False)
+                            capture_output=True, timeout=5, check=False, **kwargs)
     return result.stdout.decode("utf-8").strip() if result.returncode == 0 else None
 
 
