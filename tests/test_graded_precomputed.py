@@ -9,6 +9,7 @@ import pytest
 
 from graded_fixture import OBSERVED, unit
 from mindie_knowledge.graded import index as index_module
+from mindie_knowledge.graded.index import response_token_estimate
 from mindie_knowledge.graded.repository import CATALOG_KEY, INDEX_KEY
 from mindie_knowledge.graded.units import GradedUnit
 from mindie_knowledge.loop.store import Store
@@ -24,6 +25,12 @@ def forbid_recomputation(monkeypatch):
         raise AssertionError("a current precomputed index must not parse YAML or tokenize bodies")
     monkeypatch.setattr(GradedUnit, "from_text", classmethod(unexpected))
     monkeypatch.setattr(index_module, "token_counts", unexpected)
+
+
+def test_query_elapsed_ms_does_not_shift_response_token_estimate():
+    short = {"results": [], "usage": {"estimated_tokens": 0}, "query_elapsed_ms": 1.2}
+    long = dict(short, query_elapsed_ms=12.345678901234)
+    assert response_token_estimate(short) == response_token_estimate(long)
 
 
 def test_reopened_query_preserves_scores_bodies_and_inheritance_without_recomputation(store, tmp_path, monkeypatch):

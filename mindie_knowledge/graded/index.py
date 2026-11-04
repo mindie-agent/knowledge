@@ -34,7 +34,13 @@ def token_estimate(text: str) -> int:
 
 
 def response_token_estimate(payload) -> int:
-    """Whole-response estimate over its canonical JSON serialization."""
+    """Whole-response estimate over its canonical JSON serialization.
+
+    Observation latency is not delivered knowledge: ``query_elapsed_ms`` must
+    not change the ceiling when its decimal spelling grows or shrinks.
+    """
+    if isinstance(payload, dict) and "query_elapsed_ms" in payload:
+        payload = {key: value for key, value in payload.items() if key != "query_elapsed_ms"}
     return token_estimate(canonical(payload))
 
 
