@@ -3,6 +3,8 @@
 [Invariants]
 - Markdown packages (`tasks/<id>/index.md` + `blocks/<hash>.md`) are the sole body
   authority; `.reme-index/` is a disposable derived index bound to `catalog.generation`.
+- One unreadable task is omitted from ranking and named as a fault. It does not
+  discard other tasks' derived rows or commit an empty generation over them.
 - `TechnicalTokenizerV1` preserves domain API/version/CJK token boundaries;
   chunk hashes and graph-to-BM25 document ID sets are verified on checkpoint load.
 
@@ -39,7 +41,9 @@ from ..loop.locks import StartLock
 from ..retrieval import query_tokens, tokens
 from .store import _canonical, _digest, _parse_block
 from .provenance import POLICY, body_tokens, citations, group_matches, page_groups
-from .references import block_ref, feedback_ref, parse_read_ref, task_ref
+from .references import (
+    MaterialHits, block_ref, feedback_ref, material_fault, parse_read_ref, task_ref,
+)
 from .catalog import signature, CurrentVisibility
 from .reme_checkpoint import ReMeCheckpoint
 
@@ -147,6 +151,27 @@ class VerifiedMarkdownFileChunker(MarkdownFileChunker):
         return self.verified[1]
 
 
+def _block_path(task_id, block_id):
+    return f"tasks/{task_id}/blocks/{block_id}.md"
+
+
+def _annotate_material_failure(exc, faults):
+    exc.mindie_material_faults = list(faults)
+    return exc
+
+
+def _retarget_unreadable_cites(groups, fault_ids, domain):
+    """A present task that could not be read is not an absent citation."""
+    def visit(items):
+        for item in items:
+            for citation in item.get("cites") or ():
+                if (citation.get("source_domain") == domain
+                        and citation.get("source_task_id") in fault_ids):
+                    citation["citation_status"] = "unreadable"
+            visit(item.get("related") or ())
+    visit(groups)
+
+
 class ReMeIndex:
     def __init__(self, root, domain):
         self.root = Path(root)
@@ -164,6 +189,10 @@ class ReMeIndex:
         self._eligible_cache = {}
         self._chunk_body_terms = {}
         self._body_term_pool = {}
+        self._read_faults = []
+        self._read_causes = []
+        self._unbound_ids = set()
+        self._unbound_scan = False
 
     def clear_query_terms(self):
         self._chunk_body_terms.clear()
@@ -247,82 +276,104 @@ class ReMeIndex:
                 self.task_paths.setdefault(path.split("/")[1], set()).add(path)
             self._generation = generation
             self._eligible_cache.clear()
+            self._unbound_ids.clear()
+            self._unbound_scan = True
 
     def _refresh(self, tasks, catalog):
         self._load()
         generation = catalog.generation
+        self._read_faults = []
+        self._read_causes = []
         if self._generation > generation:
             raise ValueError("ReMe checkpoint is newer than the current material catalog")
-        if self._generation == generation:
-            return
-        try:
-            self._apply_changes(tasks, catalog, generation)
-        except BaseException as exc:
-            # Chunking, deletion and upsert mutate memory before persistence.
-            # Restore the committed checkpoint on the next attempt even when
-            # failure happened before the checkpoint transaction began.
+        if self._generation != generation:
             try:
-                self.runner.run(self._close())
-            except BaseException as cleanup:
-                exc.add_note(f"ReMe cleanup also failed: {type(cleanup).__name__}: {cleanup}")
-            self._generation = None
+                self._apply_changes(tasks, catalog, generation)
+            except BaseException as exc:
+                self._rollback_index(exc)
+                raise
+        # A warm query must not walk every current task. Scan once after load,
+        # then retry only ids already known to be missing from the checkpoint.
+        if self._unbound_scan:
+            self._collect_unbound(tasks)
+            self._unbound_scan = False
+        try:
+            self._recover_unbound(tasks, getattr(catalog, "_row_faults", {}))
+        except BaseException as exc:
+            # A commit that did finish stays in the checkpoint; memory reloads it.
+            self._rollback_index(exc)
             raise
+        self._fail_if_every_task_unreadable(tasks)
 
-    def _apply_changes(self, tasks, catalog, generation):
-        desired, deleted = {}, set()
-        for change in catalog.changes(self._generation):
-            task_id = change["task_id"]
-            task = tasks.get(task_id)
-            paths = set()
-            for block in task["blocks"] if task else ():
-                rel = f"tasks/{task_id}/blocks/{block['block_id']}.md"
-                paths.add(rel)
-                if self.bindings.get(rel, {}).get("descriptor") != _digest(block):
-                    desired[rel] = block
-            deleted.update(self.task_paths.get(task_id, set()) - paths)
-            if paths:
-                self.task_paths[task_id] = paths
-            else:
-                self.task_paths.pop(task_id, None)
+    def _rollback_index(self, exc):
+        # Chunking, deletion and upsert mutate memory before persistence.
+        # Restore the committed checkpoint on the next attempt even when
+        # failure happened before the checkpoint transaction began.
+        try:
+            self.runner.run(self._close())
+        except BaseException as cleanup:
+            exc.add_note(f"ReMe cleanup also failed: {type(cleanup).__name__}: {cleanup}")
+        self._generation = None
+
+    def _fail_if_every_task_unreadable(self, tasks):
+        failed = {fault["task_id"] for fault in self._read_faults}
+        if tasks and failed >= set(tasks):
+            raise _annotate_material_failure(self._read_causes[0], self._read_faults)
+
+    def _stage_block(self, rel, block):
+        # Validate authoritative bytes before ReMe's derived text
+        # normalization; universal-newline reads would hide corruption.
+        text = (self.root / rel).read_bytes().decode("utf-8")
+        body = _parse_block(text, block)
+        direct_tokens = body_tokens(body)
+        cites = citations(body)
+        self.chunker.verified = (self.root / rel, text)
+        try:
+            node, chunks = self.runner.run(self.chunker.chunk(self.root / rel))
+        finally:
+            self.chunker.verified = None
+        # Fallible block headers travel with the package. Consumers reuse
+        # them locally and never pay another model to summarize the body.
+        for chunk in chunks:
+            prefix = block["title"] + "\n" + block["summary"] + "\n"
+            chunk.metadata.update(mindie_policy=POLICY, mindie_body_offset=len(prefix))
+            chunk.text = prefix + chunk.text
+            chunk.set_hash_id()
+        node.chunk_ids = [chunk.id for chunk in chunks]
+        record = dict(
+            binding=dict(descriptor=_digest(block), signature=signature(self.root / rel)),
+            metadata=dict(body_tokens=direct_tokens, cites=cites),
+            node=node.model_dump(mode="json"),
+            chunks=[dict(value=chunk.model_dump(mode="json"),
+                         frequencies=dict(Counter(self.store.keyword_index._tokenize(chunk.text))))
+                    for chunk in chunks],
+        )
+        return (node, chunks), record
+
+    def _remember_fault(self, task_id, exc, block_id):
+        # Remember the id even when this search already recorded the fault,
+        # so the next search can retry a repaired package without a full walk.
+        self._unbound_ids.add(task_id)
+        if any(fault["task_id"] == task_id for fault in self._read_faults):
+            return
+        self._read_faults.append(material_fault(self.domain, task_id, exc, block_id=block_id))
+        self._read_causes.append(exc)
+
+    def _commit_index(self, changed, deleted, generation):
         if deleted:
             self.runner.run(self.store.delete(list(deleted)))
-        changed, upserts = {}, []
-        for rel, block in desired.items():
-            # Validate authoritative bytes before ReMe's derived text
-            # normalization; universal-newline reads would hide corruption.
-            text = (self.root / rel).read_bytes().decode("utf-8")
-            body = _parse_block(text, block)
-            direct_tokens = body_tokens(body)
-            cites = citations(body)
-            self.chunker.verified = (self.root / rel, text)
-            try:
-                node, chunks = self.runner.run(self.chunker.chunk(self.root / rel))
-            finally:
-                self.chunker.verified = None
-            # Fallible block headers travel with the package. Consumers reuse
-            # them locally and never pay another model to summarize the body.
-            for chunk in chunks:
-                prefix = block["title"] + "\n" + block["summary"] + "\n"
-                chunk.metadata.update(mindie_policy=POLICY, mindie_body_offset=len(prefix))
-                chunk.text = prefix + chunk.text
-                chunk.set_hash_id()
-            node.chunk_ids = [chunk.id for chunk in chunks]
-            upserts.append((node, chunks))
-            binding = dict(descriptor=_digest(block), signature=signature(self.root / rel))
-            metadata = dict(body_tokens=direct_tokens, cites=cites)
-            changed[rel] = dict(binding=binding, metadata=metadata, node=node.model_dump(mode="json"),
-                chunks=[dict(value=chunk.model_dump(mode="json"),
-                             frequencies=dict(Counter(self.store.keyword_index._tokenize(chunk.text)))) for chunk in chunks])
+        upserts = [value["upsert"] for value in changed.values()]
         # ReMe's native batch API extends each term posting once. A call per
         # block repeatedly copies the growing arrays. These are references to
         # the chunks the in-memory store must retain, not a second body corpus.
         if upserts:
             self.runner.run(self.store.upsert(upserts))
-        self.checkpoint.commit(changed, deleted, generation)
+        stored = {path: value["record"] for path, value in changed.items()}
+        self.checkpoint.commit(stored, deleted, generation)
         for path in deleted:
             self.bindings.pop(path, None)
             self.file_metadata.pop(path, None)
-        for path, value in changed.items():
+        for path, value in stored.items():
             self.bindings[path] = value["binding"]
             self.file_metadata[path] = value["metadata"]
         keyword = self.store.keyword_index
@@ -331,6 +382,97 @@ class ReMeIndex:
         self._generation = generation
         self._eligible_cache.clear()
         self._prune_query_terms()
+
+    def _apply_changes(self, tasks, catalog, generation):
+        desired, deleted = {}, set()
+        for change in catalog.changes(self._generation):
+            task_id = change["task_id"]
+            task = tasks.get(task_id)
+            paths = set()
+            for block in task["blocks"] if task else ():
+                rel = _block_path(task_id, block["block_id"])
+                paths.add(rel)
+                if self.bindings.get(rel, {}).get("descriptor") != _digest(block):
+                    desired[rel] = block
+            deleted.update(self.task_paths.get(task_id, set()) - paths)
+            if paths:
+                self.task_paths[task_id] = paths
+            else:
+                self.task_paths.pop(task_id, None)
+        by_task = {}
+        for rel, block in desired.items():
+            by_task.setdefault(rel.split("/")[1], []).append((rel, block))
+        changed, failed = {}, {}
+        for task_id, blocks in by_task.items():
+            prepared, block_id = [], None
+            try:
+                for rel, block in blocks:
+                    block_id = block["block_id"]
+                    upsert, record = self._stage_block(rel, block)
+                    prepared.append((rel, upsert, record))
+            except TimeoutError:
+                raise
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                failed[task_id] = (block_id, exc)
+                self._remember_fault(task_id, exc, block_id)
+                continue
+            self._unbound_ids.discard(task_id)
+            for rel, upsert, record in prepared:
+                changed[rel] = dict(upsert=upsert, record=record)
+        for task_id in failed:
+            deleted.update(self.task_paths.get(task_id, ()))
+            for block in tasks.get(task_id, {}).get("blocks", ()):
+                deleted.add(_block_path(task_id, block["block_id"]))
+        if failed and set(tasks) <= set(failed):
+            # Every current task failed. Keep the last committed checkpoint.
+            raise _annotate_material_failure(self._read_causes[0], self._read_faults)
+        self._commit_index(changed, deleted, generation)
+
+    def _collect_unbound(self, tasks):
+        for ident, task in tasks.items():
+            if any(self.bindings.get(_block_path(ident, block["block_id"]), {}).get("descriptor")
+                   != _digest(block) for block in task["blocks"]):
+                self._unbound_ids.add(ident)
+
+    def _recover_unbound(self, tasks, row_faults):
+        """Retry ids left out of the checkpoint. Do not walk every current task."""
+        skip = {fault["task_id"] for fault in self._read_faults}
+        changed, deleted = {}, set()
+        for ident in list(self._unbound_ids):
+            if ident in skip:
+                continue
+            task = tasks.get(ident)
+            if task is None:
+                if ident in row_faults:
+                    continue
+                deleted.update(self.task_paths.get(ident, ()))
+                self._unbound_ids.discard(ident)
+                continue
+            pending = [block for block in task["blocks"]
+                       if self.bindings.get(_block_path(ident, block["block_id"]), {}).get("descriptor")
+                       != _digest(block)]
+            if not pending:
+                self._unbound_ids.discard(ident)
+                continue
+            prepared, block_id = [], None
+            try:
+                for block in pending:
+                    block_id = block["block_id"]
+                    rel = _block_path(ident, block["block_id"])
+                    upsert, record = self._stage_block(rel, block)
+                    prepared.append((rel, upsert, record))
+            except TimeoutError:
+                raise
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                self._remember_fault(ident, exc, block_id)
+                for block in task["blocks"]:
+                    deleted.add(_block_path(ident, block["block_id"]))
+                continue
+            self._unbound_ids.discard(ident)
+            for rel, upsert, record in prepared:
+                changed[rel] = dict(upsert=upsert, record=record)
+        if changed or deleted:
+            self._commit_index(changed, deleted, self._generation)
 
     def verify_path(self, path, descriptor):
         binding = self.bindings.get(path)
@@ -375,35 +517,70 @@ class ReMeIndex:
             paths.append(path)
         return paths
 
+    def _select_eligible(self, tasks, allowed_ids, conditions):
+        eligible = {}
+        faulted = {fault["task_id"] for fault in self._read_faults}
+        for ident, task in tasks.items():
+            if ident in faulted:
+                continue
+            entry = task["entry"]
+            if allowed_ids is not None and ident not in allowed_ids:
+                continue
+            if isinstance(allowed_ids, Mapping) and allowed_ids[ident] != entry["revision"]:
+                self._remember_fault(ident, ValueError("metadata and current material revision differ"), None)
+                continue
+            if entry["kind"] == "knowledge" and any(
+                key in entry["conditions"] and entry["conditions"][key] != str(value)
+                for key, value in (conditions or {}).items()
+            ):
+                continue
+            paths = []
+            missing = None
+            for block in task["blocks"]:
+                path = _block_path(ident, block["block_id"])
+                if path not in self.store.file_graph._nodes:
+                    missing = block
+                    break
+                paths.append((path, block))
+            if missing is not None:
+                self._remember_fault(
+                    ident, ValueError("current block is not in the derived index"), missing["block_id"])
+                continue
+            for path, block in paths:
+                eligible[path] = (ident, task, block)
+        self._fail_if_every_task_unreadable(tasks)
+        faulted = {fault["task_id"] for fault in self._read_faults}
+        if faulted:
+            eligible = {path: item for path, item in eligible.items() if item[0] not in faulted}
+        chunk_ids = {cid for path in eligible for cid in self.store.file_graph._nodes[path].chunk_ids
+                     if cid in self.store.keyword_index.document_ids}
+        return eligible, chunk_ids, _digest(sorted(eligible))
+
     def search(self, tasks, query, limit, conditions, allowed_ids, continuation=None, *, catalog):
         lock = StartLock(self.root / ".index.lock", wait=5.0)
         lock.acquire(wait=5.0)
         try:
             self._refresh(tasks, catalog)
-            cacheable = allowed_ids is None or isinstance(allowed_ids, CurrentVisibility)
+            # A damaged header is not an unpromoted pointer. Unpromoted metadata
+            # still fails the whole query, with no per-task fault attached.
+            row_faults = getattr(catalog, "_row_faults", {})
+            if allowed_ids is not None and set(allowed_ids) - set(tasks) - set(row_faults):
+                raise ValueError("metadata references material pointers not yet promoted")
+            for ident, exc in row_faults.items():
+                self._remember_fault(ident, exc, None)
+            cacheable = not self._read_faults and (
+                allowed_ids is None or isinstance(allowed_ids, CurrentVisibility))
             cache_key = (self._generation, _canonical(conditions or {}), id(allowed_ids))
             cached = self._eligible_cache.get(cache_key) if cacheable else None
+            if cached is not None and any(
+                path not in self.store.file_graph._nodes for path in cached[1]
+            ):
+                cached = None
             if cached is None:
-                eligible = {}
-                if allowed_ids is not None and set(allowed_ids) - set(tasks):
-                    raise ValueError("metadata references material pointers not yet promoted")
-                for ident, task in tasks.items():
-                    entry = task["entry"]
-                    if allowed_ids is not None and ident not in allowed_ids:
-                        continue
-                    if isinstance(allowed_ids, Mapping) and allowed_ids[ident] != entry["revision"]:
-                        raise ValueError("metadata and current material revision differ")
-                    if entry["kind"] == "knowledge" and any(
-                        key in entry["conditions"] and entry["conditions"][key] != str(value)
-                        for key, value in (conditions or {}).items()
-                    ):
-                        continue
-                    for block in task["blocks"]:
-                        eligible[f"tasks/{ident}/blocks/{block['block_id']}.md"] = (ident, task, block)
-                chunk_ids = {cid for path in eligible for cid in self.store.file_graph._nodes[path].chunk_ids
-                             if cid in self.store.keyword_index.document_ids}
-                cached = (allowed_ids, eligible, chunk_ids, _digest(sorted(eligible)))
-                if cacheable:
+                eligible, chunk_ids, eligible_fingerprint = self._select_eligible(
+                    tasks, allowed_ids, conditions)
+                cached = (allowed_ids, eligible, chunk_ids, eligible_fingerprint)
+                if cacheable and not self._read_faults:
                     if len(self._eligible_cache) >= 8:
                         self._eligible_cache.pop(next(iter(self._eligible_cache)))
                     self._eligible_cache[cache_key] = cached
@@ -416,7 +593,8 @@ class ReMeIndex:
             query_terms = set(query_tokens(query))
             if exact_paths is not None:
                 matches = [self.store.file_chunks[cid] for path in exact_paths
-                           for cid in self.store.file_graph._nodes[path].chunk_ids]
+                           for cid in getattr(self.store.file_graph._nodes.get(path), "chunk_ids", ())
+                           if cid in self.store.file_chunks]
             elif eligible:
                 expanded_query = " ".join(query_tokens(query)) or query
                 scores = self.runner.run(self.store.keyword_index.retrieve_filtered(
@@ -427,9 +605,16 @@ class ReMeIndex:
                 matches = []
             output = {}
             for chunk in matches:
-                ident, task, block = eligible[chunk.path]
+                located = eligible.get(chunk.path)
+                if located is None:
+                    continue
+                ident, task, block = located
+                source_metadata = self.file_metadata.get(chunk.path)
+                if source_metadata is None:
+                    self._remember_fault(
+                        ident, ValueError("current block is not in the derived index"), block["block_id"])
+                    continue
                 metadata = chunk.metadata
-                source_metadata = self.file_metadata[chunk.path]
                 if (metadata.get("mindie_policy") != POLICY
                         or type(metadata.get("mindie_body_offset")) is not int
                         or not 0 <= metadata["mindie_body_offset"] <= len(chunk.text)
@@ -477,6 +662,11 @@ class ReMeIndex:
                     match_basis="identity" if exact_paths is not None else "body" if matched_terms else "index",
                     _body_terms=matched_terms, _cites=source_metadata["cites"],
                     _selection_rank=selection_rank)
+            if self._read_faults:
+                faulted = {fault["task_id"] for fault in self._read_faults}
+                output = {path: item for path, item in output.items() if item["entry_id"] not in faulted}
+                self._eligible_cache.pop(cache_key, None)
+                self._fail_if_every_task_unreadable(tasks)
             if exact_paths:
                 # Exact lookup is navigation of the requested object. It must
                 # never be redirected to a cited source by lexical grouping.
@@ -489,8 +679,13 @@ class ReMeIndex:
                           if public else [])
             else:
                 groups = group_matches(list(output.values()), tasks, self.domain)
-            return page_groups(groups, query=query, conditions=conditions, fingerprint=fingerprint,
+            if self._read_faults:
+                _retarget_unreadable_cites(
+                    groups, {fault["task_id"] for fault in self._read_faults}, self.domain)
+            page = page_groups(groups, query=query, conditions=conditions, fingerprint=fingerprint,
                                limit=limit, continuation=continuation)
+            cause = self._read_causes[0] if self._read_causes else None
+            return MaterialHits(page, self._read_faults, cause)
         finally:
             lock.release()
 

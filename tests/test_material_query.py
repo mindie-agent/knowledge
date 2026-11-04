@@ -4,6 +4,8 @@ These are authored fixtures, not real task records or model outputs. They cover
 first observations, paraphrases, failed reuse and maintenance without a model.
 """
 import hashlib
+import json
+import traceback
 from pathlib import Path
 
 import pytest
@@ -201,14 +203,55 @@ def test_exact_task_and_block_lookups_do_not_redirect_to_a_source(materials):
         assert not hit["related"]
 
 
+def _entry_ids(results):
+    found = []
+
+    def walk(items):
+        for item in items:
+            if item.get("entry_id"):
+                found.append(item["entry_id"])
+            walk(item.get("related") or ())
+
+    walk(results)
+    return found
+
+
+def _cites(results):
+    found = []
+
+    def walk(items):
+        for item in items:
+            found.extend(item.get("cites") or ())
+            walk(item.get("related") or ())
+
+    walk(results)
+    return found
+
+
 def test_present_source_corruption_is_not_misreported_as_missing_citation(materials):
     a = record(materials, "A", "RMSNorm calibration matched the reference.")
-    record(materials, "B", f"RMSNorm calibration readback from {ref(a)}.")
+    b = record(materials, "B", f"RMSNorm calibration readback from {ref(a)}.")
     materials.search("RMSNorm calibration")
     path = materials.root / "tasks" / a["task_id"] / "blocks" / (a["blocks"][0]["block_id"] + ".md")
-    path.write_bytes(path.read_bytes() + b"corrupt")
+    original = path.read_bytes()
+    path.write_bytes(original + b"corrupt")
+    found = materials.search("RMSNorm calibration")
+    assert a["task_id"] not in _entry_ids(found)
+    assert b["task_id"] in _entry_ids(found)
+    fault = found.material_faults[0]
+    assert fault["task_id"] == a["task_id"]
+    assert fault["reason"] == "block_hash_mismatch"
+    assert fault["error_code"] == "material_corrupt"
+    cites = [item for item in _cites(found) if item["source_task_id"] == a["task_id"]]
+    assert cites
+    assert {item["citation_status"] for item in cites} == {"unreadable"}
+    assert all(item["citation_status"] != "missing" for item in _cites(found))
+    assert cites[0]["current_source_ref"] == ref(a)
+    assert path.read_bytes() == original + b"corrupt"
+    assert materials.index_status()["phase"] == "failed"
+    assert materials._index._chunk_body_terms
     with pytest.raises(ValueError, match="hash mismatch"):
-        materials.search("RMSNorm calibration")
+        materials.get_document(a["task_id"])
 
 
 def test_citation_only_identifiers_do_not_establish_body_match(materials):
@@ -320,3 +363,140 @@ def test_query_rpc_distinguishes_cursor_input_from_present_material_failure(stor
         service.http.shutdown()
         service.http.server_close()
         thread.join(timeout=5)
+
+
+def test_one_corrupt_catalog_header_does_not_hide_the_other_task(materials):
+    good = record(materials, "good header", "shared-catalog-token healthy body")
+    bad = record(materials, "bad header", "shared-catalog-token damaged body")
+    catalog = materials._current_catalog()
+    assert catalog._seen == -1
+    saved = catalog.db.execute(
+        "SELECT header FROM tasks WHERE task_id=?", (bad["task_id"],)).fetchone()[0]
+    catalog.db.execute("UPDATE tasks SET header=? WHERE task_id=?", ("{broken", bad["task_id"]))
+    catalog.db.commit()
+    block = materials.root / "tasks" / bad["task_id"] / "blocks" / (bad["blocks"][0]["block_id"] + ".md")
+    before = block.read_bytes()
+    found = materials.search("shared-catalog-token")
+    assert _entry_ids(found) == [good["task_id"]]
+    fault = found.material_faults[0]
+    assert fault["task_id"] == bad["task_id"]
+    assert fault["reason"] == "manifest_unreadable"
+    assert fault["error_code"] == "material_corrupt"
+    assert str(materials.root) not in json.dumps(fault)
+    assert block.read_bytes() == before
+    catalog.db.execute("UPDATE tasks SET header=? WHERE task_id=?", (saved, bad["task_id"]))
+    catalog.db.commit()
+    restored = materials.search("damaged body")
+    assert bad["task_id"] in _entry_ids(restored)
+    assert not restored.material_faults
+
+
+def _open_query_service(store, tmp_path):
+    import threading
+    from mindie_knowledge.loop.activation import Admission
+    from mindie_knowledge.loop.engine import Engine
+    from mindie_knowledge.loop.transport import Service
+    from conftest import make_admission, write_settings
+
+    settings = tmp_path / "community.json"
+    write_settings(settings, consent_choice="contribute", enabled=False, roots=[tmp_path])
+    admission = Admission(make_admission(tmp_path, project_root=tmp_path))
+    engine = Engine(store, settings_path=settings, admission=admission)
+    service = Service(engine, admission=admission)
+    thread = threading.Thread(target=service.http.serve_forever, daemon=True)
+    thread.start()
+    return service, thread
+
+
+def _shutdown_query_service(service, thread):
+    service.http.shutdown()
+    service.http.server_close()
+    thread.join(timeout=5)
+
+
+def test_one_unreadable_material_does_not_fail_the_graded_query(store, tmp_path, monkeypatch):
+    """AD #312: knowledge.rpc query must not die at _query_materials for one bad package."""
+    from graded_fixture import unit
+    from mindie_knowledge.loop.transport import rpc
+    from mindie_knowledge.materials.references import MaterialReadError, block_ref
+
+    owner = "a" * 64
+    good = store.create_draft(kind="experience", title="Healthy", summary="Readable.",
+                              content="HealthyMarkerToken stays in the result.", owner=owner)
+    bad = store.create_draft(kind="experience", title="Damaged", summary="Unreadable.",
+                             content="DamagedMarkerToken must not be served.", owner=owner)
+    task = store.materials.read_task(bad["entry_id"])
+    block = task["blocks"][0]
+    path = store.materials.root / "tasks" / bad["entry_id"] / "blocks" / (block["block_id"] + ".md")
+    original = path.read_bytes()
+    path.write_bytes(original + b"corrupt")
+    isolated = store.query("HealthyMarkerToken")
+    assert good["entry_id"] in _entry_ids(isolated["results"])
+    assert bad["entry_id"] not in _entry_ids(isolated["results"])
+    assert isolated["material_faults"][0]["task_id"] == bad["entry_id"]
+    assert isolated["material_faults"][0]["reason"] == "block_hash_mismatch"
+    assert "material_faults names each task" in isolated["note"]
+    assert path.read_bytes() == original + b"corrupt"
+    bad_ref = block_ref(store.domain, bad["entry_id"], block["block_id"], block["sha256"])
+    with pytest.raises(MaterialReadError) as explained:
+        store.explain(bad_ref)
+    assert explained.value.code == "material_corrupt"
+    store.graded.install([unit()])
+    recorded = []
+    monkeypatch.setattr("mindie_knowledge.loop.transport.failure",
+                        lambda *args, **kwargs: recorded.append(kwargs))
+    service, thread = _open_query_service(store, tmp_path)
+    identity = dict(_session_id="manual-A", _session_verified=True)
+    try:
+        remote = rpc(service.connection, "query", dict(identity, query="HealthyMarkerToken"))
+    finally:
+        _shutdown_query_service(service, thread)
+    assert good["entry_id"] in _entry_ids(remote["results"])
+    assert bad["entry_id"] not in _entry_ids(remote["results"])
+    assert remote["material_faults"][0]["reason"] == "block_hash_mismatch"
+    assert str(store.materials.root) not in json.dumps(remote["material_faults"])
+    assert not any(item.get("category") == "material_corrupt" for item in recorded)
+    again = store.query("HealthyMarkerToken")
+    assert again["material_faults"][0]["task_id"] == bad["entry_id"]
+    path.write_bytes(original)
+    restored = store.query("DamagedMarkerToken")
+    assert bad["entry_id"] in _entry_ids(restored["results"])
+    assert "material_faults" not in restored
+
+
+def test_catalog_wide_pointer_damage_still_fails_query_on_the_reported_stack(store, tmp_path, monkeypatch):
+    """The reported do_POST → _query_materials fingerprint stays a hard failure."""
+    from graded_fixture import unit
+    from mindie_knowledge.loop.transport import rpc
+    from mindie_knowledge.materials.references import MaterialReadError
+
+    store.create_draft(kind="experience", title="Preserved", summary="Observation.",
+                       content="material canary stays on disk", owner="a" * 64)
+    store.graded.install([unit()])
+    path = store.materials.root / "current.json"
+    path.write_text("{}\n", encoding="utf-8")
+    captured = {}
+
+    def grab(*_args, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr("mindie_knowledge.loop.transport.failure", grab)
+    service, thread = _open_query_service(store, tmp_path)
+    identity = dict(_session_id="manual-A", _session_verified=True)
+    try:
+        with pytest.raises(MaterialReadError) as caught:
+            rpc(service.connection, "query", dict(identity, query="material"))
+    finally:
+        _shutdown_query_service(service, thread)
+    assert caught.value.code == "material_corrupt"
+    assert "do_POST" not in {frame.name for frame in traceback.extract_tb(caught.value.__traceback__)}
+    assert path.read_text(encoding="utf-8") == "{}\n"
+    server = captured["exception"]
+    assert captured["stage"] == "query"
+    assert captured["category"] == "material_corrupt"
+    assert isinstance(server, MaterialReadError)
+    assert isinstance(server.__cause__, ValueError)
+    names = [frame.name for frame in traceback.extract_tb(server.__traceback__)]
+    cursor = 0
+    for function in ("do_POST", "call", "_dispatch", "query", "_query_materials"):
+        cursor = names.index(function, cursor) + 1

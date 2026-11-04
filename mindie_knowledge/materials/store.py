@@ -5,6 +5,8 @@
   caches validated headers and current pointers.
 - Two-phase promotion stages candidates first, retains `current.json` pointers
   atomically, and retires only unreferenced candidate directories.
+- One unreadable current task is omitted from search and named; catalog-wide
+  pointer or checkpoint damage still fails the whole query.
 - Manifest/package validation lives in `package_format` and is re-exported here.
 
 [Timeouts & Locks]
@@ -54,6 +56,43 @@ from .package_format import (
     package_from_files,
     validate_package_files,
 )
+
+
+def _without_unreadable(results, bad_ids):
+    """Drop hits for tasks that failed verification and keep their citations honest."""
+    def mark(item):
+        for citation in item.get("cites") or ():
+            ref = citation.get("current_source_ref")
+            if citation.get("source_task_id") in bad_ids or ref in bad_refs:
+                citation["citation_status"] = "unreadable"
+        return item
+
+    bad_refs = set()
+    def collect(items):
+        for item in items:
+            if item.get("entry_id") in bad_ids and item.get("ref"):
+                bad_refs.add(item["ref"])
+            collect(item.get("related") or ())
+    collect(results)
+    kept = []
+    for group in results:
+        related = []
+        dropped = False
+        for item in group.get("related") or ():
+            if item.get("entry_id") in bad_ids:
+                dropped = True
+                continue
+            related.append(mark(item))
+        if group.get("entry_id") in bad_ids:
+            for item in related:
+                kept.append(dict(item, related=[], related_count=0, related_next=None,
+                                 group_score=item.get("score", 0.0), group_basis="task"))
+            continue
+        mark(group)
+        if dropped:
+            group = dict(group, related=related, related_count=len(related), related_next=None)
+        kept.append(group)
+    return kept
 
 
 class MaterialStore:
@@ -576,10 +615,37 @@ class MaterialStore:
         with self._locked_current():
             return self._current_catalog().ensure_current()
 
-    def _verify_matches(self, results, tasks):
-        """Inspect selected authority, never stat every unrelated block."""
+    def _verify_selected(self, parsed, tasks, checked_tasks):
         from .catalog import signature
-        from .references import parse_read_ref
+        task_id = parsed["task_id"]
+        task = tasks[task_id]
+        if task_id not in checked_tasks:
+            path = self._manifest_path(task_id, task["entry"]["revision"])
+            current = signature(path)
+            if current is None:
+                raise FileNotFoundError("required current material manifest is missing")
+            if current != task["_manifest_signature"]:
+                header = self._header(task_id, task["entry"]["revision"])
+                if any(header[key] != task[key] for key in header):
+                    raise ValueError("current material catalog differs from the authoritative manifest")
+                task["_manifest_signature"] = current
+            checked_tasks.add(task_id)
+        if parsed["kind"] == "block":
+            block = next((block for block in task["blocks"] if block["block_id"] == parsed["block_id"]), None)
+            if block is None or block["sha256"] != parsed["sha256"]:
+                raise ValueError("search result is not a current material block")
+            self._index.verify_path(f"tasks/{task_id}/blocks/{block['block_id']}.md", block)
+
+    def _verify_matches(self, results, tasks):
+        """Inspect selected authority, never stat every unrelated block.
+
+        One task whose current bytes no longer match is omitted and named.
+        When every current task fails, the original read error is re-raised
+        and nothing is served.
+        """
+        from .references import MaterialHits, ReadReferenceError, material_fault, parse_read_ref
+        faults = list(getattr(results, "material_faults", ()))
+        cause = getattr(results, "material_cause", None)
         selected, checked_tasks = set(), set()
         def visit(items):
             for item in items:
@@ -590,26 +656,37 @@ class MaterialStore:
                         selected.add(citation["current_source_ref"])
                 visit(item.get("related", ()))
         visit(results)
+        failures = {}
         for ref in selected:
-            parsed = parse_read_ref(ref, domain=self.domain)
+            try:
+                parsed = parse_read_ref(ref, domain=self.domain)
+            except ReadReferenceError:
+                raise
             task_id = parsed["task_id"]
-            task = tasks[task_id]
-            if task_id not in checked_tasks:
-                path = self._manifest_path(task_id, task["entry"]["revision"])
-                current = signature(path)
-                if current is None:
-                    raise FileNotFoundError("required current material manifest is missing")
-                if current != task["_manifest_signature"]:
-                    header = self._header(task_id, task["entry"]["revision"])
-                    if any(header[key] != task[key] for key in header):
-                        raise ValueError("current material catalog differs from the authoritative manifest")
-                    task["_manifest_signature"] = current
-                checked_tasks.add(task_id)
-            if parsed["kind"] == "block":
-                block = next((block for block in task["blocks"] if block["block_id"] == parsed["block_id"]), None)
-                if block is None or block["sha256"] != parsed["sha256"]:
-                    raise ValueError("search result is not a current material block")
-                self._index.verify_path(f"tasks/{task_id}/blocks/{block['block_id']}.md", block)
+            if task_id in failures:
+                continue
+            try:
+                self._verify_selected(parsed, tasks, checked_tasks)
+            except TimeoutError:
+                raise
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                block_id = parsed.get("block_id") if parsed.get("kind") == "block" else None
+                failures[task_id] = (exc, block_id)
+        if failures:
+            if tasks and set(tasks) <= set(failures):
+                exc = next(iter(failures.values()))[0]
+                extra = [material_fault(self.domain, ident, item[0], block_id=item[1])
+                         for ident, item in failures.items()]
+                exc.mindie_material_faults = faults + extra
+                raise exc
+            results = _without_unreadable(list(results), set(failures))
+            known = {item["task_id"] for item in faults}
+            for ident, (exc, block_id) in failures.items():
+                if ident not in known:
+                    faults.append(material_fault(self.domain, ident, exc, block_id=block_id))
+            if cause is None:
+                cause = next(iter(failures.values()))[0]
+        return MaterialHits(results, faults, cause)
 
     def search(self, query=None, limit=5, conditions=None, allowed_ids=None, continuation=None):
         from .provenance import QueryContinuationError, query_request
@@ -623,7 +700,7 @@ class MaterialStore:
             try:
                 results = self._index.search(tasks, query, limit, conditions, allowed_ids,
                                              continuation=continuation, catalog=catalog)
-                self._verify_matches(results, tasks)
+                results = self._verify_matches(results, tasks)
             except QueryContinuationError:
                 # A stale/invalid caller cursor is not a broken derived index.
                 raise
@@ -632,8 +709,13 @@ class MaterialStore:
                 self._index_failure = type(exc).__name__
                 self._index_verified = None
                 raise
-            self._index_verified = generation
-            self._index_failure = None
+            if getattr(results, "material_faults", None):
+                # Partial reads stay visible. The index is not fully verified.
+                self._index_failure = "MaterialReadError"
+                self._index_verified = None
+            else:
+                self._index_verified = generation
+                self._index_failure = None
             return results
 
     def index_status(self):
@@ -662,8 +744,12 @@ class MaterialStore:
                 self._index_failure = type(exc).__name__
                 self._index_verified = None
                 raise
-            self._index_verified = fingerprint
-            self._index_failure = None
+            if self._index._read_faults:
+                self._index_failure = "MaterialReadError"
+                self._index_verified = None
+            else:
+                self._index_verified = fingerprint
+                self._index_failure = None
             return self.index_status()
 
     def close(self):
