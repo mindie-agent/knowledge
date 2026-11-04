@@ -451,7 +451,7 @@ def _summary_failure(detail):
 
 def _summary_diagnostics(db, session, roots, result):
     """Project counters and safe states in SQL; never load model output or body."""
-    from ..materials.summarizer import failure_detail
+    from ..materials.summarizer import SUMMARY_FAILURE_REASONS, failure_detail, terminal_diagnostic
     placeholders = ",".join("?" for _ in roots)
     scoped = f"""
         SELECT t.entry_id FROM transcript_tasks t LEFT JOIN captures c ON c.id=t.capture_id
@@ -506,6 +506,11 @@ def _summary_diagnostics(db, session, roots, result):
         for key, value in usage.items():
             totals[key] += value
         detail = failure_detail(dict(error=row['receipt_error'], error_reason=row['receipt_error_reason'])) if row['has_receipt'] else None
+        if detail is not None and detail.get('reason') == 'unknown_failure':
+            reported = terminal_diagnostic(state, dict(status=state, model_calls=calls, error=row['receipt_error'],
+                                                       error_reason='unknown_failure'))
+            if reported['category'] in SUMMARY_FAILURE_REASONS:
+                detail = failure_detail(dict(error=row['receipt_error'], error_reason=reported['category']))
         if len(attempts) < 5:
             attempts.append(dict(attempt_id=row['attempt_id'], status=state, billing_status=billing,
                                  **({'category': row['error']} if row['error'] in categories else {}),
