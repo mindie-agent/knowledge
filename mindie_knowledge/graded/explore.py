@@ -211,86 +211,90 @@ def read_bounded_jsonl(path: Path, *, max_bytes: int = 262144, max_rows: int = 1
     return rows
 
 
-def resolve_workspace_audit_paths(ws_env: str | None, cwd: Path, disk_ledger: Path | None) -> tuple[str, list[Path], list[Path]]:
-    """Resolve workspace scope key, audit read candidates, and audit write targets."""
-    if disk_ledger is not None:
-        ws_root = disk_ledger.parent.parent if disk_ledger.parent.name == "logs" else disk_ledger.parent
-    elif ws_env:
-        ws_root = Path(ws_env)
-    elif (cwd.parent / "workspace").is_dir():
-        ws_root = cwd.parent / "workspace"
-    else:
-        ws_root = cwd
+def _resolved_path(path: Path) -> Path:
     try:
-        scope_key = str(ws_root.resolve())
+        return path.resolve()
     except OSError:
-        scope_key = str(ws_root)
-    read_cands: list[Path] = []
-    write_targets: list[Path] = []
+        return path
 
-    def _add(target_list: list[Path], cand: Path) -> None:
-        try:
-            resolved = cand.resolve()
-        except OSError:
-            resolved = cand
-        if resolved not in target_list:
-            target_list.append(resolved)
 
-    if ws_env and (Path(ws_env).parent / "profile").is_dir():
-        p = Path(ws_env).parent / "profile" / "knowledge_query_audit.jsonl"
-        _add(read_cands, p)
-        _add(write_targets, p)
-    if cwd.name == "profile":
-        p = cwd / "knowledge_query_audit.jsonl"
-        _add(read_cands, p)
-        _add(write_targets, p)
-    elif (cwd.parent / "profile").is_dir():
-        p = cwd.parent / "profile" / "knowledge_query_audit.jsonl"
-        _add(read_cands, p)
-        _add(write_targets, p)
-    for logs_dir in (
-        [disk_ledger.parent] if disk_ledger is not None else []
-    ) + (
-        [Path(ws_env) / "logs"] if ws_env and (Path(ws_env) / "logs").is_dir() else []
-    ) + (
-        [cwd / "logs"] if (cwd / "logs").is_dir() else []
-    ) + (
-        [cwd.parent / "workspace" / "logs"] if (cwd.parent / "workspace" / "logs").is_dir() else []
-    ):
-        p = logs_dir / "knowledge_query_audit.jsonl"
-        _add(read_cands, p)
-        _add(write_targets, p)
-    _add(read_cands, cwd / "knowledge_query_audit.jsonl")
-    return scope_key, read_cands, write_targets
+def _path_within(root: Path, candidate: Path) -> bool:
+    try:
+        _resolved_path(candidate).relative_to(_resolved_path(root))
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def resolve_workspace_ledger(ws_env: str | None, cwd: Path) -> tuple[Path, Path | None, bool]:
+    """Return ``(workspace_root, ledger_or_none, workspace_gated)``.
+
+    An explicit bench workspace never falls through to another tree. Without
+    it, only a real ledger file gates explore — a directory named workspace does not.
+    """
+    if ws_env:
+        root = Path(ws_env)
+        ledger = root / "logs" / "experiment-ledger.jsonl"
+        return root, ledger if ledger.is_file() else None, True
+    for root in (cwd, cwd.parent / "workspace", cwd.parent / "work"):
+        ledger = root / "logs" / "experiment-ledger.jsonl"
+        if ledger.is_file():
+            return root, ledger, True
+    return cwd, None, False
+
+
+def resolve_workspace_audit_paths(workspace_root: Path, *, persist_root: bool = False) -> tuple[str, list[Path], list[Path]]:
+    """Audit path under this workspace only. A sibling profile audit is not prior reuse.
+
+    An existing ``logs/`` directory is the audit home. Otherwise a file is
+    created in the workspace root only for a gated workspace, never for an
+    ordinary cwd that has no ledger.
+    """
+    root = _resolved_path(workspace_root)
+    if (workspace_root / "logs").is_dir():
+        audit = workspace_root / "logs" / "knowledge_query_audit.jsonl"
+    elif persist_root and workspace_root.is_dir():
+        audit = workspace_root / "knowledge_query_audit.jsonl"
+    else:
+        return str(root), [], []
+    resolved = _resolved_path(audit)
+    paths = [resolved] if _path_within(root, resolved) else []
+    return str(root), list(paths), list(paths)
+
+
+def _reuse_record_matches_scope(obj: Any, scope_key: str) -> bool:
+    if not isinstance(obj, dict) or obj.get("effective_mode") != "reuse":
+        return False
+    recorded = obj.get("workspace_scope")
+    return recorded == scope_key if isinstance(recorded, str) and recorded.strip() else True
 
 
 def has_prior_reuse_audit(audit_paths: Sequence[Path], *, scope_key: str, memory_scopes: set[str], max_bytes: int = 262144) -> bool:
-    """Check whether a reuse query was recorded in memory or bounded audit logs."""
+    """True when this workspace already recorded reuse in memory or its own audit file."""
     if scope_key in memory_scopes:
         return True
+    root = Path(scope_key)
     for audit_file in audit_paths:
-        if not audit_file.is_file():
+        if not _path_within(root, audit_file) or not audit_file.is_file():
             continue
+        seen: list[dict] = []
         try:
             with audit_file.open("rb") as fh:
                 head_text = fh.read(max_bytes).decode("utf-8", errors="replace")
         except OSError:
-            continue
+            head_text = ""
         for line in head_text.splitlines():
-            text = line.strip()
-            if not text:
-                continue
             try:
-                obj = json.loads(text)
+                obj = json.loads(line.strip()) if line.strip() else None
             except ValueError:
-                continue
-            if isinstance(obj, dict) and obj.get("effective_mode") == "reuse":
-                memory_scopes.add(scope_key)
-                return True
-        for obj in read_bounded_jsonl(audit_file, max_bytes=max_bytes, max_rows=64):
-            if obj.get("effective_mode") == "reuse":
-                memory_scopes.add(scope_key)
-                return True
+                obj = None
+            if isinstance(obj, dict):
+                seen.append(obj)
+        if audit_file.stat().st_size > max_bytes:
+            seen.extend(read_bounded_jsonl(audit_file, max_bytes=max_bytes, max_rows=64))
+        if any(_reuse_record_matches_scope(obj, scope_key) for obj in seen):
+            memory_scopes.add(scope_key)
+            return True
     return False
 
 

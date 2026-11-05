@@ -7,7 +7,8 @@ are never inferred from a unit's tier, corpus path or unrelated nearby axioms.
 Shared parents are charged once per response; explain_closure never truncates a
 unit body and reports every budget miss explicitly.
 [Timeouts & Locks] No model/network work; build time is separate from query time.
-[Side-Effect Policy] Read explicit corpus roots only; never write or import tasks.
+[Side-Effect Policy] Reads explicit corpus roots and appends one audit line under
+that workspace only. A bench workspace never reads another tree's ledger. No task import.
 """
 from __future__ import annotations
 
@@ -202,25 +203,18 @@ class RoutingIndex:
         transition_reason = "requested_mode_preserved"
         stalled_count = 0
         distinct_candidate_hashes = []
+        distinct_refuted_candidate_hashes = []
         ws_env = os.environ.get("MINDIE_BENCH_WORKSPACE")
         cwd = Path.cwd()
-        ledger_candidates = []
-        if ws_env:
-            ledger_candidates.append(Path(ws_env) / "logs" / "experiment-ledger.jsonl")
-        ledger_candidates.extend([
-            cwd / "logs" / "experiment-ledger.jsonl",
-            cwd.parent / "workspace" / "logs" / "experiment-ledger.jsonl",
-            cwd.parent / "work" / "logs" / "experiment-ledger.jsonl",
-        ])
         from .explore import (
             assess_stagnation,
             has_prior_reuse_audit,
             read_bounded_jsonl,
             resolve_workspace_audit_paths,
+            resolve_workspace_ledger,
         )
-        disk_ledger = next((p for p in ledger_candidates if p.is_file()), None)
-        workspace_gated = bool(ws_env) or disk_ledger is not None or (cwd.parent / "workspace").is_dir()
-        scope_key, audit_candidates, audit_targets = resolve_workspace_audit_paths(ws_env, cwd, disk_ledger)
+        _workspace_root, disk_ledger, workspace_gated = resolve_workspace_ledger(ws_env, cwd)
+        scope_key, audit_candidates, audit_targets = resolve_workspace_audit_paths(_workspace_root, persist_root=workspace_gated)
         disk_rows = read_bounded_jsonl(disk_ledger) if disk_ledger is not None else []
         if disk_rows:
             ledger_entries = disk_rows
@@ -236,22 +230,22 @@ class RoutingIndex:
             )
             stalled_count = int(stagnation_info.get("stalled_count", 0))
             distinct_candidate_hashes = list(stagnation_info.get("distinct_candidate_hashes") or ())
+            distinct_refuted_candidate_hashes = list(stagnation_info.get("distinct_refuted_candidate_hashes") or ())
             has_prior_reuse = has_prior_reuse_audit(
-                audit_candidates, scope_key=scope_key, memory_scopes=self._prior_reuse_scopes
-            )
-            if workspace_gated and not has_prior_reuse:
-                mode = "reuse"
-                transition_reason = "prior_reuse_required_before_explore"
-            elif stagnation_info.get("promotion_ready"):
-                if requested_mode == "reuse" and (has_prior_reuse or not workspace_gated):
-                    auto_switched_from_reuse = True
-                    transition_reason = "auto_promoted_from_reuse_on_stagnation"
-                else:
-                    transition_reason = "caller_requested_explore_with_verified_stagnation"
-                mode = "explore"
-            elif workspace_gated and mode == "explore":
-                mode = "reuse"
-                transition_reason = "stagnation_threshold_not_met"
+                audit_candidates, scope_key=scope_key, memory_scopes=self._prior_reuse_scopes)
+            floor = workspace_gated and not has_prior_reuse
+            promotable = bool(stagnation_info.get("promotion_ready")) and (has_prior_reuse or not workspace_gated)
+            if floor:
+                mode, transition_reason = "reuse", "prior_reuse_required_before_explore"
+            elif requested_mode == "diagnose":
+                mode, transition_reason = "diagnose", "diagnose_preserved"
+            elif promotable and requested_mode == "reuse":
+                auto_switched_from_reuse, mode = True, "explore"
+                transition_reason = "auto_promoted_from_reuse_on_stagnation"
+            elif promotable and requested_mode == "explore":
+                mode, transition_reason = "explore", "caller_requested_explore_with_verified_stagnation"
+            elif workspace_gated and requested_mode == "explore":
+                mode, transition_reason = "reuse", "stagnation_threshold_not_met"
         if token_budget is None:
             token_budget = 24000 if mode == "explore" else 8000
         if conditions is not None and not isinstance(conditions, dict):
@@ -387,6 +381,8 @@ class RoutingIndex:
             missing = [reason.split(":", 1)[0] for reason in applicability[ident].reasons
                        if reason.endswith(("not supplied", "version not supplied"))]
             for parent in self.closure[ident]:
+                if explore_disabled and self.units[parent].metadata["tier"] == "L4":
+                    continue
                 status = applicability[parent]
                 if status.status != "matched":
                     inherited = [reason.split(":", 1)[0] for reason in status.reasons
@@ -415,7 +411,10 @@ class RoutingIndex:
                     "ready_to_apply": ready,
                     "conditions_matched": applicability[ident].status == "matched",
                     "missing_conditions": missing,
-                    "inherits_from": list(unit.metadata["inherits_from"]),
+                    "inherits_from": [
+                        parent for parent in unit.metadata["inherits_from"]
+                        if not (explore_disabled and self.units[parent].metadata["tier"] == "L4")
+                    ],
                     "body_token_estimate": token_estimate(unit.body),
                     "closure_token_estimate": token_estimate(unit.body) + sum(
                         token_estimate(self.units[parent].body) for parent in self.closure[ident]),
@@ -526,7 +525,9 @@ class RoutingIndex:
                     "auto_switched_from_reuse": auto_switched_from_reuse,
                     "transition_reason": transition_reason,
                     "observed_failed_attempts": stalled_count,
+                    "workspace_scope": scope_key,
                     "distinct_candidate_hashes": distinct_candidate_hashes[-16:],
+                    "observed_candidate_hashes": distinct_refuted_candidate_hashes[-16:],
                     "ledger_run_ids": run_ids,
                     "delivered_unit_ids": [
                         r.get("id") for r in final_payload.get("results", ()) if isinstance(r, dict)
@@ -687,6 +688,9 @@ class RoutingIndex:
             def include_parent(parent_id, inherited, omitted, *, reserve_tokens=0):
                 nonlocal left
                 parent = self.units[parent_id]
+                if explore_disabled and parent.metadata["tier"] == "L4":
+                    omitted.append({"status": "withheld_by_policy"})
+                    return
                 status = applicability[parent_id]
                 if status.status != "matched":
                     omitted.append({"id": parent_id, **status.to_dict()})
