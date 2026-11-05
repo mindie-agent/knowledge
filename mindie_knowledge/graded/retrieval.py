@@ -94,9 +94,11 @@ def mixed_query(store, legacy, query, *, limit, conditions, domain_path, token_b
                "domain_path_scope": "graded ranking preference only; legacy matches retain their existing domain",
                "note": "Graded rules and legacy task material retain distinct reference types. Per-source ranks are "
                        "interleaved within one limit. Legacy related_next cursors continue through the original block query."}
-    if mode == "explore":
+    if graded.get("mode", mode) == "explore":
         payload["exploration_context"] = graded.get("exploration_context")
         payload["stripped_l3_ids"] = graded.get("stripped_l3_ids", [])
+    if "rsi_status" in graded:
+        payload["rsi_status"] = graded["rsi_status"]
     def count_sources(current):
         current["source_results"] = {
             "graded": sum(1 for row in current["results"] if row.get("source") == "graded"),

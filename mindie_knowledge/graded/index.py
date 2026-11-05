@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from collections import Counter
 import hashlib
+import json
 import math
 import os
 from pathlib import Path
@@ -156,6 +157,7 @@ class RoutingIndex:
             for ident, unit in sorted(self.units.items())
         ]).encode()).hexdigest()
         self.build_elapsed_ms = (time.perf_counter() - started) * 1000
+        self._prior_reuse_scopes: set[str] = set()
 
     @classmethod
     def from_root(cls, root):
@@ -193,6 +195,63 @@ class RoutingIndex:
             raise ValueError("query must be nonempty text")
         if mode not in {"reuse", "diagnose", "explore"}:
             raise ValueError("mode must be one of ['diagnose', 'explore', 'reuse']")
+        requested_mode = mode
+        caller_initiated_explore = requested_mode == "explore"
+        explore_disabled = os.environ.get("MINDIE_DISABLE_RSI_EXPLORE") == "1"
+        auto_switched_from_reuse = False
+        transition_reason = "requested_mode_preserved"
+        stalled_count = 0
+        distinct_candidate_hashes = []
+        ws_env = os.environ.get("MINDIE_BENCH_WORKSPACE")
+        cwd = Path.cwd()
+        ledger_candidates = []
+        if ws_env:
+            ledger_candidates.append(Path(ws_env) / "logs" / "experiment-ledger.jsonl")
+        ledger_candidates.extend([
+            cwd / "logs" / "experiment-ledger.jsonl",
+            cwd.parent / "workspace" / "logs" / "experiment-ledger.jsonl",
+            cwd.parent / "work" / "logs" / "experiment-ledger.jsonl",
+        ])
+        from .explore import (
+            assess_stagnation,
+            has_prior_reuse_audit,
+            read_bounded_jsonl,
+            resolve_workspace_audit_paths,
+        )
+        disk_ledger = next((p for p in ledger_candidates if p.is_file()), None)
+        workspace_gated = bool(ws_env) or disk_ledger is not None or (cwd.parent / "workspace").is_dir()
+        scope_key, audit_candidates, audit_targets = resolve_workspace_audit_paths(ws_env, cwd, disk_ledger)
+        disk_rows = read_bounded_jsonl(disk_ledger) if disk_ledger is not None else []
+        if disk_rows:
+            ledger_entries = disk_rows
+        if explore_disabled:
+            mode = "reuse"
+            transition_reason = "explore_disabled_by_policy"
+        else:
+            effective_entries = disk_rows if workspace_gated else (ledger_entries or [])
+            stagnation_info = (
+                assess_stagnation(effective_entries)
+                if effective_entries
+                else {"stalled": False, "stalled_count": 0, "promotion_ready": False}
+            )
+            stalled_count = int(stagnation_info.get("stalled_count", 0))
+            distinct_candidate_hashes = list(stagnation_info.get("distinct_candidate_hashes") or ())
+            has_prior_reuse = has_prior_reuse_audit(
+                audit_candidates, scope_key=scope_key, memory_scopes=self._prior_reuse_scopes
+            )
+            if workspace_gated and not has_prior_reuse:
+                mode = "reuse"
+                transition_reason = "prior_reuse_required_before_explore"
+            elif stagnation_info.get("promotion_ready"):
+                if requested_mode == "reuse" and (has_prior_reuse or not workspace_gated):
+                    auto_switched_from_reuse = True
+                    transition_reason = "auto_promoted_from_reuse_on_stagnation"
+                else:
+                    transition_reason = "caller_requested_explore_with_verified_stagnation"
+                mode = "explore"
+            elif workspace_gated and mode == "explore":
+                mode = "reuse"
+                transition_reason = "stagnation_threshold_not_met"
         if token_budget is None:
             token_budget = 24000 if mode == "explore" else 8000
         if conditions is not None and not isinstance(conditions, dict):
@@ -256,11 +315,17 @@ class RoutingIndex:
         for ident, score in scores.items():
             if score > 0 and applicability[ident].status == "matched":
                 inherited_by_higher.update(self.closure[ident])
+        has_l3 = any(u.metadata["tier"] == "L3" for u in self.units.values())
+        held_back_l4_ids = []
         ranked = []
         for ident, score in scores.items():
             path = self.units[ident].metadata["domain_path"]
             preferred = bool(domain_path and (path == domain_path or path.startswith(domain_path + "/")))
             tier = self.units[ident].metadata["tier"]
+            if (explore_disabled or (mode != "explore" and has_l3)) and tier == "L4":
+                if score > 0 and not explore_disabled:
+                    held_back_l4_ids.append(ident)
+                continue
             tier_weight = 0.55 if (mode == "reuse" and tier == "L4") else 1.0
             if score:
                 ranked.append((score * (1.1 if preferred else 1) * tier_weight, ident,
@@ -275,11 +340,13 @@ class RoutingIndex:
         stripped_l3_ids = []
         if mode == "explore":
             promoted = {}
-            for _score, ident, _route in source_selected:
+            for _score, ident, _route in ranked:
                 unit = self.units[ident]
                 if unit.metadata["tier"] != "L3":
                     continue
                 stripped_l3_ids.append(ident)
+                if ( _score, ident, _route ) not in source_selected:
+                    source_selected.append((_score, ident, _route))
                 if applicability[ident].status != "matched":
                     continue
                 for parent in self.closure[ident]:
@@ -390,7 +457,11 @@ class RoutingIndex:
                         path = unit.metadata["domain_path"]
                         preferred = bool(domain_path and (path == domain_path or path.startswith(domain_path + "/")))
                         tier = unit.metadata["tier"]
-                        tier_weight = 0.55 if (mode == "reuse" and tier == "L4") else 1.0
+                        if (explore_disabled or mode != "explore") and tier == "L4":
+                            if score > 0 and not explore_disabled:
+                                held_back_l4_ids.append(ident)
+                            continue
+                        tier_weight = 1.0
                         unknown_ranked.append((score * (1.1 if preferred else 1) * tier_weight, ident,
                                                "preferred_domain" if preferred else "cross_directory"))
                     unknown_ranked.sort(key=lambda item: (-item[0], item[1]))
@@ -429,7 +500,69 @@ class RoutingIndex:
                         "verify those facts, or call knowledge_explain(ref=...) without conditions to inspect a unit."
                     ).strip()
             payload["mode"] = mode
+            def _write_query_audit(final_payload):
+                if mode == "reuse":
+                    self._prior_reuse_scopes.add(scope_key)
+                if not audit_targets:
+                    return
+                mounted_l4 = [
+                    u["id"]
+                    for u in (final_payload.get("exploration_context") or {}).get("mounted_units", ())
+                    if isinstance(u, dict) and u.get("tier") == "L4"
+                ]
+                run_ids = [
+                    r.get("run_id")
+                    for r in (ledger_entries or ())
+                    if isinstance(r, dict) and isinstance(r.get("run_id"), str)
+                ][-16:]
+                rec = {
+                    "timestamp_epoch": time.time(),
+                    "operation": "query",
+                    "query": query,
+                    "requested_mode": requested_mode,
+                    "effective_mode": mode,
+                    "caller_initiated_explore": caller_initiated_explore,
+                    "explore_disabled": explore_disabled,
+                    "auto_switched_from_reuse": auto_switched_from_reuse,
+                    "transition_reason": transition_reason,
+                    "observed_failed_attempts": stalled_count,
+                    "distinct_candidate_hashes": distinct_candidate_hashes[-16:],
+                    "ledger_run_ids": run_ids,
+                    "delivered_unit_ids": [
+                        r.get("id") for r in final_payload.get("results", ()) if isinstance(r, dict)
+                    ],
+                    "delivered_tiers": [
+                        r.get("tier") for r in final_payload.get("results", ()) if isinstance(r, dict)
+                    ],
+                    "mounted_l4_ids": mounted_l4,
+                    "native_subcontext": bool(native_subcontext),
+                    "has_bottleneck_summary": bool(bottleneck_summary),
+                }
+                for target_file in audit_targets:
+                    try:
+                        with target_file.open("a", encoding="utf-8") as fh:
+                            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                    except (OSError, ValueError):
+                        pass
+
             if mode != "explore":
+                if not explore_disabled and token_budget >= 4000:
+                    active_l3 = sorted({
+                        item["id"]
+                        for key in ("cards", "results", "unverified_cards")
+                        for item in payload.get(key, ())
+                        if item.get("tier") == "L3"
+                    })
+                    if active_l3 or held_back_l4_ids:
+                        payload["rsi_status"] = {
+                            "requested_mode": requested_mode,
+                            "mode": mode,
+                            "active_l3_ids": active_l3,
+                            "held_back_l4_count": len(set(held_back_l4_ids)),
+                            "stagnation_threshold": 3,
+                            "observed_failed_attempts": stalled_count,
+                        }
+                _write_query_audit(payload)
                 return payload
             rows, seen = [], set()
             for _score, ident, _route in source_selected:
@@ -464,8 +597,19 @@ class RoutingIndex:
             context["stagnation"] = assess_stagnation(ledger_entries or [])
             context["stripped_l3_ids"] = stripped_l3_ids
             context["subagent_fact_pack"]["stripped_l3_ids"] = stripped_l3_ids
+            if auto_switched_from_reuse:
+                context["auto_switched_from_reuse"] = True
             payload["exploration_context"] = context
             payload["stripped_l3_ids"] = stripped_l3_ids
+            if token_budget >= 4000:
+                payload["rsi_status"] = {
+                    "requested_mode": requested_mode,
+                    "mode": "explore",
+                    "auto_switched_from_reuse": auto_switched_from_reuse,
+                    "stripped_l3_ids": stripped_l3_ids,
+                    "stagnation": context["stagnation"],
+                }
+            _write_query_audit(payload)
             return payload
 
         if navigation_only:

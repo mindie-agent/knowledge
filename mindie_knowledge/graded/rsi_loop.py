@@ -222,7 +222,8 @@ def _sync_from_ledger(state: dict, *, preserve_step: bool = False) -> None:
     state["rounds"] = rounds
     state["round"] = len(rounds) + 1
     state["pending_distill"] = pending
-    state["mode"] = "explore" if stagnation.get("stalled") else "reuse"
+    explore_disabled = os.environ.get("MINDIE_DISABLE_RSI_EXPLORE") == "1"
+    state["mode"] = "explore" if (stagnation.get("stalled") and not explore_disabled) else "reuse"
     if state["max_rounds"] is not None and len(rounds) >= state["max_rounds"]:
         _finish(state, f"max_rounds {state['max_rounds']} reached")
     elif not preserve_step and state["status"] == "running" and state.get("step") != "learn":
@@ -324,7 +325,18 @@ def _profile(state, body):
 
 
 def _consult(state, body):
-    if body.get("mode") != state["mode"]:
+    req_mode = body.get("mode")
+    explore_disabled = os.environ.get("MINDIE_DISABLE_RSI_EXPLORE") == "1"
+    if explore_disabled and req_mode == "explore":
+        raise ValueError("RSI explore mode is disabled in this reuse-only profile; query knowledge in 'reuse' mode")
+    if (
+        req_mode == "explore"
+        and state["mode"] == "reuse"
+        and not explore_disabled
+        and any(r.get("verdict") not in KEPT for r in state.get("rounds", ()))
+    ):
+        state["mode"] = "explore"
+    if req_mode != state["mode"]:
         raise ValueError(f"this round must query knowledge in {state['mode']!r} mode")
     refs = body.get("unit_refs")
     if not isinstance(refs, list) or any(
@@ -541,7 +553,8 @@ def _learn(state, body):
                                 verdict=verdict, outcome=record.get("outcome"),
                                 speedup_ratio=record.get("speedup_ratio"),
                                 stagnation=stagnation.get("status")))
-    state["mode"] = "explore" if stagnation.get("stalled") else "reuse"
+    explore_disabled = os.environ.get("MINDIE_DISABLE_RSI_EXPLORE") == "1"
+    state["mode"] = "explore" if (stagnation.get("stalled") and not explore_disabled) else "reuse"
     if state["max_rounds"] is not None and state["round"] >= state["max_rounds"]:
         _finish(state, f"max_rounds {state['max_rounds']} reached")
         return None, extra

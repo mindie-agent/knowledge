@@ -45,6 +45,8 @@ PROGRESS_VERDICTS = {"supported", "attained", "subtarget_valid", "improved",
                      "qualified_improvement", "distill_candidate"}
 NEGATIVE_VERDICTS = {"refuted", "failed", "negative", "rejected", "unsupported",
                      "record_conditional_finding"}
+NEGATIVE_OUTCOMES = {"no_improvement", "regression", "failed", "refuted",
+                     "speedup_within_noise"}
 
 
 def _mapping(value: Any, label: str) -> dict:
@@ -84,18 +86,30 @@ def assess_stagnation(ledger_entries: Sequence[Mapping[str, Any]], *,
     limit = consecutive_limit if max_stalled_attempts is None else max_stalled_attempts
     if type(limit) is not int or limit < 1:
         raise ValueError("consecutive_limit must be a positive integer")
-    unique: list[dict] = []
-    positions: dict[str, int] = {}
+    unique_map: dict[str, dict] = {}
     for index, raw in enumerate(ledger_entries or ()):
         entry = _mapping(raw, f"ledger_entries[{index}]")
+        if entry.get("is_baseline") is True:
+            continue
+        cand_sha = (
+            entry.get("candidate_sha256")
+            or entry.get("candidate_hash")
+            or entry.get("source_digest")
+        )
         run_id = entry.get("run_id")
-        key = run_id.strip() if isinstance(run_id, str) and run_id.strip() else f"attempt:{index}"
-        if key in positions:
-            unique[positions[key]] = entry
+        if isinstance(cand_sha, str) and cand_sha.strip():
+            norm_sha = cand_sha.strip()
+            entry = {**entry, "_candidate_hash": norm_sha}
+            key = f"sha256:{norm_sha}"
+        elif isinstance(run_id, str) and run_id.strip():
+            key = run_id.strip()
         else:
-            positions[key] = len(unique)
-            unique.append(entry)
+            key = f"attempt:{index}"
+        unique_map.pop(key, None)
+        unique_map[key] = entry
+    unique = list(unique_map.values())
     stalled_count, repair, progressed, budget_exhausted, unverified = 0, False, False, False, 0
+    refuted_hashes_since_progress: list[str] = []
     for attempt in unique:
         verdict, outcome = attempt.get("verdict"), attempt.get("outcome")
         axes = attempt.get("axes")
@@ -115,8 +129,13 @@ def assess_stagnation(ledger_entries: Sequence[Mapping[str, Any]], *,
               or attempt.get("improvement") is True
               or (isinstance(axes, Mapping) and axes.get("goal_achieved") is True)):
             stalled_count, progressed = 0, True
-        else:
+            refuted_hashes_since_progress = []
+        elif (verdict in NEGATIVE_VERDICTS or outcome in NEGATIVE_OUTCOMES
+              or attainment in {"not_attained", "regressed", "failed"}):
             stalled_count += 1
+            chash = attempt.get("_candidate_hash")
+            if isinstance(chash, str) and chash and chash not in refuted_hashes_since_progress:
+                refuted_hashes_since_progress.append(chash)
     # Two consecutive legacy "unsupported" verdicts remain the historical
     # threshold; richer ledger entries use the requested three-attempt window.
     legacy = bool(unique) and all(
@@ -143,12 +162,136 @@ def assess_stagnation(ledger_entries: Sequence[Mapping[str, Any]], *,
         reason = "no decisive information yet"
     if repair and status in {"progressing", "monitoring"}:
         reason += "; some attempts require repaired execution conditions"
+    distinct_hashes = [
+        entry["_candidate_hash"]
+        for entry in unique
+        if isinstance(entry.get("_candidate_hash"), str) and entry["_candidate_hash"]
+    ]
+    promotion_threshold = max(limit, 3)
+    promotion_ready = bool(
+        stalled_count >= promotion_threshold
+        and len(refuted_hashes_since_progress) >= promotion_threshold
+    )
     return {"stalled": stalled, "stalled_count": stalled_count, "consecutive_limit": limit,
             "status": status, "reason": reason,
             "tail_run_ids": [entry["run_id"] for entry in unique[-limit:]
                              if isinstance(entry.get("run_id"), str)],
+            "distinct_candidate_hashes": distinct_hashes,
+            "distinct_refuted_candidate_hashes": refuted_hashes_since_progress,
+            "promotion_ready": promotion_ready,
             "unverified_hypotheses_remaining": unverified, "budget_exhausted": budget_exhausted,
             "should_escalate": bool(stalled), "escalation_reason": reason}
+
+
+def read_bounded_jsonl(path: Path, *, max_bytes: int = 262144, max_rows: int = 128) -> list[dict]:
+    """Read at most the trailing max_bytes and max_rows JSON object lines from path."""
+    if not path.is_file():
+        return []
+    try:
+        size = path.stat().st_size
+        offset = max(0, size - max_bytes)
+        with path.open("rb") as fh:
+            if offset > 0:
+                fh.seek(offset)
+                fh.readline()
+            raw_text = fh.read(max_bytes).decode("utf-8", errors="replace")
+    except OSError:
+        return []
+    rows: list[dict] = []
+    for line in raw_text.splitlines()[-max_rows:]:
+        text = line.strip()
+        if not text:
+            continue
+        try:
+            obj = json.loads(text)
+        except ValueError:
+            continue
+        if isinstance(obj, dict):
+            rows.append(obj)
+    return rows
+
+
+def resolve_workspace_audit_paths(ws_env: str | None, cwd: Path, disk_ledger: Path | None) -> tuple[str, list[Path], list[Path]]:
+    """Resolve workspace scope key, audit read candidates, and audit write targets."""
+    if disk_ledger is not None:
+        ws_root = disk_ledger.parent.parent if disk_ledger.parent.name == "logs" else disk_ledger.parent
+    elif ws_env:
+        ws_root = Path(ws_env)
+    elif (cwd.parent / "workspace").is_dir():
+        ws_root = cwd.parent / "workspace"
+    else:
+        ws_root = cwd
+    try:
+        scope_key = str(ws_root.resolve())
+    except OSError:
+        scope_key = str(ws_root)
+    read_cands: list[Path] = []
+    write_targets: list[Path] = []
+
+    def _add(target_list: list[Path], cand: Path) -> None:
+        try:
+            resolved = cand.resolve()
+        except OSError:
+            resolved = cand
+        if resolved not in target_list:
+            target_list.append(resolved)
+
+    if ws_env and (Path(ws_env).parent / "profile").is_dir():
+        p = Path(ws_env).parent / "profile" / "knowledge_query_audit.jsonl"
+        _add(read_cands, p)
+        _add(write_targets, p)
+    if cwd.name == "profile":
+        p = cwd / "knowledge_query_audit.jsonl"
+        _add(read_cands, p)
+        _add(write_targets, p)
+    elif (cwd.parent / "profile").is_dir():
+        p = cwd.parent / "profile" / "knowledge_query_audit.jsonl"
+        _add(read_cands, p)
+        _add(write_targets, p)
+    for logs_dir in (
+        [disk_ledger.parent] if disk_ledger is not None else []
+    ) + (
+        [Path(ws_env) / "logs"] if ws_env and (Path(ws_env) / "logs").is_dir() else []
+    ) + (
+        [cwd / "logs"] if (cwd / "logs").is_dir() else []
+    ) + (
+        [cwd.parent / "workspace" / "logs"] if (cwd.parent / "workspace" / "logs").is_dir() else []
+    ):
+        p = logs_dir / "knowledge_query_audit.jsonl"
+        _add(read_cands, p)
+        _add(write_targets, p)
+    _add(read_cands, cwd / "knowledge_query_audit.jsonl")
+    return scope_key, read_cands, write_targets
+
+
+def has_prior_reuse_audit(audit_paths: Sequence[Path], *, scope_key: str, memory_scopes: set[str], max_bytes: int = 262144) -> bool:
+    """Check whether a reuse query was recorded in memory or bounded audit logs."""
+    if scope_key in memory_scopes:
+        return True
+    for audit_file in audit_paths:
+        if not audit_file.is_file():
+            continue
+        try:
+            with audit_file.open("rb") as fh:
+                head_text = fh.read(max_bytes).decode("utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in head_text.splitlines():
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                obj = json.loads(text)
+            except ValueError:
+                continue
+            if isinstance(obj, dict) and obj.get("effective_mode") == "reuse":
+                memory_scopes.add(scope_key)
+                return True
+        for obj in read_bounded_jsonl(audit_file, max_bytes=max_bytes, max_rows=64):
+            if obj.get("effective_mode") == "reuse":
+                memory_scopes.add(scope_key)
+                return True
+    return False
 
 
 def _compact_unit(unit: dict) -> dict | None:

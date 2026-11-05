@@ -31,6 +31,9 @@ def explain_closure(index, refs, *, conditions=None, known_refs=None, domain=Non
     """
     if mode not in {"reuse", "diagnose", "explore"}:
         raise ValueError("mode must be one of ['diagnose', 'explore', 'reuse']")
+    explore_disabled = __import__("os").environ.get("MINDIE_DISABLE_RSI_EXPLORE") == "1"
+    if explore_disabled and mode == "explore":
+        mode = "reuse"
     if token_budget is None:
         token_budget = 24000 if mode == "explore" else 16000
     if type(token_budget) is not int or not 1 <= token_budget <= 64000:
@@ -102,6 +105,9 @@ def explain_closure(index, refs, *, conditions=None, known_refs=None, domain=Non
         seen_requested.add((ident, revision))
         unit = index.units.get(ident)
         if unit is None:
+            add_unresolved({"id": ident, "status": "not_found"})
+            continue
+        if explore_disabled and unit.metadata.get("tier") == "L4":
             add_unresolved({"id": ident, "status": "not_found"})
             continue
         if revision is not None and revision != unit.revision:

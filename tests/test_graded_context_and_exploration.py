@@ -570,3 +570,82 @@ def test_rsi_loop_reconciles_superseded_verdicts_older_retries_and_refuted_recov
     assert res_replay["status"] == "running"
 
 
+def test_auto_promotion_outside_benchmark_layout_and_l4_disable_isolation(tmp_path, monkeypatch):
+    premise = _unit("unit-promo-l1", "L1", "axiom", {"soc": ["Ascend910B"]},
+                    body="UB 32B hardware premise for workflow alpha.", path="_common")
+    workflow = _unit("unit-promo-l3", "L3", "workflow", {"soc": ["Ascend910B"]},
+                     parents=[premise.id], body="Baseline workflow alpha.")
+    mutator = _unit("unit-promo-l4", "L4", "mutator", {"soc": ["Ascend910B"]},
+                    body="Mutator workflow alpha.")
+    index = RoutingIndex([premise, workflow, mutator])
+    conds = {"soc": "Ascend910B"}
+
+    ws = tmp_path / "normal_project"
+    logs_dir = ws / "logs"
+    logs_dir.mkdir(parents=True)
+    monkeypatch.chdir(ws)
+    monkeypatch.delenv("MINDIE_BENCH_WORKSPACE", raising=False)
+    monkeypatch.delenv("MINDIE_DISABLE_RSI_EXPLORE", raising=False)
+
+    # First reuse query in a normal project without any sibling profile/ directory
+    first = index.query("workflow alpha", conditions=conds, mode="reuse", token_budget=8000)
+    assert first["mode"] == "reuse"
+    assert (logs_dir / "knowledge_query_audit.jsonl").is_file()
+
+    # Duplicate candidate_hash across 3 run_ids must not promote
+    ledger_file = logs_dir / "experiment-ledger.jsonl"
+    dup_rows = [
+        {"run_id": f"r-{i}", "verdict": "refuted", "outcome": "no_improvement", "candidate_hash": "same-sha"}
+        for i in range(3)
+    ]
+    ledger_file.write_text("\n".join(json.dumps(r) for r in dup_rows) + "\n", encoding="utf-8")
+    still_reuse = index.query("workflow alpha", conditions=conds, mode="reuse", token_budget=8000)
+    assert still_reuse["mode"] == "reuse"
+
+    # Two legacy verdict-only records must not promote
+    legacy_rows = [
+        {"run_id": "leg-1", "verdict": "unsupported"},
+        {"run_id": "leg-2", "verdict": "unsupported"},
+    ]
+    ledger_file.write_text("\n".join(json.dumps(r) for r in legacy_rows) + "\n", encoding="utf-8")
+    assert index.query("workflow alpha", conditions=conds, mode="reuse", token_budget=8000)["mode"] == "reuse"
+
+    # Three distinct candidate hashes without an explicit negative verdict/outcome must not promote
+    pending_rows = [
+        {"run_id": f"pend-{i}", "candidate_sha256": f"pending-sha-{i}"}
+        for i in range(3)
+    ]
+    ledger_file.write_text("\n".join(json.dumps(r) for r in pending_rows) + "\n", encoding="utf-8")
+    assert index.query("workflow alpha", conditions=conds, mode="reuse", token_budget=8000)["mode"] == "reuse"
+
+    # Re-evaluating an earlier candidate hash with a supported verdict resets stagnation at the latest position
+    reeval_rows = [
+        {"run_id": "r-a1", "verdict": "refuted", "outcome": "no_improvement", "candidate_hash": "sha-A"},
+        {"run_id": "r-b1", "verdict": "refuted", "outcome": "no_improvement", "candidate_hash": "sha-B"},
+        {"run_id": "r-c1", "verdict": "refuted", "outcome": "no_improvement", "candidate_hash": "sha-C"},
+        {"run_id": "r-d1", "verdict": "refuted", "outcome": "no_improvement", "candidate_hash": "sha-D"},
+        {"run_id": "r-a2", "verdict": "supported", "outcome": "speedup_verified", "candidate_hash": "sha-A"},
+    ]
+    ledger_file.write_text("\n".join(json.dumps(r) for r in reeval_rows) + "\n", encoding="utf-8")
+    assert index.query("workflow alpha", conditions=conds, mode="reuse", token_budget=8000)["mode"] == "reuse"
+
+    # Three distinct refuted candidates promote reuse -> explore even across a fresh RoutingIndex
+    distinct_rows = [
+        {"run_id": f"d-{i}", "verdict": "refuted", "outcome": "no_improvement", "candidate_hash": f"sha-{i}"}
+        for i in range(3)
+    ]
+    ledger_file.write_text("\n".join(json.dumps(r) for r in distinct_rows) + "\n", encoding="utf-8")
+    fresh_index = RoutingIndex([premise, workflow, mutator])
+    promoted = fresh_index.query("workflow alpha", conditions=conds, mode="reuse", token_budget=16000)
+    assert promoted["mode"] == "explore"
+    assert mutator.id in {r["id"] for r in promoted["results"]}
+
+    # MINDIE_DISABLE_RSI_EXPLORE=1 must exclude L4 even in an L4-only corpus
+    monkeypatch.setenv("MINDIE_DISABLE_RSI_EXPLORE", "1")
+    l4_only = RoutingIndex([mutator])
+    disabled_res = l4_only.query("workflow alpha", conditions=conds, mode="reuse", token_budget=8000)
+    assert disabled_res["results"] == []
+    assert disabled_res["cards"] == []
+
+
+
