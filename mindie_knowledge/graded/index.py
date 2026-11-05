@@ -340,7 +340,7 @@ class RoutingIndex:
             preferred = bool(domain_path and (path == domain_path or path.startswith(domain_path + "/")))
             tier = self.units[ident].metadata["tier"]
             if mode != "explore" and has_l3 and tier == "L4":
-                if score > 0:
+                if score > 0 and not explore_disabled:
                     held_back_l4_ids.append(ident)
                 continue
             tier_weight = 0.55 if (mode == "reuse" and tier == "L4") else 1.0
