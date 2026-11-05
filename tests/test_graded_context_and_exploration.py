@@ -610,6 +610,25 @@ def test_auto_promotion_outside_benchmark_layout_and_l4_disable_isolation(tmp_pa
     ledger_file.write_text("\n".join(json.dumps(r) for r in legacy_rows) + "\n", encoding="utf-8")
     assert index.query("workflow alpha", conditions=conds, mode="reuse", token_budget=8000)["mode"] == "reuse"
 
+    # Three distinct candidate hashes without an explicit negative verdict/outcome must not promote
+    pending_rows = [
+        {"run_id": f"pend-{i}", "candidate_sha256": f"pending-sha-{i}"}
+        for i in range(3)
+    ]
+    ledger_file.write_text("\n".join(json.dumps(r) for r in pending_rows) + "\n", encoding="utf-8")
+    assert index.query("workflow alpha", conditions=conds, mode="reuse", token_budget=8000)["mode"] == "reuse"
+
+    # Re-evaluating an earlier candidate hash with a supported verdict resets stagnation at the latest position
+    reeval_rows = [
+        {"run_id": "r-a1", "verdict": "refuted", "outcome": "no_improvement", "candidate_hash": "sha-A"},
+        {"run_id": "r-b1", "verdict": "refuted", "outcome": "no_improvement", "candidate_hash": "sha-B"},
+        {"run_id": "r-c1", "verdict": "refuted", "outcome": "no_improvement", "candidate_hash": "sha-C"},
+        {"run_id": "r-d1", "verdict": "refuted", "outcome": "no_improvement", "candidate_hash": "sha-D"},
+        {"run_id": "r-a2", "verdict": "supported", "outcome": "speedup_verified", "candidate_hash": "sha-A"},
+    ]
+    ledger_file.write_text("\n".join(json.dumps(r) for r in reeval_rows) + "\n", encoding="utf-8")
+    assert index.query("workflow alpha", conditions=conds, mode="reuse", token_budget=8000)["mode"] == "reuse"
+
     # Three distinct refuted candidates promote reuse -> explore even across a fresh RoutingIndex
     distinct_rows = [
         {"run_id": f"d-{i}", "verdict": "refuted", "outcome": "no_improvement", "candidate_hash": f"sha-{i}"}

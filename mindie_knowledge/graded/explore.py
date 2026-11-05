@@ -45,6 +45,8 @@ PROGRESS_VERDICTS = {"supported", "attained", "subtarget_valid", "improved",
                      "qualified_improvement", "distill_candidate"}
 NEGATIVE_VERDICTS = {"refuted", "failed", "negative", "rejected", "unsupported",
                      "record_conditional_finding"}
+NEGATIVE_OUTCOMES = {"no_improvement", "regression", "failed", "refuted",
+                     "speedup_within_noise"}
 
 
 def _mapping(value: Any, label: str) -> dict:
@@ -84,8 +86,7 @@ def assess_stagnation(ledger_entries: Sequence[Mapping[str, Any]], *,
     limit = consecutive_limit if max_stalled_attempts is None else max_stalled_attempts
     if type(limit) is not int or limit < 1:
         raise ValueError("consecutive_limit must be a positive integer")
-    unique: list[dict] = []
-    positions: dict[str, int] = {}
+    unique_map: dict[str, dict] = {}
     for index, raw in enumerate(ledger_entries or ()):
         entry = _mapping(raw, f"ledger_entries[{index}]")
         if entry.get("is_baseline") is True:
@@ -104,11 +105,9 @@ def assess_stagnation(ledger_entries: Sequence[Mapping[str, Any]], *,
             key = run_id.strip()
         else:
             key = f"attempt:{index}"
-        if key in positions:
-            unique[positions[key]] = entry
-        else:
-            positions[key] = len(unique)
-            unique.append(entry)
+        unique_map.pop(key, None)
+        unique_map[key] = entry
+    unique = list(unique_map.values())
     stalled_count, repair, progressed, budget_exhausted, unverified = 0, False, False, False, 0
     refuted_hashes_since_progress: list[str] = []
     for attempt in unique:
@@ -131,7 +130,8 @@ def assess_stagnation(ledger_entries: Sequence[Mapping[str, Any]], *,
               or (isinstance(axes, Mapping) and axes.get("goal_achieved") is True)):
             stalled_count, progressed = 0, True
             refuted_hashes_since_progress = []
-        else:
+        elif (verdict in NEGATIVE_VERDICTS or outcome in NEGATIVE_OUTCOMES
+              or attainment in {"not_attained", "regressed", "failed"}):
             stalled_count += 1
             chash = attempt.get("_candidate_hash")
             if isinstance(chash, str) and chash and chash not in refuted_hashes_since_progress:
