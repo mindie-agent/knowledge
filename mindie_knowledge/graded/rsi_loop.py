@@ -6,7 +6,8 @@ over `experiment-ledger.jsonl`. MCP steps stay with the Agent; `propose` fingerp
 and gates through `experiment_ledger`, `measure` judges through `experiment_ledger.judge`
 (`evaluate_rsi_candidate_gates`), `learn` / `record` atomically commit through
 `experiment_ledger.append` (ledger line + `PROGRESS.md` under `<ledger>.lock`),
-and `_stagnation` asks `assess_stagnation` whether the next round must explore.
+and `_stagnation` asks `assess_stagnation` whether three distinct refuted
+candidates make the next round explore. One non-kept verdict does not.
 
 [Invariants]
 - `experiment-ledger.jsonl` is the authoritative fact store: `init` reconciles
@@ -223,7 +224,7 @@ def _sync_from_ledger(state: dict, *, preserve_step: bool = False) -> None:
     state["round"] = len(rounds) + 1
     state["pending_distill"] = pending
     explore_disabled = os.environ.get("MINDIE_DISABLE_RSI_EXPLORE") == "1"
-    state["mode"] = "explore" if (stagnation.get("stalled") and not explore_disabled) else "reuse"
+    state["mode"] = "explore" if (stagnation.get("promotion_ready") and not explore_disabled) else "reuse"
     if state["max_rounds"] is not None and len(rounds) >= state["max_rounds"]:
         _finish(state, f"max_rounds {state['max_rounds']} reached")
     elif not preserve_step and state["status"] == "running" and state.get("step") != "learn":
@@ -333,7 +334,7 @@ def _consult(state, body):
         req_mode == "explore"
         and state["mode"] == "reuse"
         and not explore_disabled
-        and any(r.get("verdict") not in KEPT for r in state.get("rounds", ()))
+        and _stagnation(state).get("promotion_ready")
     ):
         state["mode"] = "explore"
     if req_mode != state["mode"]:
@@ -457,8 +458,9 @@ def _stagnation(state) -> dict:
                      outcome=r.get("outcome") or r.get("run_status"),
                      hypothesis=r.get("mutation_summary"),
                      hypothesis_verified=r["verdict"] in KEPT)
-        for key in ("new_observation", "divergent_layer_identified"):
-            if key in r:
+        for key in ("candidate_sha256", "candidate_hash", "source_digest",
+                    "new_observation", "divergent_layer_identified"):
+            if key in r and r[key] is not None:
                 entry[key] = r[key]
         entries.append(entry)
     return assess_stagnation(entries, consecutive_limit=STALL_WINDOW)
@@ -554,7 +556,7 @@ def _learn(state, body):
                                 speedup_ratio=record.get("speedup_ratio"),
                                 stagnation=stagnation.get("status")))
     explore_disabled = os.environ.get("MINDIE_DISABLE_RSI_EXPLORE") == "1"
-    state["mode"] = "explore" if (stagnation.get("stalled") and not explore_disabled) else "reuse"
+    state["mode"] = "explore" if (stagnation.get("promotion_ready") and not explore_disabled) else "reuse"
     if state["max_rounds"] is not None and state["round"] >= state["max_rounds"]:
         _finish(state, f"max_rounds {state['max_rounds']} reached")
         return None, extra

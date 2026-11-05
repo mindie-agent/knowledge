@@ -646,6 +646,154 @@ def test_auto_promotion_outside_benchmark_layout_and_l4_disable_isolation(tmp_pa
     disabled_res = l4_only.query("workflow alpha", conditions=conds, mode="reuse", token_budget=8000)
     assert disabled_res["results"] == []
     assert disabled_res["cards"] == []
+    assert mutator.id not in json.dumps(disabled_res)
+
+
+def _refuted_ledger(path: Path, digests: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = [
+        {"run_id": f"r-{i}", "verdict": "refuted", "outcome": "no_improvement",
+         "candidate_sha256": digest}
+        for i, digest in enumerate(digests)
+    ]
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+
+def test_first_workspace_query_stays_reuse_until_a_same_workspace_audit_exists(tmp_path, monkeypatch):
+    premise = _unit("unit-floor-l1", "L1", "axiom", {"soc": ["Ascend910B"]},
+                    body="UB premise for workflow alpha.", path="_common")
+    workflow = _unit("unit-floor-l3", "L3", "workflow", {"soc": ["Ascend910B"]},
+                     parents=[premise.id], body="Baseline workflow alpha.")
+    mutator = _unit("unit-floor-l4", "L4", "mutator", {"soc": ["Ascend910B"]},
+                    body="SECRET_L4_MUTATOR workflow alpha.")
+    conds = {"soc": "Ascend910B"}
+    monkeypatch.delenv("MINDIE_DISABLE_RSI_EXPLORE", raising=False)
+    bench = tmp_path / "bench"
+    profile = bench / "profile"
+    profile.mkdir(parents=True)
+    profile_audit = profile / "knowledge_query_audit.jsonl"
+    profile_audit.write_text(
+        json.dumps({"effective_mode": "reuse", "query": "other workspace"}) + "\n",
+        encoding="utf-8",
+    )
+    profile_before = profile_audit.read_bytes()
+    task = bench / "taskB"
+    _refuted_ledger(task / "logs" / "experiment-ledger.jsonl", ["sha-a", "sha-b", "sha-c"])
+    foreign = tmp_path / "foreign"
+    _refuted_ledger(foreign / "logs" / "experiment-ledger.jsonl", ["other-a", "other-b", "other-c"])
+    (foreign / "logs" / "knowledge_query_audit.jsonl").write_text(
+        json.dumps({"effective_mode": "reuse"}) + "\n", encoding="utf-8")
+    monkeypatch.setenv("MINDIE_BENCH_WORKSPACE", str(task))
+    monkeypatch.chdir(foreign)
+
+    first = RoutingIndex([premise, workflow, mutator]).query(
+        "workflow alpha", conditions=conds, mode="reuse", token_budget=16000)
+    assert first["mode"] == "reuse"
+    assert workflow.id in {row["id"] for row in first["results"]}
+    assert mutator.id not in {row["id"] for row in first["results"]}
+    assert "SECRET_L4_MUTATOR" not in json.dumps(first)
+
+    promoted = RoutingIndex([premise, workflow, mutator]).query(
+        "workflow alpha", conditions=conds, mode="reuse", token_budget=16000)
+    assert promoted["mode"] == "explore"
+    assert promoted["rsi_status"]["auto_switched_from_reuse"] is True
+    assert mutator.id in {row["id"] for row in promoted["results"]}
+    audit = [
+        json.loads(line)
+        for line in (task / "logs" / "knowledge_query_audit.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert audit[-1]["observed_candidate_hashes"] == ["sha-a", "sha-b", "sha-c"]
+    assert audit[-1]["workspace_scope"] == str(task.resolve())
+    assert profile_audit.read_bytes() == profile_before
+
+    empty = tmp_path / "emptyws"
+    empty.mkdir()
+    monkeypatch.setenv("MINDIE_BENCH_WORKSPACE", str(empty))
+    held = RoutingIndex([premise, workflow, mutator]).query(
+        "workflow alpha", conditions=conds, mode="explore", token_budget=16000)
+    again = RoutingIndex([premise, workflow, mutator]).query(
+        "workflow alpha", conditions=conds, mode="reuse", token_budget=16000)
+    assert held["mode"] == "reuse" and again["mode"] == "reuse"
+    assert mutator.id not in {row["id"] for row in again["results"]}
+
+
+def test_diagnose_is_not_rewritten_to_explore_and_workspace_dir_alone_does_not_gate(tmp_path, monkeypatch):
+    premise = _unit("unit-diag-l1", "L1", "axiom", {"soc": ["Ascend910B"]},
+                    body="UB premise for workflow alpha.", path="_common")
+    workflow = _unit("unit-diag-l3", "L3", "workflow", {"soc": ["Ascend910B"]},
+                     parents=[premise.id], body="Baseline workflow alpha.")
+    mutator = _unit("unit-diag-l4", "L4", "mutator", {"soc": ["Ascend910B"]},
+                    body="Mutator workflow alpha.")
+    conds = {"soc": "Ascend910B"}
+    monkeypatch.delenv("MINDIE_BENCH_WORKSPACE", raising=False)
+    monkeypatch.delenv("MINDIE_DISABLE_RSI_EXPLORE", raising=False)
+    ws = tmp_path / "ws"
+    _refuted_ledger(ws / "logs" / "experiment-ledger.jsonl", ["sha-a", "sha-b", "sha-c"])
+    monkeypatch.chdir(ws)
+    index = RoutingIndex([premise, workflow, mutator])
+    assert index.query("workflow alpha", conditions=conds, mode="reuse", token_budget=8000)["mode"] == "reuse"
+    diagnosed = index.query("workflow alpha", conditions=conds, mode="diagnose", token_budget=16000)
+    assert diagnosed["mode"] == "diagnose"
+    assert mutator.id not in {row["id"] for row in diagnosed["results"]}
+    assert "exploration_context" not in diagnosed
+
+    app = tmp_path / "proj" / "app"
+    (tmp_path / "proj" / "workspace").mkdir(parents=True)
+    app.mkdir()
+    monkeypatch.chdir(app)
+    explored = RoutingIndex([premise, workflow, mutator]).query(
+        "workflow alpha", conditions=conds, mode="explore", token_budget=16000)
+    assert explored["mode"] == "explore"
+    assert mutator.id in {row["id"] for row in explored["results"]}
+    assert not (app / "knowledge_query_audit.jsonl").exists()
+
+
+def test_disable_explore_strips_inherited_l4_bodies(tmp_path, monkeypatch):
+    mutator = _unit("unit-hidden-l4", "L4", "mutator", {"soc": ["Ascend910B"]},
+                    body="SECRET_L4_MUTATOR do not mount.")
+    child = _unit("unit-hidden-l2", "L2", "sop", {"soc": ["Ascend910B"]},
+                  parents=[mutator.id], body="SOP that cites the hidden mutator.")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("MINDIE_BENCH_WORKSPACE", raising=False)
+    monkeypatch.setenv("MINDIE_DISABLE_RSI_EXPLORE", "1")
+    index = RoutingIndex([child, mutator])
+    queried = index.query("hidden mutator", conditions={"soc": "Ascend910B"}, mode="explore", token_budget=8000)
+    blob = json.dumps(queried)
+    assert queried["mode"] == "reuse"
+    assert child.id in {row["id"] for row in queried["results"]}
+    assert "SECRET_L4_MUTATOR" not in blob
+    assert mutator.id not in blob
+    explained = index.explain_closure([child.id], conditions={"soc": "Ascend910B"}, mode="explore")
+    explained_blob = json.dumps(explained)
+    assert child.id in {row["id"] for row in explained["units"]}
+    assert "SECRET_L4_MUTATOR" not in explained_blob
+    assert mutator.id not in explained_blob
+
+
+def test_rsi_consult_does_not_latch_explore_without_three_distinct_candidates(tmp_path, monkeypatch):
+    from mindie_knowledge.graded import rsi_loop as loop
+
+    monkeypatch.delenv("MINDIE_DISABLE_RSI_EXPLORE", raising=False)
+    journal = tmp_path / "experiment-ledger.jsonl"
+
+    def write(digests):
+        rows = [
+            {"task_id": "t", "exp_id": f"e{i}", "verdict": "refuted", "outcome": "no_improvement",
+             "source_digest": digest, "run_ids": [f"r{i}"], "mutation_summary": "tile"}
+            for i, digest in enumerate(digests)
+        ]
+        journal.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+    write(["sha256:same", "sha256:same", "sha256:same"])
+    state = {"mode": "reuse", "ledger": str(journal), "task_id": "t", "rounds": [], "current": {}}
+    with pytest.raises(ValueError, match="reuse"):
+        loop._consult(state, {"mode": "explore", "unit_refs": []})
+    assert state["mode"] == "reuse"
+
+    write(["sha256:one", "sha256:two", "sha256:three"])
+    accepted = loop._consult(state, {"mode": "explore", "unit_refs": []})
+    assert state["mode"] == "explore"
+    assert accepted == ("propose", {})
 
 
 

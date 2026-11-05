@@ -6,6 +6,8 @@
 - A requested ancestor excluded for budget blocks its child rather than
   returning a partial rule; explore mode strips L3 bodies only from the payload.
 - Known refs suppress only an exact `id@revision`, never an older/unversioned ref.
+- `MINDIE_DISABLE_RSI_EXPLORE=1` withholds L4 bodies and L4 ids from ancestors
+  as well as from directly requested refs.
 
 [Timeouts & Locks]
 - Pure in-memory graph and metadata work; no subprocess, network or lock wait.
@@ -198,6 +200,12 @@ def explain_closure(index, refs, *, conditions=None, known_refs=None, domain=Non
     def entry_for(ident):
         unit = index.units[ident]
         status = status_of(ident) if grouped is not None else None
+        inherits = list(unit.metadata["inherits_from"])
+        if explore_disabled:
+            inherits = [
+                parent for parent in inherits
+                if index.units[parent].metadata.get("tier") != "L4"
+            ]
         return {"id": ident, "revision": unit.revision,
                 "title": unit.metadata["title"], "tier": unit.metadata["tier"],
                 "category": unit.metadata["category"],
@@ -206,7 +214,7 @@ def explain_closure(index, refs, *, conditions=None, known_refs=None, domain=Non
                 "domain_path": unit.metadata["domain_path"],
                 "conditions": unit.metadata["conditions"],
                 "provenance": unit.metadata["provenance"],
-                "inherits_from": list(unit.metadata["inherits_from"]),
+                "inherits_from": inherits,
                 "content": unit.body,
                 "applicability": status.to_dict() if status is not None else None,
                 "ready_to_apply": bool(status is not None and status.status == "matched"
@@ -222,10 +230,13 @@ def explain_closure(index, refs, *, conditions=None, known_refs=None, domain=Non
 
     for ident in ordered:
         unit = index.units[ident]
+        if explore_disabled and unit.metadata.get("tier") == "L4":
+            continue
         ancestors = index.closure[ident]
         new_ancestors = [parent for parent in ancestors
                          if parent not in loaded
-                         and (parent, index.units[parent].revision) not in visible]
+                         and (parent, index.units[parent].revision) not in visible
+                         and not (explore_disabled and index.units[parent].metadata.get("tier") == "L4")]
         unit_needed = ident not in loaded and (ident, unit.revision) not in visible
         # A requested ancestor excluded earlier for budget leaves this
         # child without a required premise; do not assemble a partial rule.

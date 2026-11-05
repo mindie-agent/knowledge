@@ -33,6 +33,39 @@ def receipt(name="all_retained"):
     return json.loads((Path(__file__).parent / "fixtures/graded-ablation-verified.json").read_text())[name]
 
 
+def test_raw_experiment_ledger_is_not_normalized_or_silently_retiered():
+    """full_candidate / ablate_* lines are not C4 receipts and must not be rewritten into an L2 commit."""
+    request, proposal = prepared(receipt())
+    ledger = "\n".join(json.dumps({
+        "run_id": name,
+        "verdict": "supported" if name == "full_candidate" else "refuted",
+        "candidate_sha256": "candidate-" + name,
+        "kind": name,
+    }) for name in ("full_candidate", "ablate_a", "ablate_b"))
+    selected = dict(
+        kind="experiment_ledger", outcome="verified", source_locator="logs/experiment-ledger.jsonl",
+        source_digest=hashlib.sha256(ledger.encode()).hexdigest(), content=ledger,
+        evidence_refs=["ledger-row"], repetitions=3,
+    )
+    request["evidence_inputs"] = ["experiment_ledger"]
+    request["sanitized_inputs"] = [selected]
+    request.pop("request_digest", None)
+    request["request_digest"] = _sha(request)
+    proposal["evidence_inputs"] = list(request["evidence_inputs"])
+    row = proposal["units"][0]
+    row["frontmatter"]["provenance"].update(
+        source_type="experiment_ledger",
+        source_locator=selected["source_locator"],
+        source_digest=selected["source_digest"],
+        evidence_refs=list(selected["evidence_refs"]),
+    )
+    original = (row["target_unit_id"], row["target_tier"], row["category"], row["operation"], row["frontmatter"]["id"])
+    with pytest.raises(ValueError, match="final-combination|reproduced_empirical|provenance"):
+        validate_decision(proposal, request)
+    assert (row["target_unit_id"], row["target_tier"], row["category"], row["operation"], row["frontmatter"]["id"]) == original
+    assert row["frontmatter"]["tier"] == "L4"
+
+
 def test_all_retained_independent_final_is_valid_without_a_pruning_claim():
     value = receipt()
     assert value["final_combination_verified"] and not value["pruned_combination_verified"]
