@@ -195,9 +195,12 @@ class RoutingIndex:
         if mode not in {"reuse", "diagnose", "explore"}:
             raise ValueError("mode must be one of ['diagnose', 'explore', 'reuse']")
         requested_mode = mode
+        caller_initiated_explore = requested_mode == "explore"
         explore_disabled = os.environ.get("MINDIE_DISABLE_RSI_EXPLORE") == "1"
         auto_switched_from_reuse = False
+        transition_reason = "requested_mode_preserved"
         stalled_count = 0
+        distinct_candidate_hashes = []
         ws_env = os.environ.get("MINDIE_BENCH_WORKSPACE")
         cwd = Path.cwd()
         ledger_candidates = []
@@ -225,11 +228,13 @@ class RoutingIndex:
             ledger_entries = disk_rows
         if explore_disabled:
             mode = "reuse"
+            transition_reason = "explore_disabled_by_policy"
         else:
             from .explore import assess_stagnation
             effective_entries = disk_rows if workspace_gated else (ledger_entries or [])
             stagnation_info = assess_stagnation(effective_entries) if effective_entries else {"stalled": False, "stalled_count": 0}
             stalled_count = int(stagnation_info.get("stalled_count", 0))
+            distinct_candidate_hashes = list(stagnation_info.get("distinct_candidate_hashes") or ())
             has_prior_reuse = False
             audit_candidates = []
             if ws_env and (Path(ws_env).parent / "profile").is_dir():
@@ -253,12 +258,17 @@ class RoutingIndex:
                         pass
             if workspace_gated and not has_prior_reuse:
                 mode = "reuse"
+                transition_reason = "prior_reuse_required_before_explore"
             elif stagnation_info.get("stalled"):
-                if mode == "reuse" or has_prior_reuse:
+                if requested_mode == "reuse" and (has_prior_reuse or not workspace_gated):
                     auto_switched_from_reuse = True
+                    transition_reason = "auto_promoted_from_reuse_on_stagnation"
+                else:
+                    transition_reason = "caller_requested_explore_with_verified_stagnation"
                 mode = "explore"
             elif workspace_gated and mode == "explore":
                 mode = "reuse"
+                transition_reason = "stagnation_threshold_not_met"
         if token_budget is None:
             token_budget = 24000 if mode == "explore" else 8000
         if conditions is not None and not isinstance(conditions, dict):
@@ -532,9 +542,12 @@ class RoutingIndex:
                     "query": query,
                     "requested_mode": requested_mode,
                     "effective_mode": mode,
+                    "caller_initiated_explore": caller_initiated_explore,
                     "explore_disabled": explore_disabled,
                     "auto_switched_from_reuse": auto_switched_from_reuse,
+                    "transition_reason": transition_reason,
                     "observed_failed_attempts": stalled_count,
+                    "distinct_candidate_hashes": distinct_candidate_hashes,
                     "ledger_run_ids": [
                         r.get("run_id")
                         for r in (ledger_entries or ())

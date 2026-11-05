@@ -88,8 +88,16 @@ def assess_stagnation(ledger_entries: Sequence[Mapping[str, Any]], *,
     positions: dict[str, int] = {}
     for index, raw in enumerate(ledger_entries or ()):
         entry = _mapping(raw, f"ledger_entries[{index}]")
+        if entry.get("is_baseline") is True:
+            continue
+        cand_sha = entry.get("candidate_sha256")
         run_id = entry.get("run_id")
-        key = run_id.strip() if isinstance(run_id, str) and run_id.strip() else f"attempt:{index}"
+        if isinstance(cand_sha, str) and cand_sha.strip():
+            key = f"sha256:{cand_sha.strip()}"
+        elif isinstance(run_id, str) and run_id.strip():
+            key = run_id.strip()
+        else:
+            key = f"attempt:{index}"
         if key in positions:
             unique[positions[key]] = entry
         else:
@@ -143,10 +151,16 @@ def assess_stagnation(ledger_entries: Sequence[Mapping[str, Any]], *,
         reason = "no decisive information yet"
     if repair and status in {"progressing", "monitoring"}:
         reason += "; some attempts require repaired execution conditions"
+    distinct_hashes = [
+        entry["candidate_sha256"].strip()
+        for entry in unique
+        if isinstance(entry.get("candidate_sha256"), str) and entry["candidate_sha256"].strip()
+    ]
     return {"stalled": stalled, "stalled_count": stalled_count, "consecutive_limit": limit,
             "status": status, "reason": reason,
             "tail_run_ids": [entry["run_id"] for entry in unique[-limit:]
                              if isinstance(entry.get("run_id"), str)],
+            "distinct_candidate_hashes": distinct_hashes,
             "unverified_hypotheses_remaining": unverified, "budget_exhausted": budget_exhausted,
             "should_escalate": bool(stalled), "escalation_reason": reason}
 
