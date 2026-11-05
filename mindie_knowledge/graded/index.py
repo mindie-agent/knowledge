@@ -157,6 +157,7 @@ class RoutingIndex:
             for ident, unit in sorted(self.units.items())
         ]).encode()).hexdigest()
         self.build_elapsed_ms = (time.perf_counter() - started) * 1000
+        self._prior_reuse_scopes: set[str] = set()
 
     @classmethod
     def from_root(cls, root):
@@ -211,55 +212,37 @@ class RoutingIndex:
             cwd.parent / "workspace" / "logs" / "experiment-ledger.jsonl",
             cwd.parent / "work" / "logs" / "experiment-ledger.jsonl",
         ])
+        from .explore import (
+            assess_stagnation,
+            has_prior_reuse_audit,
+            read_bounded_jsonl,
+            resolve_workspace_audit_paths,
+        )
         disk_ledger = next((p for p in ledger_candidates if p.is_file()), None)
         workspace_gated = bool(ws_env) or disk_ledger is not None or (cwd.parent / "workspace").is_dir()
-        disk_rows = []
-        if disk_ledger is not None:
-            try:
-                disk_rows = [
-                    json.loads(line)
-                    for line in disk_ledger.read_text(encoding="utf-8").splitlines()
-                    if line.strip()
-                ]
-                disk_rows = [r for r in disk_rows if isinstance(r, dict)]
-            except (OSError, ValueError):
-                disk_rows = []
+        scope_key, audit_candidates, audit_targets = resolve_workspace_audit_paths(ws_env, cwd, disk_ledger)
+        disk_rows = read_bounded_jsonl(disk_ledger) if disk_ledger is not None else []
         if disk_rows:
             ledger_entries = disk_rows
         if explore_disabled:
             mode = "reuse"
             transition_reason = "explore_disabled_by_policy"
         else:
-            from .explore import assess_stagnation
             effective_entries = disk_rows if workspace_gated else (ledger_entries or [])
-            stagnation_info = assess_stagnation(effective_entries) if effective_entries else {"stalled": False, "stalled_count": 0}
+            stagnation_info = (
+                assess_stagnation(effective_entries)
+                if effective_entries
+                else {"stalled": False, "stalled_count": 0, "promotion_ready": False}
+            )
             stalled_count = int(stagnation_info.get("stalled_count", 0))
             distinct_candidate_hashes = list(stagnation_info.get("distinct_candidate_hashes") or ())
-            has_prior_reuse = False
-            audit_candidates = []
-            if ws_env and (Path(ws_env).parent / "profile").is_dir():
-                audit_candidates.append(Path(ws_env).parent / "profile" / "knowledge_query_audit.jsonl")
-            audit_candidates.extend([
-                cwd / "knowledge_query_audit.jsonl",
-                cwd.parent / "profile" / "knowledge_query_audit.jsonl",
-            ])
-            for audit_file in audit_candidates:
-                if audit_file.is_file():
-                    try:
-                        prior = [
-                            json.loads(ln)
-                            for ln in audit_file.read_text(encoding="utf-8").splitlines()
-                            if ln.strip()
-                        ]
-                        if any(isinstance(p, dict) and p.get("effective_mode") == "reuse" for p in prior):
-                            has_prior_reuse = True
-                            break
-                    except (OSError, ValueError):
-                        pass
+            has_prior_reuse = has_prior_reuse_audit(
+                audit_candidates, scope_key=scope_key, memory_scopes=self._prior_reuse_scopes
+            )
             if workspace_gated and not has_prior_reuse:
                 mode = "reuse"
                 transition_reason = "prior_reuse_required_before_explore"
-            elif stagnation_info.get("stalled"):
+            elif stagnation_info.get("promotion_ready"):
                 if requested_mode == "reuse" and (has_prior_reuse or not workspace_gated):
                     auto_switched_from_reuse = True
                     transition_reason = "auto_promoted_from_reuse_on_stagnation"
@@ -339,7 +322,7 @@ class RoutingIndex:
             path = self.units[ident].metadata["domain_path"]
             preferred = bool(domain_path and (path == domain_path or path.startswith(domain_path + "/")))
             tier = self.units[ident].metadata["tier"]
-            if mode != "explore" and has_l3 and tier == "L4":
+            if (explore_disabled or (mode != "explore" and has_l3)) and tier == "L4":
                 if score > 0 and not explore_disabled:
                     held_back_l4_ids.append(ident)
                 continue
@@ -474,8 +457,8 @@ class RoutingIndex:
                         path = unit.metadata["domain_path"]
                         preferred = bool(domain_path and (path == domain_path or path.startswith(domain_path + "/")))
                         tier = unit.metadata["tier"]
-                        if mode != "explore" and tier == "L4":
-                            if score > 0:
+                        if (explore_disabled or mode != "explore") and tier == "L4":
+                            if score > 0 and not explore_disabled:
                                 held_back_l4_ids.append(ident)
                             continue
                         tier_weight = 1.0
@@ -518,17 +501,8 @@ class RoutingIndex:
                     ).strip()
             payload["mode"] = mode
             def _write_query_audit(final_payload):
-                audit_targets = []
-                if ws_env and (Path(ws_env).parent / "profile").is_dir():
-                    audit_targets.append((Path(ws_env).parent / "profile" / "knowledge_query_audit.jsonl").resolve())
-                if cwd.name == "profile":
-                    p_cand = (cwd / "knowledge_query_audit.jsonl").resolve()
-                    if p_cand not in audit_targets:
-                        audit_targets.append(p_cand)
-                elif (cwd.parent / "profile").is_dir():
-                    p_cand = (cwd.parent / "profile" / "knowledge_query_audit.jsonl").resolve()
-                    if p_cand not in audit_targets:
-                        audit_targets.append(p_cand)
+                if mode == "reuse":
+                    self._prior_reuse_scopes.add(scope_key)
                 if not audit_targets:
                     return
                 mounted_l4 = [
@@ -536,6 +510,11 @@ class RoutingIndex:
                     for u in (final_payload.get("exploration_context") or {}).get("mounted_units", ())
                     if isinstance(u, dict) and u.get("tier") == "L4"
                 ]
+                run_ids = [
+                    r.get("run_id")
+                    for r in (ledger_entries or ())
+                    if isinstance(r, dict) and isinstance(r.get("run_id"), str)
+                ][-16:]
                 rec = {
                     "timestamp_epoch": time.time(),
                     "operation": "query",
@@ -547,12 +526,8 @@ class RoutingIndex:
                     "auto_switched_from_reuse": auto_switched_from_reuse,
                     "transition_reason": transition_reason,
                     "observed_failed_attempts": stalled_count,
-                    "distinct_candidate_hashes": distinct_candidate_hashes,
-                    "ledger_run_ids": [
-                        r.get("run_id")
-                        for r in (ledger_entries or ())
-                        if isinstance(r, dict) and isinstance(r.get("run_id"), str)
-                    ],
+                    "distinct_candidate_hashes": distinct_candidate_hashes[-16:],
+                    "ledger_run_ids": run_ids,
                     "delivered_unit_ids": [
                         r.get("id") for r in final_payload.get("results", ()) if isinstance(r, dict)
                     ],
