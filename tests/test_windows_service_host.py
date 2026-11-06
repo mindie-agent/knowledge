@@ -129,6 +129,8 @@ def scheduler(tmp_path, monkeypatch):
     config_path.write_text(json.dumps(config))
     sid = "S-1-5-21-123"
     state = dict(task=None, calls=[], interrupt=None)
+    from windows_launcher_fixture import write_launcher
+    write_launcher(tmp_path / "pythonw.exe")
     def private(path):
         path.mkdir(parents=True, exist_ok=True)
         return sid
@@ -182,6 +184,30 @@ def test_interrupted_registration_reconciles_exact_task_without_replaying_regist
         host.request_start(path, config)
     state["interrupt"] = None
     host.request_start(path, config)
+    assert state["calls"] == ["register", "start"]
+
+
+def test_legacy_registered_console_entry_is_blocked_and_can_recover(scheduler):
+    from windows_launcher_fixture import write_launcher
+    path, config, state = scheduler
+    state["interrupt"] = "register"
+    with pytest.raises(KeyboardInterrupt):
+        host.request_start(path, config)
+    root = host._paths(config)
+    record = host._read(root / "launch.json")
+    transfer = root / (record["attempt"] + ".context")
+    assert not transfer.exists()  # Proven pre-start cleanup removed the transfer.
+    operation = (root / "operation.json").read_bytes()
+    write_launcher(Path(record["python"]), subsystem=3)
+    state["interrupt"] = None
+    with pytest.raises(host.ServiceHostError, match="interpreter:windowless_interpreter_invalid"):
+        host.request_start(path, config)
+    assert state["calls"] == ["register"]
+    assert not transfer.exists()
+    assert (root / "operation.json").read_bytes() == operation
+    write_launcher(Path(record["python"]))
+    resumed = host.request_start(path, config)
+    assert resumed.record["attempt"] == record["attempt"]
     assert state["calls"] == ["register", "start"]
 
 

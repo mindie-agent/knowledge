@@ -27,6 +27,7 @@ SAFE_CODES = {
     "manager_operation_failed", "manager_status_invalid", "identity_unavailable",
     "unowned_file", "unowned_directory", "launch_record_invalid", "launch_record_too_large",
     "private_directory_unavailable", "foreign_task", "windowless_interpreter_missing",
+    "windowless_interpreter_invalid",
     "interpreter_path_unsupported",
     "foreign_launch_record", "registered_task_missing", "service_action_exited",
     "start_outcome_unknown", "launch_operation_invalid", "registration_outcome_unknown",

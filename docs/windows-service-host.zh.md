@@ -51,5 +51,20 @@ sequenceDiagram
 
 ## 4. `pythonw.exe` 无窗口标准流保护与透明错误传递
 
+- **验证真正的 GUI 启动器（#115）**：创建任务与恢复已注册任务的每次实际启动前，都直接读取入口文件的 DOS/PE 头，要求 PE32/PE32+ 的 `Subsystem == IMAGE_SUBSYSTEM_WINDOWS_GUI (2)`。文件名为 `pythonw.exe`、文件存在、任务设置为 `Hidden`，都不能证明不会弹窗。控制台型入口、损坏或不可读的文件报告 `interpreter:windowless_interpreter_invalid`，缺失文件报告 `interpreter:windowless_interpreter_missing`；拒绝路径不会注册或启动新任务。检查不缓存，旧环境或原地更新不能绕过它。
+- **异常旧环境的恢复**：通过插件正常的运行环境重建/升级路径恢复同一 CPython 安装对应的 GUI 启动器，再重试原有服务入口。服务代码不覆盖解释器二进制，也不退回系统 Python；因此保持原虚拟环境、模块参数、所有权和一次性启动回执。已经运行的任务继续按现有停止协议处理，无法确认结果的启动不重放。
 - **防止 `None` 标准流导致第三方库崩溃**：在 Windows 下，无窗口进程 `pythonw.exe` 往往会将 `sys.stdin`、`sys.stdout` 和 `sys.stderr` 设为 `None`，这会导致依赖标准输出流配置日志器的组件（如 ReMe）在初始化时直接崩溃。为此，服务宿主在加载任何业务组件前，会自动为缺失的标准流绑定真实的 UTF-8 空设备文件句柄（`DEVNULL`），并在退出时负责关闭。
 - **跨进程保留真实启动错误**：当后台组件在启动阶段报错时，其静态阶段码、异常类型与原因会通过白名单校验后写回当前尝试的结果回执中，确保前台轮询调用方看到的是**真实的组件故障原因**，而不是被笼统的宿主连接超时所掩盖。
+
+## 5. Windows 验证
+
+普通 Windows CI 运行 `tests/test_windows_interpreter.py` 和 `tests/test_windows_service_host.py`，覆盖真实 `python.exe` 被命名为 `pythonw.exe`、PE32/PE32+、新任务拒绝、旧注册任务恢复及修复后正常重试。
+
+真实交互式 Windows 桌面验收使用临时域和临时计划任务，运行正常服务入口、认证状态 RPC、停止与任务删除，并核对 `sys.prefix`、参数、窗口和进程树。Hosted CI 缺少交互式登录令牌，因此这项验收须在具备桌面的 Windows 主机显式运行：
+
+```powershell
+$env:MINDIE_TEST_WINDOWS_SCHEDULER = '1'
+.venv\Scripts\python.exe -m pytest -q tests/test_windows_scheduled_service.py
+```
+
+2026-11-06 在 Windows x86_64、uv 0.13.3、CPython 3.13.16 的现有虚拟环境实测通过：服务就绪、虚拟环境身份与参数保持、没有可见窗口、进程树无 `conhost.exe`，停止后消费者锁释放且测试计划任务删除。该结果不推断旧现场二进制的生成来源，也不替代其它 uv/CPython 组合的实测。
