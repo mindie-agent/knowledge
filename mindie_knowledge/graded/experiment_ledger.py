@@ -57,7 +57,8 @@ def _git(repo: Path, *args: str, deadline: float, stdout=subprocess.PIPE) -> byt
     timeout = min(GIT_TIMEOUT, deadline - time.monotonic())
     if timeout <= 0:
         raise subprocess.TimeoutExpired(["git", *args], FINGERPRINT_TIMEOUT)
-    res = subprocess.run(["git", "-C", str(repo), *args], stdout=stdout, stderr=subprocess.PIPE, timeout=timeout, check=False)
+    options = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+    res = subprocess.run(["git", "-C", str(repo), *args], stdout=stdout, stderr=subprocess.PIPE, timeout=timeout, check=False, **options)
     if res.returncode:
         raise ValueError(res.stderr.decode("utf-8", errors="replace").strip() or f"git {args[0]} failed")
     return res.stdout

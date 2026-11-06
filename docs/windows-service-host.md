@@ -51,5 +51,20 @@ To pass configuration paths and selected environment variables across the Task S
 
 ## 4. Windowless `pythonw.exe` Stream Guards & Transparent Startup Errors
 
+- **Validate the GUI launcher (#115)**: Before creating a task and before actually starting a recovered registration, read the executable's DOS/PE headers and require PE32/PE32+ `Subsystem == IMAGE_SUBSYSTEM_WINDOWS_GUI (2)`. The filename, file existence and task `Hidden` setting do not establish windowless execution. Console, malformed or unreadable launchers produce `interpreter:windowless_interpreter_invalid`; absent files produce `interpreter:windowless_interpreter_missing`. Rejection never registers or starts a new task. Validation is uncached so old environments and in-place updates cannot bypass it.
+- **Recover an invalid old environment**: Rebuild or upgrade through the plugin's normal runtime preparation path to restore the matching CPython GUI launcher, then retry the service entry. The service does not overwrite interpreter binaries or substitute a system Python. Virtual-environment identity, module arguments, ownership and one-use receipts remain intact. Already-running tasks retain their normal stop protocol, and uncertain starts are never replayed.
 - **Preventing `None` Stream Crashes in `pythonw.exe`**: Unlike console processes, `pythonw.exe` can leave `sys.stdin`, `sys.stdout`, and `sys.stderr` set to `None`, which crashes libraries (including ReMe's logger initialization) that expect valid stream objects. Before loading components, the service host attaches a real UTF-8 null-device file handle (`DEVNULL`) to any missing stream and closes only the handles it created on exit.
 - **Preserving Root-Cause Startup Errors Across Process Boundaries**: If a component fails during startup, its static stage code, exception class, and cause are allowlist-validated and returned in the attempt receipt—so the caller sees the actual component failure rather than a generic host timeout.
+
+## 5. Windows Verification
+
+Normal Windows CI runs `tests/test_windows_interpreter.py` and `tests/test_windows_service_host.py`, including a real console `python.exe` named `pythonw.exe`, PE32/PE32+, rejection before registration, recovery of old registrations, and successful retry after repair.
+
+Interactive desktop acceptance uses an isolated domain and temporary task, exercises the normal service entry, authenticated status RPC, stop and task deletion, and verifies `sys.prefix`, arguments, windows and the process tree. Hosted CI lacks an interactive login token; explicitly run this acceptance on a Windows desktop:
+
+```powershell
+$env:MINDIE_TEST_WINDOWS_SCHEDULER = '1'
+.venv\Scripts\python.exe -m pytest -q tests/test_windows_scheduled_service.py
+```
+
+Verified on 2026-11-06 with Windows x86_64, uv 0.13.3 and CPython 3.13.16 in the existing virtual environment: service readiness, preserved environment identity and arguments, no visible window or descendant `conhost.exe`, released consumer lock and deleted test task after stop. This does not establish the origin of the old incident's binary or validate other uv/CPython combinations.

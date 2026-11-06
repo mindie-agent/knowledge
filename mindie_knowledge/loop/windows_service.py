@@ -25,6 +25,7 @@ import uuid
 from xml.etree import ElementTree as ET
 
 from ..filesystem import filesystem_path, git_path, path_identity, resolved_path
+from ..windows_interpreter import require_windowless
 from . import service_context
 
 MARKER = "mindie-knowledge.windows-service/1"
@@ -163,8 +164,7 @@ def _verify_task(task, record, manifest):
 def _record(config_path, config, root, sid):
     from .lifecycle import config_fingerprint
     python = Path(sys.executable).with_name("pythonw.exe")
-    if not python.is_file():
-        raise ServiceHostError("windowless_interpreter_missing", stage="interpreter")
+    require_windowless(python)
     if len(git_path(resolved_path(python))) > 260:
         raise ServiceHostError("interpreter_path_unsupported", stage="interpreter")
     attempt = uuid.uuid4().hex
@@ -555,6 +555,9 @@ def _start_registered(root, record, task):
     from .lifecycle import require_active
     config = config_at(record["config"])
     require_active(record["config"], config)
+    # Recheck the recorded entry too: an old registration or an in-place
+    # environment update must not bypass the GUI check at task creation.
+    require_windowless(record["python"])
     if (root / (record["attempt"] + ".claimed")).exists():
         raise ServiceHostError("launch_attempt_already_consumed", stage="reconcile", uncertain=True)
     context_path = root / (record["attempt"] + ".context")
