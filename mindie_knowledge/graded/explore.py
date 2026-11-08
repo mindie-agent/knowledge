@@ -184,30 +184,37 @@ def assess_stagnation(ledger_entries: Sequence[Mapping[str, Any]], *,
 
 
 def read_bounded_jsonl(path: Path, *, max_bytes: int = 262144, max_rows: int = 128) -> list[dict]:
-    """Read at most the trailing max_bytes and max_rows JSON object lines from path."""
-    if not path.is_file():
-        return []
+    """Read trailing JSON object lines. Missing files are empty; damaged files raise."""
     try:
+        if not path.is_file():
+            return []
         size = path.stat().st_size
         offset = max(0, size - max_bytes)
         with path.open("rb") as fh:
             if offset > 0:
                 fh.seek(offset)
                 fh.readline()
-            raw_text = fh.read(max_bytes).decode("utf-8", errors="replace")
-    except OSError:
-        return []
+            raw = fh.read(max_bytes)
+        if len(raw) == max_bytes and not raw.endswith(b"\n"):
+            raw = raw.rsplit(b"\n", 1)[0] if b"\n" in raw else b""
+        body = raw.decode("utf-8")
+    except TimeoutError:
+        raise
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"{path}: cannot read experiment ledger: {type(exc).__name__}: {exc}") from exc
+    lines = body.splitlines()
     rows: list[dict] = []
-    for line in raw_text.splitlines()[-max_rows:]:
+    for index, line in enumerate(lines[-max_rows:], start=1):
         text = line.strip()
         if not text:
             continue
         try:
             obj = json.loads(text)
-        except ValueError:
-            continue
-        if isinstance(obj, dict):
-            rows.append(obj)
+        except ValueError as exc:
+            raise ValueError(f"{path}: trailing JSONL row {index} is not valid JSON: {exc}") from exc
+        if not isinstance(obj, dict):
+            raise ValueError(f"{path}: trailing JSONL row {index} must be an object")
+        rows.append(obj)
     return rows
 
 

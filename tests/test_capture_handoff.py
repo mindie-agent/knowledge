@@ -120,7 +120,9 @@ def test_locked_store_is_not_accepted(tmp_path):
         held.rollback()
         held.close()
     assert result["stage"] == "unavailable"
-    assert result["reason"] == "store-locked"
+    # 0.1 s cannot cover the 1 s SQLite lock floor after admission; this is
+    # budget exhaustion, not a sub-second busy_timeout wait on the lock.
+    assert result["reason"] == "budget-exhausted"
     assert result["capture_id"] is None
     assert time.monotonic() - started < 1.5
     stored = capture_hook(config, _event(admission))

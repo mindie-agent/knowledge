@@ -20,6 +20,9 @@
 [Timeouts & Locks]
 - Cross-process initialization is serialized by `StartLock(<db>.init.lock)` with
   a bounded `timeout` (default 10.0s) and SQLite `timeout` (default 5.0s) in WAL mode.
+- `open_database` sets `PRAGMA busy_timeout=5000` once. Callers with a remaining
+  budget below `SQLITE_BUSY_FLOOR_SECONDS` (1 s) must fail closed before connect
+  rather than shrinking the lock wait into the sub-second range.
 
 [Side-Effect Policy]
 - Local filesystem and SQLite state only; zero network or subprocess execution.
@@ -30,6 +33,28 @@ import sqlite3
 
 from .loop.locks import StartLock
 from .filesystem import filesystem_path, sqlite_file_uri
+
+SQLITE_BUSY_TIMEOUT_MS = 5000
+SQLITE_BUSY_FLOOR_SECONDS = 1.0
+SQLITE_BUSY_PREFERRED_SECONDS = 3.0
+
+
+def sqlite_busy_timeout_ms(remaining=None):
+    """PRAGMA busy_timeout milliseconds for a remaining caller budget.
+
+    ``None`` remaining keeps the 5 s authority floor. A remaining budget below
+    1 s returns ``None`` so the caller can fail closed before opening SQLite
+    instead of waiting 1–999 ms on a lock.
+    """
+    if remaining is None:
+        return SQLITE_BUSY_TIMEOUT_MS
+    if type(remaining) not in (int, float) or remaining != remaining:
+        raise ValueError("SQLite remaining budget must be a finite number")
+    if remaining < SQLITE_BUSY_FLOOR_SECONDS:
+        return None
+    if remaining >= SQLITE_BUSY_PREFERRED_SECONDS:
+        return max(int(SQLITE_BUSY_PREFERRED_SECONDS * 1000), int(remaining * 1000))
+    return max(int(SQLITE_BUSY_FLOOR_SECONDS * 1000), int(remaining * 1000))
 
 
 def require_columns(db, required):
@@ -110,7 +135,7 @@ def open_database(path, *, schema, required, initialize, residue=(), validate=No
         # SQLite's Python `timeout` covers the initial lock, not every wait
         # after a WAL checkpoint or a concurrent writer. Keep the 5 s floor
         # explicit on the connection itself.
-        db.execute('PRAGMA busy_timeout=5000')
+        db.execute(f'PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}')
         if os.environ.get('MINDIE_DISABLE_FSYNC') == '1':
             db.execute('PRAGMA synchronous=OFF')
         if initialize_missing and not lock.prior_record:

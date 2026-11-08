@@ -5,6 +5,8 @@ import hashlib
 import json
 from pathlib import Path
 
+import pytest
+
 from mindie_knowledge.graded.index import RoutingIndex, read_units
 from mindie_knowledge.graded.maintenance import (
     apply_move_plan,
@@ -534,4 +536,169 @@ def test_build_routing_index_auto_advances_revision_when_content_changes(tmp_pat
     reloaded = GradedUnit.from_text((tmp_path / value.path).read_text(encoding="utf-8"), value.path)
     assert reloaded.revision == 2
     assert build_routing_index(tmp_path, check=True)["ok"] is True
+
+
+def test_corrupt_routing_manifest_does_not_skip_revision_monotonicity(tmp_path: Path) -> None:
+    value = _unit("rules/unit-corrupt-rev.md", ident="unit-corrupt-rev")
+    _make_corpus(tmp_path, value)
+    assert build_routing_index(tmp_path)["ok"] is True
+    manifest_path = tmp_path / "index" / "routing-manifest.json"
+    topology_path = tmp_path / "index" / "shard-topology.json"
+    topology_before = topology_path.read_bytes()
+    manifest_path.write_text("{not-json", encoding="utf-8", newline="\n")
+
+    rebuilt = build_routing_index(tmp_path)
+
+    assert rebuilt["ok"] is False
+    assert rebuilt["written"] is False
+    assert any(item["kind"] == "routing_index_unreadable" for item in rebuilt["errors"])
+    assert manifest_path.read_text(encoding="utf-8") == "{not-json"
+    assert topology_path.read_bytes() == topology_before
+
+
+def test_manifest_only_routing_index_can_rebuild_topology(tmp_path: Path) -> None:
+    value = _unit("rules/unit-manifest-only.md", ident="unit-manifest-only")
+    _make_corpus(tmp_path, value)
+    assert build_routing_index(tmp_path)["ok"] is True
+    topology_path = tmp_path / "index" / "shard-topology.json"
+    topology_path.unlink()
+    rebuilt = build_routing_index(tmp_path)
+    assert rebuilt["ok"] is True
+    assert rebuilt["written"] is True
+    assert topology_path.is_file()
+    topology_doc = json.loads(topology_path.read_text(encoding="utf-8"))
+    assert topology_doc["schema"] == "mindie-shard-topology/1"
+    assert "unit-manifest-only" in topology_doc["units"]
+
+
+def test_empty_dict_routing_manifest_does_not_overwrite_history(tmp_path: Path) -> None:
+    value = _unit("rules/unit-empty-dict.md", ident="unit-empty-dict")
+    _make_corpus(tmp_path, value)
+    assert build_routing_index(tmp_path)["ok"] is True
+    manifest_path = tmp_path / "index" / "routing-manifest.json"
+    topology_path = tmp_path / "index" / "shard-topology.json"
+    topology_before = topology_path.read_bytes()
+    manifest_path.write_text("{}", encoding="utf-8", newline="\n")
+
+    rebuilt = build_routing_index(tmp_path)
+
+    assert rebuilt["ok"] is False
+    assert rebuilt["written"] is False
+    assert any(item["kind"] == "routing_index_unreadable" for item in rebuilt["errors"])
+    assert manifest_path.read_text(encoding="utf-8") == "{}"
+    assert topology_path.read_bytes() == topology_before
+
+
+def test_empty_units_list_does_not_overwrite_history(tmp_path: Path) -> None:
+    value = _unit("rules/unit-empty-units.md", ident="unit-empty-units")
+    _make_corpus(tmp_path, value)
+    assert build_routing_index(tmp_path)["ok"] is True
+    manifest_path = tmp_path / "index" / "routing-manifest.json"
+    topology_path = tmp_path / "index" / "shard-topology.json"
+    topology_before = topology_path.read_bytes()
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["units"] = []
+    manifest_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8", newline="\n")
+    wiped = manifest_path.read_text(encoding="utf-8")
+
+    rebuilt = build_routing_index(tmp_path)
+
+    assert rebuilt["ok"] is False
+    assert rebuilt["written"] is False
+    assert any(item["kind"] == "routing_index_unreadable" for item in rebuilt["errors"])
+    assert manifest_path.read_text(encoding="utf-8") == wiped
+    assert topology_path.read_bytes() == topology_before
+
+
+def test_mixed_malformed_manifest_row_does_not_overwrite_history(tmp_path: Path) -> None:
+    value = _unit("rules/unit-mixed-row.md", ident="unit-mixed-row")
+    _make_corpus(tmp_path, value)
+    assert build_routing_index(tmp_path)["ok"] is True
+    manifest_path = tmp_path / "index" / "routing-manifest.json"
+    topology_path = tmp_path / "index" / "shard-topology.json"
+    topology_before = topology_path.read_bytes()
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["units"].append("not-an-object")
+    manifest_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8", newline="\n")
+    mixed = manifest_path.read_text(encoding="utf-8")
+
+    rebuilt = build_routing_index(tmp_path)
+
+    assert rebuilt["ok"] is False
+    assert rebuilt["written"] is False
+    assert any(item["kind"] == "routing_index_unreadable" for item in rebuilt["errors"])
+    assert manifest_path.read_text(encoding="utf-8") == mixed
+    assert topology_path.read_bytes() == topology_before
+
+
+def test_null_units_are_omitted_history_not_damage(tmp_path: Path) -> None:
+    value = _unit("rules/unit-null-units.md", ident="unit-null-units")
+    _make_corpus(tmp_path, value)
+    assert build_routing_index(tmp_path)["ok"] is True
+    manifest_path = tmp_path / "index" / "routing-manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["units"] = None
+    manifest_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8", newline="\n")
+
+    rebuilt = build_routing_index(tmp_path)
+
+    assert rebuilt["ok"] is True
+    assert rebuilt["written"] is True
+    restored = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert isinstance(restored["units"], list) and restored["units"]
+
+
+def test_manifest_rows_may_omit_optional_revision(tmp_path: Path) -> None:
+    value = _unit("rules/unit-optional-rev.md", ident="unit-optional-rev")
+    _make_corpus(tmp_path, value)
+    assert build_routing_index(tmp_path)["ok"] is True
+    manifest_path = tmp_path / "index" / "routing-manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for row in payload["units"]:
+        row.pop("revision", None)
+    manifest_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8", newline="\n")
+
+    rebuilt = build_routing_index(tmp_path)
+
+    assert rebuilt["ok"] is True
+    assert rebuilt["written"] is True
+    restored = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert all("revision" in row for row in restored["units"])
+
+
+def test_empty_dict_routing_topology_does_not_overwrite_history(tmp_path: Path) -> None:
+    value = _unit("rules/unit-empty-topo.md", ident="unit-empty-topo")
+    _make_corpus(tmp_path, value)
+    assert build_routing_index(tmp_path)["ok"] is True
+    manifest_path = tmp_path / "index" / "routing-manifest.json"
+    topology_path = tmp_path / "index" / "shard-topology.json"
+    manifest_before = manifest_path.read_bytes()
+    topology_path.write_text("{}", encoding="utf-8", newline="\n")
+
+    rebuilt = build_routing_index(tmp_path)
+
+    assert rebuilt["ok"] is False
+    assert rebuilt["written"] is False
+    assert any(item["kind"] == "routing_index_unreadable" for item in rebuilt["errors"])
+    assert topology_path.read_text(encoding="utf-8") == "{}"
+    assert manifest_path.read_bytes() == manifest_before
+
+
+def test_routing_manifest_read_timeout_is_not_empty_history(tmp_path: Path, monkeypatch) -> None:
+    value = _unit("rules/unit-timeout-rev.md", ident="unit-timeout-rev")
+    _make_corpus(tmp_path, value)
+    assert build_routing_index(tmp_path)["ok"] is True
+    manifest_path = tmp_path / "index" / "routing-manifest.json"
+    error = TimeoutError("routing read exceeded its remaining budget")
+
+    def timed_out(self, *args, **kwargs):
+        if Path(self) == manifest_path:
+            raise error
+        return original_read_text(self, *args, **kwargs)
+
+    original_read_text = Path.read_text
+    monkeypatch.setattr(Path, "read_text", timed_out)
+    with pytest.raises(TimeoutError) as raised:
+        build_routing_index(tmp_path)
+    assert raised.value is error
 

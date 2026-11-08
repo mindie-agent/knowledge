@@ -408,9 +408,10 @@ def test_sync_discards_old_git_objects_and_old_database_bodies(env):
     assert not (feed.dir / 'staging').exists()
 
 
-def test_normal_sync_has_no_internal_execution_deadline(env, monkeypatch):
+def test_normal_sync_applies_bounded_default_timeout(env, monkeypatch):
     import mindie_knowledge.loop.feed as feed_module
     import mindie_knowledge.gitread as gitread
+    from mindie_knowledge.loop.feed import DEFAULT_SYNC_TIMEOUT_SECONDS
     git, repo, store, feed = env
     commit_docs(git, repo, [entry_doc('7' * 64, 'Complete public evidence')])
     calls = []
@@ -429,4 +430,14 @@ def test_normal_sync_has_no_internal_execution_deadline(env, monkeypatch):
     monkeypatch.setattr(gitread.CatFileBatch, 'read', checked_read)
     assert feed.sync()['status'] == 'synced'
     assert {kind for kind, _ in calls} == {'process', 'listing', 'blob'}
-    assert all(deadline is None for _, deadline in calls)
+    assert all(value is not None for _, value in calls)
+    process_timeouts = [value for kind, value in calls if kind == 'process']
+    assert process_timeouts
+    assert all(0 < value <= DEFAULT_SYNC_TIMEOUT_SECONDS for value in process_timeouts)
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan")])
+def test_sync_rejects_non_positive_or_non_finite_timeout(env, timeout):
+    git, repo, store, feed = env
+    with pytest.raises(ValueError, match="finite positive"):
+        feed.sync(timeout=timeout)

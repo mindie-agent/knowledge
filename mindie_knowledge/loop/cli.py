@@ -77,11 +77,10 @@ def validate_config(config):
     if not adapter:
         raise ValueError("public transcript mode requires a transcript adapter")
     if adapter is not None:
-        candidate = Path(adapter)
         if (
             not isinstance(adapter, str)
-            or not candidate.is_absolute()
-            or candidate.suffix != ".py"
+            or not Path(adapter).is_absolute()
+            or Path(adapter).suffix != ".py"
         ):
             raise ValueError(
                 "transcript_adapter must be an absolute local parser module path"
@@ -628,15 +627,9 @@ def main(argv=None):
 
         return run_wake(args.config, args.event)
     if args.operation == "hook":
-        try:
-            raw = sys.stdin.buffer.read()
-            capture_hook(args.config, json.loads(raw))
-        except TimeoutError:
-            raise
-        except (ValueError, TypeError, AttributeError, OSError, RecursionError):
-            pass
-        print("{}")
-        return 0
+        from .handoff import run_stop_hook
+
+        return run_stop_hook(args.config)
     if args.operation == "diagnostic-status":
         from .diagnostics import snapshot
 
