@@ -488,14 +488,14 @@ def _previous_unit_states(
     if error:
         return {}, error
     revisions: dict[str, int | None] = {}
-    if manifest is not None and "units" in manifest:
+    if manifest is not None and manifest.get("units") is not None:
         revisions, error = _history_from_units(
             manifest["units"], path=manifest_path, label="routing manifest",
             mapping=False, optional="revision")
         if error:
             return {}, error
     digests: dict[str, str | None] = {}
-    if topology_doc is not None and "units" in topology_doc:
+    if topology_doc is not None and topology_doc.get("units") is not None:
         digests, error = _history_from_units(
             topology_doc["units"], path=topology_path, label="shard topology",
             mapping=True, optional="content_sha256")

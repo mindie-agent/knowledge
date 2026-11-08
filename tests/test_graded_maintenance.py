@@ -631,6 +631,23 @@ def test_mixed_malformed_manifest_row_does_not_overwrite_history(tmp_path: Path)
     assert topology_path.read_bytes() == topology_before
 
 
+def test_null_units_are_omitted_history_not_damage(tmp_path: Path) -> None:
+    value = _unit("rules/unit-null-units.md", ident="unit-null-units")
+    _make_corpus(tmp_path, value)
+    assert build_routing_index(tmp_path)["ok"] is True
+    manifest_path = tmp_path / "index" / "routing-manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["units"] = None
+    manifest_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8", newline="\n")
+
+    rebuilt = build_routing_index(tmp_path)
+
+    assert rebuilt["ok"] is True
+    assert rebuilt["written"] is True
+    restored = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert isinstance(restored["units"], list) and restored["units"]
+
+
 def test_manifest_rows_may_omit_optional_revision(tmp_path: Path) -> None:
     value = _unit("rules/unit-optional-rev.md", ident="unit-optional-rev")
     _make_corpus(tmp_path, value)
