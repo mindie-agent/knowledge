@@ -424,7 +424,6 @@ def _write_pair(manifest_path: Path, manifest: dict, topology_path: Path, topolo
 def _existing_routing_document(
     path: Path, *, label: str, schemas: frozenset[str], keys: tuple[str, ...],
 ) -> tuple[dict | None, str | None]:
-    """Return a present document, ``None`` when absent, or an error for damage."""
     if not path.is_file():
         return None, None
     try:
@@ -433,12 +432,32 @@ def _existing_routing_document(
         raise
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         return None, f"existing {label} cannot be read: {type(exc).__name__}: {exc} ({path})"
-    if not isinstance(payload, dict):
-        return None, f"{label} is not an object: {path}"
-    if not any(payload.get(key) in schemas for key in keys):
+    if not isinstance(payload, dict) or not any(payload.get(key) in schemas for key in keys):
         return None, f"{label} schema is missing or unsupported: {path}"
     return payload, None
 
+
+def _history_from_units(rows, *, path, label, mapping: bool, optional: str):
+    kind = "an object" if mapping else "a list"
+    if not isinstance(rows, dict if mapping else list):
+        return {}, f"{label} units are not {kind}: {path}"
+    if not rows:
+        return {}, f"{label} units are empty: {path}"
+    pairs = list(rows.items()) if mapping else [
+        (row.get("id") if isinstance(row, dict) else None, row) for row in rows]
+    history, bad = {}, f"{label} history rows are malformed: {path}"
+    for ident, row in pairs:
+        if not isinstance(ident, str) or not isinstance(row, dict) or ident in history:
+            return {}, bad
+        if optional not in row:
+            history[ident] = None
+            continue
+        value = row[optional]
+        valid = type(value) is int if optional == "revision" else isinstance(value, str)
+        if not valid:
+            return {}, bad
+        history[ident] = value
+    return history, None
 
 def _needs_revision_advance(unit, old_rev, old_sha) -> bool:
     if old_rev is not None and unit.revision < old_rev:
@@ -446,12 +465,9 @@ def _needs_revision_advance(unit, old_rev, old_sha) -> bool:
     return old_sha is not None and unit.content_sha256 != old_sha and (
         old_rev is None or unit.revision <= old_rev)
 
-
 def _advanced_revision(unit, old_rev, old_sha) -> int:
-    if old_sha is not None and unit.content_sha256 != old_sha:
-        return (old_rev if old_rev is not None else unit.revision) + 1
-    return old_rev if old_rev is not None else unit.revision
-
+    base = old_rev if old_rev is not None else unit.revision
+    return base + 1 if old_sha is not None and unit.content_sha256 != old_sha else base
 
 def _previous_unit_states(
     manifest_path: Path, topology_path: Path,
@@ -471,37 +487,22 @@ def _previous_unit_states(
     )
     if error:
         return {}, error
-    revisions: dict[str, int] = {}
-    if manifest is not None:
-        rows = manifest.get("units", [])
-        if not isinstance(rows, list):
-            return {}, f"routing manifest units are not a list: {manifest_path}"
-        revisions = {
-            row["id"]: row["revision"]
-            for row in rows
-            if isinstance(row, dict) and isinstance(row.get("id"), str)
-            and type(row.get("revision")) is int
-        }
-        if rows and not revisions:
-            return {}, f"routing manifest history rows are malformed: {manifest_path}"
-    digests: dict[str, str] = {}
-    if topology_doc is not None:
-        rows = topology_doc.get("units") or {}
-        if not isinstance(rows, dict):
-            return {}, f"shard topology units are not an object: {topology_path}"
-        digests = {
-            ident: row["content_sha256"]
-            for ident, row in rows.items()
-            if isinstance(ident, str) and isinstance(row, dict)
-            and isinstance(row.get("content_sha256"), str)
-        }
-        if rows and not digests:
-            return {}, f"shard topology history rows are malformed: {topology_path}"
-    previous = {
-        ident: (revisions.get(ident), digests.get(ident))
-        for ident in revisions.keys() | digests.keys()
-    }
-    return previous, None
+    revisions: dict[str, int | None] = {}
+    if manifest is not None and "units" in manifest:
+        revisions, error = _history_from_units(
+            manifest["units"], path=manifest_path, label="routing manifest",
+            mapping=False, optional="revision")
+        if error:
+            return {}, error
+    digests: dict[str, str | None] = {}
+    if topology_doc is not None and "units" in topology_doc:
+        digests, error = _history_from_units(
+            topology_doc["units"], path=topology_path, label="shard topology",
+            mapping=True, optional="content_sha256")
+        if error:
+            return {}, error
+    return {ident: (revisions.get(ident), digests.get(ident))
+            for ident in revisions.keys() | digests.keys()}, None
 
 
 def _check_payloads(manifest_path: Path, topology_path: Path, manifest: dict, topology_doc: dict) -> list[str]:

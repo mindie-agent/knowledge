@@ -293,6 +293,25 @@ def test_admission_timeout_propagates_from_capture_hook(tmp_path, monkeypatch):
     assert raised.value is error
 
 
+def test_admission_timeout_is_preserved_when_receipt_write_times_out(tmp_path, monkeypatch):
+    project = tmp_path / "proj"
+    project.mkdir()
+    config, admission = _engine_config(tmp_path, project)
+    error = TimeoutError("admission read exceeded its remaining budget")
+
+    def boom(self, *args, **kwargs):
+        raise error
+
+    def receipt_timeout(*args, **kwargs):
+        raise TimeoutError("delivery receipt exceeded its remaining budget")
+
+    monkeypatch.setattr(handoff.Admission, "capture_authorization", boom)
+    monkeypatch.setattr(handoff, "_record", receipt_timeout)
+    with pytest.raises(TimeoutError) as raised:
+        cli.capture_hook(config, _stop_event(admission), timeout=6.0)
+    assert raised.value is error
+
+
 def test_stop_hook_cli_timeout_still_emits_host_protocol(tmp_path, monkeypatch, capsys):
     project = tmp_path / "proj"
     project.mkdir()

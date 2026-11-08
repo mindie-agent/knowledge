@@ -589,6 +589,66 @@ def test_empty_dict_routing_manifest_does_not_overwrite_history(tmp_path: Path) 
     assert topology_path.read_bytes() == topology_before
 
 
+def test_empty_units_list_does_not_overwrite_history(tmp_path: Path) -> None:
+    value = _unit("rules/unit-empty-units.md", ident="unit-empty-units")
+    _make_corpus(tmp_path, value)
+    assert build_routing_index(tmp_path)["ok"] is True
+    manifest_path = tmp_path / "index" / "routing-manifest.json"
+    topology_path = tmp_path / "index" / "shard-topology.json"
+    topology_before = topology_path.read_bytes()
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["units"] = []
+    manifest_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8", newline="\n")
+    wiped = manifest_path.read_text(encoding="utf-8")
+
+    rebuilt = build_routing_index(tmp_path)
+
+    assert rebuilt["ok"] is False
+    assert rebuilt["written"] is False
+    assert any(item["kind"] == "routing_index_unreadable" for item in rebuilt["errors"])
+    assert manifest_path.read_text(encoding="utf-8") == wiped
+    assert topology_path.read_bytes() == topology_before
+
+
+def test_mixed_malformed_manifest_row_does_not_overwrite_history(tmp_path: Path) -> None:
+    value = _unit("rules/unit-mixed-row.md", ident="unit-mixed-row")
+    _make_corpus(tmp_path, value)
+    assert build_routing_index(tmp_path)["ok"] is True
+    manifest_path = tmp_path / "index" / "routing-manifest.json"
+    topology_path = tmp_path / "index" / "shard-topology.json"
+    topology_before = topology_path.read_bytes()
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["units"].append("not-an-object")
+    manifest_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8", newline="\n")
+    mixed = manifest_path.read_text(encoding="utf-8")
+
+    rebuilt = build_routing_index(tmp_path)
+
+    assert rebuilt["ok"] is False
+    assert rebuilt["written"] is False
+    assert any(item["kind"] == "routing_index_unreadable" for item in rebuilt["errors"])
+    assert manifest_path.read_text(encoding="utf-8") == mixed
+    assert topology_path.read_bytes() == topology_before
+
+
+def test_manifest_rows_may_omit_optional_revision(tmp_path: Path) -> None:
+    value = _unit("rules/unit-optional-rev.md", ident="unit-optional-rev")
+    _make_corpus(tmp_path, value)
+    assert build_routing_index(tmp_path)["ok"] is True
+    manifest_path = tmp_path / "index" / "routing-manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for row in payload["units"]:
+        row.pop("revision", None)
+    manifest_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8", newline="\n")
+
+    rebuilt = build_routing_index(tmp_path)
+
+    assert rebuilt["ok"] is True
+    assert rebuilt["written"] is True
+    restored = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert all("revision" in row for row in restored["units"])
+
+
 def test_empty_dict_routing_topology_does_not_overwrite_history(tmp_path: Path) -> None:
     value = _unit("rules/unit-empty-topo.md", ident="unit-empty-topo")
     _make_corpus(tmp_path, value)

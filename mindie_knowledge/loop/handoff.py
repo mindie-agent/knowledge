@@ -574,7 +574,10 @@ def accept_stop(config_path, event, *, timeout=None):
                 session, token, timeout=auth_timeout,
             )
     except TimeoutError:
-        _record(config, stage="accept", cause="budget-exhausted", event=event_id)
+        try:
+            _record(config, stage="accept", cause="budget-exhausted", event=event_id)
+        except TimeoutError:
+            pass
         raise
     except AdmissionUnavailable:
         _record(config, stage="accept", cause="admission-unreadable", event=event_id)
