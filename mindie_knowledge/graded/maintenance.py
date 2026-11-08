@@ -30,6 +30,7 @@ from ..markdown import _atomic_write_text
 
 LINT_SCHEMA = "mindie-graded-lint/1"
 PLAN_SCHEMA = "mindie-shard-plan/1"
+ROUTING_MANIFEST_SCHEMA = "mindie-routing-manifest/1"
 TOPOLOGY_SCHEMA = "mindie-shard-topology/1"
 APPLY_SCHEMA = "mindie-shard-apply-report/1"
 APPLY_PLAN_SCHEMA = "mindie-shard-apply-plan/1"
@@ -420,43 +421,87 @@ def _write_pair(manifest_path: Path, manifest: dict, topology_path: Path, topolo
                 pass
 
 
-def _previous_unit_states(
-    manifest_path: Path, topology_path: Path,
-) -> tuple[dict[str, tuple[int, str]], str | None]:
-    """Load prior routing state. Missing both files is empty; a damaged existing index is an error."""
-    manifest_exists = manifest_path.is_file()
-    topology_exists = topology_path.is_file()
-    if not manifest_exists and not topology_exists:
-        return {}, None
-    if not manifest_exists:
-        return {}, f"routing manifest is missing while shard topology exists: {manifest_path}"
-    if not topology_exists:
-        return {}, f"shard topology is missing while routing manifest exists: {topology_path}"
+def _existing_routing_document(
+    path: Path, *, label: str, schemas: frozenset[str], keys: tuple[str, ...],
+) -> tuple[dict | None, str | None]:
+    """Return a present document, ``None`` when absent, or an error for damage."""
+    if not path.is_file():
+        return None, None
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        topology_doc = json.loads(topology_path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except TimeoutError:
         raise
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        return {}, (
-            f"existing routing index cannot be read: {type(exc).__name__}: {exc} "
-            f"({manifest_path}, {topology_path})"
-        )
-    if not isinstance(manifest, dict):
-        return {}, f"routing manifest is not an object: {manifest_path}"
-    if not isinstance(topology_doc, dict):
-        return {}, f"shard topology is not an object: {topology_path}"
-    revisions = {
-        row["id"]: row["revision"]
-        for row in manifest.get("units", ())
-        if isinstance(row, dict) and isinstance(row.get("id"), str) and type(row.get("revision")) is int
+        return None, f"existing {label} cannot be read: {type(exc).__name__}: {exc} ({path})"
+    if not isinstance(payload, dict):
+        return None, f"{label} is not an object: {path}"
+    if not any(payload.get(key) in schemas for key in keys):
+        return None, f"{label} schema is missing or unsupported: {path}"
+    return payload, None
+
+
+def _needs_revision_advance(unit, old_rev, old_sha) -> bool:
+    if old_rev is not None and unit.revision < old_rev:
+        return True
+    return old_sha is not None and unit.content_sha256 != old_sha and (
+        old_rev is None or unit.revision <= old_rev)
+
+
+def _advanced_revision(unit, old_rev, old_sha) -> int:
+    if old_sha is not None and unit.content_sha256 != old_sha:
+        return (old_rev if old_rev is not None else unit.revision) + 1
+    return old_rev if old_rev is not None else unit.revision
+
+
+def _previous_unit_states(
+    manifest_path: Path, topology_path: Path,
+) -> tuple[dict[str, tuple[int | None, str | None]], str | None]:
+    """Load prior routing state. Missing files are empty; damaged present files error."""
+    manifest, error = _existing_routing_document(
+        manifest_path, label="routing manifest",
+        schemas=frozenset({ROUTING_MANIFEST_SCHEMA}),
+        keys=("schema", "schema_version"),
+    )
+    if error:
+        return {}, error
+    topology_doc, error = _existing_routing_document(
+        topology_path, label="shard topology",
+        schemas=frozenset({TOPOLOGY_SCHEMA}),
+        keys=("schema",),
+    )
+    if error:
+        return {}, error
+    revisions: dict[str, int] = {}
+    if manifest is not None:
+        rows = manifest.get("units", [])
+        if not isinstance(rows, list):
+            return {}, f"routing manifest units are not a list: {manifest_path}"
+        revisions = {
+            row["id"]: row["revision"]
+            for row in rows
+            if isinstance(row, dict) and isinstance(row.get("id"), str)
+            and type(row.get("revision")) is int
+        }
+        if rows and not revisions:
+            return {}, f"routing manifest history rows are malformed: {manifest_path}"
+    digests: dict[str, str] = {}
+    if topology_doc is not None:
+        rows = topology_doc.get("units") or {}
+        if not isinstance(rows, dict):
+            return {}, f"shard topology units are not an object: {topology_path}"
+        digests = {
+            ident: row["content_sha256"]
+            for ident, row in rows.items()
+            if isinstance(ident, str) and isinstance(row, dict)
+            and isinstance(row.get("content_sha256"), str)
+        }
+        if rows and not digests:
+            return {}, f"shard topology history rows are malformed: {topology_path}"
+    previous = {
+        ident: (revisions.get(ident), digests.get(ident))
+        for ident in revisions.keys() | digests.keys()
     }
-    digests = {
-        ident: row["content_sha256"]
-        for ident, row in (topology_doc.get("units") or {}).items()
-        if isinstance(ident, str) and isinstance(row, dict) and isinstance(row.get("content_sha256"), str)
-    }
-    return {ident: (revisions[ident], digests[ident]) for ident in revisions.keys() & digests.keys()}, None
+    return previous, None
 
 
 def _check_payloads(manifest_path: Path, topology_path: Path, manifest: dict, topology_doc: dict) -> list[str]:
@@ -500,7 +545,7 @@ def build_routing_index(root: Path | str, *, index_dir: Path | str | None = None
                 if unit.id not in previous:
                     continue
                 old_rev, old_sha = previous[unit.id]
-                if unit.revision < old_rev or (unit.content_sha256 != old_sha and unit.revision <= old_rev):
+                if _needs_revision_advance(unit, old_rev, old_sha):
                     report["errors"].append(_error(
                         "revision_not_advanced",
                         f"{_unit_path(unit)}: graded unit content changed without advancing revision ({old_rev} -> {unit.revision})",
@@ -511,8 +556,8 @@ def build_routing_index(root: Path | str, *, index_dir: Path | str | None = None
                 if unit.id not in previous:
                     continue
                 old_rev, old_sha = previous[unit.id]
-                if unit.revision < old_rev or (unit.content_sha256 != old_sha and unit.revision <= old_rev):
-                    target_rev = (old_rev + 1) if unit.content_sha256 != old_sha else old_rev
+                if _needs_revision_advance(unit, old_rev, old_sha):
+                    target_rev = _advanced_revision(unit, old_rev, old_sha)
                     updated = GradedUnit.from_parts({**unit.metadata, "revision": target_rev}, unit.body, unit.path)
                     _atomic_write_text(root / _unit_path(unit), updated.render())
                     advanced = True

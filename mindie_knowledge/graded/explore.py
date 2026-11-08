@@ -195,14 +195,14 @@ def read_bounded_jsonl(path: Path, *, max_bytes: int = 262144, max_rows: int = 1
                 fh.seek(offset)
                 fh.readline()
             raw = fh.read(max_bytes)
+        if len(raw) == max_bytes and not raw.endswith(b"\n"):
+            raw = raw.rsplit(b"\n", 1)[0] if b"\n" in raw else b""
         body = raw.decode("utf-8")
     except TimeoutError:
         raise
     except (OSError, UnicodeError) as exc:
         raise ValueError(f"{path}: cannot read experiment ledger: {type(exc).__name__}: {exc}") from exc
     lines = body.splitlines()
-    if len(raw) == max_bytes and not raw.endswith(b"\n") and lines:
-        lines.pop()
     rows: list[dict] = []
     for index, line in enumerate(lines[-max_rows:], start=1):
         text = line.strip()

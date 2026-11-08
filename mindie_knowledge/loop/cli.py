@@ -77,11 +77,10 @@ def validate_config(config):
     if not adapter:
         raise ValueError("public transcript mode requires a transcript adapter")
     if adapter is not None:
-        candidate = Path(adapter)
         if (
             not isinstance(adapter, str)
-            or not candidate.is_absolute()
-            or candidate.suffix != ".py"
+            or not Path(adapter).is_absolute()
+            or Path(adapter).suffix != ".py"
         ):
             raise ValueError(
                 "transcript_adapter must be an absolute local parser module path"
@@ -337,45 +336,6 @@ def capture_hook(config_path, event, *, timeout=None):
     from .handoff import accept_stop
 
     return accept_stop(config_path, event, timeout=timeout)
-
-
-def _record_hook_delivery_failure(config_path, cause):
-    from .diagnostics import record_delivery_failure
-    try:
-        config = config_at(config_path)
-    except TimeoutError:
-        raise
-    except (OSError, ValueError):
-        failure("knowledge.capture", stage="accept",
-                category=str(cause).replace("-", "_"), reportable=False)
-        return
-    try:
-        record_delivery_failure(config, stage="accept", cause=cause)
-    except TimeoutError:
-        raise
-    except (OSError, ValueError):
-        pass
-
-
-def _run_stop_hook(config_path):
-    from .transport import MAX_BODY
-    try:
-        raw = sys.stdin.buffer.read(MAX_BODY + 1)
-        if len(raw) > MAX_BODY:
-            raise ValueError("Stop hook stdin exceeds the 2 MiB transport limit")
-        result = capture_hook(config_path, json.loads(raw))
-        if isinstance(result, dict) and result.get("stage") in {"rejected", "unavailable"}:
-            _record_hook_delivery_failure(
-                config_path, result.get("cause") or result.get("reason") or "internal")
-            print(f"mindie-knowledge hook: {result.get('stage')}: {result.get('reason')}",
-                  file=sys.stderr)
-    except TimeoutError:
-        raise
-    except (ValueError, TypeError, AttributeError, OSError, RecursionError) as exc:
-        print(f"mindie-knowledge hook: {type(exc).__name__}: {exc}", file=sys.stderr)
-        _record_hook_delivery_failure(config_path, "internal")
-    print("{}")
-    return 0
 
 
 def distill_selected(config_path, payload):
@@ -667,7 +627,9 @@ def main(argv=None):
 
         return run_wake(args.config, args.event)
     if args.operation == "hook":
-        return _run_stop_hook(args.config)
+        from .handoff import run_stop_hook
+
+        return run_stop_hook(args.config)
     if args.operation == "diagnostic-status":
         from .diagnostics import snapshot
 

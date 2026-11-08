@@ -14,9 +14,10 @@
 - Uses `WAKE_PROBE_SECONDS = 2.0` for control-plane RPC liveness probing and
   non-blocking `StartLock(wake.lock, wait=0)` so concurrent Stop hooks never
   pile up spawning duplicate service starters.
-- Stop SQLite opens keep `PRAGMA busy_timeout` at least 1000 ms. Remaining
-  budget below that floor returns `unavailable`/`budget-exhausted` before
-  connect instead of a sub-second lock wait.
+- Stop SQLite opens keep `PRAGMA busy_timeout` at least 1000 ms from the
+  remaining Stop deadline after connect/WAL. Remaining budget below that
+  floor returns `unavailable`/`budget-exhausted`. Admission `TimeoutError`
+  propagates to library callers; the native Stop adapter still prints `{}`.
 
 [Side-Effect Policy]
 - Writes at most one `captures` row and spawns at most one detached background
@@ -403,6 +404,58 @@ def _record(config, **kwargs):
         pass
 
 
+_HOOK_ERRORS = (ValueError, TypeError, AttributeError, OSError, RecursionError)
+
+
+def _record_hook_failure(config_path, cause, event=None):
+    from .cli import config_at
+    from .dfx import failure
+    from .diagnostics import record_delivery_failure
+
+    try:
+        config = config_at(config_path)
+        record_delivery_failure(config, stage="accept", cause=cause, event=event)
+    except _HOOK_ERRORS:
+        failure(
+            "knowledge.capture", stage="accept",
+            category=str(cause).replace("-", "_"), reportable=False,
+        )
+
+
+def run_stop_hook(config_path):
+    """Native Stop adapter: record failures, print ``{}``, return 0."""
+    from .transport import MAX_BODY
+
+    event = None
+    try:
+        raw = sys.stdin.buffer.read(MAX_BODY + 1)
+        if len(raw) > MAX_BODY:
+            raise ValueError("Stop hook stdin exceeds the 2 MiB transport limit")
+        payload = json.loads(raw)
+        kind, key = _identity(payload)
+        session = payload.get("session_id")
+        if kind and _text(session, 256) and _text(key, 256):
+            event = _event_hash(payload.get("harness") or "", kind, session, key)
+        result = accept_stop(config_path, payload)
+        if isinstance(result, dict) and result.get("stage") in {"rejected", "unavailable"}:
+            _record_hook_failure(
+                config_path, result.get("cause") or result.get("reason") or "internal",
+                event=event,
+            )
+            print(
+                f"mindie-knowledge hook: {result.get('stage')}: {result.get('reason')}",
+                file=sys.stderr,
+            )
+    except TimeoutError as exc:
+        print(f"mindie-knowledge hook: TimeoutError: {exc}", file=sys.stderr)
+        _record_hook_failure(config_path, "budget-exhausted", event=event)
+    except _HOOK_ERRORS as exc:
+        print(f"mindie-knowledge hook: {type(exc).__name__}: {exc}", file=sys.stderr)
+        _record_hook_failure(config_path, "internal", event=event)
+    print("{}")
+    return 0
+
+
 def accept_stop(config_path, event, *, timeout=None):
     """Durable Stop handoff. See the shared contract for the returned stage."""
     from . import settings as settings_mod
@@ -522,11 +575,7 @@ def accept_stop(config_path, event, *, timeout=None):
             )
     except TimeoutError:
         _record(config, stage="accept", cause="budget-exhausted", event=event_id)
-        return _result(
-            stage="unavailable", reason="budget-exhausted", cause="budget-exhausted",
-            summary_dropped=dropped,
-            recovery=_RECOVERY["budget-exhausted"],
-        )
+        raise
     except AdmissionUnavailable:
         _record(config, stage="accept", cause="admission-unreadable", event=event_id)
         return _result(
@@ -548,20 +597,33 @@ def accept_stop(config_path, event, *, timeout=None):
             summary_dropped=dropped,
             recovery=_RECOVERY["store-not-ready"],
         )
+    db = None
     try:
-        db_timeout = deadline - time.monotonic()
-        busy_ms = sqlite_busy_timeout_ms(db_timeout)
-        if busy_ms is None:
+        remaining = deadline - time.monotonic()
+        if sqlite_busy_timeout_ms(remaining) is None:
             _record(config, stage="accept", cause="budget-exhausted", event=event_id)
             return _result(
                 stage="unavailable", reason="budget-exhausted", cause="budget-exhausted",
                 summary_dropped=dropped,
                 recovery=_RECOVERY["budget-exhausted"],
             )
-        db = sqlite3.connect(path, timeout=max(SQLITE_BUSY_FLOOR_SECONDS, db_timeout))
+        db = sqlite3.connect(path, timeout=max(SQLITE_BUSY_FLOOR_SECONDS, remaining))
         db.execute("PRAGMA journal_mode=WAL")
+        remaining = deadline - time.monotonic()
+        busy_ms = sqlite_busy_timeout_ms(remaining)
+        if busy_ms is None:
+            db.close()
+            db = None
+            _record(config, stage="accept", cause="budget-exhausted", event=event_id)
+            return _result(
+                stage="unavailable", reason="budget-exhausted", cause="budget-exhausted",
+                summary_dropped=dropped,
+                recovery=_RECOVERY["budget-exhausted"],
+            )
         db.execute(f"PRAGMA busy_timeout={busy_ms}")
     except sqlite3.OperationalError as exc:
+        if db is not None:
+            db.close()
         text = str(exc).lower()
         if "locked" in text or "busy" in text:
             _record(config, stage="accept", cause="store-locked", event=event_id)
@@ -574,6 +636,8 @@ def accept_stop(config_path, event, *, timeout=None):
         return _result(stage="unavailable", reason="store-not-ready", cause="store-not-ready",
                        summary_dropped=dropped)
     except sqlite3.Error:
+        if db is not None:
+            db.close()
         _record(config, stage="accept", cause="store-not-ready", event=event_id)
         return _result(stage="unavailable", reason="store-not-ready", cause="store-not-ready",
                        summary_dropped=dropped)

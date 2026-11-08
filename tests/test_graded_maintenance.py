@@ -556,6 +556,57 @@ def test_corrupt_routing_manifest_does_not_skip_revision_monotonicity(tmp_path: 
     assert topology_path.read_bytes() == topology_before
 
 
+def test_manifest_only_routing_index_can_rebuild_topology(tmp_path: Path) -> None:
+    value = _unit("rules/unit-manifest-only.md", ident="unit-manifest-only")
+    _make_corpus(tmp_path, value)
+    assert build_routing_index(tmp_path)["ok"] is True
+    topology_path = tmp_path / "index" / "shard-topology.json"
+    topology_path.unlink()
+    rebuilt = build_routing_index(tmp_path)
+    assert rebuilt["ok"] is True
+    assert rebuilt["written"] is True
+    assert topology_path.is_file()
+    topology_doc = json.loads(topology_path.read_text(encoding="utf-8"))
+    assert topology_doc["schema"] == "mindie-shard-topology/1"
+    assert "unit-manifest-only" in topology_doc["units"]
+
+
+def test_empty_dict_routing_manifest_does_not_overwrite_history(tmp_path: Path) -> None:
+    value = _unit("rules/unit-empty-dict.md", ident="unit-empty-dict")
+    _make_corpus(tmp_path, value)
+    assert build_routing_index(tmp_path)["ok"] is True
+    manifest_path = tmp_path / "index" / "routing-manifest.json"
+    topology_path = tmp_path / "index" / "shard-topology.json"
+    topology_before = topology_path.read_bytes()
+    manifest_path.write_text("{}", encoding="utf-8", newline="\n")
+
+    rebuilt = build_routing_index(tmp_path)
+
+    assert rebuilt["ok"] is False
+    assert rebuilt["written"] is False
+    assert any(item["kind"] == "routing_index_unreadable" for item in rebuilt["errors"])
+    assert manifest_path.read_text(encoding="utf-8") == "{}"
+    assert topology_path.read_bytes() == topology_before
+
+
+def test_empty_dict_routing_topology_does_not_overwrite_history(tmp_path: Path) -> None:
+    value = _unit("rules/unit-empty-topo.md", ident="unit-empty-topo")
+    _make_corpus(tmp_path, value)
+    assert build_routing_index(tmp_path)["ok"] is True
+    manifest_path = tmp_path / "index" / "routing-manifest.json"
+    topology_path = tmp_path / "index" / "shard-topology.json"
+    manifest_before = manifest_path.read_bytes()
+    topology_path.write_text("{}", encoding="utf-8", newline="\n")
+
+    rebuilt = build_routing_index(tmp_path)
+
+    assert rebuilt["ok"] is False
+    assert rebuilt["written"] is False
+    assert any(item["kind"] == "routing_index_unreadable" for item in rebuilt["errors"])
+    assert topology_path.read_text(encoding="utf-8") == "{}"
+    assert manifest_path.read_bytes() == manifest_before
+
+
 def test_routing_manifest_read_timeout_is_not_empty_history(tmp_path: Path, monkeypatch) -> None:
     value = _unit("rules/unit-timeout-rev.md", ident="unit-timeout-rev")
     _make_corpus(tmp_path, value)

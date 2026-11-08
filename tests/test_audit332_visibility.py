@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -240,3 +241,172 @@ def test_workspace_query_does_not_treat_corrupt_ledger_as_no_history(tmp_path, m
         RoutingIndex([premise, workflow]).query(
             "workflow alpha", conditions={"soc": "Ascend910B"}, mode="reuse",
         )
+
+
+def test_stop_hook_cli_keeps_host_protocol_when_config_reread_raises_typeerror(
+    tmp_path, monkeypatch, capsys,
+):
+    project = tmp_path / "proj"
+    project.mkdir()
+    config, admission = _engine_config(tmp_path, project)
+    payload = json.loads(config.read_text(encoding="utf-8"))
+    payload["transcript_adapter"] = 123
+    config.write_text(json.dumps(payload), encoding="utf-8", newline="\n")
+    _stdin_buffer(monkeypatch, json.dumps(_stop_event(admission)).encode("utf-8"))
+    assert cli.main(["hook", "--config", str(config)]) == 0
+    captured = capsys.readouterr()
+    assert captured.out.strip() == "{}"
+    assert captured.err
+    assert "unavailable" in captured.err or "TypeError" in captured.err or "transcript_adapter" in captured.err
+
+
+def test_stop_hook_cli_keeps_host_protocol_when_reporting_config_at_raises_typeerror(
+    tmp_path, monkeypatch, capsys,
+):
+    project = tmp_path / "proj"
+    project.mkdir()
+    config, admission = _engine_config(tmp_path, project)
+
+    def boom(_path):
+        raise TypeError("expected str, not int")
+
+    monkeypatch.setattr(cli, "config_at", boom)
+    _stdin_buffer(monkeypatch, json.dumps(_stop_event(admission)).encode("utf-8"))
+    assert cli.main(["hook", "--config", str(config)]) == 0
+    captured = capsys.readouterr()
+    assert captured.out.strip() == "{}"
+    assert "TypeError" in captured.err
+
+
+def test_admission_timeout_propagates_from_capture_hook(tmp_path, monkeypatch):
+    project = tmp_path / "proj"
+    project.mkdir()
+    config, admission = _engine_config(tmp_path, project)
+    error = TimeoutError("admission read exceeded its remaining budget")
+
+    def boom(self, *args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(handoff.Admission, "capture_authorization", boom)
+    with pytest.raises(TimeoutError) as raised:
+        cli.capture_hook(config, _stop_event(admission), timeout=6.0)
+    assert raised.value is error
+
+
+def test_stop_hook_cli_timeout_still_emits_host_protocol(tmp_path, monkeypatch, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+    config, admission = _engine_config(tmp_path, project)
+    error = TimeoutError("admission read exceeded its remaining budget")
+
+    def boom(self, *args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(handoff.Admission, "capture_authorization", boom)
+    _stdin_buffer(monkeypatch, json.dumps(_stop_event(admission)).encode("utf-8"))
+    assert cli.main(["hook", "--config", str(config)]) == 0
+    captured = capsys.readouterr()
+    assert captured.out.strip() == "{}"
+    assert "TimeoutError" in captured.err
+    payload = json.loads(_delivery_path(cli.config_at(config)).read_text(encoding="utf-8"))
+    assert payload["status"] == "unresolved"
+    assert payload["cause"] == "budget-exhausted"
+    assert payload.get("event")
+
+
+def test_stop_hook_cli_keeps_delivery_event_correlation(tmp_path, monkeypatch, capsys):
+    from mindie_knowledge.loop.diagnostics import clear_delivery_event
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    config, admission = _engine_config(tmp_path, project)
+    monkeypatch.setenv("MINDIE_KNOWLEDGE_STOP_TIMEOUT_SECONDS", "0.1")
+    event = _stop_event(admission)
+    _stdin_buffer(monkeypatch, json.dumps(event).encode("utf-8"))
+    assert cli.main(["hook", "--config", str(config)]) == 0
+    captured = capsys.readouterr()
+    assert captured.out.strip() == "{}"
+    loaded = cli.config_at(config)
+    payload = json.loads(_delivery_path(loaded).read_text(encoding="utf-8"))
+    assert payload["cause"] == "budget-exhausted"
+    kind, key = handoff._identity(event)
+    hashed = handoff._event_hash(event.get("harness") or "", kind, event["session_id"], key)
+    assert payload.get("event") == hashed
+    clear_delivery_event(loaded, hashed)
+    assert not _delivery_path(loaded).exists()
+
+
+def _trace_store_connect(monkeypatch, store_path, clock, wal_delay, pragmas, begins):
+    real_connect = sqlite3.connect
+    store = Path(store_path).resolve()
+
+    def connect_wrapper(*args, **kwargs):
+        db = real_connect(*args, **kwargs)
+        target = args[0] if args else kwargs.get("database")
+        try:
+            same = Path(str(target)).resolve() == store
+        except OSError:
+            same = False
+        if not same:
+            return db
+
+        def tracer(sql):
+            lowered = sql.lower().replace(" ", "")
+            if "journal_mode" in lowered and "wal" in lowered:
+                clock["now"] += wal_delay
+            if "busy_timeout" in lowered:
+                pragmas.append(lowered)
+            if lowered.startswith("begin"):
+                begins.append(sql)
+
+        db.set_trace_callback(tracer)
+        return db
+
+    monkeypatch.setattr(sqlite3, "connect", connect_wrapper)
+    monkeypatch.setattr(handoff.sqlite3, "connect", connect_wrapper)
+
+
+def test_stop_store_busy_timeout_deducts_wal_wait(tmp_path, monkeypatch):
+    project = tmp_path / "proj"
+    project.mkdir()
+    config, admission = _engine_config(tmp_path, project)
+    loaded = cli.config_at(config)
+    clock = {"now": 100.0}
+    monkeypatch.setattr(handoff.time, "monotonic", lambda: clock["now"])
+    pragmas, begins = [], []
+    _trace_store_connect(
+        monkeypatch, handoff._store_path(loaded), clock, 1.2, pragmas, begins,
+    )
+    result = cli.capture_hook(config, _stop_event(admission), timeout=2.0)
+    assert result["stage"] == "unavailable"
+    assert result["reason"] == "budget-exhausted"
+    assert begins == []
+    assert not any("busy_timeout=2000" in item for item in pragmas)
+
+
+def test_stop_store_busy_timeout_uses_remaining_after_wal(tmp_path, monkeypatch):
+    project = tmp_path / "proj"
+    project.mkdir()
+    config, admission = _engine_config(tmp_path, project)
+    loaded = cli.config_at(config)
+    clock = {"now": 100.0}
+    monkeypatch.setattr(handoff.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(handoff, "_probe", lambda *args, **kwargs: "ready")
+    pragmas, begins = [], []
+    _trace_store_connect(
+        monkeypatch, handoff._store_path(loaded), clock, 0.5, pragmas, begins,
+    )
+    result = cli.capture_hook(config, _stop_event(admission), timeout=2.0)
+    assert result["stage"] in {"accepted-local", "accepted-runtime", "accepted"}
+    assert any("busy_timeout=1500" in item for item in pragmas)
+    assert begins
+
+
+def test_truncated_utf8_ledger_tail_is_dropped_not_corruption(tmp_path):
+    complete = (json.dumps({"run_id": "ok"}, ensure_ascii=False) + "\n").encode("utf-8")
+    zhong = "中".encode("utf-8")
+    rest = b'{"run_id": "' + zhong + b'"}\n'
+    payload = complete + rest[: rest.index(zhong) + 1]
+    path = tmp_path / "experiment-ledger.jsonl"
+    path.write_bytes(payload)
+    assert read_bounded_jsonl(path, max_bytes=len(payload)) == [{"run_id": "ok"}]
