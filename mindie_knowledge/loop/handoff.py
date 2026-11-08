@@ -558,13 +558,6 @@ def accept_stop(config_path, event, *, timeout=None):
     )
     deadline = time.monotonic() + stop_timeout
     auth_timeout = min(3.0, stop_timeout * 0.5)
-    if auth_timeout < SQLITE_BUSY_FLOOR_SECONDS:
-        _record(config, stage="accept", cause="budget-exhausted", event=event_id)
-        return _result(
-            stage="unavailable", reason="budget-exhausted", cause="budget-exhausted",
-            summary_dropped=dropped,
-            recovery=_RECOVERY["budget-exhausted"],
-        )
     try:
         admission = Admission(admission_path)
         if resolve_lease:

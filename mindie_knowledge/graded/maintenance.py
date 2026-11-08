@@ -537,7 +537,7 @@ def build_routing_index(root: Path | str, *, index_dir: Path | str | None = None
     if errors:
         return report
     previous, previous_error = _previous_unit_states(manifest_path, topology_path)
-    if previous_error:
+    if previous_error and (units or "units are empty" not in previous_error):
         report["errors"].append(_error("routing_index_unreadable", previous_error))
         return report
     if previous:
