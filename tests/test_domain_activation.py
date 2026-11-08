@@ -131,22 +131,20 @@ def test_native_deactivation_real_sqlite_lock_is_partial_and_preserves_lease(tmp
             return db
 
         monkeypatch.setattr(Admission, "_database", traced_database)
+        started = time.monotonic()
         result = deactivate_registered_domains(default, session="current", timeout=0.2)
+        elapsed = time.monotonic() - started
         locked.rollback()
+    assert elapsed < 1.0
     assert result["status"] == "partial" and not result["changed"]
     outcomes = {item["domain"]: item for item in result["domains"]}
-    assert outcomes["vllm-ascend"]["status"] == "unavailable"
+    assert outcomes["vllm-ascend"]["status"] == "timed_out"
     busy = []
-    busy_index = begin_index = None
-    for index, statement in enumerate(statements):
+    for statement in statements:
         match = re.search(r"PRAGMA\s+busy_timeout=(\d+)", statement, re.I)
         if match:
             busy.append(int(match.group(1)))
-            busy_index = index
-        if "BEGIN IMMEDIATE" in statement.upper() and begin_index is None:
-            begin_index = index
-    assert len(busy) == 1 and 0 < busy[0] <= 200
-    assert busy_index is not None and begin_index is not None and busy_index < begin_index
+    assert busy == []
     assert first.active_lease("current")["enabled"]
 
 

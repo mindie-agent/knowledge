@@ -6,15 +6,16 @@ contract/2 parses ordinary graded Markdown through GradedUnit and installs only
 through GradedRepository.install_feed. The contract schema selects the format,
 never a silent fallback. Incomplete reads never imply deletion; an actual
 removal from a fully validated snapshot withdraws the unit.
-[Timeouts & Locks] One sync lock per feed; Git work honors the caller's explicit
-deadline/cancel and no internal elapsed-time deadline. Candidate attempts use
-persisted bounded backoff.
+[Timeouts & Locks] One sync lock per feed; Git work honors the caller's deadline
+or the 300 s default. ``timeout=None`` is never forwarded to subprocesses.
+Candidate attempts use persisted bounded backoff.
 [Side-Effect Policy] Local Git cache, staging files, SQLite receipts and the
 selected store snapshot only. No model, network write or remote publication.
 """
 
 from __future__ import annotations
 
+import math
 import re
 import hashlib
 import shutil
@@ -56,6 +57,8 @@ DISCOVERY_FAILURE_LIMIT = 3
 # (one minute doubling to one hour), persisted across restarts.
 CANDIDATE_BACKOFF_BASE = 60
 CANDIDATE_BACKOFF_CAP = 3600
+# Clone + fetch + gc of a public knowledge snapshot; matches publication git I/O.
+DEFAULT_SYNC_TIMEOUT_SECONDS = 300.0
 _ENTRY_RE = re.compile(r"^tasks/[0-9a-f]{64}/(?:index\.md|blocks/[A-Za-z0-9_-]{1,128}\.md)$")
 _FEEDBACK_RE = re.compile(r"^feedback/[^/]+\.json$")
 _METADATA_FILES = {"README.md", "README", "AGENTS.md", "LICENSE", "LICENSE.md",
@@ -405,8 +408,14 @@ class Feed:
         )
 
     def sync(self, *, force=False, cancel=None, timeout=None):
-        if timeout is not None and (type(timeout) not in (int, float) or timeout <= 0):
-            raise ValueError("explicit sync timeout must be positive")
+        if timeout is None:
+            timeout = DEFAULT_SYNC_TIMEOUT_SECONDS
+        elif (
+            type(timeout) not in (int, float)
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
+            raise ValueError("explicit sync timeout must be a finite positive number")
         _check_cancel(cancel)
         receipt_key = "feed:" + self.ident
         receipt = self.store.feed_get(receipt_key) or {}
@@ -418,7 +427,7 @@ class Feed:
                         retained_commit=receipt.get("commit"))
         try:
             self._cancel = cancel
-            deadline = None if timeout is None else time.monotonic() + timeout
+            deadline = time.monotonic() + timeout
             discovery_key = f"feed-discovery:{self.ident}"
             discovery = self.store.feed_get(discovery_key) or {}
             failures = discovery.get("failures", 0)

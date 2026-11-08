@@ -420,16 +420,32 @@ def _write_pair(manifest_path: Path, manifest: dict, topology_path: Path, topolo
                 pass
 
 
-def _previous_unit_states(manifest_path: Path, topology_path: Path) -> dict[str, tuple[int, str]]:
-    if not manifest_path.is_file() or not topology_path.is_file():
-        return {}
+def _previous_unit_states(
+    manifest_path: Path, topology_path: Path,
+) -> tuple[dict[str, tuple[int, str]], str | None]:
+    """Load prior routing state. Missing both files is empty; a damaged existing index is an error."""
+    manifest_exists = manifest_path.is_file()
+    topology_exists = topology_path.is_file()
+    if not manifest_exists and not topology_exists:
+        return {}, None
+    if not manifest_exists:
+        return {}, f"routing manifest is missing while shard topology exists: {manifest_path}"
+    if not topology_exists:
+        return {}, f"shard topology is missing while routing manifest exists: {topology_path}"
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         topology_doc = json.loads(topology_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return {}
-    if not isinstance(manifest, dict) or not isinstance(topology_doc, dict):
-        return {}
+    except TimeoutError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return {}, (
+            f"existing routing index cannot be read: {type(exc).__name__}: {exc} "
+            f"({manifest_path}, {topology_path})"
+        )
+    if not isinstance(manifest, dict):
+        return {}, f"routing manifest is not an object: {manifest_path}"
+    if not isinstance(topology_doc, dict):
+        return {}, f"shard topology is not an object: {topology_path}"
     revisions = {
         row["id"]: row["revision"]
         for row in manifest.get("units", ())
@@ -440,7 +456,7 @@ def _previous_unit_states(manifest_path: Path, topology_path: Path) -> dict[str,
         for ident, row in (topology_doc.get("units") or {}).items()
         if isinstance(ident, str) and isinstance(row, dict) and isinstance(row.get("content_sha256"), str)
     }
-    return {ident: (revisions[ident], digests[ident]) for ident in revisions.keys() & digests.keys()}
+    return {ident: (revisions[ident], digests[ident]) for ident in revisions.keys() & digests.keys()}, None
 
 
 def _check_payloads(manifest_path: Path, topology_path: Path, manifest: dict, topology_doc: dict) -> list[str]:
@@ -474,7 +490,10 @@ def build_routing_index(root: Path | str, *, index_dir: Path | str | None = None
               "manifest": str(manifest_path), "topology": str(topology_path), "errors": list(errors)}
     if errors:
         return report
-    previous = _previous_unit_states(manifest_path, topology_path)
+    previous, previous_error = _previous_unit_states(manifest_path, topology_path)
+    if previous_error:
+        report["errors"].append(_error("routing_index_unreadable", previous_error))
+        return report
     if previous:
         if check:
             for unit in units:

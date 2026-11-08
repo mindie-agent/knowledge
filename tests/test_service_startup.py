@@ -146,7 +146,7 @@ def test_cold_wake_spawn_failure_is_visible_and_releases_ownership(tmp_path, mon
         raise PermissionError('private-path-and-provider-detail')
 
     monkeypatch.setattr(process, 'spawn_service', denied)
-    assert handoff.run_wake(config, event=event) == 0
+    assert handoff.run_wake(config, event=event) == 2
     diagnostic = (root / 'test/latest-delivery.json').read_text(encoding='utf-8')
     payload = json.loads(diagnostic)
     assert payload['cause'] == 'wake-failed'

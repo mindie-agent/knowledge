@@ -18,6 +18,8 @@
   `open_database(..., timeout=5.0)` (`timeout=2.0` on reads) in WAL mode.
 - A supplied deactivation timeout covers both the thread lock and database
   waits; its TimeoutError remains visible to the caller.
+- Remaining caller budgets below the 1 s SQLite lock floor fail closed before
+  connect; `PRAGMA busy_timeout` is never set below 1000 ms.
 
 [Side-Effect Policy]
 - Local SQLite state (`0700` dir / `0600` file) only; failure counters (`finish`)
@@ -38,7 +40,11 @@ from pathlib import Path
 from .store import session_key
 from .locks import StartInProgress
 
-from ..owned_state import open_database
+from ..owned_state import (
+    SQLITE_BUSY_FLOOR_SECONDS,
+    open_database,
+    sqlite_busy_timeout_ms,
+)
 
 BASE_COLUMNS = {"session", "token", "enabled", "failures"}
 CAPTURE_COLUMNS = BASE_COLUMNS | {"project_root", "root_session", "activated_at"}
@@ -113,12 +119,18 @@ class Admission:
             raise TimeoutError("admission write exceeded its in-process lock budget")
         try:
             remaining = None if deadline is None else deadline - time.monotonic()
-            if remaining is not None and remaining <= 0:
+            if remaining is not None and remaining < SQLITE_BUSY_FLOOR_SECONDS:
                 raise TimeoutError("admission write exhausted its caller budget")
             # A caller with several stores owns one outer budget. Opening can
             # wait on both the initialization lock and SQLite journal setup.
-            db = self._database(initialize_missing=initialize_missing,
-                                timeout=5.0 if remaining is None else remaining / 2)
+            # The connect timeout stays at least 1 s so SQLite never uses a
+            # sub-second lock wait on this path.
+            db = self._database(
+                initialize_missing=initialize_missing,
+                timeout=5.0 if remaining is None else max(
+                    SQLITE_BUSY_FLOOR_SECONDS, remaining / 2,
+                ),
+            )
             if db is None:
                 if missing_error is not None:
                     raise ValueError(missing_error)
@@ -126,10 +138,9 @@ class Admission:
             try:
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
-                    if remaining <= 0:
+                    busy_ms = sqlite_busy_timeout_ms(remaining)
+                    if busy_ms is None:
                         raise TimeoutError("admission write exhausted its caller budget")
-                    busy_ms = (max(3000, int(remaining * 1000))
-                               if remaining >= 3.0 else max(1, int(remaining * 1000)))
                     db.execute(f"PRAGMA busy_timeout={busy_ms}")
                     db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 10000)
                 self.path.parent.chmod(0o700)
@@ -371,7 +382,8 @@ class Admission:
         if db is None:
             return {"state": "inactive"}
         try:
-            busy_ms = max(3000, int(timeout * 1000)) if timeout >= 3.0 else max(1, int(timeout * 1000))
+            # Caller lock budgets may be short; PRAGMA busy_timeout never is.
+            busy_ms = sqlite_busy_timeout_ms(timeout) or int(SQLITE_BUSY_FLOOR_SECONDS * 1000)
             db.execute(f"PRAGMA busy_timeout={busy_ms}")
             deadline = time.monotonic() + timeout
             db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 10000)
@@ -421,6 +433,8 @@ class Admission:
             }
         except AdmissionUnavailable:
             raise
+        except TimeoutError:
+            raise
         except (OSError, sqlite3.Error, ValueError) as exc:
             raise AdmissionUnavailable(str(exc)) from exc
         finally:
@@ -447,7 +461,8 @@ class Admission:
         if db is None:
             return {"state": "inactive"}
         try:
-            busy_ms = max(3000, int(timeout * 1000)) if timeout >= 3.0 else max(1, int(timeout * 1000))
+            # Caller lock budgets may be short; PRAGMA busy_timeout never is.
+            busy_ms = sqlite_busy_timeout_ms(timeout) or int(SQLITE_BUSY_FLOOR_SECONDS * 1000)
             db.execute(f"PRAGMA busy_timeout={busy_ms}")
             deadline = time.monotonic() + timeout
             db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 10000)
@@ -493,6 +508,8 @@ class Admission:
                 "failures": failures,
             }
         except AdmissionUnavailable:
+            raise
+        except TimeoutError:
             raise
         except (OSError, sqlite3.Error, ValueError) as exc:
             raise AdmissionUnavailable(str(exc)) from exc

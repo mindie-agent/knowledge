@@ -5,6 +5,8 @@ import hashlib
 import json
 from pathlib import Path
 
+import pytest
+
 from mindie_knowledge.graded.index import RoutingIndex, read_units
 from mindie_knowledge.graded.maintenance import (
     apply_move_plan,
@@ -534,4 +536,41 @@ def test_build_routing_index_auto_advances_revision_when_content_changes(tmp_pat
     reloaded = GradedUnit.from_text((tmp_path / value.path).read_text(encoding="utf-8"), value.path)
     assert reloaded.revision == 2
     assert build_routing_index(tmp_path, check=True)["ok"] is True
+
+
+def test_corrupt_routing_manifest_does_not_skip_revision_monotonicity(tmp_path: Path) -> None:
+    value = _unit("rules/unit-corrupt-rev.md", ident="unit-corrupt-rev")
+    _make_corpus(tmp_path, value)
+    assert build_routing_index(tmp_path)["ok"] is True
+    manifest_path = tmp_path / "index" / "routing-manifest.json"
+    topology_path = tmp_path / "index" / "shard-topology.json"
+    topology_before = topology_path.read_bytes()
+    manifest_path.write_text("{not-json", encoding="utf-8", newline="\n")
+
+    rebuilt = build_routing_index(tmp_path)
+
+    assert rebuilt["ok"] is False
+    assert rebuilt["written"] is False
+    assert any(item["kind"] == "routing_index_unreadable" for item in rebuilt["errors"])
+    assert manifest_path.read_text(encoding="utf-8") == "{not-json"
+    assert topology_path.read_bytes() == topology_before
+
+
+def test_routing_manifest_read_timeout_is_not_empty_history(tmp_path: Path, monkeypatch) -> None:
+    value = _unit("rules/unit-timeout-rev.md", ident="unit-timeout-rev")
+    _make_corpus(tmp_path, value)
+    assert build_routing_index(tmp_path)["ok"] is True
+    manifest_path = tmp_path / "index" / "routing-manifest.json"
+    error = TimeoutError("routing read exceeded its remaining budget")
+
+    def timed_out(self, *args, **kwargs):
+        if Path(self) == manifest_path:
+            raise error
+        return original_read_text(self, *args, **kwargs)
+
+    original_read_text = Path.read_text
+    monkeypatch.setattr(Path, "read_text", timed_out)
+    with pytest.raises(TimeoutError) as raised:
+        build_routing_index(tmp_path)
+    assert raised.value is error
 

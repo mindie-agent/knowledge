@@ -14,6 +14,9 @@
 - Uses `WAKE_PROBE_SECONDS = 2.0` for control-plane RPC liveness probing and
   non-blocking `StartLock(wake.lock, wait=0)` so concurrent Stop hooks never
   pile up spawning duplicate service starters.
+- Stop SQLite opens keep `PRAGMA busy_timeout` at least 1000 ms. Remaining
+  budget below that floor returns `unavailable`/`budget-exhausted` before
+  connect instead of a sub-second lock wait.
 
 [Side-Effect Policy]
 - Writes at most one `captures` row and spawns at most one detached background
@@ -33,6 +36,7 @@ import sys
 import time
 from pathlib import Path
 
+from ..owned_state import SQLITE_BUSY_FLOOR_SECONDS, sqlite_busy_timeout_ms
 from .activation import Admission, AdmissionUnavailable
 from .diagnostics import _DELIVERY_RECOVERY as _RECOVERY
 from .store import (
@@ -355,6 +359,7 @@ def request_wake(config_path, *, session_id, event=None, timeout=None):
 def run_wake(config_path, event=None):
     """Detached owner of the same readiness operation used by normal calls."""
     from .cli import config_at, ensure_service
+    from .dfx import failure
     from .diagnostics import clear_delivery_event, record_delivery_failure
     from .lifecycle import ServiceRetired
 
@@ -362,17 +367,26 @@ def run_wake(config_path, event=None):
         config = config_at(config_path)
     except TimeoutError:
         raise
-    except (OSError, ValueError):
-        return 0
+    except (OSError, ValueError) as exc:
+        print(
+            f"mindie-knowledge wake: configuration {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        failure(
+            "knowledge.capture", stage="wake",
+            category="configuration_unavailable", reportable=False,
+        )
+        return 2
     try:
         ensure_service(config_path, _from_detached_starter=True)
     except ServiceRetired:
         return 0  # An already-spawned old helper is expected after retirement.
     except TimeoutError:
         raise
-    except (OSError, ValueError, RuntimeError):
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f"mindie-knowledge wake: {type(exc).__name__}", file=sys.stderr)
         record_delivery_failure(config, stage="wake", cause="wake-failed", event=event)
-        return 0
+        return 2
     if event:
         clear_delivery_event(config, event)
     return 0
@@ -490,15 +504,29 @@ def accept_stop(config_path, event, *, timeout=None):
         else float(os.environ.get("MINDIE_KNOWLEDGE_STOP_TIMEOUT_SECONDS", 6.0))
     )
     deadline = time.monotonic() + stop_timeout
+    auth_timeout = min(3.0, stop_timeout * 0.5)
+    if auth_timeout < SQLITE_BUSY_FLOOR_SECONDS:
+        _record(config, stage="accept", cause="budget-exhausted", event=event_id)
+        return _result(
+            stage="unavailable", reason="budget-exhausted", cause="budget-exhausted",
+            summary_dropped=dropped,
+            recovery=_RECOVERY["budget-exhausted"],
+        )
     try:
         admission = Admission(admission_path)
-        auth_timeout = min(3.0, stop_timeout * 0.5)
         if resolve_lease:
             auth = admission.resolve_capture_lease(session, timeout=auth_timeout)
         else:
             auth = admission.capture_authorization(
                 session, token, timeout=auth_timeout,
             )
+    except TimeoutError:
+        _record(config, stage="accept", cause="budget-exhausted", event=event_id)
+        return _result(
+            stage="unavailable", reason="budget-exhausted", cause="budget-exhausted",
+            summary_dropped=dropped,
+            recovery=_RECOVERY["budget-exhausted"],
+        )
     except AdmissionUnavailable:
         _record(config, stage="accept", cause="admission-unreadable", event=event_id)
         return _result(
@@ -521,12 +549,17 @@ def accept_stop(config_path, event, *, timeout=None):
             recovery=_RECOVERY["store-not-ready"],
         )
     try:
-        db_timeout = max(0.05, deadline - time.monotonic())
-        db = sqlite3.connect(path, timeout=db_timeout)
+        db_timeout = deadline - time.monotonic()
+        busy_ms = sqlite_busy_timeout_ms(db_timeout)
+        if busy_ms is None:
+            _record(config, stage="accept", cause="budget-exhausted", event=event_id)
+            return _result(
+                stage="unavailable", reason="budget-exhausted", cause="budget-exhausted",
+                summary_dropped=dropped,
+                recovery=_RECOVERY["budget-exhausted"],
+            )
+        db = sqlite3.connect(path, timeout=max(SQLITE_BUSY_FLOOR_SECONDS, db_timeout))
         db.execute("PRAGMA journal_mode=WAL")
-        # A 3 s floor avoids sub-second thrash when the caller has budget for
-        # it; a tighter Stop budget still wins so the hook returns on time.
-        busy_ms = max(3000, int(db_timeout * 1000)) if db_timeout >= 3.0 else max(1, int(db_timeout * 1000))
         db.execute(f"PRAGMA busy_timeout={busy_ms}")
     except sqlite3.OperationalError as exc:
         text = str(exc).lower()
