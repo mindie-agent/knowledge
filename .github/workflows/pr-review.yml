@@ -33,3 +33,13 @@ jobs:
         run: >
           python -m mindie_knowledge.redact --check
           README.md CONTRIBUTING.md docs mindie_knowledge/skills
+
+  release-ready:
+    name: release-ready
+    needs: [checks]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: python -c 'import json,os; assert all(job["result"] == "success" for job in json.loads(os.environ["RESULTS"]).values()), "required CI failed or was skipped"'
