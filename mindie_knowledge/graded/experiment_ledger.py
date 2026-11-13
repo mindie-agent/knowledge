@@ -34,8 +34,10 @@ import argparse, contextlib, hashlib, json, math, os, re, statistics, subprocess
 from pathlib import Path
 try:
     from .explore_support import flagged as _flagged, guard_regression as _guard_regression
+    from .rsi_crossover import bind_fold_lineage, default_ablation_retained, normalize_parent_exp_ids
 except ImportError:
     from mindie_knowledge.graded.explore_support import flagged as _flagged, guard_regression as _guard_regression
+    from mindie_knowledge.graded.rsi_crossover import bind_fold_lineage, default_ablation_retained, normalize_parent_exp_ids
 
 SCHEMA_VERSION, EVALUATION_SCHEMA = "mindie-experiment-ledger/1", "mindie-rsi-evaluation/1"
 PROGRESS_MARKER_START, PROGRESS_MARKER_END = "<!-- mindie-rsi-progress:start -->", "<!-- mindie-rsi-progress:end -->"
@@ -44,7 +46,8 @@ TASK_ARTIFACT_NAMES = frozenset({"rsi-loop.json", "rsi-loop.json.lock", "rsi-loo
 RECOVERY_TOKEN_RE = re.compile(r"(?i)(?:\b(?:in_flight_runs|slot_id|job_id|run_id|host_endpoint|manifest_path)\b|\b(?:endpoint|manifest)\b[`'\"]?\s*[:=])")
 SETTLED = frozenset({"supported", "subtarget_valid", "refuted"})
 INCONCLUSIVE_STATUSES = frozenset({"compile_failed", "infra_failed", "measurement_invalid", "timeout", "interrupted", "unknown"})
-LEARN_MUTABLE_KEYS = frozenset({"schema_version", "supersedes_exp_id", "lesson", "new_observation", "divergent_layer_identified", "_superseded_ids", "candidate_repo"})
+FOLD_TRANSIENT_KEYS = frozenset({"_superseded_ids", "_same_source_aliases", "_bound_parent_digests"})
+LEARN_MUTABLE_KEYS = frozenset({"schema_version", "supersedes_exp_id", "lesson", "new_observation", "divergent_layer_identified", "candidate_repo"}) | FOLD_TRANSIENT_KEYS
 GIT_TIMEOUT = 15.0  # source: per-call git bound used by InferRSI infra/targets/git.py
 FINGERPRINT_TIMEOUT = 4 * GIT_TIMEOUT  # source: four git calls of a submodule-free fingerprint
 LARGE_FILE_BYTES = 512 * 1024 * 1024  # source: git core.bigFileThreshold default (512 MiB)
@@ -259,8 +262,7 @@ def _ablation_retained(evidence):
     resolved = _resolve_ablation_retained(raw_val, evidence.get("ablation_receipt"))
     if resolved is not None or any(k in evidence for k in ("ablation_retained", "ablation_ok", "ablation_passed", "ablation", "ablation_receipt")):
         return resolved
-    factors = evidence.get("factors")
-    return True if not factors or len(factors) <= 1 else None
+    return default_ablation_retained(evidence)
 
 def _gate3_status(
     resolved_ablation: bool | None, *, hygiene_ok: bool | None = None,
@@ -393,9 +395,11 @@ def judge(evidence) -> dict:
         guard_workloads=evidence.get("guard_workloads"), reusable_scope=evidence.get("reusable_scope"),
         require_reusable_scope=bool(evidence.get("require_reusable_scope", False)))
     entry.update(paired_rounds=checked["paired_rounds"], direction=checked["direction"])
-    for k in ("source_digest", "baseline_source_digest", "baseline_exp_id"):
+    for k in ("source_digest", "baseline_source_digest", "baseline_exp_id", "bottleneck_lane"):
         if isinstance(evidence.get(k), str) and evidence[k].strip():
             entry[k] = evidence[k].strip()
+    if evidence.get("parent_exp_ids") is not None:
+        entry["parent_exp_ids"] = normalize_parent_exp_ids(evidence["parent_exp_ids"], exp_id=entry["candidate_id"], baseline_exp_id=entry.get("baseline_exp_id"))
     for k in ("baseline_metric", "candidate_metric"):
         if checked[k] is not None:
             entry[k] = round(checked[k], 6)
@@ -450,6 +454,12 @@ def validate(record) -> dict:
         _number(record["card_seconds"], "card_seconds", strict=False)
     if record.get("conditions") is not None and not isinstance(record["conditions"], dict):
         raise ValueError("conditions must be an object")
+    if record.get("parent_exp_ids") is not None:
+        record["parent_exp_ids"] = normalize_parent_exp_ids(record["parent_exp_ids"], exp_id=record["exp_id"], baseline_exp_id=record.get("baseline_exp_id"))
+    if record.get("parent_source_digests") is not None:
+        psd = record["parent_source_digests"]
+        if not isinstance(psd, dict) or any(not isinstance(k, str) or not k.strip() or not isinstance(v, str) for k, v in psd.items()):
+            raise ValueError("parent_source_digests must map exp_id strings to source_digest strings")
     return record
 
 def fold(records) -> tuple[list[dict], dict]:
@@ -461,16 +471,7 @@ def fold(records) -> tuple[list[dict], dict]:
         own_val = float(record["card_seconds"]) if record.get("card_seconds") is not None else None
         prior, key = record.get("supersedes_exp_id"), record.get("exp_id") or record.get("candidate_id")
         carried, prev_raw = (chain_seconds.pop(prior), last_raw_own.pop(prior, None)) if (prior is not None and prior in live) else (None, None)
-        if prior is not None and prior in live:
-            aliases = [a for a in (live[prior].get("_superseded_ids") or ()) if a != key]
-            if prior != key and prior not in aliases:
-                aliases.append(prior)
-            if aliases:
-                record["_superseded_ids"] = aliases
-            live = ({**live, key: record} if key == prior
-                    else {(key if k == prior else k): (record if k == prior else v) for k, v in live.items() if k != key})
-        else:
-            live[key] = record
+        live = bind_fold_lineage(live, prior, key, record)
         seconds = (float(own_val or 0.0) if carried is None else (carried + float(own_val or 0.0)) if fresh
                    else carried if (own_val is None or (prev_raw is not None and own_val == prev_raw and carried > prev_raw) or own_val == carried) else own_val)
         if own_val is not None or carried is not None:
@@ -678,7 +679,7 @@ def _merge_idempotent_retry(existing: dict, entry: dict) -> tuple[dict, bool]:
     eff_distill = new_distill if new_distill is not None else old_distill
     eff_note = new_note if new_note is not None else old_note
     needs_revision = (eff_distill != old_distill or eff_note != old_note)
-    merged = {k: v for k, v in existing.items() if k != "_superseded_ids"}
+    merged = {k: v for k, v in existing.items() if k not in FOLD_TRANSIENT_KEYS}
     merged["lesson"] = dict(distill=eff_distill, note=eff_note)
     for flag in ("new_observation", "divergent_layer_identified"):
         if flag in entry and existing.get(flag) != entry[flag]:
@@ -687,7 +688,7 @@ def _merge_idempotent_retry(existing: dict, entry: dict) -> tuple[dict, bool]:
 
 def append(path, record, *, progress=None, goal="", allow_idempotent_retry: bool = False) -> dict:
     """Validate, commit the ledger line, and atomically update `PROGRESS.md`."""
-    entry = {k: v for k, v in dict(validate(record)).items() if k != "_superseded_ids"}
+    entry = {k: v for k, v in dict(validate(record)).items() if k not in FOLD_TRANSIENT_KEYS}
     entry.setdefault("schema_version", SCHEMA_VERSION)
     path, progress_path = Path(path), Path(progress) if progress else Path(path).parent / "PROGRESS.md"
     path.parent.mkdir(parents=True, exist_ok=True)
