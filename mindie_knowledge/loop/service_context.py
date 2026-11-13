@@ -14,6 +14,9 @@ from pathlib import Path
 import re
 import stat
 from mindie_diagnostics.service_environment import NETWORK_ENV as TRANSPORT_ENV
+from mindie_diagnostics.service_environment import (
+    apply as apply_network, git_transport_environment, validate_git_environment,
+)
 
 SCHEMA = "mindie-service-context/1"
 LIMIT = 128 * 1024
@@ -92,6 +95,7 @@ def capture(config, binding):
     names = set(declaration["environment"]) | set(NETWORK_ENV)
     values = {key: os.environ[key] for key in names
               if key in os.environ}
+    values.update(git_transport_environment(os.environ))
     value = dict(schema=SCHEMA, binding=binding, paths=declaration["paths"], environment=values)
     raw = json.dumps(value, sort_keys=True, ensure_ascii=True).encode()
     if len(raw) > LIMIT:
@@ -131,10 +135,17 @@ def consume(path, config, binding):
     if (not isinstance(value, dict) or value.get("schema") != SCHEMA
             or value.get("binding") != binding or value.get("paths") != declaration["paths"]
             or not isinstance(value.get("environment"), dict)
-            or set(value["environment"]) - (set(declaration["environment"]) | set(NETWORK_ENV))
             or any(not isinstance(item, str) or "\x00" in item
                    for item in value["environment"].values())):
         raise ContextError("service_context_binding_invalid")
+    try:
+        validate_git_environment(value["environment"])
+        allowed = (set(declaration["environment"]) | set(NETWORK_ENV)
+                   | set(git_transport_environment(value["environment"])))
+        if set(value["environment"]) - allowed:
+            raise ValueError("undeclared service environment")
+    except (ValueError, KeyError):
+        raise ContextError("service_context_binding_invalid") from None
     # No service is admitted if the one-use secret transfer cannot be removed.
     try:
         path.unlink()
@@ -154,4 +165,4 @@ def apply(config, values):
     for key in list(os.environ):
         if normalize(key) in declared:
             del os.environ[key]
-    os.environ.update(values)
+    apply_network(values)

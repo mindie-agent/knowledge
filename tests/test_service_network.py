@@ -8,6 +8,8 @@ from mindie_knowledge.loop import service_context
 
 
 def test_default_network_context_crosses_real_service_process_boundary(tmp_path, monkeypatch):
+    from mindie_diagnostics import service_environment
+
     selected = {
         "HTTPS_PROXY": "http://fixture:encoded%40password@proxy.invalid:8080",
         "SSL_CERT_FILE": str(tmp_path / "Company CA.pem"),
@@ -15,6 +17,11 @@ def test_default_network_context_crosses_real_service_process_boundary(tmp_path,
         "UV_DEFAULT_INDEX": "https://packages.example.invalid/simple",
         "GH_CONFIG_DIR": str(tmp_path / "github"),
         "GH_TOKEN": "synthetic-one-use-token",
+        "GIT_CONFIG_COUNT": "2",
+        "GIT_CONFIG_KEY_0": "http.proxy",
+        "GIT_CONFIG_VALUE_0": "http://proxy.invalid:8080",
+        "GIT_CONFIG_KEY_1": "http.sslCAInfo",
+        "GIT_CONFIG_VALUE_1": str(tmp_path / "Company CA.pem"),
     }
     for key in service_context.NETWORK_ENV:
         monkeypatch.delenv(key, raising=False)
@@ -25,7 +32,10 @@ def test_default_network_context_crosses_real_service_process_boundary(tmp_path,
     path.write_bytes(service_context.capture(config, binding))
     path.chmod(0o600)
     env = {k: v for k, v in os.environ.items() if k not in service_context.NETWORK_ENV}
-    env["PYTHONPATH"] = str(Path(service_context.__file__).resolve().parents[2])
+    env["PYTHONPATH"] = os.pathsep.join([
+        str(Path(service_context.__file__).resolve().parents[2]),
+        str(Path(service_environment.__file__).resolve().parents[1]),
+    ])
     result = subprocess.run(
         [sys.executable, "-c",
          "import json,os,sys;"
@@ -45,7 +55,11 @@ def test_absent_proxy_removes_stale_service_environment(monkeypatch):
     monkeypatch.setenv("HTTPS_PROXY", "http://previous-network.invalid")
     monkeypatch.setenv("GH_TOKEN", "stale-service-token")
     monkeypatch.setenv("UNRELATED_SETTING", "keep")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "http.proxy")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "http://stale-git-proxy.invalid:8080")
     service_context.apply({}, {})
     assert "HTTPS_PROXY" not in os.environ
     assert "GH_TOKEN" not in os.environ
+    assert "GIT_CONFIG_COUNT" not in os.environ
     assert os.environ["UNRELATED_SETTING"] == "keep"

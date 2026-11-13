@@ -29,7 +29,7 @@ from .locks import StartInProgress, StartLock
 from .store import _backoff_seconds, digest
 from mindie_knowledge.community.common import CommunityError, run_argv
 from mindie_knowledge.gitbin import GitUnavailableError, resolve_git
-from mindie_knowledge.gitread import with_windows_longpaths, _check_cancel
+from mindie_knowledge.gitread import scoped_git_environment, _check_cancel
 from mindie_knowledge.publication_contract import (
     DATA_FORMAT_V2, FORMATS_BY_SCHEMA, data_format, read_git_contract,
 )
@@ -39,15 +39,11 @@ from mindie_knowledge.git_layout import feed_repository_path, validate_git_direc
 
 def _feed_git_env():
     """hooksPath and credential-helper suppression, plus Windows long paths."""
-    return with_windows_longpaths({
+    return {
+        **scoped_git_environment([("core.hooksPath", os.devnull), ("credential.helper", "")]),
         "GIT_TERMINAL_PROMPT": "0",
         "GCM_INTERACTIVE": "never",
-        "GIT_CONFIG_COUNT": "2",
-        "GIT_CONFIG_KEY_0": "core.hooksPath",
-        "GIT_CONFIG_VALUE_0": os.devnull,
-        "GIT_CONFIG_KEY_1": "credential.helper",
-        "GIT_CONFIG_VALUE_1": "",
-    })
+    }
 
 # Repeated discovery failure defers ordinary calls for one hour, the
 # updater's established post-failure cadence; it is not a new quota.
