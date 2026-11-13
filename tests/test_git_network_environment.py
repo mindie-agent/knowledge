@@ -16,6 +16,11 @@ from mindie_knowledge.publication_check import _git_env
     _git_env,
 ])
 def test_caller_git_transport_settings_survive_owned_configuration(tmp_path, monkeypatch, environment):
+    configuration = tmp_path / "gitconfig"
+    original = "[http]\nsslBackend = schannel\n"
+    configuration.write_text(original, encoding="utf-8")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(configuration))
     selected = [("http.proxy", "http://enterprise-fixture.invalid:8080"),
                 ("http.sslCAInfo", str(tmp_path / "Company CA.pem")),
                 ("http.sslVerify", "true"),
@@ -28,10 +33,11 @@ def test_caller_git_transport_settings_survive_owned_configuration(tmp_path, mon
     effective = environment()
     result = subprocess.run(
         [resolve_git(), "config", "--get-regexp", r"^http\."],
-        env=effective, capture_output=True, text=True, timeout=5, check=True,
+        env=effective, cwd=tmp_path, capture_output=True, text=True, timeout=5, check=True,
         **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}),
     )
     observed = dict(line.split(" ", 1) for line in result.stdout.splitlines())
-    assert observed == {key.lower(): value for key, value in selected}
+    assert observed == {"http.sslbackend": "schannel", **{key.lower(): value for key, value in selected}}
+    assert configuration.read_text(encoding="utf-8") == original
     assert {key: value for key, value in os.environ.items()
             if key.startswith("GIT_CONFIG_")} == before
