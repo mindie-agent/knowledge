@@ -11,7 +11,7 @@
   here so existing imports keep working.
 
 [Timeouts & Locks]
-- Opened via `open_database` in WAL mode (`timeout=5.0s`); in-process writes
+- Opened via `open_database` in WAL mode (`timeout=60.0s`, `busy_timeout=5000ms`); in-process writes
   serialize on `self.lock` (`threading.RLock`) with `BEGIN IMMEDIATE`.
 
 [Side-Effect Policy]
@@ -72,9 +72,11 @@ from .store_outbox import OutboxMixin
 
 class Store(MaterialMixin, OutboxMixin, QueryMixin):
 
-    def __init__(self, root, domain):
+    def __init__(self, root, domain, *, timeout=60.0, deadline=None):
         if not isinstance(domain, str) or not documents.DOMAIN_RE.fullmatch(domain):
             raise ValueError("invalid domain")
+        self._open_timeout = timeout
+        self._open_deadline = deadline
         from ..state_layout import prepare_layout
         try:
             with prepare_layout(root, domain) as directory:
@@ -93,8 +95,6 @@ class Store(MaterialMixin, OutboxMixin, QueryMixin):
         self.root.mkdir(parents=True, exist_ok=True)
         self.root.chmod(0o700)
         self.lock = threading.RLock()
-        from mindie_knowledge.materials.store import MaterialStore
-        self.materials = MaterialStore(self.root / "materials", domain=domain)
         self._material_dirty = set()
         self._closed = False
         from ..owned_state import open_database
@@ -102,10 +102,14 @@ class Store(MaterialMixin, OutboxMixin, QueryMixin):
             self.root / "state-v4.sqlite3", schema=SCHEMA,
             required=_STATE_COLUMNS, initialize=_initialize_state, validate=_validate_state,
             validate_current=_validate_schema_identity,
+            timeout=getattr(self, "_open_timeout", 60.0),
+            deadline=getattr(self, "_open_deadline", None),
             residue=(self.root / "materials" / "current.json",
                      self.root / "materials" / ".current-catalog.sqlite3",
                      self.root / "materials" / "tasks", self.root / "outbox"),
         )
+        from mindie_knowledge.materials.store import MaterialStore
+        self.materials = MaterialStore(self.root / "materials", domain=domain)
         self.db.execute('BEGIN IMMEDIATE')
         try:
             snapshot = {}
@@ -123,7 +127,7 @@ class Store(MaterialMixin, OutboxMixin, QueryMixin):
             self.db.executemany("INSERT OR IGNORE INTO known_revisions VALUES(?,?)",
                                 [(entry_id, revision) for entry_id, revisions in snapshot.items()
                                  for revision in set(revisions.values())])
-        except Exception:
+        except BaseException:
             self.db.rollback()
             self.db.close()
             self.materials.close()

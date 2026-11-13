@@ -20,38 +20,42 @@ from lane_support import parser_path
 
 def test_short_admission_read_keeps_busy_timeout_floor(tmp_path, monkeypatch):
     import re
-    from mindie_knowledge.loop.activation import Admission
+    from mindie_knowledge import owned_state
+    from mindie_knowledge.loop.activation import Admission, AdmissionUnavailable
 
     path = make_admission(tmp_path, project_root=tmp_path)
     gate = Admission(path)
     token = admission_token(path)
     statements = []
-    original = Admission._database
+    real_connect = owned_state.sqlite3.connect
 
-    def traced(self, *args, **kwargs):
-        db = original(self, *args, **kwargs)
-        if db is not None:
-            db.set_trace_callback(statements.append)
+    def traced_connect(*args, **kwargs):
+        db = real_connect(*args, **kwargs)
+        db.set_trace_callback(statements.append)
         return db
 
-    monkeypatch.setattr(Admission, "_database", traced)
-    assert gate.capture_authorization("manual-A", token, timeout=0.1)["state"] == "admitted"
+    monkeypatch.setattr(owned_state.sqlite3, "connect", traced_connect)
+    with pytest.raises(AdmissionUnavailable):
+        gate.capture_authorization("manual-A", token, timeout=0.1)
+    assert statements == []
+
+    assert gate.capture_authorization("manual-A", token, timeout=6.0)["state"] == "admitted"
     busy = []
     for statement in statements:
-        match = re.search(r"PRAGMA\s+busy_timeout=(\d+)", statement, re.I)
+        match = re.search(r"^\s*PRAGMA\s+busy_timeout=(\d+)", statement, re.I)
         if match:
             busy.append(int(match.group(1)))
-    assert busy and min(busy) >= 1000
+    assert busy and set(busy) == {SQLITE_BUSY_TIMEOUT_MS}
 
 
 def test_sqlite_busy_timeout_never_goes_sub_second():
     assert sqlite_busy_timeout_ms(None) == SQLITE_BUSY_TIMEOUT_MS
     assert sqlite_busy_timeout_ms(0.05) is None
     assert sqlite_busy_timeout_ms(0.999) is None
-    assert sqlite_busy_timeout_ms(1.0) == 1000
-    assert sqlite_busy_timeout_ms(2.5) == 2500
-    assert sqlite_busy_timeout_ms(3.0) == 3000
-    assert sqlite_busy_timeout_ms(6.0) == 6000
+    assert sqlite_busy_timeout_ms(1.0) is None
+    assert sqlite_busy_timeout_ms(4.999) is None
+    assert sqlite_busy_timeout_ms(5.0) == SQLITE_BUSY_TIMEOUT_MS
+    assert sqlite_busy_timeout_ms(6.0) == SQLITE_BUSY_TIMEOUT_MS
 
 
 def _engine_config(tmp_path, project):
@@ -371,9 +375,9 @@ def _trace_store_connect(monkeypatch, store_path, clock, wal_delay, pragmas, beg
 
         def tracer(sql):
             lowered = sql.lower().replace(" ", "")
-            if "journal_mode" in lowered and "wal" in lowered:
+            if lowered.startswith("pragmajournal_mode=wal"):
                 clock["now"] += wal_delay
-            if "busy_timeout" in lowered:
+            if lowered.startswith("pragmabusy_timeout="):
                 pragmas.append(lowered)
             if lowered.startswith("begin"):
                 begins.append(sql)
@@ -394,13 +398,13 @@ def test_stop_store_busy_timeout_deducts_wal_wait(tmp_path, monkeypatch):
     monkeypatch.setattr(handoff.time, "monotonic", lambda: clock["now"])
     pragmas, begins = [], []
     _trace_store_connect(
-        monkeypatch, handoff._store_path(loaded), clock, 1.2, pragmas, begins,
+        monkeypatch, handoff._store_path(loaded), clock, 2.5, pragmas, begins,
     )
-    result = cli.capture_hook(config, _stop_event(admission), timeout=2.0)
+    result = cli.capture_hook(config, _stop_event(admission), timeout=7.0)
     assert result["stage"] == "unavailable"
     assert result["reason"] == "budget-exhausted"
     assert begins == []
-    assert not any("busy_timeout=2000" in item for item in pragmas)
+    assert all("busy_timeout=5000" in item for item in pragmas)
 
 
 def test_stop_store_busy_timeout_uses_remaining_after_wal(tmp_path, monkeypatch):
@@ -413,11 +417,11 @@ def test_stop_store_busy_timeout_uses_remaining_after_wal(tmp_path, monkeypatch)
     monkeypatch.setattr(handoff, "_probe", lambda *args, **kwargs: "ready")
     pragmas, begins = [], []
     _trace_store_connect(
-        monkeypatch, handoff._store_path(loaded), clock, 0.5, pragmas, begins,
+        monkeypatch, handoff._store_path(loaded), clock, 1.5, pragmas, begins,
     )
-    result = cli.capture_hook(config, _stop_event(admission), timeout=2.0)
+    result = cli.capture_hook(config, _stop_event(admission), timeout=7.0)
     assert result["stage"] in {"accepted-local", "accepted-runtime", "accepted"}
-    assert any("busy_timeout=1500" in item for item in pragmas)
+    assert pragmas and all("busy_timeout=5000" in item for item in pragmas)
     assert begins
 
 
@@ -429,3 +433,232 @@ def test_truncated_utf8_ledger_tail_is_dropped_not_corruption(tmp_path):
     path = tmp_path / "experiment-ledger.jsonl"
     path.write_bytes(payload)
     assert read_bounded_jsonl(path, max_bytes=len(payload)) == [{"run_id": "ok"}]
+
+
+def test_open_database_and_admission_reads_enforce_floor_during_init_and_single_deadline(tmp_path, monkeypatch):
+    import threading
+    import time
+    from mindie_knowledge import owned_state
+    from mindie_knowledge.loop import activation
+    from mindie_knowledge.loop.locks import StartLock
+
+    connect_timeouts: list[float] = []
+    pre_wal_busy: list[int] = []
+    real_connect = owned_state.sqlite3.connect
+
+    def recording_connect(*args, **kwargs):
+        connect_timeouts.append(float(kwargs.get("timeout", 0.0)))
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(owned_state.sqlite3, "connect", recording_connect)
+    db_path = tmp_path / "subsec.sqlite3"
+    with pytest.raises(owned_state.SqliteBudgetExhausted):
+        owned_state.open_database(
+            db_path,
+            schema="test/1",
+            required={"items": {"id"}},
+            initialize=lambda conn: conn.execute("CREATE TABLE items(id TEXT PRIMARY KEY)"),
+            timeout=0.1,
+        )
+    assert connect_timeouts == []
+    assert not db_path.exists()
+
+    db = owned_state.open_database(
+        db_path,
+        schema="test/1",
+        required={"items": {"id"}},
+        initialize=lambda conn: (
+            pre_wal_busy.append(conn.execute("PRAGMA busy_timeout").fetchone()[0]),
+            conn.execute("CREATE TABLE items(id TEXT PRIMARY KEY)"),
+        ),
+        timeout=6.0,
+    )
+    assert db is not None
+    db.close()
+    assert connect_timeouts == [owned_state.SQLITE_BUSY_FLOOR_SECONDS]
+    assert pre_wal_busy == [owned_state.SQLITE_BUSY_TIMEOUT_MS]
+
+    adm_path = make_admission(tmp_path, project_root=tmp_path)
+    gate = activation.Admission(adm_path)
+    token = admission_token(adm_path)
+
+    # Real SQLite EXCLUSIVE lock contention: insufficient caller budget must
+    # fail closed immediately before entering the 5000 ms SQLite busy wait.
+    holder = real_connect(adm_path, check_same_thread=False)
+    holder.execute("BEGIN EXCLUSIVE")
+    release_timer = threading.Timer(0.4, holder.rollback)
+    release_timer.start()
+    try:
+        started = time.monotonic()
+        with pytest.raises(activation.AdmissionUnavailable):
+            gate.capture_authorization("manual-A", token, timeout=0.1)
+        assert time.monotonic() - started < 0.08
+    finally:
+        release_timer.join(timeout=2.0)
+        holder.close()
+
+    # Contended StartLock must only wait (deadline - 5.0s), never full timeout + 5.0s.
+    held_init = StartLock(adm_path.with_name(adm_path.name + ".init.lock"))
+    held_init.acquire()
+    try:
+        started = time.monotonic()
+        with pytest.raises(activation.AdmissionUnavailable):
+            gate.capture_authorization("manual-A", token, timeout=5.15)
+        assert time.monotonic() - started < 0.6
+    finally:
+        held_init.release()
+
+    # Single-deadline enforcement when database open consumes budget below the 5.0s floor.
+    clock = {"now": 50.0}
+    monkeypatch.setattr(activation.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(owned_state.time, "monotonic", lambda: clock["now"])
+    real_db = activation.Admission._database
+
+    def slow_db(self, *args, **kwargs):
+        conn = real_db(self, *args, **kwargs)
+        clock["now"] += 1.5
+        return conn
+
+    monkeypatch.setattr(activation.Admission, "_database", slow_db)
+    with pytest.raises(activation.AdmissionUnavailable, match="exceeded caller timeout"):
+        gate.capture_authorization("manual-A", token, timeout=6.0)
+    with pytest.raises(activation.AdmissionUnavailable, match="exceeded caller timeout"):
+        gate.resolve_capture_lease("manual-A", timeout=6.0)
+
+
+def test_routing_and_ledger_reject_directories_and_stat_permission_errors(tmp_path, monkeypatch):
+    import os as os_mod
+    from mindie_knowledge.graded.explore import resolve_workspace_ledger
+    from mindie_knowledge.graded.maintenance import ROUTING_MANIFEST_SCHEMA, _existing_routing_document
+
+    dir_target = tmp_path / "logs" / "experiment-ledger.jsonl"
+    dir_target.mkdir(parents=True)
+    with pytest.raises(ValueError, match="not a regular file"):
+        read_bounded_jsonl(dir_target)
+    with pytest.raises(ValueError, match="not a regular file"):
+        resolve_workspace_ledger(str(tmp_path), tmp_path)
+
+    routing_dir = tmp_path / "routing.json"
+    routing_dir.mkdir()
+    doc, err = _existing_routing_document(
+        routing_dir, label="routing manifest", schemas=frozenset({ROUTING_MANIFEST_SCHEMA}), keys=("schema",),
+    )
+    assert doc is None and err is not None and "not a regular file" in err
+
+    blocked = tmp_path / "blocked.jsonl"
+    real_lstat = os_mod.lstat
+
+    def deny_blocked(target, *args, **kwargs):
+        if Path(target) == blocked:
+            raise PermissionError("simulated permission denied")
+        return real_lstat(target, *args, **kwargs)
+
+    monkeypatch.setattr(os_mod, "lstat", deny_blocked)
+    with pytest.raises(ValueError, match="PermissionError"):
+        read_bounded_jsonl(blocked)
+    doc2, err2 = _existing_routing_document(
+        blocked, label="routing manifest", schemas=frozenset({ROUTING_MANIFEST_SCHEMA}), keys=("schema",),
+    )
+    assert doc2 is None and err2 is not None and "PermissionError" in err2
+
+
+def test_multi_domain_deactivation_revokes_seven_healthy_domains_and_isolates_locked_store(tmp_path):
+    import sys as sys_mod
+    import time
+    from mindie_knowledge.loop.activation import Admission
+    from mindie_knowledge.loop.domain_routes import deactivate_registered_domains
+
+    configs: dict[str, Path] = {}
+    admissions: dict[str, Path] = {}
+    for index in range(7):
+        domain = f"domain-{index}"
+        settings = tmp_path / f"{domain}-community.json"
+        write_settings(settings, consent_choice="contribute", enabled=True, roots=[tmp_path])
+        adm_path = tmp_path / f"{domain}-admission.sqlite3"
+        cfg_path = tmp_path / f"{domain}-engine.json"
+        cfg_path.write_text(
+            json.dumps(
+                dict(
+                    root=str(tmp_path / "state"),
+                    domain=domain,
+                    admission_path=str(adm_path),
+                    community_config=str(settings),
+                    transcript_adapter=str(parser_path("codex")),
+                    redactor_executable=sys_mod.executable,
+                )
+            ),
+            encoding="utf-8",
+            newline="\n",
+        )
+        Admission(adm_path).activate("current", project_root=str(tmp_path))
+        configs[domain] = cfg_path
+        admissions[domain] = adm_path
+
+    default_cfg = configs["domain-0"]
+    extra_domains = {name: str(path) for name, path in configs.items() if name != "domain-0"}
+    started = time.monotonic()
+    result = deactivate_registered_domains(
+        default_cfg, domain_configs=extra_domains, session="current",
+    )
+    assert time.monotonic() - started < 2.0
+    assert result["status"] == "inactive" and result["changed"] is True
+    for name, adm_path in admissions.items():
+        assert Admission(adm_path).active_lease("current") is None, name
+
+    # With 6 domains where domain-0 is locked and 5 are healthy, a 24s caller
+    # budget caps domain-0 near the 5.5s floor and revokes all 5 healthy stores.
+    subset_names = [f"domain-{index}" for index in range(6)]
+    for name in subset_names:
+        Admission(admissions[name]).activate("current", project_root=str(tmp_path))
+    holder = sqlite3.connect(admissions["domain-0"])
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        partial = deactivate_registered_domains(
+            default_cfg,
+            domain_configs={name: str(configs[name]) for name in subset_names if name != "domain-0"},
+            session="current",
+            timeout=24.0,
+        )
+    finally:
+        holder.rollback()
+        holder.close()
+    assert partial["status"] == "partial" and partial["changed"] is True
+    assert Admission(admissions["domain-0"]).active_lease("current") is not None
+    for name in subset_names[1:]:
+        assert Admission(admissions[name]).active_lease("current") is None, name
+
+
+def test_stop_default_budget_fits_native_hook_wrapper_and_never_stacks_waits(tmp_path, monkeypatch):
+    from mindie_knowledge.loop import domain_routes
+
+    assert handoff.STOP_TIMEOUT_SECONDS == 6.0
+    assert domain_routes.deactivate_registered_domains.__kwdefaults__["timeout"] == 6.0
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    config, admission = _engine_config(tmp_path, project)
+    loaded = cli.config_at(config)
+    held = sqlite3.connect(handoff._store_path(loaded))
+    held.execute("BEGIN IMMEDIATE")
+    try:
+        contended = cli.capture_hook(config, _stop_event(admission))
+    finally:
+        held.rollback()
+        held.close()
+    assert contended["stage"] == "unavailable"
+    assert contended["reason"] == "store-locked"
+
+    # Partial contention on Admission (> 1.0s under default 6.0s budget) fails closed before Store SQLite.
+    clock = {"now": 200.0}
+    monkeypatch.setattr(handoff.time, "monotonic", lambda: clock["now"])
+    real_auth = handoff.Admission.capture_authorization
+
+    def delayed_auth(self, *args, **kwargs):
+        out = real_auth(self, *args, **kwargs)
+        clock["now"] += 1.5
+        return out
+
+    monkeypatch.setattr(handoff.Admission, "capture_authorization", delayed_auth)
+    stacked = cli.capture_hook(config, _stop_event(admission, turn_id="turn-2"))
+    assert stacked["stage"] == "unavailable"
+    assert stacked["reason"] == "budget-exhausted"
