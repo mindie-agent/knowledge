@@ -34,6 +34,7 @@ _COMPATIBILITY_PATHS = {
     "dsh": "harness-compatibility.json",
     "antigravity": "harness-compatibility.json",
     "workbuddy": "harness-compatibility.json",
+    "opencode": "harness-compatibility.json",
 }
 
 
