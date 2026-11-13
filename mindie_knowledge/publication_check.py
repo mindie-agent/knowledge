@@ -19,7 +19,7 @@ from contextlib import closing
 from pathlib import Path
 from .community.batch import check_path,validate_feedback
 from .community.common import SCHEMA_FEEDBACK,CommunityError,git_executable,run_argv,sha256_text
-from .gitread import CatFileBatch,iter_file_records,run_stdout_to_file,with_windows_longpaths
+from .gitread import CatFileBatch,iter_file_records,run_stdout_to_file,scoped_git_environment
 from .loop import documents
 from .loop.documents import MAX_FILE_BYTES
 from .materials.store import BLOCK_SCHEMA, _parse, _parse_manifest, _parse_block, _sha
@@ -37,8 +37,8 @@ from .graded.units import SCHEMA as GRADED_UNIT_SCHEMA
 from .graded.units import GradedUnit, relative_path
 
 def _git_env():
-    return with_windows_longpaths({'GIT_TERMINAL_PROMPT':'0','GCM_INTERACTIVE':'never','GIT_CONFIG_COUNT':'1',
-        'GIT_CONFIG_KEY_0':'core.hooksPath','GIT_CONFIG_VALUE_0':os.devnull})
+    return {**scoped_git_environment([('core.hooksPath', os.devnull)]),
+            'GIT_TERMINAL_PROMPT':'0', 'GCM_INTERACTIVE':'never'}
 
 _CHECKPOINT_EVERY=64
 _STATE_NAME='mindie-validator-state.json'

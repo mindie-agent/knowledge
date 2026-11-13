@@ -28,7 +28,7 @@ from .common import (
     run_argv,
 )
 from mindie_knowledge.gitbin import ensure_git_on_path
-from mindie_knowledge.gitread import with_windows_longpaths
+from mindie_knowledge.gitread import scoped_git_environment, with_windows_longpaths
 from mindie_knowledge.filesystem import filesystem_path, git_path
 from mindie_knowledge.git_layout import UnsupportedGitLayout, validate_git_directory
 
@@ -90,7 +90,14 @@ def _resolve_git_env(env: Mapping[str, str] | None) -> dict[str, str]:
     Windows long paths are command-local. ``{}`` matches the old
     ``env or GIT_ENV`` fallback, so credential helpers and hooksPath stay.
     """
-    return ensure_git_on_path(with_windows_longpaths(env or _GIT_BASE))
+    if env:
+        selected = dict(os.environ, **env)
+        return ensure_git_on_path(with_windows_longpaths(selected))
+    pairs = [(_GIT_BASE[f"GIT_CONFIG_KEY_{index}"], _GIT_BASE[f"GIT_CONFIG_VALUE_{index}"])
+             for index in range(int(_GIT_BASE["GIT_CONFIG_COUNT"]))]
+    selected = scoped_git_environment(pairs)
+    selected.update({key: value for key, value in _GIT_BASE.items() if not key.startswith("GIT_CONFIG_")})
+    return ensure_git_on_path(selected)
 
 
 def git_env(settings: Mapping[str, Any] | None = None, token_env: str | None = None) -> dict[str, str]:

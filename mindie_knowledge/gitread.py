@@ -36,6 +36,20 @@ _MAX_HEADER = 4096
 _READ_CHUNK = 1024 * 1024
 
 
+def scoped_git_environment(pairs):
+    """Append owned Git options after the caller's proxy, CA and TLS settings."""
+    out = dict(os.environ)
+    count = int(out.get("GIT_CONFIG_COUNT", "0"))
+    if count < 0:
+        raise ValueError("GIT_CONFIG_COUNT must not be negative")
+    for key, value in pairs:
+        out[f"GIT_CONFIG_KEY_{count}"] = key
+        out[f"GIT_CONFIG_VALUE_{count}"] = value
+        count += 1
+    out["GIT_CONFIG_COUNT"] = str(count)
+    return with_windows_longpaths(out)
+
+
 def with_windows_longpaths(env):
     """Copy ``env`` and, on Windows, require command-local ``core.longpaths``.
 
