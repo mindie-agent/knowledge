@@ -49,7 +49,7 @@ class Ledger:
                 'publication_step': 'id batch_id revision step detail at'.split(),
                 'state': 'key value'.split(),
             },
-            initialize=self._initialize, residue=(root / 'git',),
+            initialize=self._initialize, residue=(root / 'git',), timeout=60.0,
         )
 
     @staticmethod

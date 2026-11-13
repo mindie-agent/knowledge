@@ -1,8 +1,8 @@
 """Development formats may restart; released state may never be reset.
 
 [Role] Domain state directory layout and released-format migration guard.
-[Invariants] Released state is never reset or silently migrated; a version mismatch raises before any mutation.
-[Timeouts & Locks] Directory preparation is bounded by the caller and takes no persistent process lock.
+[Invariants] Released state is never reset or silently migrated; a version mismatch raises before any mutation. An aborted first-use `state-vN` directory containing zero database, lock record, or material files is rolled back under `state-layout.lock`, while any initialized state or residue remains fail-closed.
+[Timeouts & Locks] Directory preparation is bounded by the caller and serialized by `StartLock(state-layout.lock)`.
 [Side-Effect Policy] Creates and validates state directories with private permissions; no network or content writes.
 
 RELEASE_VERSION identifies the product release that protects this state.
@@ -67,11 +67,64 @@ def state_root(root, domain):
     return (base / ('state-v' + str(FORMAT))).resolve()
 
 
+def _cleanup_uncommitted_layout(selected):
+    """Roll back a newly created state-vN directory only when zero authority exists."""
+    from .loop.locks import lock_held
+    from .owned_state import _present
+
+    if not _present(selected) or selected.is_symlink() or not selected.is_dir():
+        return
+    init_lock_name = DATABASE + '.init.lock'
+    try:
+        entries = list(selected.iterdir())
+    except TimeoutError:
+        raise
+    except OSError:
+        return
+    materials_dir = None
+    init_lock = None
+    for entry in entries:
+        try:
+            st = entry.lstat()
+        except TimeoutError:
+            raise
+        except OSError:
+            return
+        if entry.name == init_lock_name:
+            if not stat.S_ISREG(st.st_mode) or st.st_size != 0 or lock_held(entry) is not False:
+                return
+            init_lock = entry
+        elif entry.name == 'materials':
+            if not stat.S_ISDIR(st.st_mode):
+                return
+            try:
+                if any(entry.iterdir()):
+                    return
+            except TimeoutError:
+                raise
+            except OSError:
+                return
+            materials_dir = entry
+        else:
+            return
+    try:
+        if materials_dir is not None:
+            materials_dir.rmdir()
+        if init_lock is not None:
+            init_lock.unlink(missing_ok=True)
+        selected.rmdir()
+    except TimeoutError:
+        raise
+    except OSError:
+        pass
+
+
 @contextmanager
 def prepare_layout(root, domain):
     """Publish the selected layout only after its database opens successfully."""
     from .loop.locks import StartLock
     from .markdown import _atomic_write_text
+    from .owned_state import _present
     # Validate the configured path before mkdir/resolve can follow a dangling
     # link and turn a broken existing root into a new empty target.
     base = filesystem_path(root).absolute() / domain
@@ -82,7 +135,13 @@ def prepare_layout(root, domain):
     try:
         selected = state_root(root, domain)
         previous = _read(base)
-        yield selected
+        created_selected = not _present(selected)
+        try:
+            yield selected
+        except BaseException:
+            if created_selected:
+                _cleanup_uncommitted_layout(selected)
+            raise
         release = RELEASE_VERSION
         if previous is not None and previous['format'] == FORMAT:
             release = release or previous['release_version']

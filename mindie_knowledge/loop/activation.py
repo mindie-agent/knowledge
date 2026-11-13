@@ -15,11 +15,11 @@
 
 [Timeouts & Locks]
 - Serializes writes with in-process `self._lock` (`threading.RLock`) and
-  `open_database(..., timeout=5.0)` (`timeout=2.0` on reads) in WAL mode.
-- A supplied deactivation timeout covers both the thread lock and database
-  waits; its TimeoutError remains visible to the caller.
-- Remaining caller budgets below the 1 s SQLite lock floor fail closed before
-  connect; `PRAGMA busy_timeout` is never set below 1000 ms.
+  `open_database(..., timeout=10.0)` (`timeout=6.0` on Stop lease reads) in WAL mode
+  with the fixed `PRAGMA busy_timeout=5000` (`5.0s` lock floor) set once on open.
+- Supplied deactivation and lease-read budgets coordinate `self._lock`, `StartLock`,
+  and SQLite around one monotonic `deadline`. Remaining budgets below the `5.0s`
+  SQLite lock floor fail closed before entering SQLite without dynamic overrides.
 
 [Side-Effect Policy]
 - Local SQLite state (`0700` dir / `0600` file) only; failure counters (`finish`)
@@ -41,7 +41,7 @@ from .store import session_key
 from .locks import StartInProgress
 
 from ..owned_state import (
-    SQLITE_BUSY_FLOOR_SECONDS,
+    SqliteBudgetExhausted,
     open_database,
     sqlite_busy_timeout_ms,
 )
@@ -96,7 +96,7 @@ class Admission:
 
     # ------------------------------------------------------------- internals
 
-    def _database(self, *, initialize_missing=False, timeout=5.0):
+    def _database(self, *, initialize_missing=False, timeout=10.0, deadline=None):
         """Use the shared authority contract; absence is valid only before use."""
         try:
             return open_database(
@@ -104,7 +104,7 @@ class Admission:
                 required={"leases": CAPTURE_COLUMNS,
                           "attempts": {"session", "kind", "identity", "created"}},
                 initialize=_initialize_admission, initialize_missing=initialize_missing,
-                timeout=timeout,
+                timeout=timeout, deadline=deadline,
             )
         except TimeoutError:
             raise
@@ -113,41 +113,48 @@ class Admission:
 
     def _write(self, fn, *, initialize_missing=False, missing_error=None, timeout=None):
         """Serialize read+modify while preserving leases and attempt receipts."""
-        deadline = None if timeout is None else time.monotonic() + timeout
-        acquired = self._lock.acquire() if deadline is None else self._lock.acquire(timeout=max(0, timeout))
+        if timeout is not None and (type(timeout) not in (int, float) or not math.isfinite(timeout)):
+            raise ValueError("admission write timeout must be a finite number")
+        deadline = None if timeout is None else time.monotonic() + float(timeout)
+        acquired = (
+            self._lock.acquire()
+            if deadline is None
+            else self._lock.acquire(timeout=max(0.0, deadline - time.monotonic()))
+        )
         if not acquired:
             raise TimeoutError("admission write exceeded its in-process lock budget")
         try:
-            remaining = None if deadline is None else deadline - time.monotonic()
-            if remaining is not None and remaining < SQLITE_BUSY_FLOOR_SECONDS:
+            if deadline is not None and sqlite_busy_timeout_ms(deadline - time.monotonic()) is None:
                 raise TimeoutError("admission write exhausted its caller budget")
-            # A caller with several stores owns one outer budget. Opening can
-            # wait on both the initialization lock and SQLite journal setup.
-            # The connect timeout stays at least 1 s so SQLite never uses a
-            # sub-second lock wait on this path.
-            db = self._database(
-                initialize_missing=initialize_missing,
-                timeout=5.0 if remaining is None else max(
-                    SQLITE_BUSY_FLOOR_SECONDS, remaining / 2,
-                ),
-            )
+            try:
+                db = self._database(
+                    initialize_missing=initialize_missing,
+                    timeout=10.0 if deadline is None else None,
+                    deadline=deadline,
+                )
+            except AdmissionUnavailable as exc:
+                if deadline is not None and (
+                    isinstance(exc.__cause__, SqliteBudgetExhausted)
+                    or time.monotonic() >= deadline
+                ):
+                    raise TimeoutError("admission write exhausted its caller budget") from exc
+                raise
             if db is None:
                 if missing_error is not None:
                     raise ValueError(missing_error)
                 return False
             try:
                 if deadline is not None:
-                    remaining = deadline - time.monotonic()
-                    busy_ms = sqlite_busy_timeout_ms(remaining)
-                    if busy_ms is None:
+                    if sqlite_busy_timeout_ms(deadline - time.monotonic()) is None:
                         raise TimeoutError("admission write exhausted its caller budget")
-                    db.execute(f"PRAGMA busy_timeout={busy_ms}")
-                    db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 10000)
+                    db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
                 self.path.parent.chmod(0o700)
                 self.path.chmod(0o600)
                 db.execute("BEGIN IMMEDIATE")
                 try:
                     result = fn(db)
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise TimeoutError("admission write exhausted its caller budget")
                     db.commit()
                 except BaseException:
                     db.rollback()
@@ -155,29 +162,59 @@ class Admission:
                 return result
             except TimeoutError:
                 raise
+            except sqlite3.OperationalError as exc:
+                if deadline is not None and (
+                    time.monotonic() >= deadline or "interrupted" in str(exc).lower()
+                ):
+                    raise TimeoutError("admission write exhausted its caller budget") from exc
+                raise AdmissionUnavailable(str(exc)) from exc
             except (OSError, sqlite3.Error) as exc:
                 raise AdmissionUnavailable(str(exc)) from exc
             finally:
+                if deadline is not None:
+                    db.set_progress_handler(None, 0)
                 db.close()
         finally:
             self._lock.release()
 
-    def _rows(self, sql="", args=()):
+    def _rows(self, sql="", args=(), *, deadline=None):
         """A missing unused store is empty; lost authority is never inactivity."""
-        db = self._database()
+        db = self._database(
+            timeout=10.0 if deadline is None else None,
+            deadline=deadline,
+        )
         if db is None:
             return []
         try:
+            if deadline is not None:
+                if sqlite_busy_timeout_ms(deadline - time.monotonic()) is None:
+                    raise SqliteBudgetExhausted("admission read exceeded caller deadline")
+                db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
             rows = db.execute("SELECT * FROM leases WHERE enabled=1 " + sql, args).fetchall()
+            if deadline is not None and time.monotonic() >= deadline:
+                raise SqliteBudgetExhausted("admission read exceeded caller deadline")
             return [{**dict(row), "capture_schema": True} for row in rows]
+        except sqlite3.OperationalError as exc:
+            if deadline is not None and (
+                isinstance(exc, SqliteBudgetExhausted)
+                or "interrupted" in str(exc).lower()
+            ):
+                budget_exc = (
+                    exc if isinstance(exc, SqliteBudgetExhausted)
+                    else SqliteBudgetExhausted("admission read exceeded caller deadline")
+                )
+                raise AdmissionUnavailable("admission read exceeded caller deadline") from budget_exc
+            raise AdmissionUnavailable(str(exc)) from exc
         except (OSError, sqlite3.Error, ValueError) as exc:
             raise AdmissionUnavailable(str(exc)) from exc
         finally:
+            if deadline is not None:
+                db.set_progress_handler(None, 0)
             db.close()
 
     # ------------------------------------------------------------ activation
 
-    def inspect(self, session):
+    def inspect(self, session, *, deadline=None):
         """Read one diagnostic lease, including disabled rows; never grant.
 
         Unlike ``active_lease``, this reports a broken or locked store honestly.
@@ -189,13 +226,22 @@ class Admission:
             return dict(status="unavailable", enabled=False, error_class="ValueError")
         db = None
         try:
-            db = self._database()
+            db = self._database(
+                timeout=10.0 if deadline is None else None,
+                deadline=deadline,
+            )
             if db is None:
                 return result
+            if deadline is not None:
+                if sqlite_busy_timeout_ms(deadline - time.monotonic()) is None:
+                    raise SqliteBudgetExhausted("admission inspect exceeded caller deadline")
+                db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
             row = db.execute(
                 "SELECT enabled, failures, project_root FROM leases WHERE session=? LIMIT 1",
                 (session,),
             ).fetchone()
+            if deadline is not None and time.monotonic() >= deadline:
+                raise SqliteBudgetExhausted("admission inspect exceeded caller deadline")
             if row is not None:
                 enabled, failures, project_root = row
                 result = dict(status="active" if enabled else "inactive",
@@ -204,9 +250,36 @@ class Admission:
         except TimeoutError:
             raise
         except (AdmissionUnavailable, OSError, sqlite3.Error, ValueError, TypeError) as exc:
-            result = dict(status="unavailable", enabled=False, error_class=type(exc).__name__)
+            cause_exc = exc.__cause__ if isinstance(exc, AdmissionUnavailable) else exc
+            cause_text = str(cause_exc).lower() if cause_exc is not None else ""
+            locked_cause = (
+                isinstance(cause_exc, sqlite3.OperationalError)
+                and not isinstance(cause_exc, SqliteBudgetExhausted)
+                and ("locked" in cause_text or "busy" in cause_text)
+                and "interrupted" not in cause_text
+            )
+            budget_exhausted = (
+                deadline is not None
+                and not locked_cause
+                and (
+                    isinstance(cause_exc, (SqliteBudgetExhausted, StartInProgress))
+                    or (
+                        isinstance(cause_exc, sqlite3.OperationalError)
+                        and "interrupted" in cause_text
+                    )
+                    or time.monotonic() >= deadline
+                )
+            )
+            result = dict(
+                status="unavailable",
+                enabled=False,
+                error_class=type(exc).__name__,
+                **({"cause": "budget-exhausted"} if budget_exhausted else {}),
+            )
         finally:
             if db is not None:
+                if deadline is not None:
+                    db.set_progress_handler(None, 0)
                 db.close()
         return result
 
@@ -318,11 +391,11 @@ class Admission:
         """Currently valid leases; read faults raise AdmissionUnavailable."""
         return self._rows()
 
-    def active_lease(self, session):
+    def active_lease(self, session, *, deadline=None):
         """Valid lease for one native session id, without a token (worker re-check)."""
         if not isinstance(session, str):
             return None
-        for lease in self._rows():
+        for lease in self._rows(deadline=deadline):
             if lease["session"] == session:
                 return lease
         return None
@@ -360,7 +433,7 @@ class Admission:
             )
         return lease
 
-    def capture_authorization(self, session, token, *, timeout=5.0):
+    def capture_authorization(self, session, token, *, timeout=6.0):
         """Read one lease for a Stop handoff.
 
         Returns ``state`` of ``admitted``, ``inactive``, or ``schema``. A
@@ -377,22 +450,31 @@ class Admission:
             or len(token) > 512
         ):
             return {"state": "inactive"}
-        timeout = max(0.05, min(float(timeout), 10.0))
-        db = self._database(timeout=timeout)
+        if type(timeout) not in (int, float) or not math.isfinite(timeout):
+            raise ValueError("capture authorization timeout must be a finite number")
+        deadline = time.monotonic() + float(timeout)
+        db = self._database(timeout=None, deadline=deadline)
         if db is None:
             return {"state": "inactive"}
         try:
-            # Caller lock budgets may be short; PRAGMA busy_timeout never is.
-            busy_ms = sqlite_busy_timeout_ms(timeout) or int(SQLITE_BUSY_FLOOR_SECONDS * 1000)
-            db.execute(f"PRAGMA busy_timeout={busy_ms}")
-            deadline = time.monotonic() + timeout
-            db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 10000)
+            if sqlite_busy_timeout_ms(deadline - time.monotonic()) is None:
+                raise AdmissionUnavailable("capture authorization exceeded caller timeout")
+            db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
             try:
                 cursor = db.execute(
                     "SELECT * FROM leases WHERE session=? LIMIT 1", (session,)
                 )
             except sqlite3.OperationalError as exc:
-                raise AdmissionUnavailable("lease schema is missing") from exc
+                text = str(exc).lower()
+                if "interrupted" in text:
+                    raise AdmissionUnavailable("capture authorization exceeded caller timeout") from exc
+                if "locked" in text or "busy" in text:
+                    raise AdmissionUnavailable(str(exc)) from exc
+                if time.monotonic() >= deadline:
+                    raise AdmissionUnavailable("capture authorization exceeded caller timeout") from exc
+                if "no such table" in text:
+                    raise AdmissionUnavailable("lease schema is missing") from exc
+                raise AdmissionUnavailable(str(exc)) from exc
             columns = [column[0] for column in cursor.description or ()]
             if not columns:
                 raise AdmissionUnavailable("lease schema is missing")
@@ -401,6 +483,8 @@ class Admission:
             if not CAPTURE_COLUMNS <= set(columns):
                 return {"state": "schema"}
             row = cursor.fetchone()
+            if time.monotonic() >= deadline:
+                raise AdmissionUnavailable("capture authorization exceeded caller timeout")
             if row is None:
                 return {"state": "inactive"}
             lease = dict(zip(columns, row))
@@ -436,11 +520,14 @@ class Admission:
         except TimeoutError:
             raise
         except (OSError, sqlite3.Error, ValueError) as exc:
+            if time.monotonic() >= deadline:
+                raise AdmissionUnavailable("capture authorization exceeded caller timeout") from exc
             raise AdmissionUnavailable(str(exc)) from exc
         finally:
+            db.set_progress_handler(None, 0)
             db.close()
 
-    def resolve_capture_lease(self, session, *, timeout=5.0):
+    def resolve_capture_lease(self, session, *, timeout=6.0):
         """Read one live lease for an internal Stop that did not pass a token.
 
         The stored token is used only to compute the activation epoch and is
@@ -456,22 +543,31 @@ class Admission:
             or len(session) > 256
         ):
             return {"state": "inactive"}
-        timeout = max(0.05, min(float(timeout), 10.0))
-        db = self._database(timeout=timeout)
+        if type(timeout) not in (int, float) or not math.isfinite(timeout):
+            raise ValueError("capture authorization timeout must be a finite number")
+        deadline = time.monotonic() + float(timeout)
+        db = self._database(timeout=None, deadline=deadline)
         if db is None:
             return {"state": "inactive"}
         try:
-            # Caller lock budgets may be short; PRAGMA busy_timeout never is.
-            busy_ms = sqlite_busy_timeout_ms(timeout) or int(SQLITE_BUSY_FLOOR_SECONDS * 1000)
-            db.execute(f"PRAGMA busy_timeout={busy_ms}")
-            deadline = time.monotonic() + timeout
-            db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 10000)
+            if sqlite_busy_timeout_ms(deadline - time.monotonic()) is None:
+                raise AdmissionUnavailable("capture authorization exceeded caller timeout")
+            db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
             try:
                 cursor = db.execute(
                     "SELECT * FROM leases WHERE session=? LIMIT 1", (session,)
                 )
             except sqlite3.OperationalError as exc:
-                raise AdmissionUnavailable("lease schema is missing") from exc
+                text = str(exc).lower()
+                if "interrupted" in text:
+                    raise AdmissionUnavailable("capture authorization exceeded caller timeout") from exc
+                if "locked" in text or "busy" in text:
+                    raise AdmissionUnavailable(str(exc)) from exc
+                if time.monotonic() >= deadline:
+                    raise AdmissionUnavailable("capture authorization exceeded caller timeout") from exc
+                if "no such table" in text:
+                    raise AdmissionUnavailable("lease schema is missing") from exc
+                raise AdmissionUnavailable(str(exc)) from exc
             columns = [column[0] for column in cursor.description or ()]
             if not columns:
                 raise AdmissionUnavailable("lease schema is missing")
@@ -480,6 +576,8 @@ class Admission:
             if not CAPTURE_COLUMNS <= set(columns):
                 return {"state": "schema"}
             row = cursor.fetchone()
+            if time.monotonic() >= deadline:
+                raise AdmissionUnavailable("capture authorization exceeded caller timeout")
             if row is None:
                 return {"state": "inactive"}
             lease = dict(zip(columns, row))
@@ -512,8 +610,11 @@ class Admission:
         except TimeoutError:
             raise
         except (OSError, sqlite3.Error, ValueError) as exc:
+            if time.monotonic() >= deadline:
+                raise AdmissionUnavailable("capture authorization exceeded caller timeout") from exc
             raise AdmissionUnavailable(str(exc)) from exc
         finally:
+            db.set_progress_handler(None, 0)
             db.close()
 
     def resolve(self, token):
