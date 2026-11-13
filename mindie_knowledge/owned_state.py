@@ -63,8 +63,20 @@ def sqlite_busy_timeout_ms(remaining=None):
     return SQLITE_BUSY_TIMEOUT_MS
 
 
-def require_columns(db, required):
+def _check_open_floor(open_deadline, stage):
+    if open_deadline is None:
+        return
+    remaining = open_deadline - time.monotonic()
+    if sqlite_busy_timeout_ms(remaining) is None:
+        raise SqliteBudgetExhausted(
+            f'SQLite caller budget ({remaining:.3f}s) is below the '
+            f'{SQLITE_BUSY_FLOOR_SECONDS:.1f}s lock floor before {stage}'
+        )
+
+
+def require_columns(db, required, *, open_deadline=None):
     for table, columns in required.items():
+        _check_open_floor(open_deadline, f'schema read ({table})')
         present = {row[1] for row in sqlite3.Connection.execute(db, f'PRAGMA table_info({table})')}
         if not set(columns) <= present:
             raise ValueError(f'authoritative state table {table} is missing or incomplete; state was not rebuilt')
@@ -147,13 +159,7 @@ def open_database(path, *, schema, required, initialize, residue=(), validate=No
             return None
         if not fresh and (not path.is_file() or path.stat().st_size == 0):
             raise ValueError('authoritative state database is empty or invalid; state was not rebuilt')
-        if open_deadline is not None:
-            remaining = open_deadline - time.monotonic()
-            if sqlite_busy_timeout_ms(remaining) is None:
-                raise SqliteBudgetExhausted(
-                    f'SQLite caller budget ({remaining:.3f}s) is below the '
-                    f'{SQLITE_BUSY_FLOOR_SECONDS:.1f}s lock floor after init lock'
-                )
+        _check_open_floor(open_deadline, 'connect')
         db = sqlite3.connect(path if fresh else sqlite_file_uri(path) + '?mode=rw',
                              uri=not fresh, check_same_thread=False, factory=OwnedConnection,
                              timeout=SQLITE_BUSY_FLOOR_SECONDS)
@@ -163,16 +169,22 @@ def open_database(path, *, schema, required, initialize, residue=(), validate=No
             db.set_progress_handler(lambda: int(time.monotonic() >= open_deadline), 1000)
         db.execute(f'PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}')
         if fresh:
+            _check_open_floor(open_deadline, 'fresh WAL setup')
             db.execute('PRAGMA journal_mode=WAL')
             db.execute(f'PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}')
+            _check_open_floor(open_deadline, 'fresh schema initialization')
             initialize(db)
             db.commit()
-        require_columns(db, required)
+        require_columns(db, required, open_deadline=None if fresh else open_deadline)
         if validate is not None:
+            if not fresh:
+                _check_open_floor(open_deadline, 'validation')
             validate(db)
         if not fresh:
+            _check_open_floor(open_deadline, 'journal_mode check')
             mode = db.execute('PRAGMA journal_mode').fetchone()
             if not mode or str(mode[0]).lower() != 'wal':
+                _check_open_floor(open_deadline, 'WAL transition')
                 db.execute('PRAGMA journal_mode=WAL')
         # Keep the fixed 5000 ms policy explicit after initialization/validation.
         db.execute(f'PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}')
@@ -189,8 +201,22 @@ def open_database(path, *, schema, required, initialize, residue=(), validate=No
         if open_deadline is not None:
             db.set_progress_handler(None, 0)
         return db
+    except sqlite3.OperationalError as exc:
+        if db is not None:
+            if open_deadline is not None:
+                db.set_progress_handler(None, 0)
+            db.close()
+        if (
+            open_deadline is not None
+            and not isinstance(exc, SqliteBudgetExhausted)
+            and 'interrupted' in str(exc).lower()
+        ):
+            raise SqliteBudgetExhausted('SQLite open exceeded caller deadline') from exc
+        raise
     except BaseException:
         if db is not None:
+            if open_deadline is not None:
+                db.set_progress_handler(None, 0)
             db.close()
         raise
     finally:

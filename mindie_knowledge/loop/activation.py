@@ -177,22 +177,44 @@ class Admission:
         finally:
             self._lock.release()
 
-    def _rows(self, sql="", args=()):
+    def _rows(self, sql="", args=(), *, deadline=None):
         """A missing unused store is empty; lost authority is never inactivity."""
-        db = self._database()
+        db = self._database(
+            timeout=10.0 if deadline is None else None,
+            deadline=deadline,
+        )
         if db is None:
             return []
         try:
+            if deadline is not None:
+                if sqlite_busy_timeout_ms(deadline - time.monotonic()) is None:
+                    raise SqliteBudgetExhausted("admission read exceeded caller deadline")
+                db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
             rows = db.execute("SELECT * FROM leases WHERE enabled=1 " + sql, args).fetchall()
+            if deadline is not None and time.monotonic() >= deadline:
+                raise SqliteBudgetExhausted("admission read exceeded caller deadline")
             return [{**dict(row), "capture_schema": True} for row in rows]
+        except sqlite3.OperationalError as exc:
+            if deadline is not None and (
+                isinstance(exc, SqliteBudgetExhausted)
+                or "interrupted" in str(exc).lower()
+            ):
+                budget_exc = (
+                    exc if isinstance(exc, SqliteBudgetExhausted)
+                    else SqliteBudgetExhausted("admission read exceeded caller deadline")
+                )
+                raise AdmissionUnavailable("admission read exceeded caller deadline") from budget_exc
+            raise AdmissionUnavailable(str(exc)) from exc
         except (OSError, sqlite3.Error, ValueError) as exc:
             raise AdmissionUnavailable(str(exc)) from exc
         finally:
+            if deadline is not None:
+                db.set_progress_handler(None, 0)
             db.close()
 
     # ------------------------------------------------------------ activation
 
-    def inspect(self, session):
+    def inspect(self, session, *, deadline=None):
         """Read one diagnostic lease, including disabled rows; never grant.
 
         Unlike ``active_lease``, this reports a broken or locked store honestly.
@@ -204,13 +226,22 @@ class Admission:
             return dict(status="unavailable", enabled=False, error_class="ValueError")
         db = None
         try:
-            db = self._database()
+            db = self._database(
+                timeout=10.0 if deadline is None else None,
+                deadline=deadline,
+            )
             if db is None:
                 return result
+            if deadline is not None:
+                if sqlite_busy_timeout_ms(deadline - time.monotonic()) is None:
+                    raise SqliteBudgetExhausted("admission inspect exceeded caller deadline")
+                db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
             row = db.execute(
                 "SELECT enabled, failures, project_root FROM leases WHERE session=? LIMIT 1",
                 (session,),
             ).fetchone()
+            if deadline is not None and time.monotonic() >= deadline:
+                raise SqliteBudgetExhausted("admission inspect exceeded caller deadline")
             if row is not None:
                 enabled, failures, project_root = row
                 result = dict(status="active" if enabled else "inactive",
@@ -219,9 +250,36 @@ class Admission:
         except TimeoutError:
             raise
         except (AdmissionUnavailable, OSError, sqlite3.Error, ValueError, TypeError) as exc:
-            result = dict(status="unavailable", enabled=False, error_class=type(exc).__name__)
+            cause_exc = exc.__cause__ if isinstance(exc, AdmissionUnavailable) else exc
+            cause_text = str(cause_exc).lower() if cause_exc is not None else ""
+            locked_cause = (
+                isinstance(cause_exc, sqlite3.OperationalError)
+                and not isinstance(cause_exc, SqliteBudgetExhausted)
+                and ("locked" in cause_text or "busy" in cause_text)
+                and "interrupted" not in cause_text
+            )
+            budget_exhausted = (
+                deadline is not None
+                and not locked_cause
+                and (
+                    isinstance(cause_exc, (SqliteBudgetExhausted, StartInProgress))
+                    or (
+                        isinstance(cause_exc, sqlite3.OperationalError)
+                        and "interrupted" in cause_text
+                    )
+                    or time.monotonic() >= deadline
+                )
+            )
+            result = dict(
+                status="unavailable",
+                enabled=False,
+                error_class=type(exc).__name__,
+                **({"cause": "budget-exhausted"} if budget_exhausted else {}),
+            )
         finally:
             if db is not None:
+                if deadline is not None:
+                    db.set_progress_handler(None, 0)
                 db.close()
         return result
 
@@ -333,11 +391,11 @@ class Admission:
         """Currently valid leases; read faults raise AdmissionUnavailable."""
         return self._rows()
 
-    def active_lease(self, session):
+    def active_lease(self, session, *, deadline=None):
         """Valid lease for one native session id, without a token (worker re-check)."""
         if not isinstance(session, str):
             return None
-        for lease in self._rows():
+        for lease in self._rows(deadline=deadline):
             if lease["session"] == session:
                 return lease
         return None
