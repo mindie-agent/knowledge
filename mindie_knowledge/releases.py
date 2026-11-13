@@ -28,6 +28,7 @@ REPOSITORIES = {
     "dsh": "mindie-agent/mindie-agent-dsh",
     "antigravity": "mindie-agent/mindie-agent-agy",
     "workbuddy": "mindie-agent/mindie-agent-wb",
+    "opencode": "mindie-agent/mindie-agent-oc",
 }
 _ID = re.compile(r"[a-z][a-z0-9_.-]{0,95}\Z")
 _SHA = re.compile(r"[0-9a-f]{40}\Z")

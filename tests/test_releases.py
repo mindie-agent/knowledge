@@ -221,3 +221,56 @@ def test_workbuddy_harness_compatibility_and_release_selection():
     if wb_compat_path.is_file():
         decl = json.loads(wb_compat_path.read_text(encoding="utf-8"))
         assert supports_harness(decl, harness_name="workbuddy", harness_version="2.0.0")
+
+
+def test_opencode_harness_compatibility_and_release_selection():
+    from mindie_knowledge.releases import REPOSITORIES
+    from mindie_knowledge.releases_io import _COMPATIBILITY_PATHS
+
+    assert REPOSITORIES["opencode"] == "mindie-agent/mindie-agent-oc"
+    assert _COMPATIBILITY_PATHS["opencode"] == "harness-compatibility.json"
+
+    supported = [interval("2.2.0", "2.99.99", inclusive=True, prerelease=True)]
+    decl = dict(
+        schema="mindie-harness-compatibility/1",
+        harness="opencode",
+        supported=deepcopy(supported),
+        used_interfaces=["plugin.v2-setup", "mcp.transform-local"],
+        interface_registry={
+            "plugin.v2-setup": dict(
+                supported=deepcopy(supported),
+                code_paths=["index.mjs", "plugins/mindie-agent/opencode_host.mjs"],
+                test_ids=["tests/test_oc_plugin.py::test_plugin_manifests_and_opencode_v2_loading"],
+                evidence_refs=["AGENTS.md"],
+            ),
+            "mcp.transform-local": dict(
+                supported=deepcopy(supported),
+                code_paths=["plugins/mindie-agent/scripts/mcp_server.py:serve"],
+                test_ids=["tests/test_oc_mcp_and_knowledge.py::test_public_mcp_excludes_knowledge_even_when_session_is_active"],
+                evidence_refs=["AGENTS.md"],
+            ),
+        },
+    )
+    assert supports_harness(decl, harness_name="opencode", harness_version="2.2.7")
+    assert not supports_harness(decl, harness_name="opencode", harness_version="2.1.9")
+    rec = dict(
+        id=1,
+        tag_name="v0.1.1",
+        draft=False,
+        prerelease=False,
+        metadata=dict(
+            schema="mindie-plugin-release/1",
+            version="0.1.1",
+            source=dict(repository="mindie-agent/mindie-agent-oc", sha="c" * 40),
+            compatibility=decl,
+        ),
+    )
+    selected = select_release(
+        [rec],
+        repository="mindie-agent/mindie-agent-oc",
+        harness_name="opencode",
+        harness_version="2.2.7",
+        installed_version="0.1.0",
+    )
+    assert selected["status"] == "candidate"
+    assert selected["candidate"]["metadata"]["version"] == "0.1.1"
