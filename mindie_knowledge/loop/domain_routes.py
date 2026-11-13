@@ -13,8 +13,10 @@
 [Timeouts & Locks]
 - Local configuration reads and atomic replacement only. Explicit activation
   reuses Admission's existing WAL/5s write budget; no network or new retry loop.
-- Native deactivation shares one 24s wait budget across registered stores so
-  multi-domain adapters keep at least the 5s SQLite lock floor per store.
+- Native deactivation shares one 6s default wait budget (within native 8s/10s
+  Hook deadlines) across unique registered stores while preserving at least the
+  5s SQLite lock floor (+ open/commit grace) per store whenever remaining total
+  budget still covers the floor.
 
 [Side-Effect Policy]
 - Selection is read-only. The register command changes only one mapping in an
@@ -26,13 +28,16 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import json
+import math
 from pathlib import Path
 import re
 import time
 
+from ..owned_state import SQLITE_BUSY_FLOOR_SECONDS
 from .documents import DOMAIN_RE
 
 _REFERENCE_AUTHORITY = re.compile(r"mindie://(?P<domain>[a-z][a-z0-9-]{0,63})/")
+_DEACTIVATE_STORE_FLOOR_SECONDS = SQLITE_BUSY_FLOOR_SECONDS + 0.5
 
 
 def _canonical_domain(value, label):
@@ -143,7 +148,7 @@ def activate_selected_domain(default_config_path, *, domain, domain_configs=None
     return dict(domain=config["domain"], engine_config=str(selected), generation=settings.generation, lease=lease)
 
 
-def deactivate_registered_domains(default_config_path, *, domain_configs=None, session, timeout=24.0):
+def deactivate_registered_domains(default_config_path, *, domain_configs=None, session, timeout=6.0):
     """Revoke this trusted native session across the adapter's existing engines.
 
     Disabled consent and changed project scope never prevent revocation. One
@@ -156,7 +161,9 @@ def deactivate_registered_domains(default_config_path, *, domain_configs=None, s
         raise ValueError("native session is required for domain deactivation")
     if domain_configs is not None and not isinstance(domain_configs, Mapping):
         raise ValueError("domain_configs must be a mapping")
-    deadline = time.monotonic() + timeout
+    if type(timeout) not in (int, float) or not math.isfinite(timeout):
+        raise ValueError("domain deactivation timeout must be a finite number")
+    deadline = time.monotonic() + float(timeout)
     targets = [(None, default_config_path), *list((domain_configs or {}).items())]
     outcomes, admissions = [], {}
     for position, (requested, path) in enumerate(targets):
@@ -179,8 +186,17 @@ def deactivate_registered_domains(default_config_path, *, domain_configs=None, s
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError("domain deactivation exhausted its total budget")
-                changed = admission.deactivate(
-                    session, timeout=remaining / (len(targets) - position))
+                stores_left = max(
+                    1,
+                    len({str(Path(candidate).resolve(strict=False)) for _, candidate in targets[position:]}),
+                )
+                share = remaining / stores_left
+                store_timeout = (
+                    min(remaining, _DEACTIVATE_STORE_FLOOR_SECONDS)
+                    if remaining >= SQLITE_BUSY_FLOOR_SECONDS and share < _DEACTIVATE_STORE_FLOOR_SECONDS
+                    else share
+                )
+                changed = admission.deactivate(session, timeout=store_timeout)
                 outcome = dict(status="inactive", changed=changed)
                 admissions[admission_identity] = outcome
                 result.update(outcome)

@@ -560,3 +560,110 @@ def test_routing_and_ledger_reject_directories_and_stat_permission_errors(tmp_pa
         blocked, label="routing manifest", schemas=frozenset({ROUTING_MANIFEST_SCHEMA}), keys=("schema",),
     )
     assert doc2 is None and err2 is not None and "PermissionError" in err2
+
+
+def test_multi_domain_deactivation_revokes_seven_healthy_domains_and_isolates_locked_store(tmp_path):
+    import sys as sys_mod
+    import time
+    from mindie_knowledge.loop.activation import Admission
+    from mindie_knowledge.loop.domain_routes import deactivate_registered_domains
+
+    configs: dict[str, Path] = {}
+    admissions: dict[str, Path] = {}
+    for index in range(7):
+        domain = f"domain-{index}"
+        settings = tmp_path / f"{domain}-community.json"
+        write_settings(settings, consent_choice="contribute", enabled=True, roots=[tmp_path])
+        adm_path = tmp_path / f"{domain}-admission.sqlite3"
+        cfg_path = tmp_path / f"{domain}-engine.json"
+        cfg_path.write_text(
+            json.dumps(
+                dict(
+                    root=str(tmp_path / "state"),
+                    domain=domain,
+                    admission_path=str(adm_path),
+                    community_config=str(settings),
+                    transcript_adapter=str(parser_path("codex")),
+                    redactor_executable=sys_mod.executable,
+                )
+            ),
+            encoding="utf-8",
+            newline="\n",
+        )
+        Admission(adm_path).activate("current", project_root=str(tmp_path))
+        configs[domain] = cfg_path
+        admissions[domain] = adm_path
+
+    default_cfg = configs["domain-0"]
+    extra_domains = {name: str(path) for name, path in configs.items() if name != "domain-0"}
+    started = time.monotonic()
+    result = deactivate_registered_domains(
+        default_cfg, domain_configs=extra_domains, session="current",
+    )
+    assert time.monotonic() - started < 2.0
+    assert result["status"] == "inactive" and result["changed"] is True
+    for name, adm_path in admissions.items():
+        assert Admission(adm_path).active_lease("current") is None, name
+
+    # With 6 domains where domain-0 is locked and 5 are healthy, a 24s caller
+    # budget caps domain-0 near the 5.5s floor and revokes all 5 healthy stores.
+    subset_names = [f"domain-{index}" for index in range(6)]
+    for name in subset_names:
+        Admission(admissions[name]).activate("current", project_root=str(tmp_path))
+    holder = sqlite3.connect(admissions["domain-0"])
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        partial = deactivate_registered_domains(
+            default_cfg,
+            domain_configs={name: str(configs[name]) for name in subset_names if name != "domain-0"},
+            session="current",
+            timeout=24.0,
+        )
+    finally:
+        holder.rollback()
+        holder.close()
+    assert partial["status"] == "partial" and partial["changed"] is True
+    assert Admission(admissions["domain-0"]).active_lease("current") is not None
+    for name in subset_names[1:]:
+        assert Admission(admissions[name]).active_lease("current") is None, name
+
+
+def test_stop_default_budget_fits_native_hook_wrapper_and_never_stacks_waits(tmp_path, monkeypatch):
+    import time
+    from mindie_knowledge.loop import domain_routes
+
+    assert handoff.STOP_TIMEOUT_SECONDS == 6.0
+    assert domain_routes.deactivate_registered_domains.__kwdefaults__["timeout"] == 6.0
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    config, admission = _engine_config(tmp_path, project)
+    loaded = cli.config_at(config)
+    held = sqlite3.connect(handoff._store_path(loaded))
+    held.execute("BEGIN IMMEDIATE")
+    started = time.monotonic()
+    try:
+        contended = cli.capture_hook(config, _stop_event(admission))
+    finally:
+        held.rollback()
+        held.close()
+    elapsed = time.monotonic() - started
+    assert contended["stage"] == "unavailable"
+    assert contended["reason"] == "store-locked"
+    # Even with OS busy-handler timer slack, default Stop completes inside native 8s/10s Hook wrappers.
+    assert elapsed < 7.5
+
+    # Partial contention on Admission (> 1.0s under default 6.0s budget) fails closed before Store SQLite.
+    clock = {"now": 200.0}
+    monkeypatch.setattr(handoff.time, "monotonic", lambda: clock["now"])
+    real_auth = handoff.Admission.capture_authorization
+
+    def delayed_auth(self, *args, **kwargs):
+        out = real_auth(self, *args, **kwargs)
+        clock["now"] += 1.5
+        return out
+
+    monkeypatch.setattr(handoff.Admission, "capture_authorization", delayed_auth)
+    stacked = cli.capture_hook(config, _stop_event(admission, turn_id="turn-2"))
+    assert stacked["stage"] == "unavailable"
+    assert stacked["reason"] == "budget-exhausted"

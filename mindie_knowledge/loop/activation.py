@@ -408,7 +408,11 @@ class Admission:
                 )
             except sqlite3.OperationalError as exc:
                 text = str(exc).lower()
-                if time.monotonic() >= deadline or "interrupted" in text:
+                if "interrupted" in text:
+                    raise AdmissionUnavailable("capture authorization exceeded caller timeout") from exc
+                if "locked" in text or "busy" in text:
+                    raise AdmissionUnavailable(str(exc)) from exc
+                if time.monotonic() >= deadline:
                     raise AdmissionUnavailable("capture authorization exceeded caller timeout") from exc
                 if "no such table" in text:
                     raise AdmissionUnavailable("lease schema is missing") from exc
@@ -497,7 +501,11 @@ class Admission:
                 )
             except sqlite3.OperationalError as exc:
                 text = str(exc).lower()
-                if time.monotonic() >= deadline or "interrupted" in text:
+                if "interrupted" in text:
+                    raise AdmissionUnavailable("capture authorization exceeded caller timeout") from exc
+                if "locked" in text or "busy" in text:
+                    raise AdmissionUnavailable(str(exc)) from exc
+                if time.monotonic() >= deadline:
                     raise AdmissionUnavailable("capture authorization exceeded caller timeout") from exc
                 if "no such table" in text:
                     raise AdmissionUnavailable("lease schema is missing") from exc

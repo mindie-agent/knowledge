@@ -163,15 +163,18 @@ def open_database(path, *, schema, required, initialize, residue=(), validate=No
             db.set_progress_handler(lambda: int(time.monotonic() >= open_deadline), 1000)
         db.execute(f'PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}')
         if fresh:
+            db.execute('PRAGMA journal_mode=WAL')
+            db.execute(f'PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}')
             initialize(db)
             db.commit()
         require_columns(db, required)
         if validate is not None:
             validate(db)
-        if open_deadline is not None and sqlite_busy_timeout_ms(open_deadline - time.monotonic()) is None:
-            raise SqliteBudgetExhausted('SQLite open budget exhausted before WAL transition')
-        db.execute('PRAGMA journal_mode=WAL')
-        # Keep the fixed 5000 ms policy explicit after journal_mode transitions.
+        if not fresh:
+            mode = db.execute('PRAGMA journal_mode').fetchone()
+            if not mode or str(mode[0]).lower() != 'wal':
+                db.execute('PRAGMA journal_mode=WAL')
+        # Keep the fixed 5000 ms policy explicit after initialization/validation.
         db.execute(f'PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}')
         if os.environ.get('MINDIE_DISABLE_FSYNC') == '1':
             db.execute('PRAGMA synchronous=OFF')
