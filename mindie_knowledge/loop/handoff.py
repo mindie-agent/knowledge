@@ -11,13 +11,12 @@
   `connection.json` is never live-owner proof.
 
 [Timeouts & Locks]
-- Uses `WAKE_PROBE_SECONDS = 2.0` for control-plane RPC liveness probing and
-  non-blocking `StartLock(wake.lock, wait=0)` so concurrent Stop hooks never
-  pile up spawning duplicate service starters.
-- Stop SQLite opens keep `PRAGMA busy_timeout` at least 1000 ms from the
-  remaining Stop deadline after connect/WAL. Remaining budget below that
-  floor returns `unavailable`/`budget-exhausted`. Admission `TimeoutError`
-  propagates to library callers; the native Stop adapter still prints `{}`.
+- Uses `STOP_TIMEOUT_SECONDS = 15.0` (`>= 6.0s` admission + `6.0s` store + `2.0s`
+  `WAKE_PROBE_SECONDS` + `1.0s` wake/diagnostics grace) and non-blocking
+  `StartLock(wake.lock, wait=0)` so concurrent Stop hooks never pile up.
+- Stop SQLite opens apply the unified `PRAGMA busy_timeout=5000` (`5.0s` lock floor)
+  once without dynamic overrides; remaining caller budgets below `5.0s` return
+  `unavailable`/`budget-exhausted` before SQLite open or transaction start.
 
 [Side-Effect Policy]
 - Writes at most one `captures` row and spawns at most one detached background
@@ -30,6 +29,7 @@ from ..state_layout import state_root
 from ..filesystem import filesystem_path
 
 import json
+import math
 import os
 import sqlite3
 import subprocess
@@ -37,7 +37,12 @@ import sys
 import time
 from pathlib import Path
 
-from ..owned_state import SQLITE_BUSY_FLOOR_SECONDS, sqlite_busy_timeout_ms
+from ..owned_state import (
+    SQLITE_BUSY_FLOOR_SECONDS,
+    SQLITE_BUSY_TIMEOUT_MS,
+    SqliteBudgetExhausted,
+    sqlite_busy_timeout_ms,
+)
 from .activation import Admission, AdmissionUnavailable
 from .diagnostics import _DELIVERY_RECOVERY as _RECOVERY
 from .store import (
@@ -48,6 +53,7 @@ from .store import (
 )
 
 WAKE_PROBE_SECONDS = 2.0  # Control-plane observation; never a business deadline.
+STOP_TIMEOUT_SECONDS = 15.0  # >= 6s admission + 6s store + 2s wake probe + 1s grace.
 
 
 def _wake_probe_seconds():
@@ -554,10 +560,20 @@ def accept_stop(config_path, event, *, timeout=None):
     stop_timeout = (
         float(timeout)
         if timeout is not None
-        else float(os.environ.get("MINDIE_KNOWLEDGE_STOP_TIMEOUT_SECONDS", 6.0))
+        else float(os.environ.get("MINDIE_KNOWLEDGE_STOP_TIMEOUT_SECONDS", STOP_TIMEOUT_SECONDS))
     )
+    if not math.isfinite(stop_timeout):
+        raise ValueError("Stop timeout must be a finite number")
     deadline = time.monotonic() + stop_timeout
-    auth_timeout = min(3.0, stop_timeout * 0.5)
+    remaining = deadline - time.monotonic()
+    if sqlite_busy_timeout_ms(remaining) is None:
+        _record(config, stage="accept", cause="budget-exhausted", event=event_id)
+        return _result(
+            stage="unavailable", reason="budget-exhausted", cause="budget-exhausted",
+            summary_dropped=dropped,
+            recovery=_RECOVERY["budget-exhausted"],
+        )
+    auth_timeout = min(6.0, remaining - 6.0) if remaining >= 11.0 else remaining
     try:
         admission = Admission(admission_path)
         if resolve_lease:
@@ -572,12 +588,19 @@ def accept_stop(config_path, event, *, timeout=None):
         except TimeoutError:
             pass
         raise
-    except AdmissionUnavailable:
-        _record(config, stage="accept", cause="admission-unreadable", event=event_id)
+    except AdmissionUnavailable as exc:
+        cause = (
+            "budget-exhausted"
+            if isinstance(exc.__cause__, SqliteBudgetExhausted)
+            or "exceeded caller timeout" in str(exc)
+            or time.monotonic() >= deadline
+            else "admission-unreadable"
+        )
+        _record(config, stage="accept", cause=cause, event=event_id)
         return _result(
-            stage="unavailable", reason="admission-unreadable", cause="admission-unreadable",
+            stage="unavailable", reason=cause, cause=cause,
             summary_dropped=dropped,
-            recovery=_RECOVERY["admission-unreadable"],
+            recovery=_RECOVERY[cause],
         )
     if auth["state"] == "inactive":
         return _result(stage="inert", reason="not-activated", summary_dropped=dropped)
@@ -595,19 +618,20 @@ def accept_stop(config_path, event, *, timeout=None):
         )
     db = None
     try:
-        remaining = deadline - time.monotonic()
-        if sqlite_busy_timeout_ms(remaining) is None:
+        if sqlite_busy_timeout_ms(deadline - time.monotonic()) is None:
             _record(config, stage="accept", cause="budget-exhausted", event=event_id)
             return _result(
                 stage="unavailable", reason="budget-exhausted", cause="budget-exhausted",
                 summary_dropped=dropped,
                 recovery=_RECOVERY["budget-exhausted"],
             )
-        db = sqlite3.connect(path, timeout=max(SQLITE_BUSY_FLOOR_SECONDS, remaining))
+        db = sqlite3.connect(path, timeout=SQLITE_BUSY_FLOOR_SECONDS)
+        db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+        db.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
         db.execute("PRAGMA journal_mode=WAL")
-        remaining = deadline - time.monotonic()
-        busy_ms = sqlite_busy_timeout_ms(remaining)
-        if busy_ms is None:
+        db.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+        if sqlite_busy_timeout_ms(deadline - time.monotonic()) is None:
+            db.set_progress_handler(None, 0)
             db.close()
             db = None
             _record(config, stage="accept", cause="budget-exhausted", event=event_id)
@@ -616,11 +640,18 @@ def accept_stop(config_path, event, *, timeout=None):
                 summary_dropped=dropped,
                 recovery=_RECOVERY["budget-exhausted"],
             )
-        db.execute(f"PRAGMA busy_timeout={busy_ms}")
     except sqlite3.OperationalError as exc:
         if db is not None:
+            db.set_progress_handler(None, 0)
             db.close()
         text = str(exc).lower()
+        if time.monotonic() >= deadline or "interrupted" in text:
+            _record(config, stage="accept", cause="budget-exhausted", event=event_id)
+            return _result(
+                stage="unavailable", reason="budget-exhausted", cause="budget-exhausted",
+                summary_dropped=dropped,
+                recovery=_RECOVERY["budget-exhausted"],
+            )
         if "locked" in text or "busy" in text:
             _record(config, stage="accept", cause="store-locked", event=event_id)
             return _result(
@@ -633,6 +664,7 @@ def accept_stop(config_path, event, *, timeout=None):
                        summary_dropped=dropped)
     except sqlite3.Error:
         if db is not None:
+            db.set_progress_handler(None, 0)
             db.close()
         _record(config, stage="accept", cause="store-not-ready", event=event_id)
         return _result(stage="unavailable", reason="store-not-ready", cause="store-not-ready",
@@ -660,6 +692,13 @@ def accept_stop(config_path, event, *, timeout=None):
             )
         except sqlite3.OperationalError as exc:
             text = str(exc).lower()
+            if time.monotonic() >= deadline or "interrupted" in text:
+                _record(config, stage="accept", cause="budget-exhausted", event=event_id)
+                return _result(
+                    stage="unavailable", reason="budget-exhausted", cause="budget-exhausted",
+                    summary_dropped=dropped,
+                    recovery=_RECOVERY["budget-exhausted"],
+                )
             if "locked" in text or "busy" in text:
                 _record(config, stage="accept", cause="store-locked", event=event_id)
                 return _result(
@@ -669,6 +708,7 @@ def accept_stop(config_path, event, *, timeout=None):
                 )
             raise
     finally:
+        db.set_progress_handler(None, 0)
         db.close()
     status = accepted["status"]
     capture_id = accepted["id"]
@@ -684,8 +724,9 @@ def accept_stop(config_path, event, *, timeout=None):
             stage=_TERMINAL[status], capture_id=capture_id, duplicate=duplicate,
             reason="stored", summary_dropped=dropped,
         )
+    probe_budget = min(_wake_probe_seconds(), deadline - time.monotonic())
     if status == "processing":
-        state = _probe(config, _wake_probe_seconds(), config_path=config_path)
+        state = _probe(config, probe_budget, config_path=config_path) if probe_budget > 0 else "unknown"
         return _result(
             stage="processing", capture_id=capture_id, duplicate=duplicate,
             wake="not-applicable",
@@ -698,7 +739,7 @@ def accept_stop(config_path, event, *, timeout=None):
         stage_name = "accepted-local"
     else:
         stage_name = "accepted-local"
-    state = _probe(config, _wake_probe_seconds(), config_path=config_path)
+    state = _probe(config, probe_budget, config_path=config_path) if probe_budget > 0 else "unknown"
     if state == "ready" and status in _UNPROCESSED_CAPTURE | {"pending", "deferred", "queued"}:
         clear_delivery_event(config, event_id)
         return _result(

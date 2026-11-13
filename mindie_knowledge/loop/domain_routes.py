@@ -13,7 +13,8 @@
 [Timeouts & Locks]
 - Local configuration reads and atomic replacement only. Explicit activation
   reuses Admission's existing WAL/5s write budget; no network or new retry loop.
-- Native deactivation shares one 6s wait budget across registered stores.
+- Native deactivation shares one 24s wait budget across registered stores so
+  multi-domain adapters keep at least the 5s SQLite lock floor per store.
 
 [Side-Effect Policy]
 - Selection is read-only. The register command changes only one mapping in an
@@ -142,7 +143,7 @@ def activate_selected_domain(default_config_path, *, domain, domain_configs=None
     return dict(domain=config["domain"], engine_config=str(selected), generation=settings.generation, lease=lease)
 
 
-def deactivate_registered_domains(default_config_path, *, domain_configs=None, session, timeout=6.0):
+def deactivate_registered_domains(default_config_path, *, domain_configs=None, session, timeout=24.0):
     """Revoke this trusted native session across the adapter's existing engines.
 
     Disabled consent and changed project scope never prevent revocation. One

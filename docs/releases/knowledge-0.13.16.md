@@ -2,6 +2,6 @@
 
 [English](knowledge-0.13.16.en.md)
 
-- **SQLite 初始化锁下限与租约读取端到端预算（`mindie-agent#332` §1 闭环）**：`open_database` 在 `sqlite3.connect` 连接入参强制不低于 `1.0s` 锁等待下限（`SQLITE_BUSY_FLOOR_SECONDS`），并在执行表结构校验、初始化与 `WAL` 切换之前立即配置 `PRAGMA busy_timeout=5000`，消除初始化窗口的亚秒级锁超时隐患；`Admission.capture_authorization` 与 `resolve_capture_lease` 在打开数据库前建立单一单调时钟截止时间（`deadline`），并在建连后按剩余预算更新 `busy_timeout` 与进度中断器，不再在建连后重置完整超时窗口。
+- **SQLite 统一 5s 锁策略、单截止时间协调与预算前置拒绝（`mindie-agent#332` §1 闭环）**：`open_database` 与 `accept_stop` 统一采用 `PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000`（`SQLITE_BUSY_FLOOR_SECONDS = 5.0`）初始化策略，移除热路径动态 `1s~3s` `busy_timeout` 覆写；将初始化文件锁（`StartLock`）、SQLite 建连/WAL 切换与租约查询统一收敛至调用方单一单调时钟截止时间（`deadline`），对剩余预算低于 `5.0s` 锁下限的调用在进入阻塞锁或 SQLite 之前立即失败返回（`budget-exhausted` / `AdmissionUnavailable`），并将 `Stop` 默认总预算提升至 `15.0s`（覆盖 `Admission` 6s、`Store` 6s、唤醒探测 2s 与诊断收尾宽限期）。
 - **路由与实验账本文件状态诚实性（Python 3.14 兼容）**：`_existing_routing_document`、`read_bounded_jsonl` 与 `resolve_workspace_ledger` 改用显式 `os.lstat` + 常规文件校验替代 `Path.is_file()`，严格仅在 `FileNotFoundError` 时视为空缺；目录、非常规文件或权限/I/O 异常（含 Python 3.14 下 `is_file()` 静默吞除 `OSError` 的场景）均显式报错阻断，杜绝损坏或无权限历史被误判为“首次空历史”。
 - **知识仓交付物契约测试结构化对齐**：`tests/test_corpus_deliverables.py` 将对知识单元正文的英文关键词匹配升级为结构化 JSON 消融回执字段校验（`candidate_id`、`leave_one_out_arms`、`fallback_boundary`），并支持 `<owner>/<repo>@<sha>:<path>` 规范代码仓证据定位符。

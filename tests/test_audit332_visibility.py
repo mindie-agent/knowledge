@@ -20,38 +20,42 @@ from lane_support import parser_path
 
 def test_short_admission_read_keeps_busy_timeout_floor(tmp_path, monkeypatch):
     import re
-    from mindie_knowledge.loop.activation import Admission
+    from mindie_knowledge import owned_state
+    from mindie_knowledge.loop.activation import Admission, AdmissionUnavailable
 
     path = make_admission(tmp_path, project_root=tmp_path)
     gate = Admission(path)
     token = admission_token(path)
     statements = []
-    original = Admission._database
+    real_connect = owned_state.sqlite3.connect
 
-    def traced(self, *args, **kwargs):
-        db = original(self, *args, **kwargs)
-        if db is not None:
-            db.set_trace_callback(statements.append)
+    def traced_connect(*args, **kwargs):
+        db = real_connect(*args, **kwargs)
+        db.set_trace_callback(statements.append)
         return db
 
-    monkeypatch.setattr(Admission, "_database", traced)
-    assert gate.capture_authorization("manual-A", token, timeout=0.1)["state"] == "admitted"
+    monkeypatch.setattr(owned_state.sqlite3, "connect", traced_connect)
+    with pytest.raises(AdmissionUnavailable):
+        gate.capture_authorization("manual-A", token, timeout=0.1)
+    assert statements == []
+
+    assert gate.capture_authorization("manual-A", token, timeout=6.0)["state"] == "admitted"
     busy = []
     for statement in statements:
-        match = re.search(r"PRAGMA\s+busy_timeout=(\d+)", statement, re.I)
+        match = re.search(r"^\s*PRAGMA\s+busy_timeout=(\d+)", statement, re.I)
         if match:
             busy.append(int(match.group(1)))
-    assert busy and min(busy) >= 1000
+    assert busy and set(busy) == {SQLITE_BUSY_TIMEOUT_MS}
 
 
 def test_sqlite_busy_timeout_never_goes_sub_second():
     assert sqlite_busy_timeout_ms(None) == SQLITE_BUSY_TIMEOUT_MS
     assert sqlite_busy_timeout_ms(0.05) is None
     assert sqlite_busy_timeout_ms(0.999) is None
-    assert sqlite_busy_timeout_ms(1.0) == 1000
-    assert sqlite_busy_timeout_ms(2.5) == 2500
-    assert sqlite_busy_timeout_ms(3.0) == 3000
-    assert sqlite_busy_timeout_ms(6.0) == 6000
+    assert sqlite_busy_timeout_ms(1.0) is None
+    assert sqlite_busy_timeout_ms(4.999) is None
+    assert sqlite_busy_timeout_ms(5.0) == SQLITE_BUSY_TIMEOUT_MS
+    assert sqlite_busy_timeout_ms(6.0) == SQLITE_BUSY_TIMEOUT_MS
 
 
 def _engine_config(tmp_path, project):
@@ -371,9 +375,9 @@ def _trace_store_connect(monkeypatch, store_path, clock, wal_delay, pragmas, beg
 
         def tracer(sql):
             lowered = sql.lower().replace(" ", "")
-            if "journal_mode" in lowered and "wal" in lowered:
+            if lowered.startswith("pragmajournal_mode=wal"):
                 clock["now"] += wal_delay
-            if "busy_timeout" in lowered:
+            if lowered.startswith("pragmabusy_timeout="):
                 pragmas.append(lowered)
             if lowered.startswith("begin"):
                 begins.append(sql)
@@ -394,13 +398,13 @@ def test_stop_store_busy_timeout_deducts_wal_wait(tmp_path, monkeypatch):
     monkeypatch.setattr(handoff.time, "monotonic", lambda: clock["now"])
     pragmas, begins = [], []
     _trace_store_connect(
-        monkeypatch, handoff._store_path(loaded), clock, 1.2, pragmas, begins,
+        monkeypatch, handoff._store_path(loaded), clock, 2.5, pragmas, begins,
     )
-    result = cli.capture_hook(config, _stop_event(admission), timeout=2.0)
+    result = cli.capture_hook(config, _stop_event(admission), timeout=7.0)
     assert result["stage"] == "unavailable"
     assert result["reason"] == "budget-exhausted"
     assert begins == []
-    assert not any("busy_timeout=2000" in item for item in pragmas)
+    assert all("busy_timeout=5000" in item for item in pragmas)
 
 
 def test_stop_store_busy_timeout_uses_remaining_after_wal(tmp_path, monkeypatch):
@@ -413,11 +417,11 @@ def test_stop_store_busy_timeout_uses_remaining_after_wal(tmp_path, monkeypatch)
     monkeypatch.setattr(handoff, "_probe", lambda *args, **kwargs: "ready")
     pragmas, begins = [], []
     _trace_store_connect(
-        monkeypatch, handoff._store_path(loaded), clock, 0.5, pragmas, begins,
+        monkeypatch, handoff._store_path(loaded), clock, 1.5, pragmas, begins,
     )
-    result = cli.capture_hook(config, _stop_event(admission), timeout=2.0)
+    result = cli.capture_hook(config, _stop_event(admission), timeout=7.0)
     assert result["stage"] in {"accepted-local", "accepted-runtime", "accepted"}
-    assert any("busy_timeout=1500" in item for item in pragmas)
+    assert pragmas and all("busy_timeout=5000" in item for item in pragmas)
     assert begins
 
 
@@ -432,8 +436,11 @@ def test_truncated_utf8_ledger_tail_is_dropped_not_corruption(tmp_path):
 
 
 def test_open_database_and_admission_reads_enforce_floor_during_init_and_single_deadline(tmp_path, monkeypatch):
+    import threading
+    import time
     from mindie_knowledge import owned_state
     from mindie_knowledge.loop import activation
+    from mindie_knowledge.loop.locks import StartLock
 
     connect_timeouts: list[float] = []
     pre_wal_busy: list[int] = []
@@ -445,6 +452,17 @@ def test_open_database_and_admission_reads_enforce_floor_during_init_and_single_
 
     monkeypatch.setattr(owned_state.sqlite3, "connect", recording_connect)
     db_path = tmp_path / "subsec.sqlite3"
+    with pytest.raises(owned_state.SqliteBudgetExhausted):
+        owned_state.open_database(
+            db_path,
+            schema="test/1",
+            required={"items": {"id"}},
+            initialize=lambda conn: conn.execute("CREATE TABLE items(id TEXT PRIMARY KEY)"),
+            timeout=0.1,
+        )
+    assert connect_timeouts == []
+    assert not db_path.exists()
+
     db = owned_state.open_database(
         db_path,
         schema="test/1",
@@ -453,30 +471,59 @@ def test_open_database_and_admission_reads_enforce_floor_during_init_and_single_
             pre_wal_busy.append(conn.execute("PRAGMA busy_timeout").fetchone()[0]),
             conn.execute("CREATE TABLE items(id TEXT PRIMARY KEY)"),
         ),
-        timeout=0.1,
+        timeout=6.0,
     )
     assert db is not None
     db.close()
-    assert connect_timeouts == [1.0]
+    assert connect_timeouts == [owned_state.SQLITE_BUSY_FLOOR_SECONDS]
     assert pre_wal_busy == [owned_state.SQLITE_BUSY_TIMEOUT_MS]
 
     adm_path = make_admission(tmp_path, project_root=tmp_path)
     gate = activation.Admission(adm_path)
     token = admission_token(adm_path)
+
+    # Real SQLite EXCLUSIVE lock contention: insufficient caller budget must
+    # fail closed immediately before entering the 5000 ms SQLite busy wait.
+    holder = real_connect(adm_path, check_same_thread=False)
+    holder.execute("BEGIN EXCLUSIVE")
+    release_timer = threading.Timer(0.4, holder.rollback)
+    release_timer.start()
+    try:
+        started = time.monotonic()
+        with pytest.raises(activation.AdmissionUnavailable):
+            gate.capture_authorization("manual-A", token, timeout=0.1)
+        assert time.monotonic() - started < 0.08
+    finally:
+        release_timer.join(timeout=2.0)
+        holder.close()
+
+    # Contended StartLock must only wait (deadline - 5.0s), never full timeout + 5.0s.
+    held_init = StartLock(adm_path.with_name(adm_path.name + ".init.lock"))
+    held_init.acquire()
+    try:
+        started = time.monotonic()
+        with pytest.raises(activation.AdmissionUnavailable):
+            gate.capture_authorization("manual-A", token, timeout=5.15)
+        assert time.monotonic() - started < 0.6
+    finally:
+        held_init.release()
+
+    # Single-deadline enforcement when database open consumes budget below the 5.0s floor.
     clock = {"now": 50.0}
     monkeypatch.setattr(activation.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(owned_state.time, "monotonic", lambda: clock["now"])
     real_db = activation.Admission._database
 
     def slow_db(self, *args, **kwargs):
         conn = real_db(self, *args, **kwargs)
-        clock["now"] += 0.25
+        clock["now"] += 1.5
         return conn
 
     monkeypatch.setattr(activation.Admission, "_database", slow_db)
     with pytest.raises(activation.AdmissionUnavailable, match="exceeded caller timeout"):
-        gate.capture_authorization("manual-A", token, timeout=0.1)
+        gate.capture_authorization("manual-A", token, timeout=6.0)
     with pytest.raises(activation.AdmissionUnavailable, match="exceeded caller timeout"):
-        gate.resolve_capture_lease("manual-A", timeout=0.1)
+        gate.resolve_capture_lease("manual-A", timeout=6.0)
 
 
 def test_routing_and_ledger_reject_directories_and_stat_permission_errors(tmp_path, monkeypatch):

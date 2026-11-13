@@ -45,8 +45,8 @@ def test_lost_native_association_never_becomes_inactive_or_replays(tmp_path, dam
         reads = [gate.leases, lambda: gate.active_lease('native'),
                  lambda: gate.check('native', lease['token']), lambda: gate.resolve(lease['token']),
                  lambda: gate.allows_hash(session_key('native')), lambda: gate.scope_root('native'),
-                 lambda: gate.capture_authorization('native', lease['token'], timeout=.1),
-                 lambda: gate.resolve_capture_lease('native', timeout=.1)]
+                 lambda: gate.capture_authorization('native', lease['token']),
+                 lambda: gate.resolve_capture_lease('native')]
         writes = [lambda: gate.associate('native', project_root=str(tmp_path), not_before=12.0),
                   lambda: gate.activate('native', project_root=str(tmp_path)),
                   lambda: gate.claim('native', 'capture', 'once', lease['token']),
@@ -69,7 +69,7 @@ def test_healthy_association_reuses_boundary_and_receipts_after_restart(tmp_path
     assert repeated['activated_at'] == 12.0
     assert not restarted.claim('native', 'capture', 'once', lease['token'])
     # Association retains identity/receipts but cannot grant the manual flywheel.
-    assert restarted.resolve_capture_lease('native', timeout=.1)['state'] == 'inactive'
+    assert restarted.resolve_capture_lease('native')['state'] == 'inactive'
     assert restarted.deactivate('native')
     with pytest.raises(ValueError, match='explicitly revoked'):
         restarted.associate('native', project_root=str(tmp_path), not_before=1000.0)

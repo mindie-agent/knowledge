@@ -116,7 +116,7 @@ def test_claim_consumes_exactly_once_and_finish_is_diagnostic_only(tmp_path):
     assert gate.claim("manual-A", "hook", "update:0.9.0", token=token) is True
     again = gate.activate("manual-A", project_root=str(tmp_path))
     assert again["token"] == token and again["enabled"] is True
-    assert gate.capture_authorization("manual-A", token, timeout=0.1)["state"] == "admitted"
+    assert gate.capture_authorization("manual-A", token)["state"] == "admitted"
     # Explicit revoke still rotates the token on the next fresh activation.
     gate.deactivate("manual-A")
     fresh = gate.activate("manual-A", project_root=str(tmp_path))

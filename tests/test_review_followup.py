@@ -136,12 +136,17 @@ def test_notification_without_token_and_locked_admission(tmp_path, monkeypatch):
         # DELETE mode makes this fixture exercise an actually blocked read.
         assert held.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
         held.execute("BEGIN EXCLUSIVE")
+        short_budget = capture_hook(config, dict(
+            event, event_id="22222222-2222-4222-8222-222222222221",
+        ), timeout=0.1)
         blocked = capture_hook(config, dict(
             event, event_id="22222222-2222-4222-8222-222222222222",
-        ), timeout=0.1)
+        ), timeout=6.0)
     finally:
         held.rollback()
         held.close()
+    assert short_budget["stage"] == "unavailable"
+    assert short_budget["reason"] == "budget-exhausted"
     assert blocked["stage"] == "unavailable"
     assert blocked["reason"] == "admission-unreadable"
     assert "retry this stop" not in (blocked.get("recovery") or "").lower()
