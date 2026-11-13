@@ -31,21 +31,16 @@ candidates make the next round explore. One non-kept verdict does not.
   `experiment_ledger.append`.
 """
 from __future__ import annotations
-
-import argparse
-import json
-import math
-import os
+import argparse, json, math, os, subprocess, sys, time
 from pathlib import Path
-import subprocess
-import sys
-import time
 
 try:
     from . import experiment_ledger as ledger
+    from .rsi_crossover import normalize_parent_exp_ids, resolve_kept_anchor, resolve_measure_ablation_receipt, snapshot_parent_source_digests, suggest_orthogonal_crossovers
 except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import experiment_ledger as ledger  # type: ignore[no-redef]
+    from rsi_crossover import normalize_parent_exp_ids, resolve_kept_anchor, resolve_measure_ablation_receipt, snapshot_parent_source_digests, suggest_orthogonal_crossovers  # type: ignore[no-redef]
 
 SCHEMA = "mindie-rsi-loop/2"
 STEPS = ("profile", "consult", "propose", "measure", "learn", "record")
@@ -285,10 +280,11 @@ def _render_step(state: dict) -> dict:
                           receipt_unconfirmed=True, receipt_warning=state.get("progress_warning"))
         return result
     guide = GUIDE[state["step"]].replace("<mode>", repr(state["mode"]))
+    eff_base = (state["current"].get("baseline_override") or state["baseline"]) if state["step"] in ("measure", "learn") else state["baseline"]
     result = dict(status="running", round=state["round"], step=state["step"],
                   mode=state["mode"], guide=guide, progress=state["progress"],
-                  baseline_source_digest=state["baseline"]["source_digest"],
-                  baseline=state["baseline"])
+                  baseline_source_digest=eff_base["source_digest"],
+                  baseline=eff_base)
     if state["step"] == "learn":
         result["verdict"] = state["current"]["entry"]["verdict"]
     if state["current"].get("skipped"):
@@ -299,6 +295,11 @@ def _render_step(state: dict) -> dict:
         result["restore_hint"] = state["restore_hint"]
     if state.get("pending_distill"):
         result["pending_distill"] = state["pending_distill"]
+    if state["step"] in ("consult", "propose") and Path(state["ledger"]).is_file():
+        live, _ = ledger.fold(r for r in ledger.iter_ledger(state["ledger"], task_id=state["task_id"]) if r.get("task_id") == state["task_id"] and r.get("exp_id"))
+        crossovers = suggest_orthogonal_crossovers(live)
+        if crossovers:
+            result["crossover_candidates"] = crossovers
     if state.get("progress_unconfirmed"):
         result.update(progress_unconfirmed=True, progress_warning=state.get("progress_warning"),
                       receipt_unconfirmed=True, receipt_warning=state.get("progress_warning"))
@@ -352,6 +353,16 @@ def _consult(state, body):
     return "propose", {}
 
 
+def _resolve_anchor_baseline(state: dict, anchor_id: str) -> dict:
+    live, _ = ledger.fold(r for r in ledger.iter_ledger(state["ledger"], task_id=state["task_id"]) if r.get("task_id") == state["task_id"] and r.get("exp_id"))
+    if anchor_id == "initial":
+        return _initial_baseline(state, live)
+    match = resolve_kept_anchor(live, anchor_id)
+    if match is None:
+        raise ValueError(f"anchor_baseline_exp_id {anchor_id!r} is not a kept candidate in ledger")
+    return dict(repo=match.get("candidate_repo") or state["baseline"]["repo"], source_digest=match["source_digest"], exp_id=match["exp_id"])
+
+
 def _propose(state, body):
     current = state["current"]
     if state["mode"] == "explore" and current.get("knowledge_mode") != "explore":
@@ -364,12 +375,24 @@ def _propose(state, body):
     if factors is not None and (not isinstance(factors, list)
                                 or any(not isinstance(f, str) or not f for f in factors)):
         raise ValueError("factors must be an array of factor names")
+    lane = body.get("bottleneck_lane")
+    if lane is not None and (not isinstance(lane, str) or not lane.strip()):
+        raise ValueError("bottleneck_lane must be nonempty text when given")
+    anchor = body.get("anchor_baseline_exp_id")
+    if anchor is not None:
+        current["baseline_override"] = _resolve_anchor_baseline(state, _text(body, "anchor_baseline_exp_id"))
+    else:
+        current.pop("baseline_override", None)
+    active_base = current.get("baseline_override") or state["baseline"]
+    parents = normalize_parent_exp_ids(body.get("parent_exp_ids"), exp_id=exp_id, baseline_exp_id=active_base.get("exp_id"))
+    live_now = ledger.fold(r for r in ledger.iter_ledger(state["ledger"], task_id=state["task_id"]) if r.get("task_id") == state["task_id"] and r.get("exp_id"))[0] if (parents or body.get("parent_source_digests") is not None) else []
+    parent_digests = snapshot_parent_source_digests(live_now, parents, conditions=scope, explicit=body.get("parent_source_digests"))
     repo = str(Path(_text(body, "candidate_repo")).resolve())
     digest = ledger.fingerprint(repo, exclude_paths=_state_paths(state))["source_digest"]
-    if digest == state["baseline"]["source_digest"]:
+    if digest == active_base["source_digest"]:
         raise ValueError("candidate source equals the baseline; change the code before proposing")
     state.pop("restore_hint", None)
-    for stale_key in ("entry", "trials", "run_ids", "run_status", "card_seconds", "receipt_refs"):
+    for stale_key in ("entry", "trials", "run_ids", "run_status", "card_seconds", "receipt_refs", "_existing_record"):
         current.pop(stale_key, None)
     decision = ledger.gate(state["ledger"], task_id=state["task_id"], source_digest=digest,
                            scope=scope, max_runs=state["max_runs"],
@@ -386,7 +409,10 @@ def _propose(state, body):
         return None, dict(gate=decision, blocked=True)
     current["candidate"] = dict(exp_id=exp_id, hypothesis=hypothesis, repo=repo,
                                 source_digest=digest, scope_conditions=scope,
-                                factors=factors, spent=decision["spent"])
+                                factors=factors, parent_exp_ids=parents,
+                                parent_source_digests=parent_digests,
+                                bottleneck_lane=lane.strip() if isinstance(lane, str) else None,
+                                spent=decision["spent"])
     return "measure", dict(gate=decision)
 
 
@@ -416,10 +442,22 @@ def _measure(state, body):
                     source_digest=candidate["source_digest"],
                     scope_conditions=candidate["scope_conditions"],
                     run_ids=run_ids, exp_id=candidate["exp_id"],
-                    hypothesis=candidate["hypothesis"], factors=candidate["factors"])
+                    hypothesis=candidate["hypothesis"], factors=candidate["factors"],
+                    parent_exp_ids=candidate.get("parent_exp_ids"),
+                    parent_source_digests=candidate.get("parent_source_digests"),
+                    bottleneck_lane=candidate.get("bottleneck_lane"))
     for key in MEASURE_OPTIONAL:
         if key in body:
             evidence[key] = body[key]
+    existing_rec = state["current"].pop("_existing_record", None)
+    derived = resolve_measure_ablation_receipt(
+        ledger_path=state["ledger"], task_id=state["task_id"],
+        iter_task_live=lambda lp, tid: ledger.fold(r for r in ledger.iter_ledger(lp, task_id=tid) if r.get("task_id") == tid and r.get("exp_id"))[0],
+        candidate=candidate, base_info=base_info, body=body, evidence=evidence,
+        checked=ledger.check_trials(evidence), default_noise_margin=ledger.DEFAULT_NOISE_MARGIN,
+        existing_record=existing_rec)
+    if derived is not None:
+        evidence["ablation_receipt"] = derived
     entry = ledger.judge(evidence)
     state["current"].update(
         run_ids=run_ids, run_status=status, card_seconds=seconds,
@@ -497,6 +535,12 @@ def _learn(state, body):
                   lesson=dict(distill=distill, note=note))
     if base_info.get("exp_id"):
         record["baseline_exp_id"] = base_info["exp_id"]
+    if candidate.get("parent_exp_ids"):
+        record["parent_exp_ids"] = candidate["parent_exp_ids"]
+    if candidate.get("parent_source_digests"):
+        record["parent_source_digests"] = dict(candidate["parent_source_digests"])
+    if candidate.get("bottleneck_lane"):
+        record["bottleneck_lane"] = candidate["bottleneck_lane"]
     for key in ("new_observation", "divergent_layer_identified"):
         if type(body.get(key)) is bool:
             record[key] = body[key]
@@ -601,9 +645,19 @@ def _record(state, body):
         if "unit_refs" not in body:
             state["current"].setdefault("unit_refs", existing.get("unit_refs") or [])
             state["current"].setdefault("knowledge_skipped", existing.get("knowledge_skipped"))
+        lane = body.get("bottleneck_lane")
+        lane_val = lane.strip() if isinstance(lane, str) and lane.strip() else existing.get("bottleneck_lane")
+        raw_parents = body.get("parent_exp_ids") if "parent_exp_ids" in body else existing.get("parent_exp_ids")
+        parents = normalize_parent_exp_ids(raw_parents, exp_id=exp_id, baseline_exp_id=existing.get("baseline_exp_id"))
+        reuse_pd, raw_pd = (body.get("supersedes_exp_id") is None and parents == existing.get("parent_exp_ids")), body.get("parent_source_digests")
+        exp_pd = {**(existing.get("parent_source_digests") or {}), **(raw_pd or {})} if (reuse_pd and (raw_pd is None or isinstance(raw_pd, dict))) else raw_pd
+        parent_digests = snapshot_parent_source_digests(live, parents, conditions=scope, explicit=exp_pd) if ("parent_source_digests" in body or not reuse_pd) else existing.get("parent_source_digests")
+        state["current"]["_existing_record"] = existing
         state["current"]["candidate"] = dict(
             exp_id=exp_id, hypothesis=hypothesis, repo=repo,
-            source_digest=digest, scope_conditions=scope, factors=factors, spent=spent)
+            source_digest=digest, scope_conditions=scope, factors=factors,
+            parent_exp_ids=parents, parent_source_digests=parent_digests,
+            bottleneck_lane=lane_val, spent=spent)
         prop_extra = dict(gate=dict(decision="submit", recovered=True, spent=spent))
     else:
         upcoming, prop_extra = _propose(state, body)
