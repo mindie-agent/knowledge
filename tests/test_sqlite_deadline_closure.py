@@ -203,7 +203,7 @@ def test_first_use_store_recovers_cleanly_after_pre_connect_or_init_deadline_exp
     def slow_init_lock(self, *, wait=None, write_record=True):
         res = orig_acquire(self, wait=0, write_record=write_record)
         if self.path.name.endswith(".init.lock"):
-            clock["now"] += 6.0
+            clock["now"] += 56.0
         return res
 
     with monkeypatch.context() as patch:
@@ -219,7 +219,7 @@ def test_first_use_store_recovers_cleanly_after_pre_connect_or_init_deadline_exp
     # 2. Mid-schema initialization deadline expiry inside Store -> prepare_layout -> open_database.
     def expiring_store_init(db):
         orig_init(db)
-        clock["now"] += 15.0
+        clock["now"] += 65.0
 
     with monkeypatch.context() as patch:
         patch.setattr(store_mod, "_initialize_state", expiring_store_init)
@@ -240,7 +240,7 @@ def test_first_use_store_recovers_cleanly_after_pre_connect_or_init_deadline_exp
     # 3. Post-commit validation deadline expiry before persist_record also rolls back fresh Store.
     def expiring_validate(db):
         orig_validate(db)
-        clock["now"] += 15.0
+        clock["now"] += 65.0
 
     with monkeypatch.context() as patch:
         patch.setattr(store_mod, "_validate_state", expiring_validate)
