@@ -93,8 +93,6 @@ class Store(MaterialMixin, OutboxMixin, QueryMixin):
         self.root.mkdir(parents=True, exist_ok=True)
         self.root.chmod(0o700)
         self.lock = threading.RLock()
-        from mindie_knowledge.materials.store import MaterialStore
-        self.materials = MaterialStore(self.root / "materials", domain=domain)
         self._material_dirty = set()
         self._closed = False
         from ..owned_state import open_database
@@ -106,6 +104,8 @@ class Store(MaterialMixin, OutboxMixin, QueryMixin):
                      self.root / "materials" / ".current-catalog.sqlite3",
                      self.root / "materials" / "tasks", self.root / "outbox"),
         )
+        from mindie_knowledge.materials.store import MaterialStore
+        self.materials = MaterialStore(self.root / "materials", domain=domain)
         self.db.execute('BEGIN IMMEDIATE')
         try:
             snapshot = {}
@@ -123,7 +123,7 @@ class Store(MaterialMixin, OutboxMixin, QueryMixin):
             self.db.executemany("INSERT OR IGNORE INTO known_revisions VALUES(?,?)",
                                 [(entry_id, revision) for entry_id, revisions in snapshot.items()
                                  for revision in set(revisions.values())])
-        except Exception:
+        except BaseException:
             self.db.rollback()
             self.db.close()
             self.materials.close()

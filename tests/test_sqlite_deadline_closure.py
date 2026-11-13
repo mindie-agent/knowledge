@@ -183,3 +183,69 @@ def test_fresh_open_database_never_self_bricks_on_connect_or_mid_init_timeout(tm
         timeout=10.0,
     )
     recovered.close()
+
+
+def test_first_use_store_recovers_cleanly_after_pre_connect_or_init_deadline_expiry(
+    tmp_path, monkeypatch
+):
+    from contextlib import closing
+    from mindie_knowledge import state_layout
+    from mindie_knowledge.loop import store as store_mod
+    from mindie_knowledge.loop.store import Store
+
+    clock = {"now": 5000.0}
+    monkeypatch.setattr(owned_state.time, "monotonic", lambda: clock["now"])
+    orig_acquire = StartLock.acquire
+    orig_init = store_mod._initialize_state
+    orig_validate = store_mod._validate_state
+
+    # 1. Pre-connect floor exhaustion inside Store -> prepare_layout -> open_database.
+    def slow_init_lock(self, *, wait=None, write_record=True):
+        res = orig_acquire(self, wait=0, write_record=write_record)
+        if self.path.name.endswith(".init.lock"):
+            clock["now"] += 6.0
+        return res
+
+    with monkeypatch.context() as patch:
+        patch.setattr(StartLock, "acquire", slow_init_lock)
+        with pytest.raises(owned_state.SqliteBudgetExhausted):
+            Store(tmp_path / "case_preconnect", "demo")
+    assert not (tmp_path / "case_preconnect" / "demo" / "state-v1").exists()
+    assert not (tmp_path / "case_preconnect" / "demo" / "state-layout.json").exists()
+    assert state_layout.state_root(tmp_path / "case_preconnect", "demo").name == "state-v1"
+    with closing(Store(tmp_path / "case_preconnect", "demo")) as recovered:
+        assert recovered.status()["entries"] == {}
+
+    # 2. Mid-schema initialization deadline expiry inside Store -> prepare_layout -> open_database.
+    def expiring_store_init(db):
+        orig_init(db)
+        clock["now"] += 15.0
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store_mod, "_initialize_state", expiring_store_init)
+        with pytest.raises(owned_state.SqliteBudgetExhausted):
+            Store(tmp_path / "case_midinit", "demo")
+    assert not (tmp_path / "case_midinit" / "demo" / "state-v1").exists()
+    assert not (tmp_path / "case_midinit" / "demo" / "state-layout.json").exists()
+    assert state_layout.state_root(tmp_path / "case_midinit", "demo").name == "state-v1"
+    with closing(Store(tmp_path / "case_midinit", "demo")) as recovered:
+        recovered.create_draft(
+            kind="experience",
+            title="recovered after mid-init budget expiry",
+            summary="synthetic",
+            content="SYNTHETIC recovery verification",
+        )
+        assert recovered.status()["entries"] == {"draft": 1}
+
+    # 3. Post-commit validation deadline expiry before persist_record also rolls back fresh Store.
+    def expiring_validate(db):
+        orig_validate(db)
+        clock["now"] += 15.0
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store_mod, "_validate_state", expiring_validate)
+        with pytest.raises(owned_state.SqliteBudgetExhausted):
+            Store(tmp_path / "case_postvalidate", "demo")
+    assert not (tmp_path / "case_postvalidate" / "demo" / "state-v1").exists()
+    with closing(Store(tmp_path / "case_postvalidate", "demo")) as recovered:
+        assert recovered.status()["entries"] == {}
