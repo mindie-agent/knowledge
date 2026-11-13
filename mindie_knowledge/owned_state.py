@@ -74,6 +74,17 @@ def _check_open_floor(open_deadline, stage):
         )
 
 
+def _cleanup_uncommitted_fresh(path):
+    for suffix in ('', '-wal', '-shm', '-journal'):
+        candidate = path if not suffix else path.with_name(path.name + suffix)
+        try:
+            candidate.unlink(missing_ok=True)
+        except TimeoutError:
+            raise
+        except OSError:
+            pass
+
+
 def require_columns(db, required, *, open_deadline=None):
     for table, columns in required.items():
         _check_open_floor(open_deadline, f'schema read ({table})')
@@ -146,6 +157,8 @@ def open_database(path, *, schema, required, initialize, residue=(), validate=No
     # authority evidence. Generic StartLock callers keep their own diagnostics.
     lock.acquire(wait=lock_wait, write_record=False)
     db = None
+    fresh = False
+    fresh_committed = False
     try:
         if path.is_symlink():
             raise ValueError('authoritative state must be a regular local file')
@@ -169,12 +182,13 @@ def open_database(path, *, schema, required, initialize, residue=(), validate=No
             db.set_progress_handler(lambda: int(time.monotonic() >= open_deadline), 1000)
         db.execute(f'PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}')
         if fresh:
-            _check_open_floor(open_deadline, 'fresh WAL setup')
             db.execute('PRAGMA journal_mode=WAL')
             db.execute(f'PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}')
-            _check_open_floor(open_deadline, 'fresh schema initialization')
             initialize(db)
+            if open_deadline is not None and time.monotonic() >= open_deadline:
+                raise SqliteBudgetExhausted('SQLite open exceeded caller deadline')
             db.commit()
+            fresh_committed = True
         require_columns(db, required, open_deadline=None if fresh else open_deadline)
         if validate is not None:
             if not fresh:
@@ -206,6 +220,8 @@ def open_database(path, *, schema, required, initialize, residue=(), validate=No
             if open_deadline is not None:
                 db.set_progress_handler(None, 0)
             db.close()
+            if fresh and not fresh_committed and not lock.prior_record:
+                _cleanup_uncommitted_fresh(path)
         if (
             open_deadline is not None
             and not isinstance(exc, SqliteBudgetExhausted)
@@ -218,6 +234,8 @@ def open_database(path, *, schema, required, initialize, residue=(), validate=No
             if open_deadline is not None:
                 db.set_progress_handler(None, 0)
             db.close()
+            if fresh and not fresh_committed and not lock.prior_record:
+                _cleanup_uncommitted_fresh(path)
         raise
     finally:
         lock.release()
