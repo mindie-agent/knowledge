@@ -13,13 +13,7 @@ files; it never rewrites rules, deletes content or writes another repository.
 """
 from __future__ import annotations
 
-import argparse
-import hashlib
-import json
-import os
-import re
-import sys
-import tempfile
+import argparse, hashlib, json, os, re, stat, sys, tempfile
 from collections import defaultdict
 from pathlib import Path, PurePosixPath
 from typing import Iterable
@@ -424,10 +418,13 @@ def _write_pair(manifest_path: Path, manifest: dict, topology_path: Path, topolo
 def _existing_routing_document(
     path: Path, *, label: str, schemas: frozenset[str], keys: tuple[str, ...],
 ) -> tuple[dict | None, str | None]:
-    if not path.is_file():
-        return None, None
     try:
+        st = os.lstat(path)
+        if not stat.S_ISREG(st.st_mode):
+            return None, f"existing {label} is not a regular file: {path}"
         payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None, None
     except TimeoutError:
         raise
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:

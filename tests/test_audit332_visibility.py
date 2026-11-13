@@ -429,3 +429,87 @@ def test_truncated_utf8_ledger_tail_is_dropped_not_corruption(tmp_path):
     path = tmp_path / "experiment-ledger.jsonl"
     path.write_bytes(payload)
     assert read_bounded_jsonl(path, max_bytes=len(payload)) == [{"run_id": "ok"}]
+
+
+def test_open_database_and_admission_reads_enforce_floor_during_init_and_single_deadline(tmp_path, monkeypatch):
+    from mindie_knowledge import owned_state
+    from mindie_knowledge.loop import activation
+
+    connect_timeouts: list[float] = []
+    pre_wal_busy: list[int] = []
+    real_connect = owned_state.sqlite3.connect
+
+    def recording_connect(*args, **kwargs):
+        connect_timeouts.append(float(kwargs.get("timeout", 0.0)))
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(owned_state.sqlite3, "connect", recording_connect)
+    db_path = tmp_path / "subsec.sqlite3"
+    db = owned_state.open_database(
+        db_path,
+        schema="test/1",
+        required={"items": {"id"}},
+        initialize=lambda conn: (
+            pre_wal_busy.append(conn.execute("PRAGMA busy_timeout").fetchone()[0]),
+            conn.execute("CREATE TABLE items(id TEXT PRIMARY KEY)"),
+        ),
+        timeout=0.1,
+    )
+    assert db is not None
+    db.close()
+    assert connect_timeouts == [1.0]
+    assert pre_wal_busy == [owned_state.SQLITE_BUSY_TIMEOUT_MS]
+
+    adm_path = make_admission(tmp_path, project_root=tmp_path)
+    gate = activation.Admission(adm_path)
+    token = admission_token(adm_path)
+    clock = {"now": 50.0}
+    monkeypatch.setattr(activation.time, "monotonic", lambda: clock["now"])
+    real_db = activation.Admission._database
+
+    def slow_db(self, *args, **kwargs):
+        conn = real_db(self, *args, **kwargs)
+        clock["now"] += 0.25
+        return conn
+
+    monkeypatch.setattr(activation.Admission, "_database", slow_db)
+    with pytest.raises(activation.AdmissionUnavailable, match="exceeded caller timeout"):
+        gate.capture_authorization("manual-A", token, timeout=0.1)
+    with pytest.raises(activation.AdmissionUnavailable, match="exceeded caller timeout"):
+        gate.resolve_capture_lease("manual-A", timeout=0.1)
+
+
+def test_routing_and_ledger_reject_directories_and_stat_permission_errors(tmp_path, monkeypatch):
+    import os as os_mod
+    from mindie_knowledge.graded.explore import resolve_workspace_ledger
+    from mindie_knowledge.graded.maintenance import ROUTING_MANIFEST_SCHEMA, _existing_routing_document
+
+    dir_target = tmp_path / "logs" / "experiment-ledger.jsonl"
+    dir_target.mkdir(parents=True)
+    with pytest.raises(ValueError, match="not a regular file"):
+        read_bounded_jsonl(dir_target)
+    with pytest.raises(ValueError, match="not a regular file"):
+        resolve_workspace_ledger(str(tmp_path), tmp_path)
+
+    routing_dir = tmp_path / "routing.json"
+    routing_dir.mkdir()
+    doc, err = _existing_routing_document(
+        routing_dir, label="routing manifest", schemas=frozenset({ROUTING_MANIFEST_SCHEMA}), keys=("schema",),
+    )
+    assert doc is None and err is not None and "not a regular file" in err
+
+    blocked = tmp_path / "blocked.jsonl"
+    real_lstat = os_mod.lstat
+
+    def deny_blocked(target, *args, **kwargs):
+        if Path(target) == blocked:
+            raise PermissionError("simulated permission denied")
+        return real_lstat(target, *args, **kwargs)
+
+    monkeypatch.setattr(os_mod, "lstat", deny_blocked)
+    with pytest.raises(ValueError, match="PermissionError"):
+        read_bounded_jsonl(blocked)
+    doc2, err2 = _existing_routing_document(
+        blocked, label="routing manifest", schemas=frozenset({ROUTING_MANIFEST_SCHEMA}), keys=("schema",),
+    )
+    assert doc2 is None and err2 is not None and "PermissionError" in err2

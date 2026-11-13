@@ -378,14 +378,17 @@ class Admission:
         ):
             return {"state": "inactive"}
         timeout = max(0.05, min(float(timeout), 10.0))
+        deadline = time.monotonic() + timeout
         db = self._database(timeout=timeout)
         if db is None:
             return {"state": "inactive"}
         try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AdmissionUnavailable("capture authorization exceeded caller timeout")
             # Caller lock budgets may be short; PRAGMA busy_timeout never is.
-            busy_ms = sqlite_busy_timeout_ms(timeout) or int(SQLITE_BUSY_FLOOR_SECONDS * 1000)
+            busy_ms = sqlite_busy_timeout_ms(remaining) or int(SQLITE_BUSY_FLOOR_SECONDS * 1000)
             db.execute(f"PRAGMA busy_timeout={busy_ms}")
-            deadline = time.monotonic() + timeout
             db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 10000)
             try:
                 cursor = db.execute(
@@ -457,14 +460,17 @@ class Admission:
         ):
             return {"state": "inactive"}
         timeout = max(0.05, min(float(timeout), 10.0))
+        deadline = time.monotonic() + timeout
         db = self._database(timeout=timeout)
         if db is None:
             return {"state": "inactive"}
         try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AdmissionUnavailable("capture authorization exceeded caller timeout")
             # Caller lock budgets may be short; PRAGMA busy_timeout never is.
-            busy_ms = sqlite_busy_timeout_ms(timeout) or int(SQLITE_BUSY_FLOOR_SECONDS * 1000)
+            busy_ms = sqlite_busy_timeout_ms(remaining) or int(SQLITE_BUSY_FLOOR_SECONDS * 1000)
             db.execute(f"PRAGMA busy_timeout={busy_ms}")
-            deadline = time.monotonic() + timeout
             db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 10000)
             try:
                 cursor = db.execute(

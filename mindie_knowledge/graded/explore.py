@@ -14,23 +14,15 @@ runs experiments, or changes a unit revision or conditions.
 """
 from __future__ import annotations
 
-import argparse
-import json
-import math
-import sys
+import argparse, json, math, os, stat, sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 from .conditions import match_conditions
 from .explore_support import (
-    build_citation_feedback_record,
-    enforce_direction_budget,
-    flagged,
-    guard_regression,
-    legacy_evaluate,
-    select_pareto_candidates,
-    stage_budget_guidance,
+    build_citation_feedback_record, enforce_direction_budget, flagged,
+    guard_regression, legacy_evaluate, select_pareto_candidates, stage_budget_guidance,
 )
 from .units import CATEGORY_TO_TIER
 
@@ -80,8 +72,7 @@ def _missing(status) -> list[str]:
 
 
 def assess_stagnation(ledger_entries: Sequence[Mapping[str, Any]], *,
-                      consecutive_limit: int = 3,
-                      max_stalled_attempts: int | None = None) -> dict[str, Any]:
+                      consecutive_limit: int = 3, max_stalled_attempts: int | None = None) -> dict[str, Any]:
     """Deduplicate ledger attempts by run_id (latest wins) and count non-progress."""
     limit = consecutive_limit if max_stalled_attempts is None else max_stalled_attempts
     if type(limit) is not int or limit < 1:
@@ -91,11 +82,7 @@ def assess_stagnation(ledger_entries: Sequence[Mapping[str, Any]], *,
         entry = _mapping(raw, f"ledger_entries[{index}]")
         if entry.get("is_baseline") is True:
             continue
-        cand_sha = (
-            entry.get("candidate_sha256")
-            or entry.get("candidate_hash")
-            or entry.get("source_digest")
-        )
+        cand_sha = entry.get("candidate_sha256") or entry.get("candidate_hash") or entry.get("source_digest")
         run_id = entry.get("run_id")
         if isinstance(cand_sha, str) and cand_sha.strip():
             norm_sha = cand_sha.strip()
@@ -183,13 +170,27 @@ def assess_stagnation(ledger_entries: Sequence[Mapping[str, Any]], *,
             "should_escalate": bool(stalled), "escalation_reason": reason}
 
 
+def _regular_ledger_stat(path: Path) -> os.stat_result | None:
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except TimeoutError:
+        raise
+    except OSError as exc:
+        raise ValueError(f"{path}: cannot read experiment ledger: {type(exc).__name__}: {exc}") from exc
+    if not stat.S_ISREG(st.st_mode):
+        raise ValueError(f"{path}: cannot read experiment ledger: not a regular file")
+    return st
+
+
 def read_bounded_jsonl(path: Path, *, max_bytes: int = 262144, max_rows: int = 128) -> list[dict]:
     """Read trailing JSON object lines. Missing files are empty; damaged files raise."""
+    st = _regular_ledger_stat(path)
+    if st is None:
+        return []
     try:
-        if not path.is_file():
-            return []
-        size = path.stat().st_size
-        offset = max(0, size - max_bytes)
+        offset = max(0, st.st_size - max_bytes)
         with path.open("rb") as fh:
             if offset > 0:
                 fh.seek(offset)
@@ -242,10 +243,10 @@ def resolve_workspace_ledger(ws_env: str | None, cwd: Path) -> tuple[Path, Path 
     if ws_env:
         root = Path(ws_env)
         ledger = root / "logs" / "experiment-ledger.jsonl"
-        return root, ledger if ledger.is_file() else None, True
+        return root, ledger if _regular_ledger_stat(ledger) is not None else None, True
     for root in (cwd, cwd.parent / "workspace", cwd.parent / "work"):
         ledger = root / "logs" / "experiment-ledger.jsonl"
-        if ledger.is_file():
+        if _regular_ledger_stat(ledger) is not None:
             return root, ledger, True
     return cwd, None, False
 

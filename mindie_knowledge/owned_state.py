@@ -120,11 +120,13 @@ def open_database(path, *, schema, required, initialize, residue=(), validate=No
             return None
         if not fresh and (not path.is_file() or path.stat().st_size == 0):
             raise ValueError('authoritative state database is empty or invalid; state was not rebuilt')
+        sqlite_timeout = 5.0 if timeout is None else max(SQLITE_BUSY_FLOOR_SECONDS, float(timeout))
         db = sqlite3.connect(path if fresh else sqlite_file_uri(path) + '?mode=rw',
                              uri=not fresh, check_same_thread=False, factory=OwnedConnection,
-                             timeout=5.0 if timeout is None else timeout)
+                             timeout=sqlite_timeout)
         db._authority_path = path
         db.row_factory = sqlite3.Row
+        db.execute(f'PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}')
         if fresh:
             initialize(db)
             db.commit()
@@ -132,9 +134,7 @@ def open_database(path, *, schema, required, initialize, residue=(), validate=No
         if validate is not None:
             validate(db)
         db.execute('PRAGMA journal_mode=WAL')
-        # SQLite's Python `timeout` covers the initial lock, not every wait
-        # after a WAL checkpoint or a concurrent writer. Keep the 5 s floor
-        # explicit on the connection itself.
+        # Keep the 5 s floor explicit after journal_mode transitions as well.
         db.execute(f'PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}')
         if os.environ.get('MINDIE_DISABLE_FSYNC') == '1':
             db.execute('PRAGMA synchronous=OFF')

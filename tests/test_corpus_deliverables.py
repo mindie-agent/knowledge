@@ -9,12 +9,15 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 
 import pytest
 
 from mindie_knowledge.graded.maintenance import build_routing_index
 from mindie_knowledge.graded.repository import GradedRepository
 from mindie_knowledge.graded.units import GradedUnit
+
+_REPO_LOCATOR_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{7,40}:\S+\Z")
 
 def _resolve_corpus_root(env_var: str, repo_name: str) -> Path:
     explicit = os.environ.get(env_var, "").strip()
@@ -93,14 +96,17 @@ def test_corpus_contract_and_rebuilt_manifest(name):
         provenance = unit.metadata["provenance"]
         assert provenance["evidence_refs"]
         for ref in provenance["evidence_refs"]:
-            if not ref.startswith(("http://", "https://")):
+            if not ref.startswith(("http://", "https://")) and not _REPO_LOCATOR_RE.fullmatch(ref):
                 assert (root / ref).is_file(), f"{unit.id}: missing evidence_ref {ref}"
         if unit.id == entry["new"]:
             locator = provenance["source_locator"]
             evidence = root / locator
             assert evidence.is_file(), f"{unit.id}: missing {locator}"
             assert hashlib.sha256(evidence.read_bytes()).hexdigest() == provenance["source_digest"]
-            assert "fallback" in unit.body.lower()
+            evidence_payload = json.loads(evidence.read_text(encoding="utf-8"))
+            assert evidence_payload["candidate_id"] == unit.id
+            assert evidence_payload["leave_one_out_arms"]
+            assert evidence_payload["fallback_boundary"]
 
     manifest = json.loads((root / "index/routing-manifest.json").read_text(encoding="utf-8"))
     assert manifest["unit_count"] == report["unit_count"]
