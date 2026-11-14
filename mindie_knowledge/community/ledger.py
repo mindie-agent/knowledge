@@ -79,6 +79,8 @@ class Ledger:
             self.db.assert_authority()
             if self._owner_authority is not None:
                 self._owner_authority()
+        except TimeoutError:
+            raise
         except (OSError, ValueError, sqlite3.Error) as exc:
             raise TransientError('publication authority is unavailable before the next remote write') from exc
 

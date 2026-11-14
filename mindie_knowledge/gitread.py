@@ -127,6 +127,8 @@ def run_stdout_to_file(argv, target, *, timeout=None, env=None, cancel=None):
                     argv, stdin=subprocess.DEVNULL, stdout=out_handle,
                     stderr=err_handle, env=merged_env, **spawn,
                 )
+            except TimeoutError:
+                raise
             except (FileNotFoundError, OSError) as exc:
                 raise OSError(f"cannot start {argv[0]}: {exc}") from exc
             try:
@@ -212,6 +214,8 @@ class CatFileBatch:
                 env=merged_env,
                 **spawn,
             )
+        except TimeoutError:
+            raise
         except (FileNotFoundError, OSError) as exc:
             raise OSError(f"cannot start git cat-file --batch: {exc}") from exc
         self._buffer = bytearray()
@@ -277,6 +281,8 @@ class CatFileBatch:
         try:
             self._process.stdin.write(rev.encode("utf-8") + b"\n")
             self._process.stdin.flush()
+        except TimeoutError:
+            raise
         except OSError as exc:
             raise OSError(f"git cat-file --batch write failed: {exc}") from exc
         line = self._readline(deadline, cancel)

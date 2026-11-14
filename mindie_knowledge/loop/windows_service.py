@@ -588,6 +588,8 @@ def _send_start(root, record, task):
         raise
     try:
         _write(root / "operation.json", dict(attempt=record["attempt"], phase="started"))
+    except TimeoutError:
+        raise
     except (OSError, ServiceHostError):
         # The manager accepted Start, but the local acknowledgement failed.
         # Keep the starting intent and one-use transfer for exact reconciliation.

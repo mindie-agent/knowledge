@@ -222,6 +222,8 @@ def read_bounded_jsonl(path: Path, *, max_bytes: int = 262144, max_rows: int = 1
 def _resolved_path(path: Path) -> Path:
     try:
         return path.resolve()
+    except TimeoutError:
+        raise
     except OSError:
         return path
 
@@ -229,17 +231,15 @@ def _resolved_path(path: Path) -> Path:
 def _path_within(root: Path, candidate: Path) -> bool:
     try:
         _resolved_path(candidate).relative_to(_resolved_path(root))
+    except TimeoutError:
+        raise
     except (OSError, ValueError):
         return False
     return True
 
 
 def resolve_workspace_ledger(ws_env: str | None, cwd: Path) -> tuple[Path, Path | None, bool]:
-    """Return ``(workspace_root, ledger_or_none, workspace_gated)``.
-
-    An explicit bench workspace never falls through to another tree. Without
-    it, only a real ledger file gates explore — a directory named workspace does not.
-    """
+    """Return ``(workspace_root, ledger_or_none, workspace_gated)`` without falling through an explicit bench root."""
     if ws_env:
         root = Path(ws_env)
         ledger = root / "logs" / "experiment-ledger.jsonl"
@@ -252,12 +252,7 @@ def resolve_workspace_ledger(ws_env: str | None, cwd: Path) -> tuple[Path, Path 
 
 
 def resolve_workspace_audit_paths(workspace_root: Path, *, persist_root: bool = False) -> tuple[str, list[Path], list[Path]]:
-    """Audit path under this workspace only. A sibling profile audit is not prior reuse.
-
-    An existing ``logs/`` directory is the audit home. Otherwise a file is
-    created in the workspace root only for a gated workspace, never for an
-    ordinary cwd that has no ledger.
-    """
+    """Audit path under this workspace only (`logs/` preferred; root file only when gated)."""
     root = _resolved_path(workspace_root)
     if (workspace_root / "logs").is_dir():
         audit = workspace_root / "logs" / "knowledge_query_audit.jsonl"
@@ -289,6 +284,8 @@ def has_prior_reuse_audit(audit_paths: Sequence[Path], *, scope_key: str, memory
         try:
             with audit_file.open("rb") as fh:
                 head_text = fh.read(max_bytes).decode("utf-8", errors="replace")
+        except TimeoutError:
+            raise
         except OSError:
             head_text = ""
         for line in head_text.splitlines():

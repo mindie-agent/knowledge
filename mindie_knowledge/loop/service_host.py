@@ -61,13 +61,78 @@ class ServiceHostError(RuntimeError):
         self.manager_hresult = manager_hresult
 
 
+def linux_user_runtime_dir() -> str | None:
+    if not sys.platform.startswith("linux"):
+        return None
+    uid = os.getuid()
+    raw = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{uid}"
+    try:
+        st_dir = os.lstat(raw)
+        if not stat.S_ISDIR(st_dir.st_mode) or st_dir.st_uid != uid:
+            return None
+        st_bus = os.lstat(os.path.join(raw, "bus"))
+        if not stat.S_ISSOCK(st_bus.st_mode) or st_bus.st_uid != uid:
+            return None
+        return raw
+    except TimeoutError:
+        raise
+    except OSError:
+        return None
+
+
+def _dbus_session_bus_usable(raw_addr: str) -> bool:
+    first = raw_addr.split(";", 1)[0].strip()
+    if not first.startswith("unix:"):
+        return bool(first)
+    for item in first[5:].split(","):
+        key, sep, val = item.partition("=")
+        if sep and key == "path":
+            try:
+                return stat.S_ISSOCK(os.lstat(val).st_mode)
+            except TimeoutError:
+                raise
+            except OSError:
+                return False
+    return True
+
+
+def linux_systemd_user_bus_available() -> bool:
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        if not stat.S_ISDIR(os.stat("/run/systemd/system").st_mode):
+            return False
+    except TimeoutError:
+        raise
+    except OSError:
+        return False
+    from .._host_exec import which_native
+    if any(which_native(cmd) is None for cmd in ("systemctl", "systemd-run", "busctl")):
+        return False
+    bus_addr = os.environ.get("DBUS_SESSION_BUS_ADDRESS", "").strip()
+    if bus_addr:
+        return _dbus_session_bus_usable(bus_addr)
+    return linux_user_runtime_dir() is not None
+
+
 def platform_backend():
     if os.name == "nt":
         from . import windows_service
         return windows_service
-    if sys.platform.startswith("linux"):
+    if sys.platform.startswith("linux") and linux_systemd_user_bus_available():
         from . import systemd_service
         return systemd_service
+    return None
+
+
+def backend_for_config(config):
+    backend = platform_backend()
+    if backend is not None:
+        return backend
+    if sys.platform.startswith("linux"):
+        from . import systemd_service
+        if systemd_service.has_launch_record(config):
+            return systemd_service
     return None
 
 
@@ -95,6 +160,8 @@ def _read(path):
         if not isinstance(result, dict):
             raise ValueError()
         return result
+    except TimeoutError:
+        raise
     except (OSError, ValueError):
         raise ServiceHostError("launch_record_invalid", stage="read") from None
 

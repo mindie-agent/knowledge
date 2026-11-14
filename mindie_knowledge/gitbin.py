@@ -12,10 +12,14 @@ r"""[Role] Deterministic resolution of the git executable and PATH propagation f
 """
 
 import os
+from os.path import dirname
 from pathlib import Path
 import shutil
 
+from ._host_exec import is_regular_file, which_native
+
 ENV_NAME = "MINDIE_GIT_BIN"
+_ORIG_WHICH = shutil.which
 
 
 class GitUnavailableError(FileNotFoundError):
@@ -23,6 +27,11 @@ class GitUnavailableError(FileNotFoundError):
 
 
 def _standard_locations():
+    localapp = os.environ.get("LOCALAPPDATA")
+    if localapp:
+        user_git = Path(localapp) / "Programs" / "Git"
+        yield user_git / "cmd" / "git.exe"
+        yield user_git / "bin" / "git.exe"
     for variable, fallback in (
         ("ProgramFiles", r"C:\Program Files"),
         ("ProgramFiles(x86)", r"C:\Program Files (x86)"),
@@ -36,16 +45,19 @@ def resolve_git():
     """The git executable this process may spawn, or an honest failure."""
     override = os.environ.get(ENV_NAME)
     if override:
-        if not Path(override).is_file():
+        if not is_regular_file(override):
             raise GitUnavailableError(
                 f"{ENV_NAME} does not name an existing file: {override}")
         return override
-    found = shutil.which("git")
+    if os.name == "nt" or shutil.which is not _ORIG_WHICH:
+        found = shutil.which("git")
+    else:
+        found = which_native("git", path=os.environ.get("PATH", ""))
     if found:
         return found
     if os.name == "nt":
         for candidate in _standard_locations():
-            if candidate.is_file():
+            if is_regular_file(candidate):
                 return str(candidate)
     raise GitUnavailableError(
         "git executable not found; set MINDIE_GIT_BIN to its absolute path"
@@ -63,11 +75,12 @@ def ensure_git_on_path(env=None) -> dict[str, str] | None:
         git_bin = resolve_git()
     except GitUnavailableError:
         return {str(k): str(v) for k, v in env.items()} if env is not None else None
-    git_dir = os.path.dirname(git_bin)
+    git_dir = dirname(git_bin)
+    pathsep = getattr(os, "pathsep", ":")
     ambient_path = (env or {}).get("PATH") if env and "PATH" in env else os.environ.get("PATH", "")
-    parts = [part for part in ambient_path.split(os.pathsep) if part]
+    parts = [part for part in ambient_path.split(pathsep) if part]
     if git_dir and git_dir not in parts:
         out = {str(k): str(v) for k, v in (env or {}).items()}
-        out["PATH"] = git_dir + (os.pathsep + ambient_path if ambient_path else "")
+        out["PATH"] = git_dir + (pathsep + ambient_path if ambient_path else "")
         return out
     return {str(k): str(v) for k, v in env.items()} if env is not None else None

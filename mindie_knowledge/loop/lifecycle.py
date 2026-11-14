@@ -137,8 +137,8 @@ def acquire_consumer(config_path, config):
 def _completed_retirement(config_path, config, outcome, receipt):
     """Discard obsolete discovery only after owner exit, under both locks."""
     from .cli import connection_path
-    from .service_host import platform_backend
-    backend = platform_backend()
+    from .service_host import backend_for_config
+    backend = backend_for_config(config)
     if backend is not None:
         try:
             backend.remove_owned(config_path, config)
@@ -239,7 +239,13 @@ def retire_service(config_path, *, control_timeout=None):
             try:
                 while _consumer_state(config):
                     _pause(deadline, "consumer_ownership")
-            except (RetirementTimeout, OSError) as exc:
+            except RetirementTimeout as exc:
+                return dict(outcome, retirement=receipt, cleanup_failed=True,
+                            cleanup_error=dict(stage='consumer_ownership', error_type=type(exc).__name__,
+                                               errno=getattr(exc, 'errno', None), operation_completed=True))
+            except TimeoutError:
+                raise
+            except OSError as exc:
                 return dict(outcome, retirement=receipt, cleanup_failed=True,
                             cleanup_error=dict(stage='consumer_ownership', error_type=type(exc).__name__,
                                                errno=getattr(exc, 'errno', None), operation_completed=True))

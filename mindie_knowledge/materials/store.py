@@ -355,6 +355,8 @@ class MaterialStore:
                 return dict(header=header, block=dict(descriptor), content=text, position=position)
             except ReadReferenceError:
                 raise
+            except TimeoutError:
+                raise
             except (OSError, ValueError, KeyError, sqlite3.Error) as exc:
                 raise MaterialReadError(
                     "Required current material could not be read or verified (" + type(exc).__name__ + ").",

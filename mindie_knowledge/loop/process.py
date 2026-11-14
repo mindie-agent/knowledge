@@ -149,8 +149,12 @@ def _posix_group_has_writers(pgid, *, timeout):
     return _ps_group_has_writers(pgid, timeout=timeout)
 
 
+_ORIG_WHICH = shutil.which
+
+
 def _ps_group_has_writers(pgid, *, timeout):
-    executable = shutil.which("ps")
+    from .._host_exec import which_native
+    executable = shutil.which("ps") if shutil.which is not _ORIG_WHICH else which_native("ps")
     if executable is None:
         raise RuntimeError("owned process group inspection requires libproc or ps")
     # BSD -g selects a process group; Linux -g selects a numeric session.

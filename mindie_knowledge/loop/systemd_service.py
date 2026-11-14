@@ -37,9 +37,19 @@ _FIELDS = ("Id", "Description", "LoadState", "ActiveState", "SubState", "Control
 
 
 def _manager(command, *, stage):
+    from .._host_exec import which_native
     from .process import bounded_run
+    from .service_host import linux_user_runtime_dir
+    exe = which_native(command[0]) if os.name != "nt" else command[0]
+    if exe is None:
+        raise ServiceHostError("manager_operation_failed", stage=stage, uncertain=False)
+    child_env = None
+    if sys.platform.startswith("linux") and not os.environ.get("XDG_RUNTIME_DIR") and not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+        rt_dir = linux_user_runtime_dir()
+        if rt_dir is not None:
+            child_env = {"XDG_RUNTIME_DIR": rt_dir}
     try:
-        return bounded_run(command, "", timeout=30, max_output=LIMIT).strip()
+        return bounded_run([exe, *command[1:]], "", timeout=30, max_output=LIMIT, child_env=child_env).strip()
     except Exception as exc:
         raise ServiceHostError(
             "manager_operation_failed", stage=stage,
@@ -92,6 +102,18 @@ def _verify_private(root):
 
 def _paths(config):
     return resolved_path(Path(config["root"]) / config["domain"] / ".systemd-service")
+
+
+def has_launch_record(config) -> bool:
+    try:
+        (_paths(config) / "launch.json").lstat()
+        return True
+    except FileNotFoundError:
+        return False
+    except TimeoutError:
+        raise
+    except OSError:
+        return True
 
 
 def _unit(label):
@@ -169,7 +191,7 @@ def _validate_process(record):
     from .service_host import _mark_process_contained
     unit = _unit(record["label"])
     _verify_unit(unit, record, Path(record["args"][-3]))
-    groups = Path("/proc/self/cgroup").read_text().splitlines()
+    groups = Path("/proc/self/cgroup").read_text(encoding="utf-8", errors="replace").splitlines()
     if (unit is None or unit.get("MainPID") != str(os.getpid())
             or groups != ["0::" + unit.get("ControlGroup", "")]):
         raise ServiceHostError("service_containment_unverified", stage="ownership")
@@ -381,6 +403,8 @@ def _start(root, record, config):
         raise
     try:
         _write(root / "operation.json", dict(attempt=record["attempt"], phase="started"))
+    except TimeoutError:
+        raise
     except (OSError, ServiceHostError):
         raise ServiceHostError("start_receipt_write_failed", stage="start", uncertain=True) from None
     return UserService(root, record)

@@ -52,7 +52,7 @@ def plan(source, session_id, output, *, parser, max_bytes=64*1024*1024, max_seco
     output.mkdir(parents=True, exist_ok=True, mode=0o700)
     manifest = output / "plan.json"
     if manifest.exists():
-        state = json.loads(manifest.read_text())
+        state = json.loads(manifest.read_text(encoding="utf-8"))
         if path_identity(state["source"]) != path_identity(source) or state["session_id"] != session_id:
             raise ValueError("plan belongs to another source or task")
         expected = FileIdentity.unserialize(state["identity"], str(source))
@@ -88,7 +88,7 @@ def plan(source, session_id, output, *, parser, max_bytes=64*1024*1024, max_seco
             state.update(status="source-grew-at-snapshot-boundary")
             break
         packet = output / f"{state['packets']:06d}.json"
-        packet.write_text(json.dumps(inc,ensure_ascii=False,indent=2))
+        packet.write_text(json.dumps(inc,ensure_ascii=False,indent=2), encoding="utf-8")
         packet.chmod(0o600)
         state["cursor"] = inc["end"]
         state["packets"] += 1
@@ -99,11 +99,11 @@ def plan(source, session_id, output, *, parser, max_bytes=64*1024*1024, max_seco
         state["public_bytes"] += len(inc["text"].encode())
         state["status"] = "complete" if state["cursor"] == state["snapshot_size"] else "pending"
         temp = output / "plan.next"
-        temp.write_text(json.dumps(state,indent=2));temp.chmod(0o600);temp.replace(manifest)
+        temp.write_text(json.dumps(state,indent=2), encoding="utf-8");temp.chmod(0o600);temp.replace(manifest)
     state["last_scan_bytes"] = state["cursor"]-start
     state["last_seconds"] = round(time.monotonic()-begun,3)
     temp = output / "plan.next"
-    temp.write_text(json.dumps(state,indent=2));temp.chmod(0o600);temp.replace(manifest)
+    temp.write_text(json.dumps(state,indent=2), encoding="utf-8");temp.chmod(0o600);temp.replace(manifest)
     return state
 
 

@@ -147,14 +147,14 @@ def generation_key(baseline, targets):
 
 def read_inventory(python, *, timeout=15):
     script = Path(__file__).with_name("runtime_inventory.py")
-    return json.loads(bounded_run([str(python), "-I", str(script)], "", timeout=timeout,
+    return json.loads(bounded_run([str(python), "-I", "-X", "utf8", str(script)], "", timeout=timeout,
                                   max_output=64 * 1024))
 
 
 def read_versions(python, names, *, timeout=15):
     """Read explicitly selected external CLI versions without asserting VCS origin."""
     script = Path(__file__).with_name("runtime_inventory.py")
-    return json.loads(bounded_run([str(python), "-I", str(script), "--versions", *names],
+    return json.loads(bounded_run([str(python), "-I", "-X", "utf8", str(script), "--versions", *names],
                                   "", timeout=timeout, max_output=64 * 1024))
 
 
@@ -204,7 +204,8 @@ def build(source, root, baseline, targets, *, python=sys.executable,
             (runtime / "pyproject.toml").write_text(
                 project_text(retained, targets, adapter_distribution=adapter_distribution),
                 encoding="utf-8", newline="\n")
-            uv = shutil.which("uv")
+            from ._host_exec import resolve_uv
+            uv = shutil.which("uv") if shutil.which.__module__ != "shutil" else resolve_uv()
             if uv is None:
                 raise FileNotFoundError("uv is required to prepare a component runtime")
             environment = dict(os.environ if env is None else env)
@@ -246,7 +247,7 @@ def build(source, root, baseline, targets, *, python=sys.executable,
             raise TimeoutError("component runtime verification budget exhausted")
         script = Path(__file__).with_name("runtime_inventory.py")
         candidate_manifest = manifest_file if manifest_file.exists() else temporary
-        actual = json.loads(bounded_run([str(selected_python), "-I", str(script), str(candidate_manifest)], "",
+        actual = json.loads(bounded_run([str(selected_python), "-I", "-X", "utf8", str(script), str(candidate_manifest)], "",
                                        timeout=min(15, remaining), max_output=64 * 1024))
         if candidate_manifest != manifest_file:
             os.replace(candidate_manifest, manifest_file)

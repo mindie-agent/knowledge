@@ -205,6 +205,8 @@ class Admission:
                 )
                 raise AdmissionUnavailable("admission read exceeded caller deadline") from budget_exc
             raise AdmissionUnavailable(str(exc)) from exc
+        except TimeoutError:
+            raise
         except (OSError, sqlite3.Error, ValueError) as exc:
             raise AdmissionUnavailable(str(exc)) from exc
         finally:
@@ -502,6 +504,8 @@ class Admission:
                 return {"state": "schema"}
             try:
                 scope = str(Path(root).expanduser().resolve(strict=False))
+            except TimeoutError:
+                raise
             except OSError as exc:
                 raise AdmissionUnavailable("lease scope is unreadable") from exc
             root_session = lease.get("root_session") or session
@@ -592,6 +596,8 @@ class Admission:
                 return {"state": "schema"}
             try:
                 scope = str(Path(root).expanduser().resolve(strict=False))
+            except TimeoutError:
+                raise
             except OSError as exc:
                 raise AdmissionUnavailable("lease scope is unreadable") from exc
             root_session = lease.get("root_session") or session

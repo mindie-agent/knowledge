@@ -39,17 +39,26 @@ def test_windows_standard_locations_are_the_last_resort(tmp_path, monkeypatch, n
     standard.write_text("")
     monkeypatch.setattr(gitbin.shutil, "which", lambda name: None)
     monkeypatch.setattr(gitbin, "os", SimpleNamespace(name="nt", environ=os.environ))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "absent-local"))
     monkeypatch.setenv("ProgramFiles", str(tmp_path))
     monkeypatch.setenv("ProgramFiles(x86)", str(tmp_path / "absent"))
     assert resolve_git() == str(standard)
     monkeypatch.setenv("ProgramFiles", str(tmp_path / "absent"))
     monkeypatch.setenv("ProgramFiles(x86)", str(tmp_path))
     assert resolve_git() == str(standard)
+    user_git = tmp_path / "local" / "Programs" / "Git" / "cmd" / "git.exe"
+    user_git.parent.mkdir(parents=True)
+    user_git.write_text("")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+    monkeypatch.setenv("ProgramFiles", str(tmp_path / "absent"))
+    monkeypatch.setenv("ProgramFiles(x86)", str(tmp_path / "absent"))
+    assert resolve_git() == str(user_git)
 
 
 def test_missing_git_fails_with_the_remedy(monkeypatch, no_pin):
     monkeypatch.setattr(gitbin.shutil, "which", lambda name: None)
     monkeypatch.setattr(gitbin, "os", SimpleNamespace(name="nt", environ=os.environ))
+    monkeypatch.setenv("LOCALAPPDATA", "C:\\absent-local")
     monkeypatch.setenv("ProgramFiles", "C:\\absent")
     monkeypatch.setenv("ProgramFiles(x86)", "C:\\absent-x86")
     with pytest.raises(GitUnavailableError, match="MINDIE_GIT_BIN.*install Git for Windows"):
