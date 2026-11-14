@@ -33,13 +33,17 @@ class ReleaseResponseTooLarge(ValueError):
 
 @cache
 def token():
+    from ._host_exec import which_native
     value = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
-    if value or not shutil.which("gh"):
+    if value:
         return value
+    gh = which_native("gh")
+    if not gh:
+        return None
     kwargs = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if os.name == "nt" else {}
-    result = subprocess.run(["gh", "auth", "token", "--hostname", "github.com"],
+    result = subprocess.run([gh, "auth", "token", "--hostname", "github.com"],
                             capture_output=True, timeout=5, check=False, **kwargs)
-    return result.stdout.decode("utf-8").strip() if result.returncode == 0 else None
+    return result.stdout.decode("utf-8", "replace").strip() if result.returncode == 0 else None
 
 
 def read(url, *, maximum, timeout, accept, redirects, directory=None, force=False, credential=None):

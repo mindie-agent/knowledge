@@ -84,6 +84,10 @@ class TransientError(CommunityError):
         super().__init__(detail, status="unavailable", retry_at=retry_at)
 
 
+class TransientTimeoutError(TransientError, TimeoutError):
+    """Pre-write local timeout: propagates as ``TimeoutError`` while keeping ``TransientError`` status."""
+
+
 class UnknownOutcome(CommunityError):
     """A remote write was attempted but its result cannot be confirmed.
 

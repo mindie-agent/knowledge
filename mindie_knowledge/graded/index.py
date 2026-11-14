@@ -529,12 +529,8 @@ class RoutingIndex:
                     "distinct_candidate_hashes": distinct_candidate_hashes[-16:],
                     "observed_candidate_hashes": distinct_refuted_candidate_hashes[-16:],
                     "ledger_run_ids": run_ids,
-                    "delivered_unit_ids": [
-                        r.get("id") for r in final_payload.get("results", ()) if isinstance(r, dict)
-                    ],
-                    "delivered_tiers": [
-                        r.get("tier") for r in final_payload.get("results", ()) if isinstance(r, dict)
-                    ],
+                    "delivered_unit_ids": [r.get("id") for r in final_payload.get("results", ()) if isinstance(r, dict)],
+                    "delivered_tiers": [r.get("tier") for r in final_payload.get("results", ()) if isinstance(r, dict)],
                     "mounted_l4_ids": mounted_l4,
                     "native_subcontext": bool(native_subcontext),
                     "has_bottleneck_summary": bool(bottleneck_summary),
@@ -543,6 +539,8 @@ class RoutingIndex:
                     try:
                         with target_file.open("a", encoding="utf-8") as fh:
                             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                    except TimeoutError:
+                        raise
                     except (OSError, ValueError):
                         pass
 

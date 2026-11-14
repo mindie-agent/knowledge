@@ -138,7 +138,7 @@ def _retire_replaced_owner_if_stale(config_path, config):
     from .handoff import _probe
     from .lifecycle import config_fingerprint, inspect_retirement
     from .locks import lock_held
-    from .service_host import platform_backend
+    from .service_host import backend_for_config
 
     try:
         raw_conn = connect(config)
@@ -157,6 +157,8 @@ def _retire_replaced_owner_if_stale(config_path, config):
             if isinstance(exc, ConnectionRefusedError) or isinstance(reason, ConnectionRefusedError):
                 try:
                     connection_path(config).unlink(missing_ok=True)
+                except TimeoutError:
+                    raise
                 except OSError:
                     return False
                 return True
@@ -189,7 +191,7 @@ def _retire_replaced_owner_if_stale(config_path, config):
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
         if _probe(config, 0.25, config_path=config_path) == "absent":
-            backend = platform_backend()
+            backend = backend_for_config(config)
             if backend is not None:
                 try:
                     backend.remove_owned(config_path, config)
@@ -199,6 +201,8 @@ def _retire_replaced_owner_if_stale(config_path, config):
                     return False
             try:
                 connection_path(config).unlink(missing_ok=True)
+            except TimeoutError:
+                raise
             except OSError:
                 return False
             return True
@@ -213,7 +217,7 @@ def ensure_service(config_path, *, _from_detached_starter=False):
     from .process import spawn_service, terminate_tree
     from .diagnostics import clear_startup_failure
     from .lifecycle import require_active
-    from .service_host import platform_backend
+    from .service_host import backend_for_config
 
     config = config_at(config_path)
     require_active(config_path, config)
@@ -248,9 +252,11 @@ def ensure_service(config_path, *, _from_detached_starter=False):
             if state == "absent" and process is None:
                 try:
                     connection_path(config).unlink(missing_ok=True)
+                except TimeoutError:
+                    raise
                 except OSError:
                     pass
-                backend = platform_backend()
+                backend = backend_for_config(config)
                 if backend is not None:
                     process = backend.request_start(config_path, config)
                 else:
@@ -728,11 +734,11 @@ def main(argv=None):
         # retired so a later start is not wedged. Cleanup failure stays
         # visible next to the completed stop, never silently skipped.
         from .handoff import _probe
-        from .service_host import platform_backend
+        from .service_host import backend_for_config
         if _probe(config, None, config_path=args.config) != "absent":
             raise
         result = dict(status="not-running")
-        backend = platform_backend()
+        backend = backend_for_config(config)
         if backend is not None:
             try:
                 backend.remove_owned(args.config, config)

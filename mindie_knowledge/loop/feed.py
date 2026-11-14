@@ -260,10 +260,12 @@ class Feed:
                 records.close()
             try:
                 listing_path.unlink(missing_ok=True)
+            except TimeoutError:
+                raise
             except OSError as cleanup:
                 # No feed switch has happened. Keep its original invalid or
                 # unavailable outcome and both reasons if scratch cleanup fails.
-                error = ValueError if isinstance(exc, ValueError) else OSError
+                error = ValueError if isinstance(exc, ValueError) else (TimeoutError if isinstance(exc, TimeoutError) else OSError)
                 raise error(f"{exc}; listing cleanup also failed: {type(cleanup).__name__}: {cleanup}") from exc
             raise
         else:

@@ -24,7 +24,14 @@ def _windows_extended(path):
 def _windows_logical(path):
     if path[:8].casefold() == "\\\\?\\unc\\":
         return "\\\\" + path[8:]
-    if path.startswith("\\\\?\\"):
+    if (
+        path.startswith("\\\\?\\")
+        and len(path) >= 7
+        and path[4].isascii()
+        and path[4].isalpha()
+        and path[5] == ":"
+        and path[6] in ("\\", "/")
+    ):
         return path[4:]
     return path
 

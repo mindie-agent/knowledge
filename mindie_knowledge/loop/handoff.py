@@ -257,7 +257,7 @@ def _wake_file(config):
 
 def _read_wake(config):
     try:
-        raw = json.loads(_wake_file(config).read_text() or "{}")
+        raw = json.loads(_wake_file(config).read_text(encoding="utf-8") or "{}")
     except FileNotFoundError:
         return {}
     return raw if isinstance(raw, dict) else {}
@@ -428,7 +428,7 @@ def request_wake(config_path, *, session_id, event=None, timeout=None):
         payload = {"wake_pid": process.pid, "at": time.time()}
         target = _wake_file(config)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(payload))
+        target.write_text(json.dumps(payload), encoding="utf-8")
         out.update(wake="requested", runtime="unavailable", reason="requested")
         return out
     finally:

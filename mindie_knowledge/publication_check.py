@@ -321,6 +321,8 @@ def _validate_graded_tree(repo, revision, domain, state_path, context, verified,
         pending_error = sys.exc_info()[1]
         try:
             listing_file.unlink()
+        except TimeoutError:
+            raise
         except OSError as cleanup_error:
             if pending_error is None:
                 raise
@@ -416,6 +418,8 @@ def _validate_tree(repo,revision,domain,state_path,context,verified,stats):
     finally:
         pending_error=sys.exc_info()[1]
         try:listing_file.unlink()
+        except TimeoutError:
+            raise
         except OSError as cleanup_error:
             if pending_error is None:
                 raise
@@ -517,6 +521,8 @@ def _validate_graded_revision_advance(repo, base_revision, domain, current_units
             reader.close()
         try:
             listing_file.unlink()
+        except TimeoutError:
+            raise
         except OSError:
             pass
     for unit in current_units:

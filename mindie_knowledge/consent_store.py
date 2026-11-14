@@ -122,6 +122,8 @@ class _UpdateLock:
                 try:
                     _lock_file_nb(fd)
                     break
+                except TimeoutError:
+                    raise
                 except OSError:
                     if time.monotonic() >= deadline:
                         raise ConsentError(
@@ -255,6 +257,8 @@ def _atomic_replace(source, target):
         try:
             os.replace(source, target)
             return
+        except TimeoutError:
+            raise
         except OSError as exc:
             # MoveFileEx (os.replace) can report either access denied or a
             # sharing violation while another process reads the destination.

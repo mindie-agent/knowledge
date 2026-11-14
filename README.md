@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mindie-agent/knowledge/releases"><img src="https://img.shields.io/badge/Release-v0.13.17-blue" alt="Release v0.13.17"></a>
+  <a href="https://github.com/mindie-agent/knowledge/releases"><img src="https://img.shields.io/badge/Release-v0.13.18-blue" alt="Release v0.13.18"></a>
   <a href="https://github.com/mindie-agent/mindie-agent"><img src="https://img.shields.io/badge/MindIE%20Agent-Core%20Runtime-7045f5.svg" alt="MindIE Agent Core Runtime"></a>
   <a href="pyproject.toml"><img src="https://img.shields.io/badge/python-3.11%2B-0284c7.svg" alt="Python 3.11+"></a>
   <a href="https://github.com/mindie-agent/knowledge-vllm-ascend"><img src="https://img.shields.io/badge/feed-vllm--ascend%20%2B%206%20domains-0f766e.svg" alt="7 Domain Knowledge Feeds"></a>

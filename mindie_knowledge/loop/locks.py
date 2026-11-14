@@ -64,6 +64,8 @@ def lock_file(fd: int, *, exclusive: bool, blocking: bool = False) -> None:
         try:
             fcntl.flock(fd, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
                         | (0 if blocking else fcntl.LOCK_NB))
+        except TimeoutError:
+            raise
         except OSError as exc:
             if exc.errno in (errno.EACCES, errno.EAGAIN):
                 raise BlockingIOError(errno.EAGAIN, "file lock is held") from None
@@ -163,17 +165,22 @@ class StartLock:
                 try:
                     _lock_file_nb(fd)
                     break
+                except TimeoutError:
+                    raise
                 except OSError as exc:
                     remaining = None if deadline is None else deadline - time.monotonic()
                     if exc.errno not in (errno.EACCES, errno.EAGAIN) or remaining is not None and remaining <= 0:
                         raise
                     time.sleep(.01 if remaining is None else min(.01, remaining))
+        except TimeoutError:
+            os.close(fd)
+            raise
         except OSError as exc:
             os.close(fd)
             if exc.errno not in (errno.EACCES, errno.EAGAIN):
                 raise
             try:
-                holder = json.loads(self.path.read_text() or "{}")
+                holder = json.loads(self.path.read_text(encoding="utf-8") or "{}")
             except TimeoutError:
                 raise
             except (OSError, ValueError):
@@ -189,11 +196,18 @@ class StartLock:
             # created the file and has not reached flock yet".
             os.lseek(fd, 0, os.SEEK_SET)
             self.prior_record = bool(os.read(fd, 4096))
-        except OSError:
-            os.close(fd)
+            if write_record:
+                self._write_record(fd, strict=False)
+        except BaseException:
+            try:
+                _unlock_file(fd)
+            except TimeoutError:
+                pass
+            except OSError:
+                pass
+            finally:
+                os.close(fd)
             raise
-        if write_record:
-            self._write_record(fd, strict=False)
         self._fd = fd
         self.acquired = True
 
@@ -222,6 +236,8 @@ class StartLock:
             os.ftruncate(fd, len(encoded))
             if strict:
                 os.fsync(fd)
+        except TimeoutError:
+            raise
         except OSError:
             if strict:
                 raise
