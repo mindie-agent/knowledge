@@ -10,8 +10,10 @@ An externally supplied ``diagnostic`` dict is never treated as proof.
 """
 
 import os
+from pathlib import Path
 
 
+_SOURCE_ROOT = Path(__file__).resolve().parents[1]
 _warned = False
 
 
@@ -73,28 +75,55 @@ def failure(
     elapsed_ms=None,
     exit_code=None,
     reportable=True,
+    reason_code=None,
+    substage=None,
+    contract_name=None,
 ):
     """Return a validated result or a visible logging_failed reference."""
     try:
         if exception is not None:
-            marker = getattr(exception, "_mindie_diagnostic", None)
-            if type(marker) is _DiagnosticMarker:
-                return marker.result
+            seen = set()
+            cur = exception
+            while cur is not None and id(cur) not in seen and len(seen) < 32:
+                seen.add(id(cur))
+                marker = getattr(cur, "_mindie_diagnostic", None)
+                if type(marker) is _DiagnosticMarker:
+                    try:
+                        exception._mindie_diagnostic = marker
+                        exception.mindie_diagnostic = {
+                            **({"incident_id": marker.result["incident_id"]} if "incident_id" in marker.result else {}),
+                            "logging_failed": marker.result["logging_failed"],
+                        }
+                    except Exception:
+                        pass
+                    return marker.result
+                cur = getattr(cur, "__cause__", None)
         from mindie_diagnostics.integration import record_failure
     except Exception:
         raw = _unavailable()
     else:
+        base_kwargs = {
+            "component": "mindie-knowledge",
+            "operation": operation,
+            "stage": stage,
+            "category": category,
+            "exception": exception,
+            "elapsed_ms": elapsed_ms,
+            "exit_code": exit_code,
+            "reportable": reportable,
+        }
+        v2_kwargs = {"source_root": _SOURCE_ROOT}
+        if reason_code is not None:
+            v2_kwargs["reason_code"] = reason_code
+        if substage is not None:
+            v2_kwargs["substage"] = substage
+        if contract_name is not None:
+            v2_kwargs["contract_name"] = contract_name
         try:
-            raw = record_failure(
-                component="mindie-knowledge",
-                operation=operation,
-                stage=stage,
-                category=category,
-                exception=exception,
-                elapsed_ms=elapsed_ms,
-                exit_code=exit_code,
-                reportable=reportable,
-            )
+            try:
+                raw = record_failure(**base_kwargs, **v2_kwargs)
+            except TypeError:
+                raw = record_failure(**base_kwargs)
         except Exception:
             raw = _unavailable()
     try:
@@ -119,3 +148,22 @@ def failure(
     except Exception:
         return result
     return result
+
+
+def record_contract_violation(
+    operation,
+    *,
+    stage="contract_check",
+    contract_name,
+    reason_code,
+    exception=None,
+):
+    """Record an authoritative local state or schema contract violation."""
+    return failure(
+        operation,
+        stage=stage,
+        category="contract_violation",
+        exception=exception,
+        reason_code=reason_code,
+        contract_name=contract_name,
+    )

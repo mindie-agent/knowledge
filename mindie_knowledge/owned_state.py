@@ -85,12 +85,30 @@ def _cleanup_uncommitted_fresh(path):
             pass
 
 
+def _report_authority_violation(reason_code, exc):
+    try:
+        from .loop.dfx import record_contract_violation
+        record_contract_violation(
+            'knowledge.owned_state',
+            stage='open_database',
+            contract_name='owned_sqlite_authority',
+            reason_code=reason_code,
+            exception=exc,
+        )
+    except TimeoutError:
+        raise
+    except Exception:
+        pass
+
+
 def require_columns(db, required, *, open_deadline=None):
     for table, columns in required.items():
         _check_open_floor(open_deadline, f'schema read ({table})')
         present = {row[1] for row in sqlite3.Connection.execute(db, f'PRAGMA table_info({table})')}
         if not set(columns) <= present:
-            raise ValueError(f'authoritative state table {table} is missing or incomplete; state was not rebuilt')
+            exc = ValueError(f'authoritative state table {table} is missing or incomplete; state was not rebuilt')
+            _report_authority_violation('missing_required_columns', exc)
+            raise exc
 
 
 def _present(path):
@@ -161,17 +179,23 @@ def open_database(path, *, schema, required, initialize, residue=(), validate=No
     fresh_committed = False
     try:
         if path.is_symlink():
-            raise ValueError('authoritative state must be a regular local file')
+            exc = ValueError('authoritative state must be a regular local file')
+            _report_authority_violation('symlink_authority_path', exc)
+            raise exc
         fresh = not path.exists()
         # `fresh` means the path is absent, so only prior evidence/residue can
         # distinguish first use from lost authority. Once a file exists, 0-byte
         # or schema damage stays fail-closed even without a persisted record.
         if fresh and (lock.prior_record or any(p.exists() or p.is_symlink() for p in leftovers)):
-            raise ValueError('authoritative state database is missing; existing material and receipts were preserved')
+            exc = ValueError('authoritative state database is missing; existing material and receipts were preserved')
+            _report_authority_violation('missing_database_with_residue', exc)
+            raise exc
         if fresh and not initialize_missing:
             return None
         if not fresh and (not path.is_file() or path.stat().st_size == 0):
-            raise ValueError('authoritative state database is empty or invalid; state was not rebuilt')
+            exc = ValueError('authoritative state database is empty or invalid; state was not rebuilt')
+            _report_authority_violation('empty_or_invalid_database', exc)
+            raise exc
         clean_fresh_attempt = fresh
         _check_open_floor(open_deadline, 'connect')
         db = sqlite3.connect(path if fresh else sqlite_file_uri(path) + '?mode=rw',
