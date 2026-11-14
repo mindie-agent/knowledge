@@ -357,6 +357,8 @@ def _resolve_unknown(ledger, row, settings, state_dir, transport, deadline) -> d
                         "expected commit is not part of the current PR head; "
                         "not confirmed"
                     )
+    except TimeoutError:
+        raise
     except TransientError as exc:
         # A failed read does not clear an earlier uncertain write, and it
         # does not authorize another POST. retry_at only delays the next read.
@@ -435,6 +437,8 @@ def _inspect_row(ledger, row, settings, state_dir, transport, deadline) -> dict[
                     status, detail = "unknown", (
                         "expected head is not part of the current PR head; not confirmed"
                     )
+    except TimeoutError:
+        raise
     except TransientError as exc:
         status, detail = "unknown", f"explicit inspection lookup failed: {exc}"
         retry_at = exc.retry_at

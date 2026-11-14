@@ -37,6 +37,7 @@ from .common import (
     CommunityError,
     Deadline,
     TransientError,
+    TransientTimeoutError,
     UnknownOutcome,
     finite_epoch,
     sha256_text,
@@ -176,6 +177,8 @@ def _submit(batch, settings, state_dir, ledger, *, cancel, transport) -> dict[st
     commit_message = render_commit_message(checked)
     try:
         scan_outbound(checked, pr_title, pr_body, commit_message)
+    except TimeoutError:
+        raise
     except CommunityError as exc:
         # Recorded as a failed attempt: the identical revision is not resent.
         ledger.record_intent(batch_id=batch_id, revision=revision,
@@ -191,6 +194,9 @@ def _submit(batch, settings, state_dir, ledger, *, cancel, transport) -> dict[st
     # never a non-fast-forward fight with the retired branch.
     try:
         prior = _own_prior_pr(ledger, batch_id, transport, repository, branch, deadline)
+    except TimeoutError as exc:
+        exc.mindie_publication_status = "unavailable"
+        raise
     except TransientError as exc:
         # A failed read is not "no existing PR" and must not start a write.
         return _receipt(checked, status="unavailable", detail=str(exc), retry_at=exc.retry_at)
@@ -236,7 +242,7 @@ def _submit(batch, settings, state_dir, ledger, *, cancel, transport) -> dict[st
         batch_id=batch_id, revision=revision, domain=checked["domain"],
         repository=repository, branch=branch,
     )
-    progress = {}
+    progress = {"pre_write": True, "write_in_flight": False}
     try:
         result = _publish(
             checked, settings, state_dir, ledger, deadline, transport,
@@ -247,7 +253,25 @@ def _submit(batch, settings, state_dir, ledger, *, cancel, transport) -> dict[st
     except _CompletedEffectReceiptFailure as exc:
         return _finish_result(checked, ledger, exc.result, recording_error=exc.cause)
     except UnknownOutcome as exc:
-        return _finish_result(checked, ledger, dict(progress, status='unknown', detail=str(exc), retry_at=exc.retry_at))
+        clean_progress = {k: v for k, v in progress.items() if k not in {"pre_write", "write_in_flight"}}
+        return _finish_result(checked, ledger, dict(clean_progress, status='unknown', detail=str(exc), retry_at=exc.retry_at))
+    except TransientTimeoutError as exc:
+        pushed = progress.get('head_sha')
+        detail = str(exc)
+        if pushed:
+            detail = 'Git push completed; subsequent publication step did not complete: ' + detail
+        known_receipt = _finish_result(
+            checked, ledger,
+            dict(
+                status=exc.status, detail=detail,
+                retry_at=exc.retry_at, head_sha=pushed,
+                completed_steps=list(progress.get('completed_steps', ['git-push'] if pushed else [])),
+                external_write_completed=bool(pushed or progress.get('external_write_completed')),
+            ),
+        )
+        exc.mindie_publication_result = known_receipt
+        exc.mindie_publication_status = exc.status
+        raise
     except CommunityError as exc:
         # A later gate/read failure cannot erase a push which already
         # completed. Preserve that fact even when creating the PR is blocked.
@@ -260,22 +284,30 @@ def _submit(batch, settings, state_dir, ledger, *, cancel, transport) -> dict[st
                               completed_steps=['git-push'] if pushed else [], external_write_completed=bool(pushed)))
     except TimeoutError as exc:
         pushed = progress.get('head_sha')
+        pre_write = bool(
+            progress.get('pre_write')
+            and not progress.get('write_in_flight')
+            and not pushed
+            and not progress.get('external_write_completed')
+        )
+        status = 'unavailable' if pre_write else 'unknown'
         detail = str(exc)
         if pushed:
             detail = 'Git push completed; subsequent publication step timed out: ' + detail
         known_receipt = _finish_result(
             checked, ledger,
             dict(
-                status='unavailable', detail=detail,
+                status=status, detail=detail,
                 retry_at=getattr(exc, 'retry_at', None), head_sha=pushed,
-                completed_steps=['git-push'] if pushed else [],
-                external_write_completed=bool(pushed),
+                completed_steps=list(progress.get('completed_steps', ['git-push'] if pushed else [])),
+                external_write_completed=bool(pushed or progress.get('external_write_completed')),
             ),
         )
         exc.mindie_publication_result = known_receipt
-        exc.mindie_publication_status = 'unavailable'
+        exc.mindie_publication_status = status
         raise
-    return _finish_result(checked, ledger, {**progress, **result})
+    clean_progress = {k: v for k, v in progress.items() if k not in {"pre_write", "write_in_flight"}}
+    return _finish_result(checked, ledger, {**clean_progress, **result})
 
 def _publication_base(checked, settings, state_dir, deadline, *, repository, write_repo, remote_url):
     """Select and validate the exact upstream base before publication intent."""
@@ -410,14 +442,16 @@ def _publish(checked, settings, state_dir, ledger, deadline, transport, *,
             ledger.record_step(batch_id, revision, "gate:before-metadata")
             _settings_gate(settings)
             ledger.assert_authority()
+            progress.update(pre_write=False, write_in_flight=True)
             transport.update_pull_request(repository, prior["number"], title=pr_title, body=pr_body, deadline=deadline)
+            progress.update(write_in_flight=False, completed_steps=['pr-update'], external_write_completed=True)
             return {"status": "unchanged", "detail": "no content change; PR metadata refreshed",
                     "pr_number": prior["number"], "pr_url": prior.get("html_url"), "head_sha": head_sha,
                     "files": actual_files, 'completed_steps': ['pr-update'], 'external_write_completed': True}
         if resumed or own_resume:
             # The exact commits are already on the remote branch; only the PR
             # step is outstanding. Skip the push entirely and create the PR.
-            progress.update(head_sha=head_sha, completed_steps=['git-push'], external_write_completed=True)
+            progress.update(pre_write=False, head_sha=head_sha, completed_steps=['git-push'], external_write_completed=True)
         else:
             return {"status": "unchanged",
                     "detail": "content already present on the target branch",
@@ -433,8 +467,9 @@ def _publish(checked, settings, state_dir, ledger, deadline, transport, *,
         ledger.record_step(batch_id, revision, "git:intended-head", head_sha)
         ledger.record_step(batch_id, revision, "git:push")
         ledger.assert_authority()
+        progress.update(pre_write=False, write_in_flight=True)
         gitops.push_branch(work_dir, branch, deadline, env=genv, cancel=deadline.cancel)
-        progress.update(head_sha=head_sha, completed_steps=['git-push'], external_write_completed=True)
+        progress.update(write_in_flight=False, head_sha=head_sha, completed_steps=['git-push'], external_write_completed=True)
         _record_completed(ledger, batch_id, revision, 'git:pushed', head_sha,
                           dict(status='failed', detail='Git push completed; PR publication did not start',
                                head_sha=head_sha, files=actual_files, completed_steps=['git-push'],
@@ -450,8 +485,9 @@ def _publish(checked, settings, state_dir, ledger, deadline, transport, *,
     if updating:
         _record_completed(ledger, batch_id, revision, 'github:update-pr', f"#{prior['number']}", pushed_result)
         ledger.assert_authority()
+        progress.update(pre_write=False, write_in_flight=True)
         transport.update_pull_request(repository, prior["number"], title=pr_title, body=pr_body, deadline=deadline)
-        progress.update(completed_steps=[*progress.get('completed_steps', []), 'pr-update'], external_write_completed=True)
+        progress.update(write_in_flight=False, completed_steps=[*progress.get('completed_steps', []), 'pr-update'], external_write_completed=True)
         return {"status": "updated", "detail": f"updated open PR #{prior['number']}",
                 "pr_number": prior["number"], "pr_url": prior.get("html_url"), "head_sha": head_sha,
                 "files": actual_files}
@@ -461,10 +497,12 @@ def _publish(checked, settings, state_dir, ledger, deadline, transport, *,
     _record_completed(ledger, batch_id, revision, 'github:create-pr', '', pushed_result)
     head_ref = branch if write_repo == repository else f"{write_repo.split('/')[0]}:{branch}"
     ledger.assert_authority()
+    progress.update(pre_write=False, write_in_flight=True)
     pr = transport.create_pull_request(
         write_repo if write_repo == repository else repository,
         title=pr_title, body=pr_body, head=head_ref, base=base_branch, deadline=deadline,
     )
+    progress.update(write_in_flight=False, completed_steps=['git-push', 'pr-create'], external_write_completed=True)
     result = {"status": "submitted", "detail": f"opened PR #{pr.get('number')}",
             "pr_number": pr.get("number"), "pr_url": pr.get("html_url"), "head_sha": head_sha,
             "files": actual_files, 'completed_steps': ['git-push', 'pr-create'], 'external_write_completed': True}

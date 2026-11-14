@@ -86,6 +86,8 @@ def main(argv: list[str] | None = None) -> int:
         else:  # pragma: no cover - argparse enforces choices
             parser.error("unknown command")
             return EXIT_USAGE
+    except TimeoutError:
+        raise
     except (CommunityError, ToolError) as exc:
         print(json.dumps({"status": getattr(exc, "status", "failed"), "detail": str(exc)[:800]},
                          ensure_ascii=False))

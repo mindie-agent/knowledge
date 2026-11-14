@@ -225,3 +225,97 @@ def test_ledger_authority_timeout_propagates_with_transient_classification(tmp_p
         assert exc_info.value.status == "unavailable"
     finally:
         ledger.close()
+
+
+def test_round3_publish_timeout_classifications_and_gitbin_path_edges(tmp_path, monkeypatch):
+    from mindie_knowledge.community import publish as pub_mod
+    from mindie_knowledge import gitbin
+
+    base_batch = {
+        "batch_id": "b-timeout",
+        "revision": "a" * 64,
+        "domain": "vllm-ascend",
+        "data_format": "materials",
+        "base_commit": "b" * 40,
+        "task_revisions": {},
+        "files": [],
+    }
+    settings = {"enabled": True, "repository": "mindie-agent/vllm-ascend-knowledge", "branch": "main"}
+
+    # 1. Authority TransientTimeoutError inside _publish propagates out of submit_batch as unavailable.
+    def fake_publish_authority(*args, **kwargs):
+        from mindie_knowledge.community.common import TransientTimeoutError
+        raise TransientTimeoutError("authority lock timed out")
+
+    with (
+        mock.patch.object(pub_mod, "validate_batch", return_value={**base_batch, "explicit_retry": False}),
+        mock.patch.object(pub_mod, "render_pr_title", return_value="title"),
+        mock.patch.object(pub_mod, "render_pr_body", return_value="body"),
+        mock.patch.object(pub_mod, "render_commit_message", return_value="msg"),
+        mock.patch.object(pub_mod, "scan_outbound", return_value=None),
+        mock.patch.object(pub_mod, "_own_prior_pr", return_value=None),
+        mock.patch.object(pub_mod, "_publication_base", return_value={}),
+        mock.patch.object(pub_mod, "_publish", side_effect=fake_publish_authority),
+    ):
+        with pytest.raises(TimeoutError, match="authority lock timed out") as auth_exc:
+            pub_mod.submit_batch(base_batch, settings, tmp_path / "state_auth", transport=mock.MagicMock())
+    assert auth_exc.value.mindie_publication_result["status"] == "unavailable"
+
+    # 2. Uncertain in-flight remote write timeout stays 'unknown' (never auto-retryable 'unavailable').
+    def fake_publish_inflight(*args, **kwargs):
+        kwargs["progress"].update(
+            pre_write=False, write_in_flight=True, head_sha="c" * 40,
+            completed_steps=["git-push"], external_write_completed=True,
+        )
+        raise TimeoutError("request-body cleanup timed out after POST")
+
+    state_unknown = tmp_path / "state_unknown"
+    with (
+        mock.patch.object(pub_mod, "validate_batch", return_value={**base_batch, "explicit_retry": False}),
+        mock.patch.object(pub_mod, "render_pr_title", return_value="title"),
+        mock.patch.object(pub_mod, "render_pr_body", return_value="body"),
+        mock.patch.object(pub_mod, "render_commit_message", return_value="msg"),
+        mock.patch.object(pub_mod, "scan_outbound", return_value=None),
+        mock.patch.object(pub_mod, "_own_prior_pr", return_value=None),
+        mock.patch.object(pub_mod, "_publication_base", return_value={}),
+        mock.patch.object(pub_mod, "_publish", side_effect=fake_publish_inflight),
+    ):
+        with pytest.raises(TimeoutError, match="request-body cleanup timed out") as unk_exc:
+            pub_mod.submit_batch(base_batch, settings, state_unknown, transport=mock.MagicMock())
+    assert unk_exc.value.mindie_publication_result["status"] == "unknown"
+    assert unk_exc.value.mindie_publication_status == "unknown"
+    ledger = Ledger(state_unknown)
+    try:
+        assert ledger.get_publication("b-timeout", "a" * 64)["status"] == "unknown"
+    finally:
+        ledger.close()
+
+    # 3. POSIX resolve_git unset PATH fallback + ensure_git_on_path reordering ahead of PE shadow.
+    if os.name != "nt":
+        pe_dir = tmp_path / "mnt_c_tools"
+        lin_dir = tmp_path / "usr_bin"
+        pe_dir.mkdir()
+        lin_dir.mkdir()
+        pe_git = pe_dir / "git"
+        buf = bytearray(0x80)
+        buf[0:2] = b"MZ"
+        buf[0x3C:0x40] = (0x40).to_bytes(4, "little")
+        buf[0x40:0x44] = b"PE\x00\x00"
+        pe_git.write_bytes(bytes(buf))
+        pe_git.chmod(0o755)
+        lin_git = lin_dir / "git"
+        lin_git.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        lin_git.chmod(0o755)
+
+        monkeypatch.delenv(gitbin.ENV_NAME, raising=False)
+        monkeypatch.delenv("PATH", raising=False)
+        monkeypatch.setattr(_host_exec.os, "defpath", str(lin_dir))
+        monkeypatch.setattr(gitbin.os, "defpath", str(lin_dir))
+        assert gitbin.resolve_git() == str(lin_git)
+
+        shadow_path = f"{pe_dir}{os.pathsep}{lin_dir}"
+        monkeypatch.setenv("PATH", shadow_path)
+        assert gitbin.resolve_git() == str(lin_git)
+        fixed_env = gitbin.ensure_git_on_path({"GH_TOKEN": "t"})
+        assert fixed_env is not None
+        assert fixed_env["PATH"].split(os.pathsep)[0] == str(lin_dir)
