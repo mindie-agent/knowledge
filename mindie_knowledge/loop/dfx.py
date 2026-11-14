@@ -83,11 +83,8 @@ def failure(
     try:
         if exception is not None:
             seen = set()
-            pending = [exception]
-            while pending and len(seen) < 32:
-                cur = pending.pop(0)
-                if cur is None or id(cur) in seen:
-                    continue
+            cur = exception
+            while cur is not None and id(cur) not in seen and len(seen) < 32:
                 seen.add(id(cur))
                 marker = getattr(cur, "_mindie_diagnostic", None)
                 if type(marker) is _DiagnosticMarker:
@@ -100,10 +97,7 @@ def failure(
                     except Exception:
                         pass
                     return marker.result
-                if getattr(cur, "__cause__", None) is not None:
-                    pending.append(cur.__cause__)
-                if getattr(cur, "__context__", None) is not None and not getattr(cur, "__suppress_context__", False):
-                    pending.append(cur.__context__)
+                cur = getattr(cur, "__cause__", None)
         from mindie_diagnostics.integration import record_failure
     except Exception:
         raw = _unavailable()
