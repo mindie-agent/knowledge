@@ -5,13 +5,17 @@ import json
 import os
 import socket
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 
 from mindie_knowledge import _host_exec, gitbin, release_http
-from mindie_knowledge.loop import service_host, systemd_service
+from mindie_knowledge.community.common import TransientError
+from mindie_knowledge.community.ledger import Ledger
+from mindie_knowledge.loop import locks, service_host, systemd_service
 
 
 def _fake_pe_bytes() -> bytes:
@@ -112,18 +116,19 @@ def test_linux_non_systemd_backend_selection_and_launch_record_preservation(tmp_
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="AF_UNIX bus socket check on Linux")
-def test_linux_user_runtime_dir_detects_owned_bus_socket(tmp_path, monkeypatch):
-    rt = tmp_path / "rt"
-    rt.mkdir(mode=0o700)
-    sock_path = rt / "bus"
-    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        srv.bind(str(sock_path))
-        monkeypatch.setenv("XDG_RUNTIME_DIR", str(rt))
-        monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
-        assert service_host.linux_user_runtime_dir() == str(rt)
-    finally:
-        srv.close()
+def test_linux_user_runtime_dir_detects_owned_bus_socket(monkeypatch):
+    with tempfile.TemporaryDirectory(prefix="mk-bus-", dir="/tmp") as short_tmp:
+        rt = Path(short_tmp) / "rt"
+        rt.mkdir(mode=0o700)
+        sock_path = rt / "bus"
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            srv.bind(str(sock_path))
+            monkeypatch.setenv("XDG_RUNTIME_DIR", str(rt))
+            monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+            assert service_host.linux_user_runtime_dir() == str(rt)
+        finally:
+            srv.close()
 
 
 def test_component_runtime_inventory_handles_utf8_under_isolated_mode(tmp_path):
@@ -131,3 +136,92 @@ def test_component_runtime_inventory_handles_utf8_under_isolated_mode(tmp_path):
 
     ver = component_runtime.read_versions(sys.executable, ["mindie-knowledge"])
     assert ver == {"mindie-knowledge": "0.13.18"}
+
+
+def test_round2_startlock_close_on_record_timeout_and_large_pe(tmp_path, monkeypatch):
+    lock = locks.StartLock(tmp_path / "start.lock")
+    real_close = locks.os.close
+    closed_fds: list[int] = []
+
+    def tracking_close(fd: int) -> None:
+        closed_fds.append(fd)
+        real_close(fd)
+
+    with (
+        mock.patch.object(locks.os, "write", side_effect=TimeoutError("record write timeout")),
+        mock.patch.object(locks.os, "close", side_effect=tracking_close),
+    ):
+        with pytest.raises(TimeoutError, match="record write timeout"):
+            lock.acquire()
+    assert len(closed_fds) == 1
+    assert lock.acquired is False
+    # Subsequent lock acquisition on the same file must succeed (fd not leaked)
+    lock2 = locks.StartLock(tmp_path / "start.lock")
+    lock2.acquire()
+    lock2.release()
+
+    large_pe = tmp_path / "large_pe"
+    buf = bytearray(0x2200)
+    buf[0:2] = b"MZ"
+    buf[0x3C:0x40] = (0x2000).to_bytes(4, "little")
+    buf[0x2000:0x2004] = b"PE\x00\x00"
+    large_pe.write_bytes(bytes(buf))
+    assert _host_exec.is_pe_executable(large_pe) is True
+
+    if os.name != "nt":
+        cwd_dir = tmp_path / "cwd"
+        def_dir = tmp_path / "defbin"
+        cwd_dir.mkdir()
+        def_dir.mkdir()
+        for folder in (cwd_dir, def_dir):
+            tool = folder / "git"
+            tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            tool.chmod(0o755)
+        monkeypatch.chdir(cwd_dir)
+        monkeypatch.setattr(_host_exec.os, "defpath", str(def_dir))
+        monkeypatch.setenv("PATH", "")
+        assert _host_exec.which_native("git") is None
+        monkeypatch.delenv("PATH", raising=False)
+        assert _host_exec.which_native("git") == str(def_dir / "git")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX systemd pre-spawn lookup timeout recovery")
+def test_systemd_lookup_timeout_does_not_strand_launch_receipt(tmp_path, monkeypatch):
+    root = tmp_path / ".systemd-service"
+    root.mkdir(mode=0o700)
+    cfg_path = tmp_path / "loop.json"
+    cfg_path.write_text("{}", encoding="utf-8")
+    cfg = {"root": str(tmp_path), "domain": "vllm-ascend"}
+    monkeypatch.setattr(systemd_service, "require_active", lambda *a, **k: None, raising=False)
+    import mindie_knowledge.loop.lifecycle as lifecycle_mod
+
+    monkeypatch.setattr(lifecycle_mod, "require_active", lambda *a, **k: None)
+    record = {
+        "attempt": "a" * 32,
+        "label": "mindie-knowledge-0123456789abcdef-" + ("a" * 32) + ".service",
+        "config": str(cfg_path),
+        "python": sys.executable,
+        "args": ["-V"],
+    }
+    (root / "launch.json").write_text(json.dumps(record), encoding="utf-8")
+    (root / "operation.json").write_text(json.dumps({"attempt": record["attempt"], "phase": "prepared"}), encoding="utf-8")
+    with mock.patch.object(_host_exec, "which_native", side_effect=TimeoutError("lookup timeout")):
+        with pytest.raises(TimeoutError, match="lookup timeout"):
+            systemd_service._start(root, record, cfg)
+    op = json.loads((root / "operation.json").read_text(encoding="utf-8"))
+    assert op["phase"] == "failed"
+
+
+def test_ledger_authority_timeout_propagates_with_transient_classification(tmp_path):
+    ledger = Ledger(tmp_path / "state")
+    try:
+        ledger.record_intent(
+            batch_id="b1", revision="r1", domain="vllm-ascend", repository="org/repo", branch="contrib/b1"
+        )
+        with mock.patch.object(ledger.db, "assert_authority", side_effect=TimeoutError("authority timeout")):
+            with pytest.raises(TimeoutError, match="publication authority timed out") as exc_info:
+                ledger.assert_authority()
+        assert isinstance(exc_info.value, TransientError)
+        assert exc_info.value.status == "unavailable"
+    finally:
+        ledger.close()

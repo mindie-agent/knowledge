@@ -112,10 +112,15 @@ class PublicationWorker:
             self.engine._fault('knowledge.publish', 'submit', 'publication_failed', exc)
             self.engine._unexpected("knowledge.publish", "submit", exc)
             try:
-                self.store.mark_batch(
-                    batch_row["batch_id"], "unknown", attempted=True,
-                    detail=f"{type(exc).__name__}: {exc}"[:500],
-                )
+                known = getattr(exc, "mindie_publication_result", None)
+                if isinstance(known, dict) and known.get("status") in {"unavailable", "failed"}:
+                    record_publication_receipt(self.store, batch_row, known, attempted=True)
+                else:
+                    status = getattr(exc, "mindie_publication_status", "unknown")
+                    self.store.mark_batch(
+                        batch_row["batch_id"], status, attempted=True,
+                        detail=f"{type(exc).__name__}: {exc}"[:500],
+                    )
             except Exception as receipt_error:
                 exc.add_note('publication runtime receipt also failed: ' + type(receipt_error).__name__)
                 raise exc from receipt_error

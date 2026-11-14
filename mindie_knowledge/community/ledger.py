@@ -74,13 +74,15 @@ class Ledger:
 
     def assert_authority(self):
         """Both the publication intent and its runtime source must still exist."""
-        from .common import TransientError
+        from .common import TransientError, TransientTimeoutError
         try:
             self.db.assert_authority()
             if self._owner_authority is not None:
                 self._owner_authority()
-        except TimeoutError:
-            raise
+        except TimeoutError as exc:
+            raise TransientTimeoutError(
+                'publication authority timed out before the next remote write'
+            ) from exc
         except (OSError, ValueError, sqlite3.Error) as exc:
             raise TransientError('publication authority is unavailable before the next remote write') from exc
 

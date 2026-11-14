@@ -36,9 +36,8 @@ _FIELDS = ("Id", "Description", "LoadState", "ActiveState", "SubState", "Control
            "Transient", "ExecMainStatus", "Result", "MainPID", *_PROPERTIES)
 
 
-def _manager(command, *, stage):
+def _resolve_manager_call(command, *, stage):
     from .._host_exec import which_native
-    from .process import bounded_run
     from .service_host import linux_user_runtime_dir
     exe = which_native(command[0]) if os.name != "nt" else command[0]
     if exe is None:
@@ -48,6 +47,12 @@ def _manager(command, *, stage):
         rt_dir = linux_user_runtime_dir()
         if rt_dir is not None:
             child_env = {"XDG_RUNTIME_DIR": rt_dir}
+    return exe, child_env
+
+
+def _manager(command, *, stage, prepared=None):
+    from .process import bounded_run
+    exe, child_env = prepared if prepared is not None else _resolve_manager_call(command, stage=stage)
     try:
         return bounded_run([exe, *command[1:]], "", timeout=30, max_output=LIMIT, child_env=child_env).strip()
     except Exception as exc:
@@ -379,27 +384,36 @@ def _request_start(config_path, config):
     return _start(root, record, config)
 
 
+def _mark_start_failed_before_spawn(root, record):
+    try:
+        _write(root / "operation.json", dict(attempt=record["attempt"], phase="failed"))
+        (root / (record["attempt"] + ".context")).unlink(missing_ok=True)
+    except TimeoutError:
+        raise
+    except (OSError, ServiceHostError):
+        pass
+
+
 def _start(root, record, config):
     from .lifecycle import require_active
     require_active(record["config"], config)
     if (root / (record["attempt"] + ".claimed")).exists():
         raise ServiceHostError("launch_attempt_already_consumed", stage="reconcile", uncertain=True)
-    _write(root / "operation.json", dict(attempt=record["attempt"], phase="starting"))
     command = ["systemd-run", "--user", "--no-ask-password", "--quiet", "--expand-environment=no",
                "--unit=" + record["label"], "--description=" + _description(root / "launch.json")]
     command.extend("--property=" + key + "=" + value for key, value in _PROPERTIES.items())
     command.extend(["--", record["python"], *record["args"]])
     try:
-        _manager(command, stage="start")
+        prepared = _resolve_manager_call(command, stage="start")
+    except BaseException:
+        _mark_start_failed_before_spawn(root, record)
+        raise
+    _write(root / "operation.json", dict(attempt=record["attempt"], phase="starting"))
+    try:
+        _manager(command, stage="start", prepared=prepared)
     except ServiceHostError as exc:
         if not exc.uncertain:
-            try:
-                _write(root / "operation.json", dict(attempt=record["attempt"], phase="failed"))
-                (root / (record["attempt"] + ".context")).unlink(missing_ok=True)
-            except TimeoutError:
-                raise
-            except (OSError, ServiceHostError):
-                pass
+            _mark_start_failed_before_spawn(root, record)
         raise
     try:
         _write(root / "operation.json", dict(attempt=record["attempt"], phase="started"))

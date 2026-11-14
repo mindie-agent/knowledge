@@ -221,9 +221,10 @@ def _submit(batch, settings, state_dir, ledger, *, cancel, transport) -> dict[st
             "error_code": exc.code, "failed_stage": "publication-contract",
             "external_write_attempted": False,
         })
-    except TimeoutError:
+    except TimeoutError as exc:
+        exc.mindie_publication_status = "unavailable"
         raise
-    except (OSError, TimeoutError) as exc:
+    except OSError as exc:
         return _receipt(checked, status="unavailable", detail=str(exc), extras={
             "failed_stage": "publication-contract", "external_write_attempted": False,
         })
@@ -257,6 +258,23 @@ def _submit(batch, settings, state_dir, ledger, *, cancel, transport) -> dict[st
         return _finish_result(checked, ledger, dict(status=exc.status, detail=detail,
                               retry_at=exc.retry_at, head_sha=pushed,
                               completed_steps=['git-push'] if pushed else [], external_write_completed=bool(pushed)))
+    except TimeoutError as exc:
+        pushed = progress.get('head_sha')
+        detail = str(exc)
+        if pushed:
+            detail = 'Git push completed; subsequent publication step timed out: ' + detail
+        known_receipt = _finish_result(
+            checked, ledger,
+            dict(
+                status='unavailable', detail=detail,
+                retry_at=getattr(exc, 'retry_at', None), head_sha=pushed,
+                completed_steps=['git-push'] if pushed else [],
+                external_write_completed=bool(pushed),
+            ),
+        )
+        exc.mindie_publication_result = known_receipt
+        exc.mindie_publication_status = 'unavailable'
+        raise
     return _finish_result(checked, ledger, {**progress, **result})
 
 def _publication_base(checked, settings, state_dir, deadline, *, repository, write_repo, remote_url):

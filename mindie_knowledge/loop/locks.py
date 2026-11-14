@@ -196,14 +196,18 @@ class StartLock:
             # created the file and has not reached flock yet".
             os.lseek(fd, 0, os.SEEK_SET)
             self.prior_record = bool(os.read(fd, 4096))
-        except TimeoutError:
-            os.close(fd)
+            if write_record:
+                self._write_record(fd, strict=False)
+        except BaseException:
+            try:
+                _unlock_file(fd)
+            except TimeoutError:
+                pass
+            except OSError:
+                pass
+            finally:
+                os.close(fd)
             raise
-        except OSError:
-            os.close(fd)
-            raise
-        if write_record:
-            self._write_record(fd, strict=False)
         self._fd = fd
         self.acquired = True
 

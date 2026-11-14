@@ -108,15 +108,16 @@ def is_wsl_drvfs(value: str | os.PathLike[str]) -> bool:
 def is_pe_executable(value: str | os.PathLike[str]) -> bool:
     try:
         with Path(value).open("rb") as handle:
-            head = handle.read(4096)
+            dos = handle.read(64)
+            if len(dos) < 64 or dos[:2] != b"MZ":
+                return False
+            pe_offset = int.from_bytes(dos[0x3C:0x40], "little", signed=False)
+            handle.seek(pe_offset)
+            return handle.read(4) == b"PE\x00\x00"
     except TimeoutError:
         raise
     except OSError:
         return False
-    if len(head) < 64 or head[:2] != b"MZ":
-        return False
-    pe_offset = int.from_bytes(head[0x3C:0x40], "little", signed=False)
-    return 0 <= pe_offset <= len(head) - 4 and head[pe_offset : pe_offset + 4] == b"PE\x00\x00"
 
 
 def _is_exec_regular_file(path_str: str) -> bool:
@@ -140,7 +141,11 @@ def which_native(command: str, *, path: str | None = None) -> str | None:
         return None
     if command.lower().endswith(_WIN_SUFFIXES):
         return None
-    raw_path = os.environ.get("PATH", "") if path is None else path
+    raw_path = os.environ.get("PATH", None) if path is None else path
+    if raw_path is None:
+        raw_path = os.defpath
+    if not raw_path:
+        return None
     for entry in raw_path.split(os.pathsep):
         if not entry:
             continue
