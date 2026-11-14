@@ -36,23 +36,27 @@ _FIELDS = ("Id", "Description", "LoadState", "ActiveState", "SubState", "Control
            "Transient", "ExecMainStatus", "Result", "MainPID", *_PROPERTIES)
 
 
-def _resolve_manager_call(command, *, stage):
+def _manager(command, *, stage):
     from .._host_exec import which_native
-    from .service_host import linux_user_runtime_dir
-    exe = which_native(command[0]) if os.name != "nt" else command[0]
-    if exe is None:
-        raise ServiceHostError("manager_operation_failed", stage=stage, uncertain=False)
-    child_env = None
-    if sys.platform.startswith("linux") and not os.environ.get("XDG_RUNTIME_DIR") and not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
-        rt_dir = linux_user_runtime_dir()
-        if rt_dir is not None:
-            child_env = {"XDG_RUNTIME_DIR": rt_dir}
-    return exe, child_env
-
-
-def _manager(command, *, stage, prepared=None):
     from .process import bounded_run
-    exe, child_env = prepared if prepared is not None else _resolve_manager_call(command, stage=stage)
+    from .service_host import linux_user_runtime_dir
+    try:
+        exe = which_native(command[0]) if os.name != "nt" else command[0]
+        if exe is None:
+            raise ServiceHostError("manager_operation_failed", stage=stage, uncertain=False)
+        child_env = None
+        if sys.platform.startswith("linux") and not os.environ.get("XDG_RUNTIME_DIR") and not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+            rt_dir = linux_user_runtime_dir()
+            if rt_dir is not None:
+                child_env = {"XDG_RUNTIME_DIR": rt_dir}
+    except ServiceHostError:
+        raise
+    except BaseException as exc:
+        try:
+            exc.mindie_execution = "not_started"
+        except AttributeError:
+            pass
+        raise
     try:
         return bounded_run([exe, *command[1:]], "", timeout=30, max_output=LIMIT, child_env=child_env).strip()
     except Exception as exc:
@@ -399,20 +403,19 @@ def _start(root, record, config):
     require_active(record["config"], config)
     if (root / (record["attempt"] + ".claimed")).exists():
         raise ServiceHostError("launch_attempt_already_consumed", stage="reconcile", uncertain=True)
+    _write(root / "operation.json", dict(attempt=record["attempt"], phase="starting"))
     command = ["systemd-run", "--user", "--no-ask-password", "--quiet", "--expand-environment=no",
                "--unit=" + record["label"], "--description=" + _description(root / "launch.json")]
     command.extend("--property=" + key + "=" + value for key, value in _PROPERTIES.items())
     command.extend(["--", record["python"], *record["args"]])
     try:
-        prepared = _resolve_manager_call(command, stage="start")
-    except BaseException:
-        _mark_start_failed_before_spawn(root, record)
-        raise
-    _write(root / "operation.json", dict(attempt=record["attempt"], phase="starting"))
-    try:
-        _manager(command, stage="start", prepared=prepared)
+        _manager(command, stage="start")
     except ServiceHostError as exc:
         if not exc.uncertain:
+            _mark_start_failed_before_spawn(root, record)
+        raise
+    except BaseException as exc:
+        if getattr(exc, "mindie_execution", None) == "not_started":
             _mark_start_failed_before_spawn(root, record)
         raise
     try:
