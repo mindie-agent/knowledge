@@ -31,6 +31,7 @@ def publish(tmp_path, files, *, domain="vllm-ascend", materialize=True):
     git(repo, 'config', 'user.email', 'check@example.invalid')
     git(repo, 'config', 'core.autocrlf', 'false')
     git(repo, 'config', 'core.eol', 'lf')
+    git(repo, 'config', 'core.longpaths', 'true')
     stream = bytearray()
     marks = []
     for mark, (name, text) in enumerate(files.items(), 1):

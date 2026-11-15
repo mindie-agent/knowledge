@@ -13,9 +13,10 @@ from urllib.parse import quote
 
 
 def _windows_extended(path):
-    path = ntpath.normpath(path)
+    logical = _windows_logical(path)
+    path = ntpath.normpath(logical if logical != path else path)
     if path.startswith("\\\\?\\"):
-        return path
+        return path.replace("/", "\\")
     if path.startswith("\\\\"):
         return "\\\\?\\UNC\\" + path[2:]
     return "\\\\?\\" + path

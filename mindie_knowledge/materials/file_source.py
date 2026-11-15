@@ -16,18 +16,21 @@ import hashlib
 import os
 from pathlib import Path
 import stat
-from mindie_knowledge.filesystem import _windows_extended
+from mindie_knowledge.filesystem import _windows_extended, _windows_logical
 from mindie_knowledge.loop.documents import MAX_FILE_BYTES
 
 
 def _io_path(path) -> str:
     raw = os.fspath(path)
     if os.name == 'nt':
-        return _windows_extended(os.path.abspath(raw))
+        return _windows_extended(os.path.abspath(_windows_logical(raw)))
     return raw
 
 
 def _within_root(real_path: str, real_root: str) -> bool:
+    if os.name == 'nt':
+        real_path = _windows_logical(real_path)
+        real_root = _windows_logical(real_root)
     try:
         return os.path.commonpath([real_path, real_root]) == real_root
     except ValueError:
@@ -179,6 +182,11 @@ class FileContents(Mapping):
         root_str = _io_path(root)
         real_root = os.path.realpath(root_str)
         return cls({
-            path: FileText(os.path.join(root_str, path), root=root_str, metadata={'path': path}, _real_root=real_root)
+            path: FileText(
+                os.path.join(root_str, path.replace('/', os.sep) if os.sep != '/' else path),
+                root=root_str,
+                metadata={'path': path},
+                _real_root=real_root,
+            )
             for path in paths
         })

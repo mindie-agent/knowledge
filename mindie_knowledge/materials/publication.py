@@ -21,7 +21,8 @@ from pathlib import Path
 
 from mindie_knowledge.community.batch import check_path
 from mindie_knowledge.community.common import MAX_FILE_BYTES, canonical
-from .file_source import FileText
+from mindie_knowledge.filesystem import filesystem_path
+from .file_source import FileText, _io_path
 
 STAGING_SCHEMA = "mindie-staged-contribution/1"
 
@@ -39,7 +40,7 @@ def staging_path(root: Path, batch_id: str, revision: str) -> Path:
         raise ValueError("invalid staged batch identity")
     if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{64}", revision):
         raise ValueError("invalid staged batch revision")
-    return Path(root) / "outbox" / "staging" / batch_id / revision
+    return filesystem_path(root) / "outbox" / "staging" / batch_id / revision
 
 
 def metadata_only(batch: dict) -> dict:
@@ -64,7 +65,7 @@ def freeze_batch(root: Path, batch: dict) -> dict:
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=".freeze-", dir=target.parent))
     try:
-        files_root = os.path.join(os.fspath(temporary), "files")
+        files_root = _io_path(temporary / "files")
         created_dirs: set[str] = set()
         for item in batch["files"]:
             path = check_path(item["path"])
@@ -82,7 +83,8 @@ def freeze_batch(root: Path, batch: dict) -> dict:
                 raw = content.encode("utf-8")
                 if len(raw) > MAX_FILE_BYTES or hashlib.sha256(raw).hexdigest() != item["sha256"]:
                     raise ValueError(f"contribution file identity mismatch: {path}")
-            dest = os.path.join(files_root, path)
+            rel_path = path.replace("/", os.sep) if os.sep != "/" else path
+            dest = os.path.join(files_root, rel_path)
             parent = os.path.dirname(dest)
             if parent not in created_dirs:
                 os.makedirs(parent, exist_ok=True)
@@ -124,18 +126,23 @@ def load_batch_payload(root, row: dict) -> dict:
     manifest = json.loads((target / "manifest.json").read_text(encoding="utf-8"))
     if manifest != {"schema": STAGING_SCHEMA, "batch": descriptor}:
         raise ValueError("staged contribution manifest differs from its outbox receipt")
-    real_target = os.path.realpath(target)
+    target_io = _io_path(target)
+    real_target = os.path.realpath(target_io)
     rst = os.stat(real_target) if os.path.exists(real_target) else None
     rid = (rst.st_dev, rst.st_ino) if rst is not None else None
-    files_dir = os.path.join(os.fspath(target), "files")
+    files_dir = os.path.join(target_io, "files")
     result = dict(descriptor, files=[])
     for item in descriptor["files"]:
         path = check_path(item["path"])
         if item.get("delete") is True:
             result["files"].append(dict(item, content=None))
             continue
-        file_str = os.path.join(files_dir, path)
-        source = FileText(file_str, root=target, sha256=item['sha256'], metadata=item, _real_root=real_target, _root_id=rid)
+        rel_path = path.replace("/", os.sep) if os.sep != "/" else path
+        file_str = os.path.join(files_dir, rel_path)
+        source = FileText(
+            file_str, root=target_io, sha256=item['sha256'], metadata=item,
+            _real_root=real_target, _root_id=rid,
+        )
         try:
             source.read_verified_bytes().decode("utf-8")  # Validate immediately and again on every later use.
         except (FileNotFoundError, NotADirectoryError, IsADirectoryError):

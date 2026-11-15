@@ -537,8 +537,9 @@ class MaterialStore:
     def export_task(self, task_id, source="draft", revision=None, *, streaming=False):
         header = self._header(task_id, revision, source)
         if streaming:
-            from .file_source import FileContents, FileText
-            root, real = self._task_root(task_id), os.path.realpath(self._task_root(task_id))
+            from .file_source import FileContents, FileText, _io_path
+            root = self._task_root(task_id)
+            real = os.path.realpath(_io_path(root))
             rst = os.stat(real) if os.path.exists(real) else None
             rid = (rst.st_dev, rst.st_ino) if rst is not None else None
             files = {'index.md': FileText(self._manifest_path(task_id, header['entry']['revision']), root=root, metadata={'path': 'index.md'}, _real_root=real, _root_id=rid)}

@@ -32,6 +32,7 @@ def init_repo(path):
     git("config", "user.email", "test@example.com")
     git("config", "core.autocrlf", "false")
     git("config", "core.eol", "lf")
+    git("config", "core.longpaths", "true")
     return git
 
 

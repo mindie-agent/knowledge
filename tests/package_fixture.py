@@ -2,13 +2,20 @@
 import atexit
 import copy
 import json
+import os
 from pathlib import Path
 import tempfile
 
+from mindie_knowledge.filesystem import filesystem_path
 from mindie_knowledge.materials import MaterialStore
 from mindie_knowledge.loop.documents import FIELDS
 
-_PACKAGE_TMP = tempfile.TemporaryDirectory(prefix="mindie-test-package-")
+_RUNNER_TMP = os.environ.get("RUNNER_TEMP", "").strip()
+_PACKAGE_TMP = tempfile.TemporaryDirectory(
+    prefix="mk-pkg-",
+    dir=_RUNNER_TMP if _RUNNER_TMP and Path(_RUNNER_TMP).is_dir() else None,
+    ignore_cleanup_errors=True,
+)
 atexit.register(_PACKAGE_TMP.cleanup)
 _PACKAGE_CACHE: dict[str, tuple[dict, dict]] = {}
 _STORE_SEQ = 0
@@ -42,7 +49,7 @@ def install_documents(store, docs, *, feed_ident, source_revision=None):
 
 
 def write_package(repo, package):
-    root = Path(repo) / "tasks" / package["task_id"]
+    root = filesystem_path(repo) / "tasks" / package["task_id"]
     for relative, text in package["files"].items():
         target = root / relative
         target.parent.mkdir(parents=True, exist_ok=True)

@@ -56,6 +56,12 @@ def _safe_mkdtemp_parent():
         if arg == "--basetemp" and idx + 1 < len(sys.argv):
             basetemp = Path(sys.argv[idx + 1]).expanduser().resolve()
             break
+    if os.name == "nt":
+        runner_tmp = os.environ.get("RUNNER_TEMP", "").strip()
+        if runner_tmp:
+            rt = Path(runner_tmp).expanduser().resolve()
+            if rt.is_dir() and (basetemp is None or (rt != basetemp and basetemp not in rt.parents)):
+                return str(rt)
     tmpdir = Path(tempfile.gettempdir()).expanduser().resolve()
     if basetemp is not None and (tmpdir == basetemp or basetemp in tmpdir.parents):
         parent = basetemp.parent
@@ -104,15 +110,15 @@ _explicit_root = os.environ.get("_MINDIE_KNOWLEDGE_BASE_TEST_ROOT") or os.enviro
 if _explicit_root:
     _base_root = Path(_explicit_root).expanduser().resolve()
 else:
-    _base_root = Path(tempfile.mkdtemp(prefix="mindie-knowledge-test-", dir=_safe_mkdtemp_parent()))
+    _base_root = Path(tempfile.mkdtemp(prefix="mk-iso-", dir=_safe_mkdtemp_parent()))
 os.environ["_MINDIE_KNOWLEDGE_BASE_TEST_ROOT"] = str(_base_root)
 _xdist_worker = os.environ.get("PYTEST_XDIST_WORKER", "").strip()
 if _xdist_worker:
     _prev_worker_pid = os.environ.get("_MINDIE_TEST_WORKER_PID", "")
     if _prev_worker_pid and _prev_worker_pid != str(os.getpid()):
-        ISOLATION_ROOT = Path(tempfile.mkdtemp(prefix=f"sub-{_xdist_worker}-", dir=_base_root))
+        ISOLATION_ROOT = Path(tempfile.mkdtemp(prefix=f"s-{_xdist_worker}-", dir=_base_root))
     else:
-        ISOLATION_ROOT = _base_root / f"worker-{_xdist_worker}"
+        ISOLATION_ROOT = _base_root / _xdist_worker
     os.environ["_MINDIE_TEST_WORKER_PID"] = str(os.getpid())
 else:
     ISOLATION_ROOT = _base_root
@@ -245,13 +251,36 @@ def lifecycle_tests_use_explicit_process_backend(request, monkeypatch):
     monkeypatch.setattr(backend, "request_start", direct_test_service)
 
 
+_AUTO_BASETEMP_ROOT: Path | None = None
+
+
 def pytest_sessionfinish(session, exitstatus):
     """Leave no synthetic diagnostics tree behind, even after a failed run."""
     import shutil
+    import stat
+
     shutil.rmtree(_TEST_DIAGNOSTICS_ROOT, ignore_errors=True)
+    if _AUTO_BASETEMP_ROOT is not None:
+        def _writable(func, target, _exc):
+            try:
+                os.chmod(target, stat.S_IWRITE)
+                func(target)
+            except TimeoutError:
+                raise
+            except OSError:
+                pass
+
+        shutil.rmtree(_AUTO_BASETEMP_ROOT, onerror=_writable)
 
 
+@pytest.hookimpl(tryfirst=True)
 def pytest_configure(config):
+    global _AUTO_BASETEMP_ROOT
+    if os.name == "nt" and not config.option.basetemp and not hasattr(config, "workerinput"):
+        runner_tmp = os.environ.get("RUNNER_TEMP", "").strip()
+        short_parent = runner_tmp if runner_tmp and Path(runner_tmp).is_dir() else None
+        _AUTO_BASETEMP_ROOT = Path(tempfile.mkdtemp(prefix="mkb-", dir=short_parent))
+        config.option.basetemp = str(_AUTO_BASETEMP_ROOT / "bt")
     config.addinivalue_line("markers", "benchmark: large payload throughput benchmark")
     config.addinivalue_line("markers", "live_npu: requires standing A2/A3 SSH access")
     if _FIXTURE_ERRORS:
