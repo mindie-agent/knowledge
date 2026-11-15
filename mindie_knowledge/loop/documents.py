@@ -199,17 +199,30 @@ def render_entry(doc: dict) -> str:
     return f"---\n{frontmatter}---\n\n{doc['content'].strip()}\n"
 
 
-class _UniqueKeyLoader(yaml.SafeLoader):
+class _UniqueKeyLoader(
+    yaml.CSafeLoader if getattr(yaml, "__with_libyaml__", False) else yaml.SafeLoader
+):
     """Safe YAML loader that rejects duplicate mapping keys outright."""
 
-    def construct_mapping(self, node, deep=False):
-        mapping = {}
-        for key_node, value_node in node.value:
-            key = self.construct_object(key_node, deep=True)
-            if key in mapping:
-                raise ValueError(f"duplicate YAML key {key!r}")
-            mapping[key] = self.construct_object(value_node, deep=True)
-        return mapping
+
+def _construct_unique_mapping(loader, node, deep=False):
+    if not isinstance(node, yaml.MappingNode):
+        raise yaml.constructor.ConstructorError(
+            None, None, f"expected a mapping node, but found {node.id}", node.start_mark
+        )
+    mapping = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=True)
+        if key in mapping:
+            raise ValueError(f"duplicate YAML key {key!r}")
+        mapping[key] = loader.construct_object(value_node, deep=True)
+    return mapping
+
+
+_UniqueKeyLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
 
 
 def parse_entry(markdown) -> dict:

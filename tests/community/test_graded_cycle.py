@@ -1,4 +1,4 @@
-"""Synthetic C5/C6 lifecycle through real Git and the FileTransport API boundary.
+"""Synthetic graded-unit lifecycle through real Git and the FileTransport API boundary.
 
 The native subprocess is a protocol fixture, not a paid model or NPU result.
 No real corpus or GitHub repository is touched.
@@ -106,7 +106,7 @@ def test_c6_outbox_git_feed_feedback_update_and_withdrawal(tmp_path, settings, s
         producer_feed.sync(force=True)
         assert producer.query("graph", conditions={"soc": "Ascend910B"})["results"][0]["feedback"]["up"] == 1
 
-        # A reviewed correction of the same evidence goes through C6 admission
+        # A reviewed correction of the same evidence goes through graded admission
         # and the identical outbox/publisher. The original paid call is untouched.
         req = prepare_request(selected, session_digest="d" * 64, task_state="completed",
                               redactor_executable=scanner(), redaction_key=producer.redaction_key())

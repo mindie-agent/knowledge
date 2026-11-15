@@ -1,4 +1,4 @@
-"""[Role] Install C5 units into the existing domain store and resolve references.
+"""[Role] Install graded knowledge units into the domain store and resolve references.
 
 [Invariants] SQLite selects one validated graded corpus. Existing task data is
 preserved; a removed unit is unreadable even through an earlier pinned ref.
@@ -54,7 +54,7 @@ class GradedRepository:
         return json.loads(Path(report["manifest"]).read_text(encoding="utf-8"))
 
     def validate_corpus(self):
-        """Return the C5/C8 validity report without writing any file."""
+        """Return the graded-unit and routing-index validity report without writing any file."""
         from .maintenance import load_corpus
         units, index, errors = load_corpus(self._corpus_root())
         tiers = {tier: sum(1 for unit in units if unit.metadata["tier"] == tier)
@@ -80,7 +80,7 @@ class GradedRepository:
         value = json.loads(raw)
         if value.get("schema") != "mindie-graded-catalog/1":
             raise ValueError("graded catalog schema mismatch")
-        # Earlier local C5 installations are local candidates, never implicit
+        # Earlier local graded-unit installations remain local candidates, never implicit
         # consent or evidence that any public feed has switched formats.
         value.setdefault("local", value.get("units", []))
         value.setdefault("feeds", {})
@@ -137,7 +137,7 @@ class GradedRepository:
     def install(self, units, *, source_identity="local-reviewed-units", generation=None, admitted_ids=None):
         """Install a reviewed local snapshot; publication needs its own grant.
 
-        The optional generation is supplied only by the admitted, redacted C6
+        The optional generation is supplied only by the admitted, redacted distillation
         path. Merely importing Markdown never authorizes outbound publication.
         """
         incoming = RoutingIndex(units)
@@ -580,7 +580,7 @@ def build_manifest(root, *, index_dir=None):
 
 
 def validate_corpus(root):
-    """Convenience wrapper for a non-writing C5/C8 corpus check."""
+    """Convenience wrapper for a non-mutating graded-corpus and routing check."""
     return GradedRepository(root).validate_corpus()
 
 

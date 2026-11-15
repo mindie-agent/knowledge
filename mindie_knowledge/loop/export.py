@@ -27,7 +27,7 @@ class ExportContentError(ValueError):
 
 
 class DistillationRequired(ValueError):
-    """Retained material drafts need explicit C6 admission for a graded target."""
+    """Retained material drafts require explicit distillation admission for a graded target."""
 
 
 class ExportQuarantinedError(ExportContentError):
@@ -134,9 +134,10 @@ def build_batch(store, *, settings, revision_fn=None):
     if target["feed_ident"] in store.graded._catalog()["feeds"]:
         raise DistillationRequired(
             f"{len(drafts)} local material drafts remain retained; this publication target uses graded units. "
-            "Select their evidence through C6 before publication; no legacy batch was frozen.")
+            "Distill their authorized evidence through knowledge_distill before publication; no legacy batch was frozen.")
     files, kept, source_revisions, rejections = [], [], {}, []
     total = 0
+    need_grouping_budget = len(drafts) > 1 or bool(votes)
     for doc in sorted(drafts, key=lambda item: item["entry_id"]):
         try:
             task_files = _task_files(store, doc, source_revisions=source_revisions, target=target)
@@ -146,13 +147,14 @@ def build_batch(store, *, settings, revision_fn=None):
             continue
         # Preserve the grouping envelope while encoding only one file at a
         # time. A long task never becomes one giant JSON allocation.
-        size = 2 + max(0, len(task_files) - 1) + sum(
-            len(canonical(dict(file)).encode('utf-8')) for file in task_files)
-        if kept and total + size > MAX_BATCH_BYTES:
-            continue  # whole task remains pending; never publish half a package
+        if need_grouping_budget:
+            size = 2 + max(0, len(task_files) - 1) + sum(
+                len(canonical(dict(file)).encode('utf-8')) for file in task_files)
+            if kept and total + size > MAX_BATCH_BYTES:
+                continue  # whole task remains pending; never publish half a package
+            total += size
         files.extend(task_files)
         kept.append(doc)
-        total += size
     if votes:
         content = canonical(_vote_payload(votes)) + "\n"
         vote_file = dict(path=f"feedback/votes-{lineage[6:]}.json", content=content,
@@ -178,7 +180,8 @@ def build_batch(store, *, settings, revision_fn=None):
         batch = dict(schema="mindie-contribution/1", batch_id=lineage, revision=revision,
                      domain=store.domain, base_commit=base_commit, entry_refs=refs, files=files,
                      summary=f"{store.domain}: {len(kept)} task packages, {len(votes)} votes"[:240])
-        validate_batch(batch)
+        entry_revisions = {doc["entry_id"]: doc["revision"] for doc in kept}
+        validate_batch(batch, _trusted_task_revisions=entry_revisions)
         descriptor = freeze_batch(store.root, batch)
         batch = load_batch_payload(store.root, descriptor)
         entry_ids = [doc["entry_id"] for doc in kept]
@@ -186,7 +189,7 @@ def build_batch(store, *, settings, revision_fn=None):
         store.create_batch(batch_id=lineage, revision=revision, batch=descriptor,
                            entry_ids=entry_ids, vote_keys=vote_keys, generation=settings.generation,
                            source_revisions={ident: source_revisions[ident] for ident in entry_ids},
-                           entry_revisions={doc["entry_id"]: doc["revision"] for doc in kept},
+                           entry_revisions=entry_revisions,
                            publication_target=target)
     except CleanupReceiptError:
         # The replacement is already durable and pending. Its local cleanup

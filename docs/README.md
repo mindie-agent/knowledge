@@ -2,7 +2,7 @@
 
 **中文** | [English](README.en.md) · [返回仓库首页](../README.md)
 
-欢迎来到 `mindie-knowledge`（`mindie-agent/knowledge`）文档中心！这里的所有文档均已采用清晰、直观的工程语言编写，帮助你快速理解**领域知识闭环是如何运转的**、**隐私脱敏是如何做到闭锁防漏的**，以及**跨平台后台服务与子进程是如何安全管理的**。
+欢迎来到 `mindie-knowledge`（`mindie-agent/knowledge`）文档中心！这里的所有文档均采用清晰、直观的工程语言编写，帮助你快速理解**领域知识闭环是如何运转的**、**隐私脱敏是如何做到闭锁防漏的**，以及**跨平台后台服务与子进程是如何安全管理的**。
 
 ---
 
@@ -29,7 +29,7 @@ flowchart LR
 | **[公开对话采集与增量索引](public-transcript-capture.zh.md)** | **[Public Transcript Capture](public-transcript-capture.md)** | 如何从宿主 Transcript 中只提取公开可见消息、通过 Gitleaks + `r3` 脱敏切分为 16 KiB 无损分块，并调用小模型增量生成导航摘要。 |
 | **[显式历史会话导入](history-import.zh.md)** | **[Historical Transcript Import](history-import.md)** | 当你想把以前跑过的某次排障会话导入知识库时，`import_transcript` 如何做前缀校验、断点续导以及与远端修订衔接。 |
 | **[社区共享与发件箱对账](community-sharing.zh.md)** | **[Community Sharing](community-sharing.md)** | 贡献者侧 `mindie_knowledge.community` 如何隔离 GitHub 凭据、幂等提交 `mindie-contribution/1` 批次，以及在网络超时后通过只读查询对账。 |
-| **[仓库审核 Bot 规范](repository-bot-contract.zh.md)** | **[Repository Bot Contract](repository-bot-contract.md)** | `mindie-content-review/2` 规范：维护者侧审核 Bot 如何结合零信任 CI 检查、做有限脱敏修正、自动合入纯内容 PR 以及处理撤下请求。 |
+| **[仓库审核 Bot 规范](repository-bot-contract.zh.md)** | **[Repository Bot Contract](repository-bot-contract.md)** | `mindie-content-review/2` 规范：维护者侧审核应用如何结合零信任 CI 检查、做有限脱敏修正、自动合入纯内容 PR 以及处理撤下请求。 |
 
 ---
 
@@ -41,7 +41,7 @@ flowchart LR
 | --- | --- | --- |
 | **[版本兼容、组件更新与跨平台文件锁](release-compatibility.zh.md)** | **[Release Compatibility & Locks](release-compatibility.md)** | `mindie-plugin-release.json` 宿主版本区间选择、8 个官方组件的独立 GitHub Release 发现与并排 `uv` 运行时构建（`component_runtime` / `runtime_inventory`），以及 POSIX/Windows 共享/排他文件锁。 |
 | **[服务与单次操作生命周期](service-process-lifetime.zh.md)** | **[Service & Attempt Lifetime](service-process-lifetime.md)** | Windows 计划任务、Linux `systemd`（254+）与 macOS `owner-pipe` 如何实现后台服务与模型子进程树的跨平台容器化隔离。 |
-| **[摘要进程与临时目录回收](summary-process-ownership.zh.md)** | **[Summary Process Ownership](summary-process-ownership.md)** | `MINDIE_SUMMARY_SCRATCH` 内部契约：为什么必须严格遵循“先持久化结果 -> 再关停进程树 -> 最后删除临时目录”的三步顺序。 |
+| **[摘要进程与临时目录回收](summary-process-ownership.zh.md)** | **[Summary Process Ownership](summary-process-ownership.md)** | `MINDIE_SUMMARY_SCRATCH` 内部契约：为什么必须严格遵循“先持久化结果 -> 关停进程树 -> 排空并关闭管道 -> 删除私有临时目录”的四步顺序。 |
 | **[Windows 知识服务宿主](windows-service-host.zh.md)** | **[Windows Service Host](windows-service-host.md)** | 原生 Windows 下如何用 Task Scheduler COM 接口 + DPAPI 一次性加密上下文，让后台知识服务跨越短生命周期的 Hook 进程安全存活。 |
 | **[Windows 进程树强归属](windows-process-ownership.zh.md)** | **[Windows Process Ownership](windows-process-ownership.md)** | `spawn_owned` 如何通过挂起创建（`CREATE_SUSPENDED`）+ `KILL_ON_JOB_CLOSE` Job Object 彻底解决 Windows 孙进程逃逸与管道挂死问题。 |
-| **[框架稳定性与验证边界](framework-stability.zh.md)** | **[Framework Stability](framework-stability.md)** | 生产解析器夹具隔离、ReMe 派生索引重建、Windows 允许删除共享（Delete-Sharing）的原子重命名配置读写，以及测试与实机验收的边界。 |
+| **[框架稳定性与验证边界](framework-stability.zh.md)** | **[Framework Stability](framework-stability.md)** | 生产解析器夹具隔离、ReMe 派生索引重建、Windows 原子重命名配置读写，以及组件测试与实机验收的边界。 |

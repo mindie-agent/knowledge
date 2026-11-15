@@ -1,4 +1,4 @@
-"""[Role] Validate the full C5 Git projection inside the existing publisher.
+"""[Role] Validate the full graded-unit Git projection inside the community publisher.
 
 [Invariants] Current remote bytes are authoritative. Stable IDs cannot split
 across paths, withdrawn ancestors cannot be retained implicitly, and content

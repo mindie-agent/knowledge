@@ -1,0 +1,79 @@
+{
+  "closure": {
+    "unit-vllm-ascend-parallel-ep-knee-eplb-and-xpyd-workflow": []
+  },
+  "federation": {
+    "corpus": {
+      "automatic": false,
+      "bytes": 7507,
+      "estimated_tokens": 1426,
+      "kind": "federation",
+      "path": ".",
+      "unit_ids": [
+        "unit-vllm-ascend-parallel-ep-knee-eplb-and-xpyd-workflow"
+      ],
+      "units": 1
+    },
+    "domains": [
+      {
+        "automatic": false,
+        "bytes": 7507,
+        "estimated_tokens": 1426,
+        "exceeds": [],
+        "kind": "federation",
+        "path": "parallelism",
+        "recommended_action": "review_federation_boundary",
+        "unit_ids": [
+          "unit-vllm-ascend-parallel-ep-knee-eplb-and-xpyd-workflow"
+        ],
+        "units": 1
+      }
+    ]
+  },
+  "index_build_elapsed_ms": 0.9374590590596199,
+  "leaves": [
+    {
+      "automatic": false,
+      "bytes": 7507,
+      "estimated_tokens": 1426,
+      "exceeds": [],
+      "kind": "leaf",
+      "path": "parallelism/ep-knee-eplb-xpyd",
+      "recommended_action": "review_leaf_split",
+      "unit_ids": [
+        "unit-vllm-ascend-parallel-ep-knee-eplb-and-xpyd-workflow"
+      ],
+      "units": 1
+    }
+  ],
+  "schema": "mindie-shard-topology/1",
+  "two_level_subtrees": [
+    {
+      "automatic": false,
+      "bytes": 7507,
+      "estimated_tokens": 1426,
+      "exceeds": [],
+      "kind": "subtree",
+      "path": "parallelism/ep-knee-eplb-xpyd",
+      "recommended_action": "review_two_level_subtree_split",
+      "unit_ids": [
+        "unit-vllm-ascend-parallel-ep-knee-eplb-and-xpyd-workflow"
+      ],
+      "units": 1
+    }
+  ],
+  "unit_count": 1,
+  "units": {
+    "unit-vllm-ascend-parallel-ep-knee-eplb-and-xpyd-workflow": {
+      "bytes": 7507,
+      "category": "workflow",
+      "content_sha256": "af749eb3a14901a1647c7b774ded332a21cced5b27d1e65b4f8c8e375548b0a0",
+      "domain_path": "parallelism/ep-knee-eplb-xpyd",
+      "estimated_tokens": 1426,
+      "evidence_strength": "hypothesis",
+      "inherits_from": [],
+      "path": "parallelism/ep-knee-eplb-xpyd/unit-vllm-ascend-parallel-ep-knee-eplb-and-xpyd-workflow.md",
+      "tier": "L3"
+    }
+  }
+}

@@ -169,7 +169,9 @@ def batch_revision(files: list[Mapping[str, Any]], domain: str, base_commit: str
     )
 
 
-def validate_batch(batch: Any) -> dict[str, Any]:
+def validate_batch(
+    batch: Any, *, _trusted_task_revisions: Mapping[str, str] | None = None
+) -> dict[str, Any]:
     if not isinstance(batch, Mapping):
         raise CommunityError("batch must be an object")
     if batch.get("schema") != SCHEMA_BATCH:
@@ -205,10 +207,10 @@ def validate_batch(batch: Any) -> dict[str, Any]:
         if path in seen_paths:
             raise CommunityError(f"duplicate path {path!r}")
         seen_paths.add(path)
-        content = item.get("content")
         if "delete" in item and item["delete"] is not True:
             raise CommunityError(f"{path}: delete must be true when present")
         if item.get("delete") is True:
+            content = item.get("content")
             from ..graded.contribution import is_unit_path
             if not is_unit_path(path) and (not path.startswith("tasks/") or path.endswith("/index.md")):
                 raise CommunityError("only superseded task block files can be deleted by a contribution")
@@ -220,9 +222,20 @@ def validate_batch(batch: Any) -> dict[str, Any]:
             checked_files.append(dict(path=path, content=None, sha256=None,
                                       base_sha256=base_sha, delete=True))
             continue
-        if not isinstance(content, str):
-            raise CommunityError(f"{path}: content must be a UTF-8 string")
-        raw = content.encode("utf-8")
+        if isinstance(item, FileText):
+            raw = item.read_verified_bytes()
+            content = raw.decode("utf-8")
+            sha = item.get("sha256")
+            if not isinstance(sha, str) or sha != item._digest:
+                raise CommunityError(f"{path}: sha256 does not match content")
+        else:
+            content = item.get("content")
+            if not isinstance(content, str):
+                raise CommunityError(f"{path}: content must be a UTF-8 string")
+            raw = content.encode("utf-8")
+            sha = item.get("sha256")
+            if not isinstance(sha, str) or sha != sha256_text(content):
+                raise CommunityError(f"{path}: sha256 does not match content")
         if len(raw) > MAX_FILE_BYTES:
             raise CommunityError(f"{path}: exceeds the per-file platform envelope")
         total += len(raw)
@@ -231,9 +244,6 @@ def validate_batch(batch: Any) -> dict[str, Any]:
             # The grouping budget may be exceeded by one platform-legal task.
             if not one_package:
                 raise CommunityError("batch exceeds the per-flush grouping budget")
-        sha = item.get("sha256")
-        if not isinstance(sha, str) or sha != sha256_text(content):
-            raise CommunityError(f"{path}: sha256 does not match content")
         base_sha = item.get("base_sha256")
         if base_sha is not None and (not isinstance(base_sha, str) or len(base_sha) != 64):
             raise CommunityError(f"{path}: base_sha256 must be null or a sha256 digest")
@@ -262,6 +272,13 @@ def validate_batch(batch: Any) -> dict[str, Any]:
     if task_files:
         from mindie_knowledge.materials import validate_package_files
         for task_id, package_files in task_files.items():
+            if _trusted_task_revisions is not None and task_id in _trusted_task_revisions:
+                trusted_rev = _trusted_task_revisions[task_id]
+                task_revisions[task_id] = trusted_rev
+                expected_ref = f"mindie://{domain}/{task_id}@{trusted_rev}"
+                if expected_ref not in entry_refs:
+                    raise CommunityError("task package requires its exact revision reference")
+                continue
             try:
                 package = validate_package_files(FileContents(package_files), domain)
             except ValueError as exc:

@@ -1,18 +1,37 @@
 """Small real material-package helpers for mechanism tests, without models."""
-from contextlib import closing
+import atexit
+import copy
+import json
 from pathlib import Path
 import tempfile
 
 from mindie_knowledge.materials import MaterialStore
 from mindie_knowledge.loop.documents import FIELDS
 
+_PACKAGE_TMP = tempfile.TemporaryDirectory(prefix="mindie-test-package-")
+atexit.register(_PACKAGE_TMP.cleanup)
+_PACKAGE_CACHE: dict[str, tuple[dict, dict]] = {}
+_STORE_SEQ = 0
+
 
 def package_for(doc):
     """Bind a manual test document to its actual Markdown package identity."""
-    with tempfile.TemporaryDirectory(prefix="mindie-test-package-") as directory, \
-            closing(MaterialStore(Path(directory), doc["domain"])) as store:
-        bound = store.put_document({key: doc[key] for key in FIELDS})
+    global _STORE_SEQ
+    payload = {key: doc[key] for key in FIELDS}
+    cache_key = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    hit = _PACKAGE_CACHE.get(cache_key)
+    if hit is not None:
+        bound, package = hit
+        doc.update(copy.deepcopy(bound))
+        return copy.deepcopy(package)
+    _STORE_SEQ += 1
+    store = MaterialStore(Path(_PACKAGE_TMP.name) / str(_STORE_SEQ), doc["domain"])
+    try:
+        bound = store.put_document(payload)
         package = store.export_task(doc["entry_id"], revision=bound["revision"])
+    finally:
+        store.close()
+    _PACKAGE_CACHE[cache_key] = (copy.deepcopy(bound), copy.deepcopy(package))
     doc.update(bound)
     return package
 

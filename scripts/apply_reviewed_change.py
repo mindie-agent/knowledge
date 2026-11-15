@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""[Role] Apply a complete authored and reviewed C5 change through the runtime.
+"""[Role] Apply a complete authored and reviewed graded-unit change through the runtime.
 [Invariants] No automatic semantic acceptance; exact base generation is required.
 [Timeouts & Locks] Local file operations only; the reviewer owns the checkout.
 [Side-Effect Policy] Changes the selected units and index only when --apply is set.

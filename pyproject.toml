@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mindie-knowledge"
-version = "0.13.18"
+version = "0.13.19"
 description = "Local knowledge and experience loop: bounded capture, optional community sharing, Git-published retrieval"
 readme = "README.md"
 license = "MIT"
@@ -23,7 +23,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8,<10", "jsonschema>=4,<5"]
+test = ["pytest>=8,<10", "pytest-xdist>=3.5,<4", "jsonschema>=4,<5"]
 
 [project.scripts]
 mindie-knowledge = "mindie_knowledge.loop.cli:main"

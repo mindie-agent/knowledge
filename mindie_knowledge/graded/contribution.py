@@ -1,4 +1,4 @@
-"""[Role] Validate C5 files inside the existing contribution envelope.
+"""[Role] Validate mindie-graded-unit/1 files inside the contribution envelope.
 
 [Invariants] A contribution binds exact unit bytes and observed semantic refs.
 Contract/1 and contract/2 payloads never mix. The publisher validates the full

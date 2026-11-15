@@ -1,4 +1,4 @@
-"""Wave 7 RSI closure, stagnation, exploration-context and gate contracts."""
+"""RSI closure, stagnation, exploration-context, and gate contracts."""
 from __future__ import annotations
 
 import json

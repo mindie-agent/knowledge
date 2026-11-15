@@ -68,16 +68,65 @@ def _source(value):
     return value
 
 
+_FAST_SAFE_DUMPER = getattr(yaml, "CSafeDumper", None)
+
+
+def _is_ascii_tree(value) -> bool:
+    if isinstance(value, str):
+        return value.isascii()
+    if isinstance(value, dict):
+        return all(isinstance(k, str) and k.isascii() and _is_ascii_tree(v) for k, v in value.items())
+    if isinstance(value, (list, tuple)):
+        return all(_is_ascii_tree(item) for item in value)
+    return True
+
+
+def _fast_block_frontmatter(block_id, source_range) -> str | None:
+    if (
+        type(source_range) is dict
+        and len(source_range) == 1
+        and "part" in source_range
+        and type(source_range["part"]) is int
+        and isinstance(block_id, str)
+        and _HEX.fullmatch(block_id) is not None
+        and any(ch in "abcdf" for ch in block_id)
+    ):
+        return f"block_id: {block_id}\nschema: {BLOCK_SCHEMA}\nsource_range:\n  part: {source_range['part']}\n"
+    return None
+
+
+def _dump_header(header):
+    if (
+        isinstance(header, dict)
+        and len(header) == len(("schema", "block_id", "source_range"))
+        and header.get("schema") == BLOCK_SCHEMA
+        and "block_id" in header
+        and "source_range" in header
+    ):
+        fast_fm = _fast_block_frontmatter(header["block_id"], header["source_range"])
+        if fast_fm is not None:
+            return fast_fm
+    if _FAST_SAFE_DUMPER is not None and _is_ascii_tree(header):
+        return yaml.dump(
+            header,
+            Dumper=_FAST_SAFE_DUMPER,
+            sort_keys=True,
+            allow_unicode=True,
+            width=documents.MAX_FILE_BYTES,
+        )
+    return yaml.safe_dump(header, sort_keys=True, allow_unicode=True, width=documents.MAX_FILE_BYTES)
+
+
 def _render(header, body):
-    return "---\n" + yaml.safe_dump(header, sort_keys=True, allow_unicode=True, width=10**6) + "---\n\n" + body
+    return "---\n" + _dump_header(header) + "---\n\n" + body
 
 
 def _parse(text):
     if not isinstance(text, str) or not text.startswith("---\n") or "\n---\n\n" not in text:
         raise ValueError("material file requires canonical YAML frontmatter")
-    raw, body = text[4:].split("\n---\n\n", 1)
+    raw, body = text.removeprefix("---\n").split("\n---\n\n", 1)
     header = yaml.load(raw, Loader=documents._UniqueKeyLoader)
-    if not isinstance(header, dict) or _render(header, body) != text:
+    if not isinstance(header, dict) or _dump_header(header) != raw + "\n":
         raise ValueError("material file is not canonical Markdown")
     return header, body
 
@@ -161,10 +210,15 @@ def _validate_manifest(header, body, domain=None):
 def _parse_block(text, descriptor):
     if _sha(text) != descriptor["sha256"]:
         raise ValueError("material block hash mismatch")
-    header, body = _parse(text)
-    expected = dict(schema=BLOCK_SCHEMA, block_id=descriptor["block_id"], source_range=descriptor["source_range"])
-    if header != expected:
-        raise ValueError("material block header differs from task descriptor")
+    fast_fm = _fast_block_frontmatter(descriptor["block_id"], descriptor["source_range"])
+    prefix = ("---\n" + fast_fm + "---\n\n") if fast_fm is not None else None
+    if prefix is not None and isinstance(text, str) and text.startswith(prefix):
+        body = text[len(prefix):]
+    else:
+        header, body = _parse(text)
+        expected = dict(schema=BLOCK_SCHEMA, block_id=descriptor["block_id"], source_range=descriptor["source_range"])
+        if header != expected:
+            raise ValueError("material block header differs from task descriptor")
     if not body or len(body.encode("utf-8")) > MAX_BLOCK_BYTES:
         raise ValueError("material block body is empty or exceeds its byte envelope")
     return body

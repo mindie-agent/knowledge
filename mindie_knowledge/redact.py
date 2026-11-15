@@ -43,7 +43,14 @@ from mindie_knowledge.redact_rules import (
     RULE_IDS,
     RULES,
     Rule,
+    ascii_digit_window,
 )
+
+
+_BUILTIN_ALLOW_REGEXES: tuple["re.Pattern[str]", ...] = tuple(
+    re.compile(p, re.IGNORECASE) for p in BUILTIN_ALLOW_PATTERNS
+)
+_PLACEHOLDER_RE = re.compile(r"<redacted:[a-z0-9-]+:[0-9a-f]{12}>")
 
 
 class Allowlist:
@@ -51,9 +58,7 @@ class Allowlist:
 
     def __init__(self, terms: Iterable[str] = (), patterns: Iterable[str] = ()):
         self.terms: set[str] = set(BUILTIN_ALLOWLIST)
-        self.patterns: list["re.Pattern[str]"] = [
-            re.compile(p, re.IGNORECASE) for p in BUILTIN_ALLOW_PATTERNS
-        ]
+        self.patterns: list["re.Pattern[str]"] = list(_BUILTIN_ALLOW_REGEXES)
         for term in terms:
             self.add(term)
         for pat in patterns:
@@ -116,22 +121,36 @@ class Finding:
         return f"{where}: [{self.rule}] {shown} — {self.hint}"
 
 
+_DEFAULT_ALLOWLIST = Allowlist()
+
+
 def scan_text(text: str, allow: Allowlist | None = None, path: str = "<text>",
               *, include_overlaps: bool = False) -> list[Finding]:
     """Report disjoint findings, or every claim for source-side union redaction."""
-    allow = allow or Allowlist()
+    if allow is None:
+        allow = _DEFAULT_ALLOWLIST
     findings: list[Finding] = []
     claimed: list[tuple[int, int]] = []
-    placeholders = [m.span() for m in re.finditer(
-        r"<redacted:[a-z0-9-]+:[0-9a-f]{12}>", text)]
+    lower_text = text.lower()
+    dwin = ascii_digit_window(text)
+    digit_text = text if dwin is None else text[:dwin]
+    digit_lower = lower_text if dwin is None else lower_text[:dwin]
+    placeholders = (
+        [m.span() for m in _PLACEHOLDER_RE.finditer(text)]
+        if "<redacted:" in text
+        else []
+    )
     for rule in RULES:
+        rtext, rlow = (digit_text, digit_lower) if rule.digit_bounded else (text, lower_text)
+        if not rtext:
+            continue
         # Each built-in finder yields disjoint spans in source order. Merge
         # its claims once, instead of comparing every match to every earlier
         # match (quadratic for a long public conversation with many hosts).
         added = []
         cursor = 0
         placeholder_cursor = 0
-        for start, end in rule.spans(text):
+        for start, end in rule.spans(rtext, rlow):
             if start == end:
                 continue
             while (placeholder_cursor < len(placeholders)
@@ -160,13 +179,15 @@ def scan_text(text: str, allow: Allowlist | None = None, path: str = "<text>",
                     end=end,
                 )
             )
-        claimed = list(heapq.merge(claimed, added))
+        if added:
+            claimed = list(heapq.merge(claimed, added)) if claimed else added
     return findings
 
 
 def scan_tree(tree: Any, allow: Allowlist | None = None, path: tuple[Any, ...] = ()) -> list[Finding]:
     """Scan every string in a parsed YAML/JSON tree, keys included."""
-    allow = allow or Allowlist()
+    if allow is None:
+        allow = _DEFAULT_ALLOWLIST
     out: list[Finding] = []
     if isinstance(tree, Mapping):
         for key, value in tree.items():

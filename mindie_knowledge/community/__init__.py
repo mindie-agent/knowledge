@@ -1,15 +1,15 @@
 """MindIE community sharing: deterministic contributor-side publication.
 
-Public API for the knowledge core:
-
-- :func:`submit_batch` — publish one validated contribution batch.
-- :func:`reconcile_batch` — bounded read-only reconciliation of one batch.
-
-Repository-side review and optional Skill proposals are the EXTERNAL Grok
-Bot software's operations under maintainer deployment (see
-``docs/repository-bot-contract.md``); this package ships no bot runtime, no
-model bridge and no scheduler. ``skill_validation`` offers deterministic
-data-only checks for Skill package bytes.
+[Role]
+Export contributor-side batch publication (`submit_batch`), reconciliation
+(`reconcile_batch`), and inspection (`inspect_batch`) entrypoints.
+[Invariants]
+Ships no repository-side bot runtime, model bridge, or background scheduler;
+all community batch payloads pass redaction and schema validation before export.
+[Timeouts & Locks]
+Import-time re-exports only; operational timeouts live in `.publish`.
+[Side-Effect Policy]
+Side-effect-free package initialization.
 """
 
 from .publish import inspect_batch, reconcile_batch, submit_batch

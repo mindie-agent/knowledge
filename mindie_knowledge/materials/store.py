@@ -538,12 +538,13 @@ class MaterialStore:
         header = self._header(task_id, revision, source)
         if streaming:
             from .file_source import FileContents, FileText
-            files = {'index.md': FileText(self._manifest_path(task_id, header['entry']['revision']),
-                                         root=self._task_root(task_id), metadata={'path': 'index.md'})}
+            root, real = self._task_root(task_id), os.path.realpath(self._task_root(task_id))
+            rst = os.stat(real) if os.path.exists(real) else None
+            rid = (rst.st_dev, rst.st_ino) if rst is not None else None
+            files = {'index.md': FileText(self._manifest_path(task_id, header['entry']['revision']), root=root, metadata={'path': 'index.md'}, _real_root=real, _root_id=rid)}
             for block in header['blocks']:
                 path = f"blocks/{block['block_id']}.md"
-                files[path] = FileText(self._task_root(task_id) / path, root=self._task_root(task_id),
-                                       sha256=block['sha256'], metadata={'path': path})
+                files[path] = FileText(root / path, root=root, sha256=block['sha256'], metadata={'path': path}, _real_root=real, _root_id=rid)
             return validate_package_files(FileContents(files), self.domain)
         files = {"index.md": self._manifest_path(task_id, header["entry"]["revision"]).read_bytes().decode("utf-8")}
         for block in header["blocks"]:

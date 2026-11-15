@@ -1,6 +1,6 @@
 """[Role] Read one exact publication-contract/2 Git snapshot as ordinary graded Markdown.
 
-[Invariants] The contract/2 tree is authoritative only through parsed C5 units.
+[Invariants] The contract/2 tree is authoritative only through parsed graded units.
 Derived routing files are validated data, never executable authority. All paths
 are normalized repository-relative paths; a unit path is exactly
 ``<domain_path>/<unit_id>.md``. A complete inherited graph, every stable ID, the

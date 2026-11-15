@@ -1,0 +1,135 @@
+{
+  "closure": {
+    "unit-cann9-steady-state-capture-and-clock-hygiene": [],
+    "unit-mindie-sim-capture-diff-trace-attribution-workflow": [
+      "unit-cann9-steady-state-capture-and-clock-hygiene"
+    ]
+  },
+  "federation": {
+    "corpus": {
+      "automatic": false,
+      "bytes": 9444,
+      "estimated_tokens": 1521,
+      "kind": "federation",
+      "path": ".",
+      "unit_ids": [
+        "unit-cann9-steady-state-capture-and-clock-hygiene",
+        "unit-mindie-sim-capture-diff-trace-attribution-workflow"
+      ],
+      "units": 2
+    },
+    "domains": [
+      {
+        "automatic": false,
+        "bytes": 4206,
+        "estimated_tokens": 641,
+        "exceeds": [],
+        "kind": "federation",
+        "path": "measurement",
+        "recommended_action": "review_federation_boundary",
+        "unit_ids": [
+          "unit-cann9-steady-state-capture-and-clock-hygiene"
+        ],
+        "units": 1
+      },
+      {
+        "automatic": false,
+        "bytes": 5238,
+        "estimated_tokens": 880,
+        "exceeds": [],
+        "kind": "federation",
+        "path": "modeling",
+        "recommended_action": "review_federation_boundary",
+        "unit_ids": [
+          "unit-mindie-sim-capture-diff-trace-attribution-workflow"
+        ],
+        "units": 1
+      }
+    ]
+  },
+  "index_build_elapsed_ms": 1.4901249669492245,
+  "leaves": [
+    {
+      "automatic": false,
+      "bytes": 4206,
+      "estimated_tokens": 641,
+      "exceeds": [],
+      "kind": "leaf",
+      "path": "measurement/steady-state/cann9",
+      "recommended_action": "review_leaf_split",
+      "unit_ids": [
+        "unit-cann9-steady-state-capture-and-clock-hygiene"
+      ],
+      "units": 1
+    },
+    {
+      "automatic": false,
+      "bytes": 5238,
+      "estimated_tokens": 880,
+      "exceeds": [],
+      "kind": "leaf",
+      "path": "modeling/capture-diff-trace",
+      "recommended_action": "review_leaf_split",
+      "unit_ids": [
+        "unit-mindie-sim-capture-diff-trace-attribution-workflow"
+      ],
+      "units": 1
+    }
+  ],
+  "schema": "mindie-shard-topology/1",
+  "two_level_subtrees": [
+    {
+      "automatic": false,
+      "bytes": 4206,
+      "estimated_tokens": 641,
+      "exceeds": [],
+      "kind": "subtree",
+      "path": "measurement/steady-state",
+      "recommended_action": "review_two_level_subtree_split",
+      "unit_ids": [
+        "unit-cann9-steady-state-capture-and-clock-hygiene"
+      ],
+      "units": 1
+    },
+    {
+      "automatic": false,
+      "bytes": 5238,
+      "estimated_tokens": 880,
+      "exceeds": [],
+      "kind": "subtree",
+      "path": "modeling/capture-diff-trace",
+      "recommended_action": "review_two_level_subtree_split",
+      "unit_ids": [
+        "unit-mindie-sim-capture-diff-trace-attribution-workflow"
+      ],
+      "units": 1
+    }
+  ],
+  "unit_count": 2,
+  "units": {
+    "unit-cann9-steady-state-capture-and-clock-hygiene": {
+      "bytes": 4206,
+      "category": "measurement",
+      "content_sha256": "a9d03a9b2e6462ad1234478c209ea4fc33400532862e3c0fc6a0755eca9a7221",
+      "domain_path": "measurement/steady-state/cann9",
+      "estimated_tokens": 641,
+      "evidence_strength": "hardware_spec",
+      "inherits_from": [],
+      "path": "measurement/steady-state/cann9/unit-cann9-steady-state-capture-and-clock-hygiene.md",
+      "tier": "L1"
+    },
+    "unit-mindie-sim-capture-diff-trace-attribution-workflow": {
+      "bytes": 5238,
+      "category": "workflow",
+      "content_sha256": "748c0362a0b640c99c0fc83dfc9ac02d048a06bf1f1eac32a258178e566de042",
+      "domain_path": "modeling/capture-diff-trace",
+      "estimated_tokens": 880,
+      "evidence_strength": "hypothesis",
+      "inherits_from": [
+        "unit-cann9-steady-state-capture-and-clock-hygiene"
+      ],
+      "path": "modeling/capture-diff-trace/unit-mindie-sim-capture-diff-trace-attribution-workflow.md",
+      "tier": "L3"
+    }
+  }
+}

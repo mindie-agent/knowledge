@@ -1,0 +1,306 @@
+{
+  "build_elapsed_ms": 2.7870829217135906,
+  "closure": {
+    "unit-ascend-day0-vector-fusion-mlapo-prefetch-multistream-mutator": [
+      "unit-vllm-ascend-hbm-memory-hidden-assassins-axioms"
+    ],
+    "unit-vllm-ascend-hbm-memory-hidden-assassins-axioms": [],
+    "unit-vllm-ascend-launch-to-sol-and-counterfactual-sop": [
+      "unit-vllm-ascend-hbm-memory-hidden-assassins-axioms"
+    ],
+    "unit-vllm-ascend-mlapo-prefetch-ablation-protocol": [
+      "unit-vllm-ascend-hbm-memory-hidden-assassins-axioms"
+    ]
+  },
+  "generation": "55271274e3883eff48cf5266063c93b716cd9d13d3086a169c8995dbd149ce21",
+  "id_path": {
+    "unit-ascend-day0-vector-fusion-mlapo-prefetch-multistream-mutator": "vllm-ascend/day0-graph/mla-prolog-prefetch/unit-ascend-day0-vector-fusion-mlapo-prefetch-multistream-mutator.md",
+    "unit-vllm-ascend-hbm-memory-hidden-assassins-axioms": "_common/unit-vllm-ascend-hbm-memory-hidden-assassins-axioms.md",
+    "unit-vllm-ascend-launch-to-sol-and-counterfactual-sop": "vllm-ascend/performance-modeling/launch-to-sol/unit-vllm-ascend-launch-to-sol-and-counterfactual-sop.md",
+    "unit-vllm-ascend-mlapo-prefetch-ablation-protocol": "vllm-ascend/performance-modeling/mlapo-ablation/unit-vllm-ascend-mlapo-prefetch-ablation-protocol.md"
+  },
+  "query_budget_excludes_build": true,
+  "schema_version": "mindie-routing-manifest/1",
+  "token_estimator": "utf8_bytes_div_4_ceiling",
+  "unit_count": 4,
+  "units": [
+    {
+      "category": "mutator",
+      "conditions": {
+        "accelerator": "ascend",
+        "cann": ">=9.0,<10",
+        "execution_mode": "aclgraph",
+        "framework": [
+          "vllm-ascend>=0.10,<0.12"
+        ],
+        "model_family": [
+          "deepseek-v3",
+          "deepseek-v4"
+        ],
+        "soc": [
+          "Ascend910B",
+          "Ascend910B4",
+          "Ascend910_93",
+          "Ascend950"
+        ],
+        "workload_phase": "decode"
+      },
+      "domain_path": "vllm-ascend/day0-graph/mla-prolog-prefetch",
+      "evidence_strength": "hypothesis",
+      "id": "unit-ascend-day0-vector-fusion-mlapo-prefetch-multistream-mutator",
+      "inherits_from": [
+        "unit-vllm-ascend-hbm-memory-hidden-assassins-axioms"
+      ],
+      "inherits_from_closure": [
+        "unit-vllm-ascend-hbm-memory-hidden-assassins-axioms"
+      ],
+      "path": "vllm-ascend/day0-graph/mla-prolog-prefetch/unit-ascend-day0-vector-fusion-mlapo-prefetch-multistream-mutator.md",
+      "provenance": {
+        "evidence_refs": [
+          "vllm-project/vllm-ascend@175ef4d49c2072f9233619636f0309f4f88b4e2c:vllm_ascend/attention/mla_v1.py"
+        ],
+        "experiment_status": "not_run_source_only",
+        "source_digest": "21a310549545013b3d2e57deac73aae7db06cb80f31236d7a9d38067bbcd4f96",
+        "source_locator": "vllm-project/vllm-ascend@175ef4d49c2072f9233619636f0309f4f88b4e2c:vllm_ascend/attention/mla_v1.py",
+        "source_type": "source_only_optimization_hypothesis",
+        "supersedes": []
+      },
+      "revision": 3,
+      "tier": "L4",
+      "title": "Day-0 MLAPO vector fusion, static-weight prefetch, and multi-stream mutator",
+      "token_estimate": 330,
+      "triggers": {
+        "error_signatures": [
+          "MLA prolog decode is launch-bound with separate RmsNorm, DynamicQuant, RoPE, and Cast kernels",
+          "vector fusion exceeds the AIV UB budget or silently drops an external live-out",
+          "prefetch regresses prefill because HBM is already saturated",
+          "multi-stream overlap of Vector and Cube is slower than one stream under shared HBM"
+        ],
+        "keywords": [
+          "MLAPO",
+          "mla_preprocess_only_decode",
+          "wd_qkv",
+          "wu_q",
+          "static weight prefetch",
+          "C_prefetch",
+          "AIV UB fusion",
+          "external live-out",
+          "Cube prologue epilogue absorption",
+          "multi-stream overlap",
+          "leave-one-out ablation"
+        ]
+      }
+    },
+    {
+      "category": "axiom",
+      "conditions": {
+        "accelerator": "ascend",
+        "cann": ">=9.0,<10",
+        "deployment": [
+          "colocated",
+          "pd_disaggregated"
+        ],
+        "execution_mode": "aclgraph",
+        "framework": [
+          "vllm-ascend>=0.10,<0.12"
+        ],
+        "soc": [
+          "Ascend910B",
+          "Ascend910B4",
+          "Ascend910_93",
+          "Ascend950"
+        ],
+        "workload_phase": [
+          "decode",
+          "prefill"
+        ]
+      },
+      "domain_path": "_common",
+      "evidence_strength": "hardware_spec",
+      "id": "unit-vllm-ascend-hbm-memory-hidden-assassins-axioms",
+      "inherits_from": [],
+      "inherits_from_closure": [],
+      "path": "_common/unit-vllm-ascend-hbm-memory-hidden-assassins-axioms.md",
+      "provenance": {
+        "evidence_refs": [
+          "vllm-project/vllm-ascend@175ef4d49c2072f9233619636f0309f4f88b4e2c:vllm_ascend/compilation/acl_graph.py",
+          "next-release-design@2026-11-14:v2-pillars-4-to-7-design.md#15.1"
+        ],
+        "source_digest": "b13492d8f117f7c7bcf3721f849f273c7c3ea890ae4cd022640b8280af9538a2",
+        "source_locator": "vllm-project/vllm-ascend@175ef4d49c2072f9233619636f0309f4f88b4e2c:vllm_ascend/compilation/acl_graph.py",
+        "source_type": "allocator_and_graph_pool_contract"
+      },
+      "revision": 2,
+      "tier": "L1",
+      "title": "HBM ledger for vLLM-Ascend — owned storage, half-open lifetimes, and peak",
+      "token_estimate": 664,
+      "triggers": {
+        "error_signatures": [
+          "NPU out of memory immediately after increasing EP or enabling EPLB",
+          "profile_run passes but the first real prefill or MTP step OOMs",
+          "npu-smi shows large reserved memory that is neither weights nor KV cache",
+          "HCCL_BUFFSIZE is too small or MoeDistributeDispatchV3 tiling fails at large EP",
+          "ACLGraph capture OOMs only when several capture buckets are enabled"
+        ],
+        "keywords": [
+          "HBM ledger",
+          "storage_id",
+          "lifetime",
+          "HCCL_BUFFSIZE",
+          "MC2 arena",
+          "EPLB redundant experts",
+          "MTP draft weights",
+          "paged KV cache",
+          "index_k",
+          "recurrent state",
+          "ACLGraph pool",
+          "graph_pool_handle",
+          "workspace",
+          "memory_reserved"
+        ]
+      }
+    },
+    {
+      "category": "sop",
+      "conditions": {
+        "accelerator": "ascend",
+        "cann": ">=9.0,<10",
+        "deployment": [
+          "colocated",
+          "pd_disaggregated"
+        ],
+        "execution_mode": "aclgraph",
+        "framework": [
+          "vllm-ascend>=0.10,<0.12"
+        ],
+        "model_family": [
+          "deepseek-v3",
+          "deepseek-v4"
+        ],
+        "soc": [
+          "Ascend910B",
+          "Ascend910B4",
+          "Ascend910_93",
+          "Ascend950"
+        ],
+        "workload_phase": [
+          "prefill",
+          "decode"
+        ]
+      },
+      "domain_path": "vllm-ascend/performance-modeling/launch-to-sol",
+      "evidence_strength": "hypothesis",
+      "id": "unit-vllm-ascend-launch-to-sol-and-counterfactual-sop",
+      "inherits_from": [
+        "unit-vllm-ascend-hbm-memory-hidden-assassins-axioms"
+      ],
+      "inherits_from_closure": [
+        "unit-vllm-ascend-hbm-memory-hidden-assassins-axioms"
+      ],
+      "path": "vllm-ascend/performance-modeling/launch-to-sol/unit-vllm-ascend-launch-to-sol-and-counterfactual-sop.md",
+      "provenance": {
+        "evidence_refs": [
+          "nr_s1_launch_sol@worktree-snapshot-20261114:mindie_sim/feature_reports.py"
+        ],
+        "source_digest": "6f7b7424d88920ed3dfb539f635dbc4d3d01cc36b0fae744856b99318854c1f9",
+        "source_locator": "nr_s1_launch_sol@worktree-snapshot-20261114:mindie_sim/feature_reports.py",
+        "source_type": "simulator_cli_and_report_contract"
+      },
+      "revision": 7,
+      "tier": "L2",
+      "title": "Launch-to-SOL and feature deltas with gated mindie-sim surfaces",
+      "token_estimate": 927,
+      "triggers": {
+        "error_signatures": [
+          "inspect-launch reports an unsupported flag instead of silently defaulting it",
+          "both enable_dsa_cp and pcp_size are set on a sparse-attention launch",
+          "sol predicts a host bound while the capture shows a cube-bound step",
+          "feature deltas are multiplied although counterfactuals_additive is false"
+        ],
+        "keywords": [
+          "mindie-sim inspect-launch",
+          "mindie-sim sol",
+          "feature-deltas",
+          "launch-to-sol",
+          "counterfactual",
+          "mrv2",
+          "pcp_size",
+          "dcp_size",
+          "enable_dsa_cp",
+          "all2all_backend",
+          "compilation_config",
+          "roofline"
+        ]
+      }
+    },
+    {
+      "category": "workflow",
+      "conditions": {
+        "accelerator": "ascend",
+        "cann": ">=9.0,<10",
+        "execution_mode": "aclgraph",
+        "framework": [
+          "vllm-ascend>=0.10,<0.12"
+        ],
+        "model_family": [
+          "deepseek-v3",
+          "deepseek-v4"
+        ],
+        "soc": [
+          "Ascend910B",
+          "Ascend910B4",
+          "Ascend910_93",
+          "Ascend950"
+        ],
+        "workload_phase": "decode"
+      },
+      "domain_path": "vllm-ascend/performance-modeling/mlapo-ablation",
+      "evidence_strength": "hypothesis",
+      "id": "unit-vllm-ascend-mlapo-prefetch-ablation-protocol",
+      "inherits_from": [
+        "unit-vllm-ascend-hbm-memory-hidden-assassins-axioms"
+      ],
+      "inherits_from_closure": [
+        "unit-vllm-ascend-hbm-memory-hidden-assassins-axioms"
+      ],
+      "path": "vllm-ascend/performance-modeling/mlapo-ablation/unit-vllm-ascend-mlapo-prefetch-ablation-protocol.md",
+      "provenance": {
+        "evidence_refs": [
+          "vllm-project/vllm-ascend@175ef4d49c2072f9233619636f0309f4f88b4e2c:vllm_ascend/device/device_op.py",
+          "vllm-project/vllm-ascend@175ef4d49c2072f9233619636f0309f4f88b4e2c:vllm_ascend/attention/mla_v1.py",
+          "knowledge@d5c7f01718bd508906d0eef1227b43697fa77912:mindie_knowledge/graded/ablation.py"
+        ],
+        "experiment_status": "not_run_source_only",
+        "source_digest": "21a310549545013b3d2e57deac73aae7db06cb80f31236d7a9d38067bbcd4f96",
+        "source_locator": "vllm-project/vllm-ascend@175ef4d49c2072f9233619636f0309f4f88b4e2c:vllm_ascend/attention/mla_v1.py",
+        "source_type": "source_only_optimization_verification_protocol"
+      },
+      "revision": 3,
+      "tier": "L3",
+      "title": "MLAPO prefetch and multi-stream promotion protocol — seven-arm ablation receipt",
+      "token_estimate": 1053,
+      "triggers": {
+        "error_signatures": [
+          "four-factor candidate table has only three leave-one-out arms",
+          "interaction is dropped because one factor is noisy in isolation",
+          "prefetch gain is claimed without residency or foreground non-regression evidence",
+          "final combination is promoted without a baseline-bound receipt"
+        ],
+        "keywords": [
+          "seven-arm ablation",
+          "baseline",
+          "full_candidate",
+          "minus_A",
+          "minus_B",
+          "minus_C",
+          "minus_D",
+          "final_combination",
+          "ablation receipt",
+          "prefetch residency",
+          "foreground non-regression",
+          "experiment ledger"
+        ]
+      }
+    }
+  ]
+}

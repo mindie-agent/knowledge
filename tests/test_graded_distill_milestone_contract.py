@@ -1,4 +1,4 @@
-"""Behavioral C6 in-flight milestone contract through the real organizer request.
+"""Behavioral graded-distillation in-flight milestone contract through the real organizer request.
 
 The organizer used here is a deterministic subprocess. It consumes the real
 prepared worker request, validates it with the shared runtime, builds the real

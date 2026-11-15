@@ -1,6 +1,6 @@
-"""[Role] Review and route the C5 graded corpus without rewriting its claims.
+"""[Role] Validate, route, and maintain graded knowledge corpora without rewriting claims.
 
-[Invariants] GradedUnit owns C5 parsing; RoutingIndex owns C8 closure. Mechanical
+[Invariants] GradedUnit owns unit parsing; RoutingIndex owns shard/inheritance closure. Mechanical
 duplication requires identical body, conditions, tier/category and evidence
 strength. Provenance variants remain distinct evidence. Trigger similarity is
 review-only. A reviewed move updates only path metadata, retaining stable ID,
@@ -55,7 +55,7 @@ def _sha(value: object) -> str:
 
 
 def load_corpus(root: Path | str) -> tuple[list[GradedUnit], RoutingIndex | None, list[dict]]:
-    """Use the C5 scanner/index; the first invalid unit is a visible error."""
+    """Scan and index graded units; surface the first invalid unit immediately."""
     try:
         units = read_units(Path(root))
     except TimeoutError:
@@ -610,7 +610,7 @@ def validate_repository(root: Path | str) -> dict:
 
 
 def lint_corpus(root: Path | str) -> dict:
-    """Validate C5/C8 and report review candidates without writing anything."""
+    """Validate graded units and routing indexes and report review candidates read-only."""
     units, index, errors = load_corpus(root)
     duplicates = mechanical_duplicates(units)
     reviews = semantic_merge_reviews(units)
@@ -739,7 +739,7 @@ def build_routing_index_main(argv: list[str] | None = None) -> int:
 
 
 def lint_main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Lint C5/C8 graded knowledge and report review candidates.")
+    parser = argparse.ArgumentParser(description="Lint graded knowledge units, routing manifests, and review candidates.")
     parser.add_argument("--root", default=".", help="corpus root (default: current directory)")
     args = parser.parse_args(argv)
     report = lint_corpus(args.root)

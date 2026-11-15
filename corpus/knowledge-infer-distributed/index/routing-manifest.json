@@ -1,0 +1,89 @@
+{
+  "build_elapsed_ms": 0.9374590590596199,
+  "closure": {
+    "unit-vllm-ascend-parallel-ep-knee-eplb-and-xpyd-workflow": []
+  },
+  "generation": "7adf19d5c581461c53df19d584d027651408ac1428c14da156926bc5690bd2f6",
+  "id_path": {
+    "unit-vllm-ascend-parallel-ep-knee-eplb-and-xpyd-workflow": "parallelism/ep-knee-eplb-xpyd/unit-vllm-ascend-parallel-ep-knee-eplb-and-xpyd-workflow.md"
+  },
+  "query_budget_excludes_build": true,
+  "schema_version": "mindie-routing-manifest/1",
+  "token_estimator": "utf8_bytes_div_4_ceiling",
+  "unit_count": 1,
+  "units": [
+    {
+      "category": "workflow",
+      "conditions": {
+        "accelerator": "ascend",
+        "cann": ">=9.0,<10",
+        "decode_cp_plan": "dcp",
+        "deployment": "pd_disaggregated",
+        "execution_mode": "aclgraph",
+        "framework": [
+          "vllm-ascend>=0.10,<0.12"
+        ],
+        "hbm_ledger_checked": true,
+        "parallel_plan": {
+          "dcp": 4,
+          "dp": 2,
+          "ep": 16,
+          "pcp": 2,
+          "pp": 1,
+          "tp": 8
+        },
+        "prefill_cp_plan": "pcp",
+        "runtime_capability": "mrv2_pcp",
+        "soc": [
+          "Ascend910_93",
+          "Ascend950"
+        ],
+        "topology": "a3_superpod",
+        "workload_phase": "decode"
+      },
+      "domain_path": "parallelism/ep-knee-eplb-xpyd",
+      "evidence_strength": "hypothesis",
+      "id": "unit-vllm-ascend-parallel-ep-knee-eplb-and-xpyd-workflow",
+      "inherits_from": [],
+      "inherits_from_closure": [],
+      "path": "parallelism/ep-knee-eplb-xpyd/unit-vllm-ascend-parallel-ep-knee-eplb-and-xpyd-workflow.md",
+      "provenance": {
+        "evidence_refs": [
+          "next-release-design@2026-11-14:v2-pillars-4-to-7-design.md#13",
+          "vllm-project/vllm-ascend@175ef4d49c2072f9233619636f0309f4f88b4e2c:docs/source/developer_guide/Design_Documents/context_parallel.md"
+        ],
+        "source_digest": "6077d6a1f70cc9cce0abb55b01a1c4a6367516e9bae36973011c4cbefe306ad4",
+        "source_locator": "next-release-design@2026-11-14:v2-pillars-4-to-7-design.md#13",
+        "source_type": "analytical_parallelism_and_serving_model"
+      },
+      "revision": 4,
+      "tier": "L3",
+      "title": "Joint DP/TP/EP/PCP/DCP feasibility, EP knee, EPLB, MTP, and xPyD sizing",
+      "token_estimate": 1426,
+      "triggers": {
+        "error_signatures": [
+          "EP64 decode latency is worse than EP32 even though per-rank expert compute fell",
+          "CombineV3 waits on one rank while all ranks moved the same bytes",
+          "enabling EPLB adds HBM and rebalance jitter without improving P99 TPOT",
+          "MTP improves TPOT at small batch but regresses at large batch",
+          "disaggregated P99 TPOT jitter correlates with KV transfer traffic"
+        ],
+        "keywords": [
+          "EP knee",
+          "EPLB",
+          "num_redundant_experts",
+          "routing skew",
+          "eta_skew",
+          "xPyD",
+          "PCP",
+          "DCP",
+          "DSA-CP",
+          "MTP crossover",
+          "goodput",
+          "expert-byte amortization",
+          "fabric-probe"
+        ]
+      }
+    }
+  ]
+}

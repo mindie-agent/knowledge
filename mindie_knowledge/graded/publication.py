@@ -1,7 +1,7 @@
-"""[Role] Prepare a deterministic, inspectable local publication proposal from a C6 distillation decision.
+"""[Role] Prepare a deterministic, inspectable local publication proposal from a distillation decision.
 
 [Invariants]
-- A decision is untrusted data. Every proposed unit is revalidated as C5, its mirrored
+- A decision is untrusted data. Every proposed unit is revalidated as GradedUnit, its mirrored
   target fields and stable IDs are checked, and the complete proposed corpus must build
   a fresh RoutingIndex without duplicate IDs/paths or inheritance cycles.
 - ``create`` never overwrites a current unit, ``merge_into_existing`` never rewrites a
@@ -63,7 +63,7 @@ LIMITATIONS = (
 
 
 class PublicationError(ValueError):
-    """A C6 decision cannot be prepared as a safe local proposal."""
+    """A distillation decision cannot be prepared as a safe local proposal."""
 
     code = "graded_publication_rejected"
 
@@ -217,11 +217,11 @@ def _parse_unit(entry: dict, path: str) -> GradedUnit:
         unit = GradedUnit.from_parts(_frontmatter(entry), compacted_body, path)
         check_impact_completeness(unit.metadata, unit.body)
     except (TypeError, ValueError) as exc:
-        # C5 messages describe structural expectations and never echo a value.
+        # Validation messages describe structural expectations and never echo raw values.
         reason = str(exc)
         if len(reason) > 240 or not re.fullmatch(r"[A-Za-z0-9 .,;:()/'_+=>-]+", reason):
             reason = "structural validation failed"
-        _fail(f"proposed unit failed C5 validation: {reason}", getattr(exc, "unit_id", None))
+        _fail(f"proposed unit failed graded-unit validation: {reason}", getattr(exc, "unit_id", None))
     if not UNIT_ID.fullmatch(unit.id):
         _fail("proposed unit id is not an exact stable unit identifier")
     return unit
@@ -278,7 +278,7 @@ def _merged_unit(target: GradedUnit, proposed: GradedUnit, path: str) -> GradedU
         revision = target.revision + (target.content_sha256 != merged.content_sha256)
         return GradedUnit.from_parts({**merged.metadata, "revision": revision}, merged.body, path)
     except (TypeError, ValueError):
-        _fail("merged unit failed C5 validation after provenance preservation")
+        _fail("merged unit failed graded-unit validation after provenance preservation")
 
 
 def _scan_proposed(units: list[GradedUnit], drop_reason: str) -> None:
@@ -453,7 +453,7 @@ def _prepare_units(decision: dict, index: RoutingIndex) -> tuple[list, list, lis
         seen_targets.add(target_id)
         target = index.units.get(target_id)
         if target is None:
-            _fail(f"target_unit_id {target_id} does not name a current C5 unit")
+            _fail(f"target_unit_id {target_id} does not name a current graded unit")
 
         if operation == "propose_semantic_merge_review":
             reviews.append(_review_entry(
@@ -476,7 +476,7 @@ def _prepare_units(decision: dict, index: RoutingIndex) -> tuple[list, list, lis
             ("evidence_strength", "evidence_strength"),
         ):
             if unit.metadata[metadata_field] != target.metadata[metadata_field]:
-                _fail(f"{decision_field} must match the existing C5 target unit")
+                _fail(f"{decision_field} must match the existing graded target unit")
 
         reasons = []
         if not _same_conditions(unit.metadata["conditions"], target.metadata["conditions"]):
@@ -507,7 +507,7 @@ def _prepare_units(decision: dict, index: RoutingIndex) -> tuple[list, list, lis
 
 def prepare_decision(decision: dict, index: RoutingIndex, *,
                      authorized_publication: bool = False) -> PublicationProposal:
-    """Prepare a local C6 publication proposal without writing anywhere.
+    """Prepare a local graded-unit publication proposal without writing anywhere.
 
     ``authorized_publication`` records local operator authorization only. It never
     sets ``ready_for_publication`` and never implies gitleaks or remote consent.

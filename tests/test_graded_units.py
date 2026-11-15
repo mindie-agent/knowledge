@@ -1,4 +1,4 @@
-"""Core C5/C6/C8 semantics, using only in-memory synthetic protocol values."""
+"""Core graded-unit schema, distillation, and maintenance semantics on synthetic values."""
 from copy import deepcopy
 import re
 
@@ -279,8 +279,8 @@ def test_model_schema_rejects_native_invalid_tier_uses_without_weakening_admissi
         proposed = decision(req, unit(tier=tier, category=category, evidence_strength="reproduced_empirical"))
         validator.validate(proposed)
         validate_decision(proposed, req)
-    # These two pairings were returned by the real DSH G3 organizer. The
-    # model-facing schema must reject them just as the C5 parser already does.
+    # These two pairings were returned by an external organizer. The
+    # model-facing schema must reject them just as the graded-unit parser already does.
     for tier, category in (("L3", "mutator"), ("L2", "measurement")):
         proposed = decision(req)
         proposed["units"][0].update(target_tier=tier, category=category)

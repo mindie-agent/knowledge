@@ -202,7 +202,7 @@ def _json_object(text, path):
 
 
 def _scan_graded_unit(unit, path):
-    """Scan C5 metadata and body; a recognized Git locator is not SSH text."""
+    """Scan graded-unit metadata and body; a recognized Git locator is not SSH text."""
     from .graded.privacy import metadata_findings
     findings = [*metadata_findings(unit.metadata, path), *scan_text(unit.body, path=path)]
     if findings:
@@ -210,7 +210,7 @@ def _scan_graded_unit(unit, path):
 
 
 def _scan_graded_json(value, path):
-    """Scan derived JSON while accepting the same C5 Git locators as units."""
+    """Scan derived routing JSON while accepting the same provenance Git locators as units."""
     from .graded.privacy import metadata_findings
     if metadata_findings(value, path):
         raise ValueError(f'{path}: public data fails the privacy scan')

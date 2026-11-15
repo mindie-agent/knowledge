@@ -92,11 +92,13 @@ def _resolve_git_env(env: Mapping[str, str] | None) -> dict[str, str]:
     """
     if env:
         selected = dict(os.environ, **env)
+        selected.setdefault("EMAIL", "mindie-community-bot@localhost.invalid")
         return ensure_git_on_path(with_windows_longpaths(selected))
     pairs = [(_GIT_BASE[f"GIT_CONFIG_KEY_{index}"], _GIT_BASE[f"GIT_CONFIG_VALUE_{index}"])
              for index in range(int(_GIT_BASE["GIT_CONFIG_COUNT"]))]
     selected = scoped_git_environment(pairs)
     selected.update({key: value for key, value in _GIT_BASE.items() if not key.startswith("GIT_CONFIG_")})
+    selected.setdefault("EMAIL", "mindie-community-bot@localhost.invalid")
     return ensure_git_on_path(selected)
 
 

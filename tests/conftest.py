@@ -1,9 +1,10 @@
-"""Shared pytest fixtures for the knowledge loop test-suite.
+"""[Role] Shared pytest fixtures and host-isolation setup for the knowledge test-suite.
 
-Isolation is applied at import, before product modules resolve ``Path.home``
-or the diagnostics policy. The directory is ``MINDIE_KNOWLEDGE_TEST_ROOT``
-when the runner sets it, otherwise a fresh temporary directory. Reporting
-stays explicitly disabled.
+[Invariants] Isolation is applied at import before product modules resolve ``Path.home``
+or diagnostics policy, never inside pytest ``--basetemp`` (which pytest wipes after import).
+[Timeouts & Locks] In-memory and local temporary directory setup; no network or locks.
+[Side-Effect Policy] Redirects ``HOME`` and ``MINDIE_*`` roots into ``ISOLATION_ROOT``;
+keeps reporting disabled.
 """
 
 import json
@@ -45,13 +46,79 @@ def _framework_source_errors():
 
 _FIXTURE_ERRORS = _framework_source_errors()
 
-_explicit_root = os.environ.get("MINDIE_KNOWLEDGE_TEST_ROOT")
+def _safe_mkdtemp_parent():
+    """Avoid placing ISOLATION_ROOT inside pytest --basetemp, which pytest wipes after conftest import."""
+    basetemp = None
+    for idx, arg in enumerate(sys.argv[1:], start=1):
+        if arg.startswith("--basetemp="):
+            basetemp = Path(arg.split("=", 1)[1]).expanduser().resolve()
+            break
+        if arg == "--basetemp" and idx + 1 < len(sys.argv):
+            basetemp = Path(sys.argv[idx + 1]).expanduser().resolve()
+            break
+    tmpdir = Path(tempfile.gettempdir()).expanduser().resolve()
+    if basetemp is not None and (tmpdir == basetemp or basetemp in tmpdir.parents):
+        parent = basetemp.parent
+        parent.mkdir(parents=True, exist_ok=True)
+        return str(parent)
+    return None
+
+
+def _drop_linux_root_dac_override():
+    """Ensure chmod(0) unreadable-file tests raise PermissionError even when shards run as uid 0."""
+    if sys.platform != "linux" or os.geteuid() != 0:
+        return
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        for cap in (1, 2):  # CAP_DAC_OVERRIDE=1, CAP_DAC_READ_SEARCH=2
+            libc.prctl(24, cap, 0, 0, 0)  # PR_CAPBSET_DROP=24
+
+        class _CapHeader(ctypes.Structure):
+            _fields_ = [("version", ctypes.c_uint32), ("pid", ctypes.c_int)]
+
+        class _CapData(ctypes.Structure):
+            _fields_ = [
+                ("effective", ctypes.c_uint32),
+                ("permitted", ctypes.c_uint32),
+                ("inheritable", ctypes.c_uint32),
+            ]
+
+        hdr = _CapHeader(0x20080522, 0)
+        data = (_CapData * 2)()
+        if libc.capget(ctypes.byref(hdr), data) == 0:
+            mask = ~((1 << 1) | (1 << 2))
+            data[0].effective &= mask
+            data[0].permitted &= mask
+            data[0].inheritable &= mask
+            libc.capset(ctypes.byref(hdr), data)
+    except TimeoutError:
+        raise
+    except OSError:
+        pass
+
+
+_drop_linux_root_dac_override()
+
+_explicit_root = os.environ.get("_MINDIE_KNOWLEDGE_BASE_TEST_ROOT") or os.environ.get("MINDIE_KNOWLEDGE_TEST_ROOT")
 if _explicit_root:
-    ISOLATION_ROOT = Path(_explicit_root).expanduser().resolve()
+    _base_root = Path(_explicit_root).expanduser().resolve()
 else:
-    ISOLATION_ROOT = Path(tempfile.mkdtemp(prefix="mindie-knowledge-test-"))
+    _base_root = Path(tempfile.mkdtemp(prefix="mindie-knowledge-test-", dir=_safe_mkdtemp_parent()))
+os.environ["_MINDIE_KNOWLEDGE_BASE_TEST_ROOT"] = str(_base_root)
+_xdist_worker = os.environ.get("PYTEST_XDIST_WORKER", "").strip()
+if _xdist_worker:
+    _prev_worker_pid = os.environ.get("_MINDIE_TEST_WORKER_PID", "")
+    if _prev_worker_pid and _prev_worker_pid != str(os.getpid()):
+        ISOLATION_ROOT = Path(tempfile.mkdtemp(prefix=f"sub-{_xdist_worker}-", dir=_base_root))
+    else:
+        ISOLATION_ROOT = _base_root / f"worker-{_xdist_worker}"
+    os.environ["_MINDIE_TEST_WORKER_PID"] = str(os.getpid())
+else:
+    ISOLATION_ROOT = _base_root
 os.environ["MINDIE_KNOWLEDGE_TEST_ROOT"] = str(ISOLATION_ROOT)
-REAL_HOME = Path(os.environ.get("HOME") or str(Path.home()))
+REAL_HOME = Path(os.environ.get("_MINDIE_TEST_REAL_HOME") or os.environ.get("HOME") or str(Path.home()))
+os.environ["_MINDIE_TEST_REAL_HOME"] = str(REAL_HOME)
 _WATCH = [
     REAL_HOME / ".config" / "mindie-agent" / "diagnostics.json",
     REAL_HOME / ".local" / "state" / "mindie" / "diagnostics",
@@ -102,12 +169,23 @@ def _isolated_home(root):
 
 _home, _config, _state, _data, _local_appdata, _appdata, _diag_root = _isolated_home(ISOLATION_ROOT)
 _real_gitleaks = REAL_HOME / ".cache" / "mindie-agent" / "gitleaks"
+if not _real_gitleaks.is_dir():
+    for _alt_gitleaks in (
+        Path(os.environ.get("MINDIE_GITLEAKS_CACHE", "")) if os.environ.get("MINDIE_GITLEAKS_CACHE") else None,
+        Path("/dev/shm/agy-gitleaks-cache"),
+    ):
+        if _alt_gitleaks is not None and _alt_gitleaks.is_dir():
+            _real_gitleaks = _alt_gitleaks
+            break
 _isolated_gitleaks = _home / ".cache" / "mindie-agent" / "gitleaks"
 if _real_gitleaks.is_dir() and not _isolated_gitleaks.exists():
     import shutil as _shutil
     _isolated_gitleaks.parent.mkdir(parents=True, exist_ok=True)
     _shutil.copytree(_real_gitleaks, _isolated_gitleaks)
 os.environ.setdefault("MINDIE_DISABLE_FSYNC", "1")
+# Prevent Git reflog/receive-pack ident_default_email() from blocking 5s on DNS
+# when HOME/.gitconfig is redirected to an empty isolated test directory.
+os.environ.setdefault("EMAIL", "mindie-test@localhost.invalid")
 os.environ["HOME"] = str(_home)
 os.environ["USERPROFILE"] = str(_home)
 os.environ["XDG_CONFIG_HOME"] = str(_config)

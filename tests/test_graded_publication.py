@@ -1,4 +1,4 @@
-"""Contract tests for deterministic C6 graded publication preparation."""
+"""Contract tests for deterministic graded publication preparation."""
 from __future__ import annotations
 
 import builtins

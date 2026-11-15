@@ -1,0 +1,131 @@
+{
+  "closure": {
+    "unit-ascend-aclgraph-bucket-padding-and-varlen-axioms": [],
+    "unit-ascend-op-abi-binding-and-single-op-repro-sop": []
+  },
+  "federation": {
+    "corpus": {
+      "automatic": false,
+      "bytes": 13939,
+      "estimated_tokens": 2581,
+      "kind": "federation",
+      "path": ".",
+      "unit_ids": [
+        "unit-ascend-aclgraph-bucket-padding-and-varlen-axioms",
+        "unit-ascend-op-abi-binding-and-single-op-repro-sop"
+      ],
+      "units": 2
+    },
+    "domains": [
+      {
+        "automatic": false,
+        "bytes": 6849,
+        "estimated_tokens": 1267,
+        "exceeds": [],
+        "kind": "federation",
+        "path": "_common",
+        "recommended_action": "review_federation_boundary",
+        "unit_ids": [
+          "unit-ascend-aclgraph-bucket-padding-and-varlen-axioms"
+        ],
+        "units": 1
+      },
+      {
+        "automatic": false,
+        "bytes": 7090,
+        "estimated_tokens": 1314,
+        "exceeds": [],
+        "kind": "federation",
+        "path": "operators",
+        "recommended_action": "review_federation_boundary",
+        "unit_ids": [
+          "unit-ascend-op-abi-binding-and-single-op-repro-sop"
+        ],
+        "units": 1
+      }
+    ]
+  },
+  "index_build_elapsed_ms": 3.530499991029501,
+  "leaves": [
+    {
+      "automatic": false,
+      "bytes": 6849,
+      "estimated_tokens": 1267,
+      "exceeds": [],
+      "kind": "leaf",
+      "path": "_common",
+      "recommended_action": "review_leaf_split",
+      "unit_ids": [
+        "unit-ascend-aclgraph-bucket-padding-and-varlen-axioms"
+      ],
+      "units": 1
+    },
+    {
+      "automatic": false,
+      "bytes": 7090,
+      "estimated_tokens": 1314,
+      "exceeds": [],
+      "kind": "leaf",
+      "path": "operators/api-abi/single-op-repro",
+      "recommended_action": "review_leaf_split",
+      "unit_ids": [
+        "unit-ascend-op-abi-binding-and-single-op-repro-sop"
+      ],
+      "units": 1
+    }
+  ],
+  "schema": "mindie-shard-topology/1",
+  "two_level_subtrees": [
+    {
+      "automatic": false,
+      "bytes": 6849,
+      "estimated_tokens": 1267,
+      "exceeds": [],
+      "kind": "subtree",
+      "path": "_common",
+      "recommended_action": "review_two_level_subtree_split",
+      "unit_ids": [
+        "unit-ascend-aclgraph-bucket-padding-and-varlen-axioms"
+      ],
+      "units": 1
+    },
+    {
+      "automatic": false,
+      "bytes": 7090,
+      "estimated_tokens": 1314,
+      "exceeds": [],
+      "kind": "subtree",
+      "path": "operators/api-abi",
+      "recommended_action": "review_two_level_subtree_split",
+      "unit_ids": [
+        "unit-ascend-op-abi-binding-and-single-op-repro-sop"
+      ],
+      "units": 1
+    }
+  ],
+  "unit_count": 2,
+  "units": {
+    "unit-ascend-aclgraph-bucket-padding-and-varlen-axioms": {
+      "bytes": 6849,
+      "category": "axiom",
+      "content_sha256": "1c725ea3d2d1da76e02f6e498191ff22baa3bceec590578eb62afc53d74c9d84",
+      "domain_path": "_common",
+      "estimated_tokens": 1267,
+      "evidence_strength": "hardware_spec",
+      "inherits_from": [],
+      "path": "_common/unit-ascend-aclgraph-bucket-padding-and-varlen-axioms.md",
+      "tier": "L1"
+    },
+    "unit-ascend-op-abi-binding-and-single-op-repro-sop": {
+      "bytes": 7090,
+      "category": "sop",
+      "content_sha256": "51025277f2d8b737b7a34a71d4ce308f52ce7f8b840bf1482c9789354d198b74",
+      "domain_path": "operators/api-abi/single-op-repro",
+      "estimated_tokens": 1314,
+      "evidence_strength": "hardware_spec",
+      "inherits_from": [],
+      "path": "operators/api-abi/single-op-repro/unit-ascend-op-abi-binding-and-single-op-repro-sop.md",
+      "tier": "L2"
+    }
+  }
+}

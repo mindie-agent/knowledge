@@ -1,4 +1,4 @@
-"""[Role] Execute C6 through the existing native worker and SummaryLedger.
+"""[Role] Execute authorized-evidence distillation through the native worker and SummaryLedger.
 
 [Invariants] One admitted paid call per evidence request. Returned decisions
 resume local application; failed or uncertain calls are never replayed here.
@@ -212,7 +212,7 @@ def run(engine, inputs, *, session_digest, task_state, authorization=None, cance
             raise
         return {**result, **receipt, "decision": decision}
     if not engine.summary_command:
-        raise ValueError("C6 requires a configured native summary worker")
+        raise ValueError("knowledge_distill requires a configured native summary worker")
     # The same command supplies its declared capability before receiving any
     # new protocol. An older paired installation is rejected before model use.
     identity = validate_identity(json.loads(bounded_run(

@@ -1,0 +1,819 @@
+{
+  "commit": "b554a39893a4e024276214a4abaa1a9c2a26a460",
+  "operators": {
+    "fused_norm_rope_attn_rope_cast_fwd": {
+      "source": "samples/attention/fused_norm_rope_attn_rope_cast_fwd",
+      "test": "test/attention/fused_norm_rope_attn_rope_cast_fwd",
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "add": {
+      "source": "samples/vector/add",
+      "test": "test/vector/add",
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "attn_epilogue": {
+      "source": "samples/attention/attn_epilogue",
+      "test": "test/attention/attn_epilogue",
+      "native": {
+        "export": "attn_epilogue",
+        "sources": [
+          "@attn_epilogue/source/attn_epilogue.py"
+        ]
+      },
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "attn_prologue": {
+      "source": "samples/attention/attn_prologue",
+      "test": "test/attention/attn_prologue",
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "flash_kda": {
+      "source": "samples/attention/flash_kda",
+      "test": "test/attention/flash_kda",
+      "native": {
+        "export": "flash_kda",
+        "sources": [
+          "@flash_kda/source/flash_kda.py",
+          "@flash_kda/source/flash_kda_metadata.py",
+          "@flash_kda/source/flash_kda_staged.py",
+          "@flash_kda/source/flash_kda_persistent.py",
+          "@flash_kda/source/flash_kda_validation.py"
+        ]
+      },
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "conditional_ledger_required"
+    },
+    "flash_kda_fwd": {
+      "source": "samples/attention/flash_kda_fwd",
+      "test": "test/attention/flash_kda_fwd",
+      "native": {
+        "export": "flash_kda_fwd",
+        "sources": [
+          "@flash_kda_fwd/source/flash_kda_fwd.py",
+          "@flash_kda_fwd/source/flash_kda_fwd_metadata.py",
+          "@flash_kda_fwd/source/flash_kda_fwd_staged.py",
+          "@flash_kda_fwd/source/flash_kda_fwd_persistent.py",
+          "@flash_kda_fwd/source/flash_kda_fwd_validation.py"
+        ]
+      },
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "flash_kda_cp_preprocess": {
+      "source": "samples/attention/flash_kda_cp_preprocess",
+      "test": "test/attention/flash_kda_cp_preprocess",
+      "native": {
+        "export": "flash_kda_cp_preprocess",
+        "sources": [
+          "@flash_kda_cp_preprocess/source/flash_kda_cp_preprocess.py",
+          "@flash_kda_cp_preprocess/source/flash_kda_cp_preprocess_metadata.py"
+        ]
+      },
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "flash_kda_cp_main": {
+      "source": "samples/attention/flash_kda_cp_main",
+      "test": "test/attention/flash_kda_cp_main",
+      "native": {
+        "export": "flash_kda_cp_main",
+        "sources": [
+          "@flash_kda_cp_main/source/flash_kda_cp_main.py",
+          "@flash_kda_cp_main/source/flash_kda_cp_main_metadata.py"
+        ]
+      },
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "matmul": {
+      "inventory_path": "matmul",
+      "source": "samples/matmul/matmul",
+      "test": "test/matmul/matmul",
+      "ci_test": "test/matmul",
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "exact_reference_plan"
+    },
+    "batch_matmul": {
+      "source": "samples/matmul/batch_matmul",
+      "test": "test/matmul/batch_matmul",
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "fused_matmul": {
+      "source": "samples/matmul/fused_matmul",
+      "test": "test/matmul/fused_matmul",
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "dual_level_quant_matmul": {
+      "source": "samples/matmul/dual_level_quant_matmul",
+      "test": "test/matmul/dual_level_quant_matmul",
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "quant_matmul": {
+      "source": "samples/matmul/quant_matmul",
+      "test": "test/matmul/quant_matmul",
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "grouped_matmul": {
+      "source": "samples/matmul/grouped_matmul",
+      "test": "test/matmul/grouped_matmul",
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "grouped_matmul_finalize_routing": {
+      "source": "samples/matmul/grouped_matmul_finalize_routing",
+      "test": "test/matmul/grouped_matmul_finalize_routing",
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "conditional_ledger_required"
+    },
+    "transpose_batch_matmul": {
+      "source": "samples/matmul/transpose_batch_matmul",
+      "test": "test/matmul/transpose_batch_matmul",
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "qwen_sparse_attn": {
+      "source": "samples/attention/qwen_sparse_attn",
+      "test": "test/attention/qwen_sparse_attn",
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "stem_indexer": {
+      "source": "samples/attention/stem_indexer",
+      "test": "test/attention/stem_indexer",
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "qsa_indexer": {
+      "source": "samples/attention/qsa_indexer",
+      "test": "test/attention/qsa_indexer",
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "indexer_prologue_k": {
+      "source": "samples/attention/indexer_prologue_k",
+      "test": "test/attention/indexer_prologue_k",
+      "native": {
+        "export": "indexer_prologue_k",
+        "sources": [
+          "@indexer_prologue_k/source/indexer_prologue_k.py"
+        ]
+      },
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "engram_gate": {
+      "source": "samples/vector/engram_gate",
+      "test": "test/vector/engram_gate",
+      "native": {
+        "export": "engram_gate",
+        "sources": [
+          "@engram_gate/source/engram_gate.py"
+        ]
+      },
+      "catalog_classification": "full_sample_physics",
+      "derivation_coverage": "closed_selected_route"
+    },
+    "quant_block_sparse_attn": {
+      "source": "samples/attention/quant_block_sparse_attn",
+      "test": "test/attention/quant_block_sparse_attn",
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "indexer_prologue_qw": {
+      "source": "samples/attention/indexer_prologue_qw",
+      "test": "test/attention/indexer_prologue_qw",
+      "native": {
+        "export": "indexer_prologue_qw",
+        "sources": [
+          "@indexer_prologue_qw/source/indexer_prologue_qw.py",
+          "@indexer_prologue_qw/source/indexer_prologue_qw_format.py"
+        ]
+      },
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "quant_lightning_indexer": {
+      "source": "samples/attention/quant_lightning_indexer",
+      "test": "test/attention/quant_lightning_indexer",
+      "native": {
+        "export": "qli",
+        "sources": [
+          "@quant_lightning_indexer/source/quant_lightning_indexer.py",
+          "@quant_lightning_indexer_metadata/source/quant_lightning_indexer_metadata.py"
+        ]
+      },
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "quant_lightning_indexer_metadata": {
+      "source": "samples/attention/quant_lightning_indexer_metadata",
+      "test": "test/attention/quant_lightning_indexer_metadata",
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "quant_sparse_lightning_indexer": {
+      "source": "samples/attention/quant_sparse_lightning_indexer",
+      "test": "test/attention/quant_sparse_lightning_indexer",
+      "native": {
+        "export": "qsli",
+        "sources": [
+          "@quant_sparse_lightning_indexer/source/quant_sparse_lightning_indexer.py",
+          "@quant_sparse_lightning_indexer_metadata/source/quant_sparse_lightning_indexer_metadata.py"
+        ]
+      },
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "quant_sparse_lightning_indexer_metadata": {
+      "source": "samples/attention/quant_sparse_lightning_indexer_metadata",
+      "test": "test/attention/quant_sparse_lightning_indexer_metadata",
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "mixed_quant_sparse_flash_mla": {
+      "source": "samples/attention/mixed_quant_sparse_flash_mla",
+      "test": "test/attention/mixed_quant_sparse_flash_mla",
+      "native": {
+        "export": "mqsmla",
+        "sources": [
+          "@mixed_quant_sparse_flash_mla/source/mixed_quant_sparse_flash_mla.py",
+          "@mixed_quant_sparse_flash_mla/source/mixed_quant_sparse_flash_mla_metadata.py"
+        ]
+      },
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "mixed_quant_sparse_flash_mla_metadata": {
+      "inventory_path": "attention/mixed_quant_sparse_flash_mla_metadata",
+      "source": "samples/attention/mixed_quant_sparse_flash_mla",
+      "test": "test/attention/mixed_quant_sparse_flash_mla_metadata",
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "block_attn_res_update_rms_norm": {
+      "source": "samples/vector/block_attn_res_update_rms_norm",
+      "test": "test/vector/block_attn_res_update_rms_norm",
+      "native": {
+        "export": "block_attn_res_update_rms_norm",
+        "sources": [
+          "@block_attn_res_update_rms_norm/source/block_attn_res_update_rms_norm.py"
+        ]
+      },
+      "catalog_classification": "full_sample_physics",
+      "derivation_coverage": "closed_selected_route"
+    },
+    "fused_recurrent_kda_snapshot": {
+      "source": "samples/attention/fused_recurrent_kda_snapshot",
+      "test": "test/attention/fused_recurrent_kda_snapshot",
+      "native": {
+        "export": "fused_recurrent_kda",
+        "sources": [
+          "@fused_recurrent_kda_snapshot/source/fused_recurrent_kda_snapshot.py"
+        ]
+      },
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "fused_recurrent_kda_replayssm": {
+      "source": "samples/attention/fused_recurrent_kda_replayssm",
+      "test": "test/attention/fused_recurrent_kda_replayssm",
+      "native": {
+        "export": "fused_recurrent_kda_replayssm",
+        "sources": [
+          "@fused_recurrent_kda_replayssm/source/fused_recurrent_kda_replayssm.py"
+        ]
+      },
+      "catalog_classification": "full_sample_physics",
+      "derivation_coverage": "closed_selected_route"
+    },
+    "mega_recurrent_kda": {
+      "source": "samples/attention/mega_recurrent_kda",
+      "test": "test/attention/mega_recurrent_kda",
+      "native": {
+        "export": "mega_recurrent_kda",
+        "sources": [
+          "@mega_recurrent_kda/source/mega_recurrent_kda.py",
+          "@mega_recurrent_kda/source/mega_recurrent_kda_common.py",
+          "@mega_recurrent_kda/source/mega_recurrent_kda_frontend.py",
+          "@mega_recurrent_kda/source/mega_recurrent_kda_backend.py"
+        ]
+      },
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "commit_recurrent_kda": {
+      "source": "samples/attention/commit_recurrent_kda",
+      "test": "test/attention/commit_recurrent_kda",
+      "native": {
+        "export": "commit_recurrent_kda",
+        "sources": [
+          "@commit_recurrent_kda/source/commit_recurrent_kda.py"
+        ]
+      },
+      "catalog_classification": "full_sample_physics",
+      "derivation_coverage": "closed_selected_route"
+    },
+    "quant_mla_prolog": {
+      "source": "samples/attention/quant_mla_prolog",
+      "test": "test/attention/quant_mla_prolog",
+      "native": {
+        "export": "quant_mla_prolog",
+        "sources": [
+          "@quant_mla_prolog/source/quant_mla_prolog.py"
+        ]
+      },
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "mla_prolog_v4": {
+      "source": "samples/attention/mla_prolog_v4",
+      "test": "test/attention/mla_prolog_v4",
+      "native": {
+        "export": "mla_prolog_v4",
+        "sources": [
+          "@mla_prolog_v4/source/mla_prolog_v4.py"
+        ]
+      },
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "gather_v2": {
+      "source": "samples/vector/gather_v2",
+      "test": "test/vector/gather_v2",
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "scatter_elements": {
+      "source": "samples/vector/scatter_elements",
+      "test": "test/vector/scatter_elements",
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "moonep": {
+      "source": "samples/mc2/moonep",
+      "test": "test/mc2/moonep",
+      "native": {
+        "export": "moonep_plan",
+        "sources": [
+          "@moonep/source/moonep_plan.py",
+          "@moonep/source/moonep_context.py"
+        ]
+      },
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "conditional_ledger_required"
+    },
+    "sparse_flash_mla": {
+      "source": "samples/attention/sparse_flash_mla",
+      "test": "test/attention/sparse_flash_mla",
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "sparse_flash_mla_metadata": {
+      "source": "samples/attention/sparse_flash_mla_metadata",
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "dynamic_mx_quant_sr": {
+      "source": "samples/vector/dynamic_mx_quant_sr",
+      "test": "test/vector/dynamic_mx_quant_sr",
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "mega_full_index": {
+      "source": "samples/attention/mega_full_index",
+      "test": "test/attention/mega_full_index",
+      "native": {
+        "export": "mega_full_index",
+        "sources": [
+          "@mega_full_index/source/mega_full_index.py",
+          "@mega_full_index/source/prologue.py",
+          "@mega_full_index/source/qli.py"
+        ]
+      },
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "conditional_ledger_required"
+    },
+    "mega_reindex": {
+      "source": "samples/attention/mega_reindex",
+      "test": "test/attention/mega_reindex",
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "matmul_streamk": {
+      "source": "samples/matmul/matmul/matmul_streamk.py",
+      "test": "test/matmul/matmul/test_matmul_streamk.py",
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "exact_reference_plan"
+    },
+    "quant_batch_matmul_mxa8w4": {
+      "source": "samples/matmul/quant_matmul/quant_batch_matmul_mxa8w4.py",
+      "test": "test/matmul/quant_matmul/test_quant_batch_matmul_mxa8w4.py",
+      "catalog_classification": "full_sample_physics",
+      "derivation_coverage": "closed_selected_route"
+    },
+    "mega_mla": {
+      "source": "samples/attention/mega_mla",
+      "test": "test/attention/mega_mla",
+      "native": {
+        "export": "mega_mla",
+        "sources": [
+          "@mega_mla/source/mega_mla_native.py",
+          "@mega_mla/source/attention_geometry.py",
+          "@mega_mla/source/attention_inputs.py",
+          "@mega_mla/source/attention_matmul.py",
+          "@mega_mla/source/mega_mla.py",
+          "@mega_mla/source/mega_mla_kernel.py",
+          "@mega_mla/source/attention_pipeline.py",
+          "@mega_mla/source/attention_sequence_filter.py",
+          "@mega_mla/source/attention_sequence_inputs.py",
+          "@mega_mla/source/attention_workspace.py",
+          "@mega_mla/source/cache_decode.py",
+          "@mega_mla/source/compressed_cache_gather.py",
+          "@mega_mla/source/dual_cache_vector_attention.py",
+          "@mega_mla/source/mxfp8_matmul.py",
+          "@mega_mla/source/paged_cache.py",
+          "@mega_mla/source/qkv_projection.py",
+          "@mega_mla/source/rotary_position_embedding.py"
+        ]
+      },
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "conditional_ledger_required"
+    },
+    "quant_batch_matmul_inplace_add": {
+      "source": "samples/matmul/quant_matmul/quant_batch_matmul_inplace_add.py",
+      "test": "test/matmul/quant_matmul/test_quant_batch_matmul_inplace_add.py",
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "weight_quant_batchmatmul": {
+      "source": "samples/matmul/weight_quant_batchmatmul",
+      "test": "test/matmul/weight_quant_batchmatmul",
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "flash_attn": {
+      "source": "samples/attention/flash_attn",
+      "test": "test/attention/flash_attn",
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "flash_mla_with_kvcache": {
+      "source": "samples/attention/flash_mla_with_kvcache",
+      "test": "test/attention/flash_mla_with_kvcache",
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "flash_attn_fp8_fullquant": {
+      "source": "samples/attention/flash_attn_fp8_fullquant",
+      "test": "test/attention/flash_attn_fp8_fullquant",
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    },
+    "mega_compressor": {
+      "source": "samples/attention/mega_compressor",
+      "test": "test/attention/mega_compressor",
+      "native": {
+        "export": "mega_compressor",
+        "sources": [
+          "@mega_compressor/source/mega_compressor.py"
+        ]
+      },
+      "catalog_classification": "structural_schema_only",
+      "derivation_coverage": "not_derived_in_this_pack"
+    }
+  },
+  "triton_rules": [
+    {
+      "number": 1,
+      "slug": "constexpr_parameters",
+      "title": "入参静态化",
+      "category": "compile",
+      "hazard_tags": []
+    },
+    {
+      "number": 2,
+      "slug": "tiling_optimization",
+      "title": "Tiling 优化",
+      "category": "memory",
+      "hazard_tags": [
+        "strided_access"
+      ]
+    },
+    {
+      "number": 3,
+      "slug": "vector_core_partition",
+      "title": "分核优化",
+      "category": "parallel",
+      "hazard_tags": [
+        "grid_core_mismatch"
+      ]
+    },
+    {
+      "number": 4,
+      "slug": "discrete_memory_access",
+      "title": "离散访存优化",
+      "category": "memory",
+      "hazard_tags": [
+        "random_gather_to_dot"
+      ]
+    },
+    {
+      "number": 5,
+      "slug": "scalar_to_vector",
+      "title": "Scalar 转 Vector",
+      "category": "vector",
+      "hazard_tags": [
+        "scalar_fallback"
+      ]
+    },
+    {
+      "number": 6,
+      "slug": "avoid_scalar_lowering",
+      "title": "避免向量 API 标量降级",
+      "category": "vector",
+      "hazard_tags": [
+        "i64_mask",
+        "noncontig_reduce"
+      ]
+    },
+    {
+      "number": 7,
+      "slug": "pass_merge",
+      "title": "Pass 消除合并",
+      "category": "memory",
+      "hazard_tags": [
+        "redundant_pass"
+      ]
+    },
+    {
+      "number": 8,
+      "slug": "dimension_merge",
+      "title": "维度合并",
+      "category": "loop",
+      "hazard_tags": [
+        "nested_loop"
+      ]
+    },
+    {
+      "number": 9,
+      "slug": "libdevice_usage",
+      "title": "Libdevice 函数使用",
+      "category": "math",
+      "hazard_tags": [
+        "hand_math"
+      ]
+    },
+    {
+      "number": 10,
+      "slug": "loop_invariant_hoisting",
+      "title": "循环不变量外提",
+      "category": "loop",
+      "hazard_tags": [
+        "redundant_load"
+      ]
+    },
+    {
+      "number": 11,
+      "slug": "load_order",
+      "title": "Load 指令重排序",
+      "category": "memory",
+      "hazard_tags": [
+        "load_dependency_bubble"
+      ]
+    },
+    {
+      "number": 12,
+      "slug": "grid_dispatch_specialization",
+      "title": "Grid 形状与多路径特化",
+      "category": "dispatch",
+      "hazard_tags": [
+        "one_kernel_many_shapes"
+      ]
+    },
+    {
+      "number": 13,
+      "slug": "mixed_strategy",
+      "title": "混合策略自动选择",
+      "category": "dispatch",
+      "hazard_tags": [
+        "shape_dtype_branch"
+      ]
+    },
+    {
+      "number": 14,
+      "slug": "dimension_merge_large_block",
+      "title": "维度合并与大 BLOCK 累加",
+      "category": "reduction",
+      "hazard_tags": [
+        "low_mask_coverage"
+      ]
+    },
+    {
+      "number": 15,
+      "slug": "continuous_copy_aggregation",
+      "title": "连续拷贝聚合",
+      "category": "copy",
+      "hazard_tags": [
+        "fine_grained_copy"
+      ]
+    },
+    {
+      "number": 16,
+      "slug": "redundant_boundary_operation",
+      "title": "消除冗余边界运算",
+      "category": "vector",
+      "hazard_tags": [
+        "redundant_mask"
+      ]
+    },
+    {
+      "number": 17,
+      "slug": "kernel_splitting",
+      "title": "Kernel 分裂",
+      "category": "dispatch",
+      "hazard_tags": [
+        "multi_case_slow"
+      ]
+    },
+    {
+      "number": 18,
+      "slug": "cube_mte3_decoupling",
+      "title": "Cube/MTE3 分阶段解耦",
+      "category": "cv",
+      "hazard_tags": [
+        "atomic_reduction"
+      ]
+    },
+    {
+      "number": 19,
+      "slug": "host_tensor_concat",
+      "title": "Host 侧张量维度拼接",
+      "category": "host",
+      "hazard_tags": [
+        "split_dot"
+      ]
+    },
+    {
+      "number": 20,
+      "slug": "workspace_decoupling",
+      "title": "Workspace 物化解耦",
+      "category": "memory",
+      "hazard_tags": [
+        "repeat_gather"
+      ]
+    },
+    {
+      "number": 21,
+      "slug": "latency_bound_tile_merge",
+      "title": "Latency-Bound Tile 合并",
+      "category": "loop",
+      "hazard_tags": [
+        "small_dot"
+      ]
+    },
+    {
+      "number": 22,
+      "slug": "device_side_gather",
+      "title": "Device-side Gather 连续化",
+      "category": "memory",
+      "hazard_tags": [
+        "workspace_roundtrip"
+      ]
+    },
+    {
+      "number": 23,
+      "slug": "chained_matmul_buffer_dtype",
+      "title": "Matmul 链中间 buffer dtype",
+      "category": "cv",
+      "hazard_tags": [
+        "fp32_acc_spill"
+      ]
+    },
+    {
+      "number": 24,
+      "slug": "preinitialized_output_optimization",
+      "title": "输出预初始化",
+      "category": "vector",
+      "hazard_tags": [
+        "default_fill_branch"
+      ]
+    },
+    {
+      "number": 25,
+      "slug": "ascend_interpolate_optimization",
+      "title": "Interpolate 专用优化",
+      "category": "operator",
+      "hazard_tags": [
+        "runtime_coord"
+      ]
+    },
+    {
+      "number": 26,
+      "slug": "ascend_pooling_optimization",
+      "title": "Pooling 专用优化",
+      "category": "operator",
+      "hazard_tags": [
+        "flat_index"
+      ]
+    },
+    {
+      "number": 27,
+      "slug": "matmul_transpose",
+      "title": "Matmul Transpose 专用优化",
+      "category": "operator",
+      "hazard_tags": [
+        "transpose_strided"
+      ]
+    },
+    {
+      "number": 28,
+      "slug": "cv_fusion",
+      "title": "CV 融合优化",
+      "category": "cv",
+      "hazard_tags": [
+        "cv_serialism",
+        "gm_intermediate_fallback"
+      ]
+    },
+    {
+      "number": 29,
+      "slug": "flash_attention_optimization",
+      "title": "Attention/FA 专用优化",
+      "category": "attention",
+      "hazard_tags": [
+        "serial_ratio_gt_1_5"
+      ]
+    },
+    {
+      "number": 30,
+      "slug": "mla_paged_attention_optimization",
+      "title": "Attention/MLA 专用优化",
+      "category": "attention",
+      "hazard_tags": [
+        "mla_block_qo"
+      ]
+    },
+    {
+      "number": 31,
+      "slug": "ir_analysis_workflow",
+      "title": "IR 分析",
+      "category": "terminal",
+      "hazard_tags": [
+        "missing_ir_evidence"
+      ]
+    },
+    {
+      "number": 32,
+      "slug": "autotune",
+      "title": "Autotune 自动调优",
+      "category": "terminal",
+      "hazard_tags": [
+        "untuned_constexpr"
+      ]
+    },
+    {
+      "number": 33,
+      "slug": "block_size_scaling",
+      "title": "Block Size Scaling",
+      "category": "terminal",
+      "hazard_tags": [
+        "unscaled_block"
+      ]
+    }
+  ],
+  "mfu_gates": [
+    "input_budget_ok",
+    "model_ref_valid",
+    "implementation_runs",
+    "single_run_time_budget_ok",
+    "effective_bw_within_hbm"
+  ],
+  "hardware_constants": {
+    "ub_simd": 253952,
+    "ub_simt": 221184,
+    "ssbuf_mix": 3072,
+    "ssbuf_pure": 1024,
+    "l0c_3510": 262144,
+    "l0c_2201": 131072,
+    "bf16_cube": 432,
+    "bf16_total": 486
+  },
+  "corpus_contract": {
+    "min_hardware_doc_chars": 1000,
+    "min_source_doc_chars": 200,
+    "min_knowledge_files": 4,
+    "min_aclgraph_symbols": 6,
+    "max_missing_preview": 10,
+    "expected_base_units": 19,
+    "expected_aclgraph_units": 7,
+    "slug_max_chars": 80
+  }
+}

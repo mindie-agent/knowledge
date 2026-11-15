@@ -27,15 +27,10 @@ This guide summarizes the stability mechanisms built into `mindie-knowledge` for
 
 ## 3. Atomic Configuration Reads & Writes on Windows
 
-Readers copy each complete document and close its handle before parsing.
-Writers serialize updates under the consent or community lock, flush a complete
-temporary file in the same directory, then publish it with `os.replace`.
-On Windows, a concurrent reader can temporarily prevent replacement. WinError 5
-and 32 are retried for at most five seconds; other errors remain immediate.
-Readers likewise allow a bounded wait when Windows reports a denied open during
-replacement.
-A persistent holder produces a visible error while the old document stays
-intact. Writers never truncate the live document or silently discard a choice.
+- **Short-Lived Read Handles**: Readers slurp the entire configuration file into memory and close the OS file handle immediately before parsing JSON, minimizing handle hold windows.
+- **Lock-Serialized Temporary Write + `os.replace`**: Writers serialize updates under the consent or community `.lock`, write and flush a complete temporary file in the same directory, and publish it atomically via `os.replace()`.
+- **Bounded Contention Retries on Windows**: Because concurrent readers on Windows can briefly block `os.replace()` or file opens during replacement (`WinError 5` / `WinError 32`), both writers and readers retry only those transient sharing errors with bounded backoff up to `5.0s`; all other I/O errors surface immediately.
+- **Zero Live Truncation**: If an external process holds the target file past the `5.0s` budget, `mindie-knowledge` raises an explicit operational error while leaving the previous committed configuration intact—never truncating a live document in place or silently dropping a user's choice.
 
 ---
 

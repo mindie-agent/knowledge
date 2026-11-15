@@ -1,4 +1,4 @@
-"""[Role] Freeze authorized C5 candidates into the existing contribution outbox.
+"""[Role] Freeze authorized graded-unit candidates into the contribution outbox.
 
 [Invariants] Only the original sharing generation can export a candidate.
 Local import is not consent. Frozen files bind semantic revisions and exact Git

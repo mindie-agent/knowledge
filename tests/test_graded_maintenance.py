@@ -1,4 +1,4 @@
-"""Business-semantics tests for DS-ENG06/C8 graded maintenance."""
+"""Business-semantics tests for graded corpus maintenance."""
 from __future__ import annotations
 
 import hashlib

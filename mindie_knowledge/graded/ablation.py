@@ -1,4 +1,4 @@
-"""[Role] Consume the case-bound measurement identity in a Bench C4 v2 receipt.
+"""[Role] Verify case-bound measurement identities in mindie-bench-ablation/2 receipts.
 
 [Invariants] Every timing sample belongs to one case/block, and comparison
 identities bind those exact samples. Observed block envelopes are not confidence
