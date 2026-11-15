@@ -1,4 +1,8 @@
-"""The Stop wake must outlive the hook process group. Not native acceptance."""
+"""[Role] Verify the Stop wake outlives the hook process group (POSIX process-group boundary, not native acceptance).
+[Invariants] Selected before spawning the hook; never masks a manager error after start.
+[Timeouts & Locks] Bounded local process-group and readiness waits (< 30s).
+[Side-Effect Policy] Spawns and terminates isolated local child processes inside ``tmp_path``.
+"""
 
 import json
 import os

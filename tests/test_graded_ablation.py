@@ -1,4 +1,4 @@
-"""Consume complete receipts emitted by the real Bench C4 evaluator."""
+"""Consume complete receipts emitted by the real MindIE Bench ablation evaluator."""
 from copy import deepcopy
 import hashlib
 import json
@@ -34,7 +34,7 @@ def receipt(name="all_retained"):
 
 
 def test_raw_experiment_ledger_is_not_normalized_or_silently_retiered():
-    """full_candidate / ablate_* lines are not C4 receipts and must not be rewritten into an L2 commit."""
+    """full_candidate / ablate_* lines are not complete ablation receipts and must not be rewritten into an L2 commit."""
     request, proposal = prepared(receipt())
     ledger = "\n".join(json.dumps({
         "run_id": name,

@@ -10,17 +10,17 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mindie-agent/knowledge/releases"><img src="https://img.shields.io/badge/Release-v0.13.18-blue" alt="Release v0.13.18"></a>
+  <a href="https://github.com/mindie-agent/knowledge/releases"><img src="https://img.shields.io/badge/Release-v0.13.19-blue" alt="Release v0.13.19"></a>
   <a href="https://github.com/mindie-agent/mindie-agent"><img src="https://img.shields.io/badge/MindIE%20Agent-Core%20Runtime-7045f5.svg" alt="MindIE Agent Core Runtime"></a>
   <a href="pyproject.toml"><img src="https://img.shields.io/badge/python-3.11%2B-0284c7.svg" alt="Python 3.11+"></a>
-  <a href="https://github.com/mindie-agent/knowledge-vllm-ascend"><img src="https://img.shields.io/badge/feed-vllm--ascend%20%2B%206%20domains-0f766e.svg" alt="7 Domain Knowledge Feeds"></a>
+  <a href="https://github.com/mindie-agent/knowledge-vllm-ascend"><img src="https://img.shields.io/badge/feed-vllm--ascend%20%2B%208%20domains-0f766e.svg" alt="9 Domain Knowledge Feeds"></a>
   <a href="mindie_knowledge/redact.py"><img src="https://img.shields.io/badge/redaction-gitleaks%20%2B%20r3-d97757.svg" alt="Redaction Gitleaks + r3"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-0d9488.svg" alt="License MIT"></a>
   <a href="LICENSE-CORPUS"><img src="https://img.shields.io/badge/corpus-CC--BY--4.0-0d9488.svg" alt="Corpus License CC-BY-4.0"></a>
 </p>
 
 <p align="center">
-  <a href="README.md">中文</a> · <strong>English</strong> · <a href="#-one-sentence-agent-native-install">⚡ One-Sentence Install</a> · <a href="#-what-problem-does-it-solve">✨ Why It Exists</a> · <a href="#-official-public-domain-knowledge-repositories">🌐 7 Domain Feeds</a> · <a href="#️-architecture--two-way-experience-flywheel">🏗️ Architecture</a> · <a href="#-inside-a-redacted-task-package">📦 Package Anatomy</a> · <a href="#️-cli--loopback-rpc-reference">🛠️ CLI & RPC</a> · <a href="docs/README.en.md">📚 Docs</a>
+  <a href="README.md">中文</a> · <strong>English</strong> · <a href="#-one-sentence-agent-native-install">⚡ One-Sentence Install</a> · <a href="#-what-problem-does-it-solve">✨ Why It Exists</a> · <a href="#-official-public-domain-knowledge-repositories">🌐 9 Domain Feeds</a> · <a href="#️-architecture--two-way-experience-flywheel">🏗️ Architecture</a> · <a href="#-inside-a-redacted-task-package">📦 Package Anatomy</a> · <a href="#️-cli--loopback-rpc-reference">🛠️ CLI & RPC</a> · <a href="docs/README.en.md">📚 Docs</a>
 </p>
 
 ---
@@ -30,7 +30,7 @@
 `mindie-knowledge` is the shared knowledge runtime inside [MindIE Agent](https://github.com/mindie-agent/mindie-agent). You don't need to manually configure background services or databases—just open **Claude Code**, **OpenAI Codex CLI**, **Kimi Code**, **DeepSeek Harness (`mindie-agent-dsh`)**, or **Google Antigravity (`mindie-agent-agy`)** and send this single sentence to your Agent:
 
 ```text
-帮我安装一下这个 https://github.com/mindie-agent/mindie-agent
+Help me install https://github.com/mindie-agent/mindie-agent
 ```
 
 Your Agent will automatically install the matching native plugin (`mindie-agent-cc`, `mindie-agent-codex`, `mindie-agent-kimi`, `mindie-agent-dsh`, or `mindie-agent-agy`), provision the pinned `mindie-knowledge` runtime, and sync the public [`knowledge-vllm-ascend`](https://github.com/mindie-agent/knowledge-vllm-ascend), [`knowledge-operators`](https://github.com/mindie-agent/knowledge-operators), and companion domain corpora in the background.
@@ -77,11 +77,11 @@ When working on Ascend NPU inference engineering (such as `vLLM-Ascend` operator
 
 **`mindie-knowledge` solves all three with a clean, deterministic architecture:**
 
-| Core Capability | How It Works in Plain English |
+| Core Capability | How It Works |
 | --- | --- |
-| **📐 L1–L4 Graded Knowledge Units (`mindie-graded-unit/1`)** | Organizes engineering knowledge into four structured tiers: **`L1 canonical-fact`** (hardware/framework invariants), **`L2 sop`** (standard troubleshooting & verification procedures), **`L3 workflow`** (multi-stage development & tuning workflows with Hermes convergence), and **`L4 optimization-pattern`** (verified optimization patterns with de-biased exploration), complete with parent-rule inheritance and explicit `applicability` predicates. |
-| **🧭 Hierarchical Shard Routing & Condition-Matched Retrieval** | Combines `routing-manifest.json` and `shard-topology.json` hierarchical shard routing with `applicability` condition matching and a local **BM25 + exact-identifier lexical index** to retrieve matching units in milliseconds—**zero model calls, zero network requests, and no resident search daemon**. |
-| **📖 Browse the Outline First, Read Exact Units or Blocks on Demand** | Supports both `mindie-graded-unit/1` graded units and `state-v4` task packages (`index.md` navigation manifest plus lossless 16 KiB material blocks `blocks/<block_id>.md`). Agents inspect summaries and applicability first and open only the units or blocks they actually need. |
+| **📐 L1–L4 Graded Knowledge Units (`mindie-graded-unit/1`)** | Organizes engineering knowledge into four structured tiers: **`L1 axiom` / `measurement`** (hardware and runtime invariants plus steady-state measurement contracts), **`L2 sop`** (reproducible troubleshooting and verification procedures), **`L3 workflow`** (multi-stage development and attribution workflows with in-place revision convergence), and **`L4 mutator`** (ablation-gated optimization transforms backed by measured speedup receipts), complete with `inherits_from` parent closure and explicit `conditions` predicates. |
+| **🧭 Hierarchical Shard Routing & Condition-Matched Retrieval** | Combines `routing-manifest.json` and `shard-topology.json` hierarchical shard routing with `conditions` predicate matching and a local **BM25 + exact-identifier lexical index** to retrieve matching units in milliseconds—**zero model calls, zero network requests, and no resident search daemon**. |
+| **📖 Browse the Outline First, Read Exact Units or Blocks on Demand** | Supports both `mindie-graded-unit/1` graded units and local task packages (`index.md` navigation manifest plus lossless 16 KiB material blocks `blocks/<block_id>.md`). Agents inspect summaries and applicability first and open only the units or blocks they actually need. |
 | **⚗️ Evidence-Driven Distillation (`knowledge_distill`) & Sync (`knowledge_sync`)** | Distills verified debugging and optimization evidence into structured graded units via `knowledge_distill`, incrementally syncs upstream corpora via `knowledge_sync`, and enforces schema, shard-topology, and privacy gates in CI via `publication_check`. |
 | **🛡️ Double Fail-Closed Privacy Redaction** | Community sharing is **off by default (Opt-in)**. When enabled, only user prompts and visible assistant replies are extracted (stripping tool noise and hidden reasoning), then scanned by **Gitleaks + `mindie_knowledge.redact` (`r3`)** before storage and before export—never letting an LLM rewrite body text. |
 | **📮 Deterministic Outbox & Read-Only Reconciliation** | Packs indexed local drafts, graded units, and publishable feedback votes into `mindie-contribution/1` batches for GitHub PR delivery. If a network call times out or leaves an `unknown` result, it reconciles via read-only remote checks—**never blindly replaying writes or repeating paid model calls**. |
@@ -91,17 +91,19 @@ When working on Ascend NPU inference engineering (such as `vLLM-Ascend` operator
 
 ## 🌐 Official Public Domain Knowledge Repositories
 
-`mindie-knowledge` powers **7 official public domain knowledge repositories** under `@mindie-agent`, each governed by `routing-manifest.json`, `shard-topology.json`, and `publication_check` CI validation for `L1–L4` graded units (`mindie-graded-unit/1`):
+`mindie-knowledge` powers **9 official public domain knowledge repositories** under `@mindie-agent`, each governed by `routing-manifest.json`, `shard-topology.json`, and `publication_check` CI validation for `L1–L4` graded units (`mindie-graded-unit/1`):
 
 | Repository | Domain ID (`domain`) | Scope & Coverage |
 | --- | --- | --- |
-| **[`knowledge-vllm-ascend`](https://github.com/mindie-agent/knowledge-vllm-ascend)** | `vllm-ascend` | `vLLM-Ascend` 0-day model adaptation (DeepSeek / Qwen / Kimi, etc.), ACLGraph/TorchAir graph compilation, MoE EP/MC2, quantization, and accuracy/performance tuning |
-| **[`knowledge-operators`](https://github.com/mindie-agent/knowledge-operators)** | `operators` | Ascend 910B / 910C (A3) / 950 (A5) operator engineering: `AscendC`, `Triton-Ascend`, `CATLASS`/`TileLang`, FIA/FlashMLA, and fused kernel optimization |
+| **[`knowledge-vllm-ascend`](https://github.com/mindie-agent/knowledge-vllm-ascend)** | `vllm-ascend` | `vLLM-Ascend` Day-0 model adaptation (DeepSeek / Qwen / Kimi, etc.), ACLGraph/TorchAir graph compilation, MoE EP/MC2, quantization, and accuracy/performance tuning |
+| **[`knowledge-xllm`](https://github.com/mindie-agent/knowledge-xllm)** | `xllm` | `xLLM` high-throughput inference adaptation, multi-stream graph scheduling, speculative decoding, communication overlap, and Ascend deployment tuning |
+| **[`knowledge-mindie-sd`](https://github.com/mindie-agent/knowledge-mindie-sd)** | `mindie-sd` | Multimodal and diffusion generation inference (DiT / video and image synthesis), sequence parallelism, attention acceleration, and memory optimization |
+| **[`knowledge-operators`](https://github.com/mindie-agent/knowledge-operators)** | `operators` | Ascend 910B / 910C (A3) / 950 (A5) operator engineering: `AscendC`, `CANNBot-DSL`, `Triton-Ascend`, FIA/FlashMLA, and fused kernel optimization |
 | **[`knowledge-infer-core`](https://github.com/mindie-agent/knowledge-infer-core)** | `infer-core` | Core inference engine scheduling, Continuous Batching, PagedAttention / KV Cache management, Speculative Decoding, and prefix caching |
-| **[`knowledge-infer-distributed`](https://github.com/mindie-agent/knowledge-infer-distributed)** | `infer-distributed` | Multi-node / multi-card distributed inference, TP/PP/DP/EP parallelism, PD disaggregation, HCCL/RoCE troubleshooting, and collective communication tuning |
-| **[`knowledge-infer-observability`](https://github.com/mindie-agent/knowledge-infer-observability)** | `infer-observability` | Inference observability & profiling: `msprof` trace analysis, Host-Device bottleneck attribution, memory breakdown, and Roofline modeling |
+| **[`knowledge-infer-distributed`](https://github.com/mindie-agent/knowledge-infer-distributed)** | `infer-distributed` | Multi-node / multi-card distributed inference, TP/PP/DP/EP/CP parallelism, xPyD disaggregation, EPLB load balancing, and HCCL/RoCE collective tuning |
+| **[`knowledge-infer-observability`](https://github.com/mindie-agent/knowledge-infer-observability)** | `infer-observability` | Inference observability & performance modeling: steady-state capture gates, `msprof`/MSPTI trace attribution, Host-Device bottleneck breakdown, and Roofline alignment |
 | **[`knowledge-infer-ops-compat`](https://github.com/mindie-agent/knowledge-infer-ops-compat)** | `infer-ops-compat` | CANN / driver / firmware / PyTorch (`torch_npu`) cross-version compatibility matrices, Ascend environment setup, container images, and build toolchains |
-| **[`knowledge-agent-engineering`](https://github.com/mindie-agent/knowledge-agent-engineering)** | `agent-engineering` | AI Coding Agent engineering practices, Harness plugin boundaries, benchmark design, progressive context disclosure, and self-evolving knowledge workflows |
+| **[`knowledge-agent-engineering`](https://github.com/mindie-agent/knowledge-agent-engineering)** | `agent-engineering` | AI Coding Agent engineering practices, Harness plugin boundaries, benchmark design, progressive context disclosure, and knowledge flywheel governance |
 
 ---
 
@@ -127,7 +129,7 @@ flowchart TB
     Gate --> Proj --> Mat --> Out
   end
 
-  subgraph Upstream["🌐 7 Public Domain Knowledge Repositories (knowledge-vllm-ascend / knowledge-operators, etc.)"]
+  subgraph Upstream["🌐 9 Public Domain Knowledge Repositories (knowledge-vllm-ascend / knowledge-operators, etc.)"]
     Contract["📜 publication-contract.json + routing-manifest.json + shard-topology.json"]
     Tasks[("📚 L1–L4 Graded Units & Canonical Tasks<br/>mindie-graded-unit/1 · tasks/&lt;task-id&gt;/ · feedback/votes-*.json")]
   end
@@ -142,7 +144,7 @@ flowchart TB
 
 | Storage Layer | Authoritative Contents | Why It Is Designed This Way |
 | --- | --- | --- |
-| **Public Feed Layer (`feed/`)** | Shallow Git cache + verified `tasks/<task-id>/` read-only package view | Follows upstream commits, streaming blobs one at a time through a persistent `git cat-file --batch` pipe. Switches the active view atomically only after full verification; bad candidates never corrupt the existing cache. |
+| **Public Feed Layer (`feed/`)** | Shallow Git cache + verified `L1–L4` graded units and `tasks/<task-id>/` read-only package view | Follows upstream commits, streaming blobs one at a time through a persistent `git cat-file --batch` pipe. Switches the active view atomically only after full verification; bad candidates never corrupt the existing cache. |
 | **Local Material & Index Layer (`materials/` + `state-v4.sqlite3`)** | Ordinary Markdown block bodies + SQLite metadata/cursors/ledgers + ReMe term-count checkpoints | **Markdown files are always the source of truth for body bytes.** SQLite holds only compact pointers, cursors, and attempt receipts. Derived BM25 indexes can be rebuilt from Markdown files at any time. |
 | **Outbox & Sharing Layer (`outbox/`)** | Frozen outbound package views + publication ledger | Active only when community sharing is enabled. Model outputs commit before local application, and uncertain network writes (`unknown`) stay frozen for read-only reconciliation. |
 
@@ -232,9 +234,9 @@ Host plugins (Claude Code, OpenAI Codex, Kimi Code, DeepSeek Harness `mindie-age
 
 | Entry Point | Purpose |
 | --- | --- |
-| **`knowledge_query(query, limit?, conditions?, known_refs?, token_budget?, continuation?, domain_path?, include_unknown?, include_archived?, navigation_only?, mode?, goal?, bottleneck_summary?, ledger_entries?, native_subcontext?, run_id?)`** | Uses `routing-manifest.json` + `shard-topology.json` hierarchical shard routing and `applicability` predicate matching to search `L1–L4` graded units (`mindie-graded-unit/1`) and task blocks (supporting `known_refs` deduplication, `token_budget` bounds, and `mode="explore"` RSI de-biased exploration), returning `ref`, `task_ref`, `feedback_ref`, excerpts, and `related_next` pagination tokens. |
-| **`knowledge_explain(ref / refs, conditions?, known_refs?, token_budget?, mode?, goal?, bottleneck_summary?, ledger_entries?, native_subcontext?, run_id?)`** | Resolves a single `ref` or batched `refs=[...]` for `L1–L4` graded knowledge units (including inherited parent rules and applicability predicates), task navigation outlines (`mindie://DOMAIN/TASK`), or hash-verified material blocks (`mindie://DOMAIN/TASK/blocks/<block-id>@<file-sha256>`). |
-| **`knowledge_distill(inputs, task_state, related_refs?, proposal?, topic?, target_signature?)`** | At `task_state="verified_milestone"` or `"completed"`, distills caller-selected authorized evidence into structured graded knowledge units (`L1 canonical-fact`, `L2 sop`, `L3 workflow`, or `L4 optimization-pattern`), supporting `related_refs` comparison, deterministic `proposal` validation (`model_calls=0`), `rejected_history` distillation feedback, and `affected_components` cross-component impact gates. |
+| **`knowledge_query(query, limit?, conditions?, known_refs?, token_budget?, continuation?, domain_path?, include_unknown?, include_archived?, navigation_only?, mode?, goal?, bottleneck_summary?, ledger_entries?, native_subcontext?, run_id?)`** | Uses `routing-manifest.json` + `shard-topology.json` hierarchical shard routing and `conditions` predicate matching to search `L1–L4` graded units (`mindie-graded-unit/1`) and task blocks (supporting `known_refs` deduplication, `token_budget` bounds, and `mode="explore"` de-biased retrieval that retains `L1/L2` invariants while stripping unverified `L3/L4` prescriptions), returning `ref`, `task_ref`, `feedback_ref`, excerpts, and `related_next` pagination tokens. |
+| **`knowledge_explain(ref / refs, conditions?, known_refs?, token_budget?, mode?, goal?, bottleneck_summary?, ledger_entries?, native_subcontext?, run_id?)`** | Resolves a single `ref` or batched `refs=[...]` for `L1–L4` graded knowledge units (including `inherits_from` parent rules and applicability predicates), task navigation outlines (`mindie://DOMAIN/TASK`), or hash-verified material blocks (`mindie://DOMAIN/TASK/blocks/<block-id>@<file-sha256>`). |
+| **`knowledge_distill(inputs, task_state, related_refs?, proposal?, topic?, target_signature?)`** | At `task_state="verified_milestone"` or `"completed"`, distills caller-selected authorized evidence into structured graded knowledge units (`L1 axiom` / `measurement`, `L2 sop`, `L3 workflow`, or `L4 mutator`), supporting `related_refs` comparison, deterministic `proposal` validation (`model_calls=0`), `rejected_history` distillation feedback, and `affected_components` cross-component impact gates. |
 | **`knowledge_feedback(ref, rating?, reason?, event_type?, run_id?, outcome?, step_id?, evidence_source?)`** | Records four-stage usage events (`event_type`: `discovered`, `loaded`, `applied`, `evaluated`, where `evaluated` binds `run_id` and `outcome`: `supported` / `refuted` / `inconclusive`) and optional `up` / `down` votes (with a single-line reason up to 1000 chars) bound to `mindie://DOMAIN/units/<id>@<revision>` (or legacy `feedback_ref`). |
 | **`knowledge_sync()`** | Runs an on-demand, model-free incremental sync against upstream public knowledge repositories, verifying blobs via `git cat-file --batch` before atomically switching the local view. |
 | **`mindie_knowledge.loop.history_import.import_transcript`** | Imports explicitly selected historical transcripts through the same deterministic redaction, chunking, and admission pipeline as live capture. |
@@ -244,7 +246,7 @@ Host plugins (Claude Code, OpenAI Codex, Kimi Code, DeepSeek Harness `mindie-age
 
 ## 📚 Documentation Index
 
-All architecture and engineering guides under [`docs/`](docs/README.en.md) are written in clear, human-friendly English and Chinese:
+All architecture and engineering guides under [`docs/`](docs/README.en.md) are available in both English and Chinese:
 
 | Topic | English Guide | 中文文档 | What It Covers |
 | --- | --- | --- | --- |
@@ -253,10 +255,10 @@ All architecture and engineering guides under [`docs/`](docs/README.en.md) are w
 | **Public Transcript Capture & Indexing** | [public-transcript-capture.md](docs/public-transcript-capture.md) | [public-transcript-capture.zh.md](docs/public-transcript-capture.zh.md) | How public turns are projected, redacted with Gitleaks + `r3`, and indexed incrementally |
 | **Explicit Historical Transcript Import** | [history-import.md](docs/history-import.md) | [history-import.zh.md](docs/history-import.zh.md) | Importing selected past sessions safely with prefix verification and resumable intake |
 | **Community Sharing & Outbox** | [community-sharing.md](docs/community-sharing.md) | [community-sharing.zh.md](docs/community-sharing.zh.md) | Contributor credential isolation, idempotent PR submission, and read-only reconciliation |
-| **Repository Review Bot Contract** | [repository-bot-contract.md](docs/repository-bot-contract.md) | [repository-bot-contract.zh.md](docs/repository-bot-contract.zh.md) | How the `mindie-content-review/2` bot validates, redacts, merges, or withdraws content PRs |
+| **Repository Review Bot Contract** | [repository-bot-contract.md](docs/repository-bot-contract.md) | [repository-bot-contract.zh.md](docs/repository-bot-contract.zh.md) | How the `mindie-content-review/2` review application validates, redacts, merges, or withdraws content PRs |
 | **Release Compatibility, Component Updates & File Locks** | [release-compatibility.md](docs/release-compatibility.md) | [release-compatibility.zh.md](docs/release-compatibility.zh.md) | Selecting compatible plugin releases, discovering/building side-by-side component runtimes, and coordinating OS file locks |
 | **Service & Attempt Process Lifetime** | [service-process-lifetime.md](docs/service-process-lifetime.md) | [service-process-lifetime.zh.md](docs/service-process-lifetime.zh.md) | Process containment across Windows Task Scheduler, Linux systemd 254+, and macOS owner pipes |
-| **Summary Process & Scratch Ownership** | [summary-process-ownership.md](docs/summary-process-ownership.md) | [summary-process-ownership.zh.md](docs/summary-process-ownership.zh.md) | Persisting results before tree teardown and scratch cleanup to eliminate race conditions |
+| **Summary Process & Scratch Ownership** | [summary-process-ownership.md](docs/summary-process-ownership.md) | [summary-process-ownership.zh.md](docs/summary-process-ownership.zh.md) | Four-step teardown order: persist outcome, stop process tree, drain pipes, then delete scratch |
 | **Windows Knowledge Service Host** | [windows-service-host.md](docs/windows-service-host.md) | [windows-service-host.zh.md](docs/windows-service-host.zh.md) | Running the background service via Windows Task Scheduler + DPAPI across short Hook lifetimes |
 | **Windows Process Tree Ownership** | [windows-process-ownership.md](docs/windows-process-ownership.md) | [windows-process-ownership.zh.md](docs/windows-process-ownership.zh.md) | Using `spawn_owned` suspended creation + `KILL_ON_JOB_CLOSE` Job Objects to prevent orphan processes |
 | **Framework Stability & Verification** | [framework-stability.md](docs/framework-stability.md) | [framework-stability.zh.md](docs/framework-stability.zh.md) | Pinned parser fixtures, rebuildable ReMe indexes, Windows atomic config renames, and test boundaries |

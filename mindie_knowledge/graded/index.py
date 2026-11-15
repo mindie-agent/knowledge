@@ -1,4 +1,4 @@
-"""[Role] C8 inheritance index and condition-aware local graded retrieval.
+"""[Role] Shard-routed inheritance index and condition-aware local graded retrieval.
 
 [Invariants] Resolve all stable references at build time; never truncate semantic
 inheritance by depth. inherits_from names necessary premises, not related topics:
@@ -68,7 +68,7 @@ def read_units(root: Path) -> list[GradedUnit]:
             with path.open("rb") as stream:
                 prefix = stream.read(8192)
                 # A corpus may contain ordinary documentation during migration.
-                # Only explicit C5 units enter this index; task packages are never read.
+                # Only explicit mindie-graded-unit/1 units enter this index; task packages are never read.
                 if not prefix.startswith((b"---\n", b"---\r\n")) or not re.search(rb"(?m)^schema:\s*['\"]?mindie-graded-unit/1['\"]?\s*$", prefix):
                     continue
                 raw = prefix + stream.read(MAX_UNIT_BYTES + 1 - len(prefix))

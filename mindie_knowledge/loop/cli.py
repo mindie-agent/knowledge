@@ -1,8 +1,8 @@
 """[Role] MindIE domain service CLI.
 
 [Invariants] Native adapters bind session identity; Stop never means completed.
-[Timeouts & Locks] C6 RPC budgets both scanners, identity, worker and cleanup.
-[Side-Effect Policy] C6 reads explicit stdin evidence and requires a live lease;
+[Timeouts & Locks] Distillation RPC budgets both scanners, identity, worker, and cleanup.
+[Side-Effect Policy] Distillation reads explicit stdin evidence and requires a live lease;
 it calls the configured native worker and installs local units, never publishes.
 
 Bounded local commands: ``serve``, ``hook``, ``status``, ``stop``, ``sync``

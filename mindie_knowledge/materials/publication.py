@@ -21,7 +21,8 @@ from pathlib import Path
 
 from mindie_knowledge.community.batch import check_path
 from mindie_knowledge.community.common import MAX_FILE_BYTES, canonical
-from .file_source import FileText
+from mindie_knowledge.filesystem import filesystem_path
+from .file_source import FileText, _io_path
 
 STAGING_SCHEMA = "mindie-staged-contribution/1"
 
@@ -39,7 +40,7 @@ def staging_path(root: Path, batch_id: str, revision: str) -> Path:
         raise ValueError("invalid staged batch identity")
     if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{64}", revision):
         raise ValueError("invalid staged batch revision")
-    return Path(root) / "outbox" / "staging" / batch_id / revision
+    return filesystem_path(root) / "outbox" / "staging" / batch_id / revision
 
 
 def metadata_only(batch: dict) -> dict:
@@ -64,19 +65,32 @@ def freeze_batch(root: Path, batch: dict) -> dict:
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=".freeze-", dir=target.parent))
     try:
+        files_root = _io_path(temporary / "files")
+        created_dirs: set[str] = set()
         for item in batch["files"]:
             path = check_path(item["path"])
             if item.get("delete") is True:
                 continue
-            content = item.get("content")
-            if not isinstance(content, str):
-                raise ValueError("contribution file has no content")
-            raw = content.encode("utf-8")
-            if len(raw) > MAX_FILE_BYTES or hashlib.sha256(raw).hexdigest() != item["sha256"]:
-                raise ValueError(f"contribution file identity mismatch: {path}")
-            file = temporary / "files" / path
-            file.parent.mkdir(parents=True, exist_ok=True)
-            file.write_bytes(raw)
+            if isinstance(item, FileText):
+                raw = item.read_verified_bytes()
+                raw.decode("utf-8")
+                if len(raw) > MAX_FILE_BYTES or item._digest != item["sha256"]:
+                    raise ValueError(f"contribution file identity mismatch: {path}")
+            else:
+                content = item.get("content")
+                if not isinstance(content, str):
+                    raise ValueError("contribution file has no content")
+                raw = content.encode("utf-8")
+                if len(raw) > MAX_FILE_BYTES or hashlib.sha256(raw).hexdigest() != item["sha256"]:
+                    raise ValueError(f"contribution file identity mismatch: {path}")
+            rel_path = path.replace("/", os.sep) if os.sep != "/" else path
+            dest = os.path.join(files_root, rel_path)
+            parent = os.path.dirname(dest)
+            if parent not in created_dirs:
+                os.makedirs(parent, exist_ok=True)
+                created_dirs.add(parent)
+            with open(dest, "wb") as fh:
+                fh.write(raw)
         (temporary / "manifest.json").write_text(
             canonical({"schema": STAGING_SCHEMA, "batch": descriptor}) + "\n",
             encoding="utf-8", newline="\n",
@@ -112,17 +126,31 @@ def load_batch_payload(root, row: dict) -> dict:
     manifest = json.loads((target / "manifest.json").read_text(encoding="utf-8"))
     if manifest != {"schema": STAGING_SCHEMA, "batch": descriptor}:
         raise ValueError("staged contribution manifest differs from its outbox receipt")
+    target_io = _io_path(target)
+    real_target = os.path.realpath(target_io)
+    rst = os.stat(real_target) if os.path.exists(real_target) else None
+    rid = (rst.st_dev, rst.st_ino) if rst is not None else None
+    files_dir = os.path.join(target_io, "files")
     result = dict(descriptor, files=[])
     for item in descriptor["files"]:
         path = check_path(item["path"])
         if item.get("delete") is True:
             result["files"].append(dict(item, content=None))
             continue
-        file = target / "files" / path
-        if file.is_symlink() or not file.is_file() or not file.resolve().is_relative_to(target.resolve()):
-            raise ValueError(f"missing or unsafe frozen contribution file: {path}")
-        source = FileText(file, root=target, sha256=item['sha256'], metadata=item)
-        source['content']  # Validate immediately and again on every later use.
+        rel_path = path.replace("/", os.sep) if os.sep != "/" else path
+        file_str = os.path.join(files_dir, rel_path)
+        source = FileText(
+            file_str, root=target_io, sha256=item['sha256'], metadata=item,
+            _real_root=real_target, _root_id=rid,
+        )
+        try:
+            source.read_verified_bytes().decode("utf-8")  # Validate immediately and again on every later use.
+        except (FileNotFoundError, NotADirectoryError, IsADirectoryError):
+            raise ValueError(f"missing or unsafe frozen contribution file: {path}") from None
+        except ValueError as exc:
+            if "identity mismatch" in str(exc) or "Unicode" in type(exc).__name__:
+                raise
+            raise ValueError(f"missing or unsafe frozen contribution file: {path}") from None
         result['files'].append(source)
     return result
 

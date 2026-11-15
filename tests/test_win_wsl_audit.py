@@ -132,10 +132,11 @@ def test_linux_user_runtime_dir_detects_owned_bus_socket(monkeypatch):
 
 
 def test_component_runtime_inventory_handles_utf8_under_isolated_mode(tmp_path):
+    import mindie_knowledge
     from mindie_knowledge import component_runtime
 
     ver = component_runtime.read_versions(sys.executable, ["mindie-knowledge"])
-    assert ver == {"mindie-knowledge": "0.13.18"}
+    assert ver == {"mindie-knowledge": mindie_knowledge.package_version()}
 
 
 def test_round2_startlock_close_on_record_timeout_and_large_pe(tmp_path, monkeypatch):

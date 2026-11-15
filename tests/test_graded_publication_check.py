@@ -32,6 +32,7 @@ def publish(tmp_path, files=None, *, schema=GRADED_SCHEMA, domain=DOMAIN):
     git(repo, "config", "user.email", "check@example.invalid")
     git(repo, "config", "core.autocrlf", "false")
     git(repo, "config", "core.eol", "lf")
+    git(repo, "config", "core.longpaths", "true")
     files["publication-contract.json"] = render_contract(make_contract(domain, "a" * 40, schema=schema))
     for name, text in files.items():
         path = repo / name

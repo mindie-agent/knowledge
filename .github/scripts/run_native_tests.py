@@ -8,9 +8,26 @@
 
 import argparse
 import json
+import os
 from pathlib import Path
+import shutil
+import stat
 import subprocess
 import sys
+import tempfile
+
+
+def _cleanup_tree(path: Path) -> None:
+    def _make_writable(func, target, _exc):
+        try:
+            os.chmod(target, stat.S_IWRITE)
+            func(target)
+        except TimeoutError:
+            raise
+        except OSError:
+            pass
+
+    shutil.rmtree(path, onerror=_make_writable)
 
 
 def main():
@@ -38,11 +55,22 @@ def main():
     )
     print(f"Native tests: shard {args.shard + 1}/{args.shards}, "
           f"{len(selected)}/{len(files)} modules", flush=True)
-    options = ["--collect-only", "-q"] if args.collect_only else [
-        "-v", "--durations=25", "--junitxml=native-knowledge.xml",
-    ]
-    return subprocess.call(
-        [sys.executable, "-m", "pytest", *selected, "-m", "not live_npu", *options], cwd=root)
+    basetemp_root = None
+    if not args.collect_only and os.name == "nt":
+        runner_tmp = os.environ.get("RUNNER_TEMP", "").strip()
+        short_parent = runner_tmp if runner_tmp and Path(runner_tmp).is_dir() else None
+        basetemp_root = Path(tempfile.mkdtemp(prefix=f"mk{args.shard}-", dir=short_parent))
+    try:
+        options = ["--collect-only", "-q"] if args.collect_only else [
+            "-n", "auto", "--dist", "worksteal", "-q", "--durations=20",
+            "-p", "no:cacheprovider", "--junitxml=native-knowledge.xml",
+            *([f"--basetemp={basetemp_root / 'bt'}"] if basetemp_root is not None else []),
+        ]
+        return subprocess.call(
+            [sys.executable, "-m", "pytest", *selected, "-m", "not live_npu", *options], cwd=root)
+    finally:
+        if basetemp_root is not None:
+            _cleanup_tree(basetemp_root)
 
 
 if __name__ == "__main__":

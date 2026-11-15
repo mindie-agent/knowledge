@@ -2,7 +2,7 @@
 
 [中文](CONTRIBUTING.md) | **English** · [Back to Homepage](README.en.md)
 
-Thank you for contributing to **MindIE Knowledge** (`mindie-agent/knowledge`)! This repository powers domain knowledge synchronization, local BM25 retrieval, double fail-closed privacy redaction, and community experience sharing for MindIE Agent.
+Thank you for contributing to **MindIE Knowledge** (`mindie-agent/knowledge`)! This repository powers graded domain knowledge synchronization, hierarchical shard routing, local BM25 retrieval, double fail-closed privacy redaction, and community experience sharing for MindIE Agent.
 
 To keep the codebase maintainable, leak-free, and honest under failure conditions, please review the guidelines below before opening a Pull Request.
 
@@ -47,7 +47,7 @@ python3 -m mindie_knowledge.redact --check README.md README.en.md CONTRIBUTING.m
 
 ## 3. Design Principles Check Before PR Submission
 
-Before opening or updating any development PR (covering code, configuration, dependencies, CI, or documentation), read the [MindIE Agent Engineering Design Principles](https://github.com/mindie-agent/mindie-agent/blob/main/docs/design-principles.en.md) and include a concise `## 设计原则 Review` section in your PR description (see [`.github/pull_request_template.md`](.github/pull_request_template.md)):
+Before opening or updating any development PR (covering code, configuration, dependencies, CI, or documentation), read the [MindIE Agent Engineering Design Principles](https://github.com/mindie-agent/mindie-agent/blob/main/docs/design-principles.en.md) and include a concise Design Principles review under the required `## 设计原则 Review` heading in your PR description (matched by CI in [`.github/pull_request_template.md`](.github/pull_request_template.md)):
 
 - **What real task cost does this change reduce?** Does it avoid unnecessary background work, duplicate state, or cognitive overhead?
 - **Are component boundaries clean?** Does it reuse mature OS/host mechanisms and delete superseded paths once replaced?

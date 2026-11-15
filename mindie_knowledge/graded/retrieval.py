@@ -1,6 +1,6 @@
-"""[Role] Keep one query entry point readable during C5 corpus migration.
+"""[Role] Unified query entry point across graded units and task material packages.
 
-[Invariants] Installing a local C5 candidate never hides existing task matches.
+[Invariants] Installing a local graded-unit candidate never hides existing task matches.
 Mixed responses identify each reference kind, keep legacy block continuation
 semantics, and are charged by the shared `graded.budget` owner so one declared
 `usage` describes the graded and legacy material actually returned. BM25 scores

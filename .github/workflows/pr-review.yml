@@ -28,11 +28,14 @@ jobs:
       - name: Test package
         env:
           MINDIE_FRAMEWORK_SOURCE: tests/fixtures/production-parsers
-        run: python -m pytest -q tests -m "not live_npu"
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python -B -m pytest -q -n auto --dist worksteal --durations=20 -p no:cacheprovider tests -m "not live_npu"
       - name: Scan packaged public docs and data for accidental private data
         run: >
-          python -m mindie_knowledge.redact --check
-          README.md CONTRIBUTING.md docs mindie_knowledge/skills
+          python -B -m mindie_knowledge.redact --check
+          README.md README.en.md CONTRIBUTING.md CONTRIBUTING.en.md docs mindie_knowledge/skills
+          corpus/README.md corpus/knowledge-vllm-ascend/README.md corpus/knowledge-operators/README.md
+          corpus/knowledge-infer-distributed/README.md corpus/knowledge-infer-observability/README.md
 
   release-ready:
     name: release-ready

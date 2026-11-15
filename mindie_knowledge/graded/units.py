@@ -1,4 +1,4 @@
-"""[Role] Parse and validate C5 graded knowledge without changing its claims.
+"""[Role] Parse and validate mindie-graded-unit/1 files without changing their claims.
 
 [Invariants] Stable unit IDs are independent of paths and content revisions.
 Tier describes use; evidence strength and source provenance remain separate.
@@ -67,7 +67,7 @@ def is_graded_unit_path(path: str) -> bool:
 
 
 def locator_parts(value):
-    """Recognize a C5 Git locator so redaction does not mistake it for SSH."""
+    """Recognize a provenance Git locator so redaction does not mistake it for SSH."""
     if not isinstance(value, str):
         return None
     match = re.fullmatch(
@@ -244,7 +244,7 @@ class GradedUnit:
         except yaml.YAMLError as exc:
             raise ValueError(f"invalid graded frontmatter: {exc}") from exc
         if "revision" not in metadata:
-            raise ValueError("persisted C5 unit requires an explicit revision")
+            raise ValueError("persisted graded unit requires an explicit revision")
         return cls.from_parts(metadata, "\n".join(lines[end + 1:]), path)
 
     def render(self) -> str:

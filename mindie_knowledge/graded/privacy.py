@@ -1,4 +1,4 @@
-"""[Role] Scan structured C5 metadata without mistaking Git locators for SSH.
+"""[Role] Scan structured graded-unit metadata without mistaking Git locators for SSH.
 
 [Invariants] Only recognized source_locator values are split into separately
 scanned repository, commit and path fields. Arbitrary strings keep every rule.

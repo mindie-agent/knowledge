@@ -38,6 +38,38 @@ class WindowsPathSpellingTests(unittest.TestCase):
             self.assertEqual(_windows_extended(logical), extended)
             self.assertEqual(_windows_extended(extended), extended)
             self.assertEqual(_windows_extended(_windows_logical(extended)), extended)
+        self.assertEqual(
+            _windows_extended("\\\\?\\C:\\root\\files\\tasks/abc/blocks/def.md"),
+            "\\\\?\\C:\\root\\files\\tasks\\abc\\blocks\\def.md",
+        )
+        self.assertEqual(
+            _windows_extended("\\\\?\\UNC\\server\\share/tasks/abc.md"),
+            "\\\\?\\UNC\\server\\share\\tasks\\abc.md",
+        )
+        import ntpath
+        import mindie_knowledge.filesystem as fs_mod
+        from mindie_knowledge.materials import file_source as fs_src
+
+        real_norm = ntpath.normpath
+        with patch.object(
+            fs_mod.ntpath,
+            "normpath",
+            side_effect=lambda p: p if p.startswith(("\\\\.\\", "\\\\?\\")) else real_norm(p),
+        ):
+            self.assertEqual(
+                _windows_extended("\\\\?\\C:\\root\\files\\tasks/abc/blocks/def.md"),
+                "\\\\?\\C:\\root\\files\\tasks\\abc\\blocks\\def.md",
+            )
+        with (
+            patch.object(fs_src.os, "name", "nt"),
+            patch.object(fs_src.os, "path", ntpath),
+        ):
+            self.assertTrue(
+                fs_src._within_root(
+                    "\\\\?\\C:\\root\\files\\tasks\\abc\\blocks\\def.md",
+                    "C:\\root\\files",
+                )
+            )
 
     def test_sqlite_uri_encodes_filename_syntax(self):
         with tempfile.TemporaryDirectory(prefix="knowledge-uri-") as directory:

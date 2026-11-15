@@ -1,0 +1,211 @@
+{
+  "closure": {
+    "unit-ascend-day0-vector-fusion-mlapo-prefetch-multistream-mutator": [
+      "unit-vllm-ascend-hbm-memory-hidden-assassins-axioms"
+    ],
+    "unit-vllm-ascend-hbm-memory-hidden-assassins-axioms": [],
+    "unit-vllm-ascend-launch-to-sol-and-counterfactual-sop": [
+      "unit-vllm-ascend-hbm-memory-hidden-assassins-axioms"
+    ],
+    "unit-vllm-ascend-mlapo-prefetch-ablation-protocol": [
+      "unit-vllm-ascend-hbm-memory-hidden-assassins-axioms"
+    ]
+  },
+  "federation": {
+    "corpus": {
+      "automatic": false,
+      "bytes": 18789,
+      "estimated_tokens": 2974,
+      "kind": "federation",
+      "path": ".",
+      "unit_ids": [
+        "unit-ascend-day0-vector-fusion-mlapo-prefetch-multistream-mutator",
+        "unit-vllm-ascend-hbm-memory-hidden-assassins-axioms",
+        "unit-vllm-ascend-launch-to-sol-and-counterfactual-sop",
+        "unit-vllm-ascend-mlapo-prefetch-ablation-protocol"
+      ],
+      "units": 4
+    },
+    "domains": [
+      {
+        "automatic": false,
+        "bytes": 4366,
+        "estimated_tokens": 664,
+        "exceeds": [],
+        "kind": "federation",
+        "path": "_common",
+        "recommended_action": "review_federation_boundary",
+        "unit_ids": [
+          "unit-vllm-ascend-hbm-memory-hidden-assassins-axioms"
+        ],
+        "units": 1
+      },
+      {
+        "automatic": false,
+        "bytes": 14423,
+        "estimated_tokens": 2310,
+        "exceeds": [],
+        "kind": "federation",
+        "path": "vllm-ascend",
+        "recommended_action": "review_federation_boundary",
+        "unit_ids": [
+          "unit-ascend-day0-vector-fusion-mlapo-prefetch-multistream-mutator",
+          "unit-vllm-ascend-launch-to-sol-and-counterfactual-sop",
+          "unit-vllm-ascend-mlapo-prefetch-ablation-protocol"
+        ],
+        "units": 3
+      }
+    ]
+  },
+  "index_build_elapsed_ms": 2.7870829217135906,
+  "leaves": [
+    {
+      "automatic": false,
+      "bytes": 4366,
+      "estimated_tokens": 664,
+      "exceeds": [],
+      "kind": "leaf",
+      "path": "_common",
+      "recommended_action": "review_leaf_split",
+      "unit_ids": [
+        "unit-vllm-ascend-hbm-memory-hidden-assassins-axioms"
+      ],
+      "units": 1
+    },
+    {
+      "automatic": false,
+      "bytes": 3048,
+      "estimated_tokens": 330,
+      "exceeds": [],
+      "kind": "leaf",
+      "path": "vllm-ascend/day0-graph/mla-prolog-prefetch",
+      "recommended_action": "review_leaf_split",
+      "unit_ids": [
+        "unit-ascend-day0-vector-fusion-mlapo-prefetch-multistream-mutator"
+      ],
+      "units": 1
+    },
+    {
+      "automatic": false,
+      "bytes": 5315,
+      "estimated_tokens": 927,
+      "exceeds": [],
+      "kind": "leaf",
+      "path": "vllm-ascend/performance-modeling/launch-to-sol",
+      "recommended_action": "review_leaf_split",
+      "unit_ids": [
+        "unit-vllm-ascend-launch-to-sol-and-counterfactual-sop"
+      ],
+      "units": 1
+    },
+    {
+      "automatic": false,
+      "bytes": 6060,
+      "estimated_tokens": 1053,
+      "exceeds": [],
+      "kind": "leaf",
+      "path": "vllm-ascend/performance-modeling/mlapo-ablation",
+      "recommended_action": "review_leaf_split",
+      "unit_ids": [
+        "unit-vllm-ascend-mlapo-prefetch-ablation-protocol"
+      ],
+      "units": 1
+    }
+  ],
+  "schema": "mindie-shard-topology/1",
+  "two_level_subtrees": [
+    {
+      "automatic": false,
+      "bytes": 4366,
+      "estimated_tokens": 664,
+      "exceeds": [],
+      "kind": "subtree",
+      "path": "_common",
+      "recommended_action": "review_two_level_subtree_split",
+      "unit_ids": [
+        "unit-vllm-ascend-hbm-memory-hidden-assassins-axioms"
+      ],
+      "units": 1
+    },
+    {
+      "automatic": false,
+      "bytes": 3048,
+      "estimated_tokens": 330,
+      "exceeds": [],
+      "kind": "subtree",
+      "path": "vllm-ascend/day0-graph",
+      "recommended_action": "review_two_level_subtree_split",
+      "unit_ids": [
+        "unit-ascend-day0-vector-fusion-mlapo-prefetch-multistream-mutator"
+      ],
+      "units": 1
+    },
+    {
+      "automatic": false,
+      "bytes": 11375,
+      "estimated_tokens": 1980,
+      "exceeds": [],
+      "kind": "subtree",
+      "path": "vllm-ascend/performance-modeling",
+      "recommended_action": "review_two_level_subtree_split",
+      "unit_ids": [
+        "unit-vllm-ascend-launch-to-sol-and-counterfactual-sop",
+        "unit-vllm-ascend-mlapo-prefetch-ablation-protocol"
+      ],
+      "units": 2
+    }
+  ],
+  "unit_count": 4,
+  "units": {
+    "unit-ascend-day0-vector-fusion-mlapo-prefetch-multistream-mutator": {
+      "bytes": 3048,
+      "category": "mutator",
+      "content_sha256": "b38c49b15be059b688f6bb6507822201aa94f7b4fe941bde31359a999a6b180e",
+      "domain_path": "vllm-ascend/day0-graph/mla-prolog-prefetch",
+      "estimated_tokens": 330,
+      "evidence_strength": "hypothesis",
+      "inherits_from": [
+        "unit-vllm-ascend-hbm-memory-hidden-assassins-axioms"
+      ],
+      "path": "vllm-ascend/day0-graph/mla-prolog-prefetch/unit-ascend-day0-vector-fusion-mlapo-prefetch-multistream-mutator.md",
+      "tier": "L4"
+    },
+    "unit-vllm-ascend-hbm-memory-hidden-assassins-axioms": {
+      "bytes": 4366,
+      "category": "axiom",
+      "content_sha256": "d98e0cace9dedbb560fcd46652ab4ef709e7240235f4a0337695a914f29ca4e6",
+      "domain_path": "_common",
+      "estimated_tokens": 664,
+      "evidence_strength": "hardware_spec",
+      "inherits_from": [],
+      "path": "_common/unit-vllm-ascend-hbm-memory-hidden-assassins-axioms.md",
+      "tier": "L1"
+    },
+    "unit-vllm-ascend-launch-to-sol-and-counterfactual-sop": {
+      "bytes": 5315,
+      "category": "sop",
+      "content_sha256": "b55aa1409c2557ae6f8f03a430d60c630386e79b35ed3f0311c8fc1e13bebad9",
+      "domain_path": "vllm-ascend/performance-modeling/launch-to-sol",
+      "estimated_tokens": 927,
+      "evidence_strength": "hypothesis",
+      "inherits_from": [
+        "unit-vllm-ascend-hbm-memory-hidden-assassins-axioms"
+      ],
+      "path": "vllm-ascend/performance-modeling/launch-to-sol/unit-vllm-ascend-launch-to-sol-and-counterfactual-sop.md",
+      "tier": "L2"
+    },
+    "unit-vllm-ascend-mlapo-prefetch-ablation-protocol": {
+      "bytes": 6060,
+      "category": "workflow",
+      "content_sha256": "d32774309922cb54c058d72b2795a60b97a41167dac677aae3924287dcff88c4",
+      "domain_path": "vllm-ascend/performance-modeling/mlapo-ablation",
+      "estimated_tokens": 1053,
+      "evidence_strength": "hypothesis",
+      "inherits_from": [
+        "unit-vllm-ascend-hbm-memory-hidden-assassins-axioms"
+      ],
+      "path": "vllm-ascend/performance-modeling/mlapo-ablation/unit-vllm-ascend-mlapo-prefetch-ablation-protocol.md",
+      "tier": "L3"
+    }
+  }
+}

@@ -100,7 +100,7 @@ class Engine(TranscriptMixin):
     def _settings(self):
         return settings_mod.load(self.settings_path)
     def apply_distillation(self, request, decision):
-        """Apply an explicit C6 organizer result; never infer completion from Stop."""
+        """Apply an explicit distillation organizer result; never infer completion from Stop."""
         from ..graded.distill import apply_decision
         return apply_decision(self.store, request, decision)
     def distill_selected(self, inputs, *, session_digest, task_state, authorization=None, cancel=None,

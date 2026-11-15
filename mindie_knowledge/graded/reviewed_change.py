@@ -1,4 +1,4 @@
-"""[Role] Apply explicitly reviewed C5 edits, factoring and withdrawals locally.
+"""[Role] Apply explicitly reviewed graded-unit edits, factoring, and withdrawals locally.
 
 [Invariants] A plan supplies complete authored units and the exact reviewed
 corpus generation. This module validates the projection; it never authors a
@@ -128,7 +128,7 @@ def apply_change(root, plan):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Apply complete, independently reviewed C5 edits to one checkout.")
+    parser = argparse.ArgumentParser(description="Apply complete, independently reviewed graded-unit edits to one checkout.")
     parser.add_argument("--root", required=True)
     parser.add_argument("--plan", required=True)
     parser.add_argument("--apply", action="store_true", help="write the reviewed projection; default is validation only")

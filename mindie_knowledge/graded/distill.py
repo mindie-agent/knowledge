@@ -1,4 +1,4 @@
-"""[Role] C6 authorized-evidence preparation and deterministic decision admission.
+"""[Role] Authorized-evidence distillation preparation and deterministic decision admission.
 
 [Invariants] An unfinished task may contain a verified substantive milestone.
 Admission is eligibility, never a mandatory unit. Stop and in-flight progress
@@ -14,6 +14,7 @@ import hashlib
 import json
 import re
 
+from ..materials.summarizer import MAX_PROMPT_BYTES
 from .index import RoutingIndex
 from .conditions import match_conditions
 from .impact import IMPACT_FIELDS, check_impact_completeness
@@ -22,6 +23,7 @@ from .units import CATEGORY_TO_TIER, GradedUnit, SHA256, TIER_CATEGORIES, UNIT_I
 
 UNIT_BODY_SOFT_BUDGET_BYTES = 4096
 UNIT_BODY_HARD_BUDGET_BYTES = 8192
+MAX_DECISION_BYTES = 2 * MAX_PROMPT_BYTES
 TRIVIAL_VERIFIED_BYTES = 512
 KINDS = {"experiment_ledger", "run_manifest", "authorized_transcript", "ecosystem_repo", "hardware_spec", "ablation_receipt"}
 OUTCOMES = {"observed", "verified", "compile_failed", "infra_failed", "measurement_invalid", "in_flight"}
@@ -39,7 +41,7 @@ COMPACT_UNIT_FIELDS = ("id", "revision", "tier", "category", "title", "condition
 
 
 def _evidence_strengths():
-    """Admit software_contract only when the installed C5 parser supports it."""
+    """Admit software_contract only when the installed graded-unit parser supports it."""
     from .units import STRENGTHS as parser_strengths
     values = ["hardware_spec", "reproduced_empirical", "single_observation", "hypothesis"]
     if "software_contract" in parser_strengths:
@@ -289,7 +291,7 @@ def prepare_request(inputs, *, session_digest, task_state, redactor_executable,
 
 def _request(request):
     if not isinstance(request, dict) or request.get("schema_version") != "mindie-distill-request/1":
-        raise ValueError("a prepared C6 evidence request is required")
+        raise ValueError("a prepared distillation evidence request is required")
     if not request.get("redaction_completed") or request.get("request_digest") != _sha(_digest_view(request)):
         raise ValueError("prepared evidence request changed or lacks completed redaction")
     if "related_units" in request:
@@ -345,12 +347,12 @@ def _admission_view(request):
 
 
 def with_worker_identity(request, identity):
-    """Use the established worker receipt fields for the new C6 result type."""
+    """Validate worker receipt fields for graded distillation outcomes."""
     from ..materials.summarizer import validate_identity
     _request(request)
     identity = validate_identity(identity)
     if REQUEST_SCHEMA not in identity.get("capabilities", []):
-        raise ValueError("installed worker does not declare C6; update the paired runtime and plugin")
+        raise ValueError("installed worker does not declare graded distillation support; update the paired runtime and plugin")
     core = {key: request[key] for key in BASE_REQUEST_KEYS}
     core.update({key: request[key] for key in OPTIONAL_REQUEST_KEYS if key in request})
     core.update(task_id=request["session_digest"], batch_id=request["request_digest"],
@@ -362,7 +364,7 @@ def with_worker_identity(request, identity):
 def validate_request(request):
     expected = with_worker_identity(request, request.get("policy_identity"))
     if request != expected:
-        raise ValueError("C6 worker request identity mismatch")
+        raise ValueError("distillation worker request identity mismatch")
     return request
 
 
@@ -454,7 +456,7 @@ def build_prompt(request):
         "starting with unit- followed by lowercase words separated by hyphens, for example unit-cache-readiness. "
         "Use that exact ID in target_unit_id and frontmatter.id; never substitute a tier or category prefix such as sop-. "
         "In frontmatter.triggers.keywords, include both canonical English technical identifiers/terms and concise Chinese domain/symptom phrases so bilingual natural-language queries match directly. "
-        "Return tier/category/evidence_strength/domain_path both in the unit target fields and C5 frontmatter. "
+        "Return tier/category/evidence_strength/domain_path both in the unit target fields and mindie-graded-unit/1 frontmatter. "
         "The runtime assigns revision; omit derived revision fields in new proposals. "
         "Return JSON only; no prose or markdown fences.\n\n"
     )
@@ -517,8 +519,8 @@ def decision_schema():
 
 
 def parse_validate_result(model_text, request):
-    if not isinstance(model_text, str) or len(model_text.encode()) > 131072:
-        raise ValueError("C6 model output exceeds 128 KiB")
+    if not isinstance(model_text, str) or len(model_text.encode()) > MAX_DECISION_BYTES:
+        raise ValueError("distillation model output exceeds 128 KiB")
     # A complete native reply must be receipted before local impact admission.
     return validate_decision(json.loads(model_text), request, check_impact=False)
 
@@ -693,7 +695,7 @@ def validate_decision(decision, request, *, check_impact=True):
 
 
 def apply_decision(store, request, decision, *, generation=None):
-    """Admit one C6 result locally; never initiate external publication."""
+    """Admit one distillation result locally; never initiate external publication."""
     _request(request)
     try:
         decision = validate_decision(decision, request)

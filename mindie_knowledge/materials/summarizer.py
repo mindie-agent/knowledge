@@ -492,7 +492,7 @@ def outcome(request, *, status, result=None, raw_result=None, usage=None,
             raise SummaryResultError("returned batch must account for one invocation")
         if graded:
             if not isinstance(result, dict) or result.get("schema_version") != "mindie-distill-decision/1":
-                raise SummaryResultError("returned C6 decision has the wrong schema")
+                raise SummaryResultError("returned distillation decision has the wrong schema")
             if "sanitized_inputs" in request:
                 from ..graded.distill import validate_decision
                 # Record the completed paid reply before local impact admission;

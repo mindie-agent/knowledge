@@ -1,4 +1,4 @@
-"""[Role] JSON projection of validated C5 units and their BM25 token counts.
+"""[Role] JSON projection of validated graded units and their BM25 token counts.
 
 [Invariants] The catalog binds the projection by its generation. Loading trusts
 the installed projection/body and does not re-read source blobs on query.

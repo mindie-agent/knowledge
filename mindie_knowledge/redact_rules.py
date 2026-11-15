@@ -19,7 +19,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Iterable, Iterator
 
 
@@ -77,8 +77,28 @@ class Rule:
     hint: str
     pattern: "re.Pattern[str] | None" = None
     finder: "Callable[[str], Iterable[tuple[int, int]]] | None" = None
+    any_substrings: tuple[str, ...] = ()
+    any_lower_substrings: tuple[str, ...] = ()
+    digit_bounded: bool = False
 
-    def spans(self, text: str) -> Iterator[tuple[int, int]]:
+    def spans(self, text: str, lower_text: str | None = None) -> Iterator[tuple[int, int]]:
+        if self.any_substrings:
+            found = False
+            for tok in self.any_substrings:
+                if tok in text:
+                    found = True
+                    break
+            if not found:
+                return
+        if self.any_lower_substrings:
+            low = text.lower() if lower_text is None else lower_text
+            found = False
+            for tok in self.any_lower_substrings:
+                if tok in low:
+                    found = True
+                    break
+            if not found:
+                return
         if self.pattern is not None:
             for m in self.pattern.finditer(text):
                 # Prefer the first capture group when a rule anchors on
@@ -119,7 +139,7 @@ def _high_entropy_tokens(text: str) -> Iterator[tuple[int, int]]:
     identifiable and are not credentials, so they are excluded; everything
     else that is >= 32 chars and mixes upper, lower and digits is reported.
     """
-    source_urls = [match.span() for match in _PINNED_SOURCE_URL.finditer(text)]
+    source_urls = [match.span() for match in _PINNED_SOURCE_URL.finditer(text)] if "https://" in text else []
     source_index = 0
     for m in _TOKEN_CANDIDATE.finditer(text):
         tok = m.group()
@@ -153,7 +173,7 @@ _INTERNAL_TLDS = "local|localdomain|internal|intranet|lan|corp|home|priv|private
 
 # Standalone MindIE reference: mindie://<domain>/<id>@<revision>. Domain is the
 # same grammar as documents.DOMAIN_RE (duplicated here so the redactor does
-# not import loop/storage). Legacy IDs use hex; C5 uses units/unit-* and a
+# not import loop/storage). Legacy IDs use hex; graded units use units/unit-* and a
 # complete 64-character semantic content digest. Neither accepts suffixes.
 # Only a complete token with a strict opening delimiter-or-start and closing
 # delimiter-or-end is recognized. Permitted surroundings: whitespace, quotes,
@@ -248,7 +268,24 @@ def _in_attached_numeric_subscript(text: str, start: int, end: int) -> bool:
     return (prev.isascii() and prev.isalnum()) or prev in ")]_"
 
 
+_IPV6_COLON_HINT = re.compile(r":[0-9a-fA-F]{1,4}:")
+_MAC_HINT = re.compile(r":[0-9a-fA-F]{2}[:-]|-[0-9a-fA-F]{2}[:-]")
+_MAC_PATTERN = re.compile(
+    r"(?<![0-9a-f:.-])(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}(?![0-9a-f:.-])",
+    re.IGNORECASE,
+)
+
+
+def _mac_spans(text: str) -> Iterator[tuple[int, int]]:
+    if _MAC_HINT.search(text) is None:
+        return
+    for m in _MAC_PATTERN.finditer(text):
+        yield m.span()
+
+
 def _ipv6_spans(text: str) -> Iterator[tuple[int, int]]:
+    if "::" not in text and _IPV6_COLON_HINT.search(text) is None:
+        return
     for m in _IPV6_PATTERN.finditer(text):
         if _in_attached_numeric_subscript(text, m.start(), m.end()):
             continue
@@ -296,9 +333,70 @@ def _package_version_spans(text: str) -> set[tuple[int, int]]:
     return spans
 
 
+_DIGITS: tuple[str, ...] = ("0", "1", "2", "3", "4", "5", "6", "7", "8", "9")
+_HOST_PREFIX_TUPLE: tuple[str, ...] = tuple(_HOST_PREFIXES.split("|"))
+_MACHINE_WORD_SPACED: tuple[str, ...] = tuple(w + " " for w in _MACHINE_WORDS.split("|"))
+_INTERNAL_TLD_HINT = re.compile(r"\.(?:" + _INTERNAL_TLDS + r")", re.IGNORECASE)
+_INTERNAL_DOMAIN_PATTERN = re.compile(
+    r"(?<![\w.-])(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:"
+    + _INTERNAL_TLDS + r")(?![\w-])",
+    re.IGNORECASE,
+)
+_IPV4_DOT_HINT = re.compile(r"\.\d{1,3}\.")
+_EIGHT_ASCII_DIGITS_HINT = re.compile(r"[0-9]{8}")
+_EIGHT_DIGITS_HINT = re.compile(r"\d{8}")
+_EMPLOYEE_ID_PATTERN = re.compile(r"(?<![\w-])[a-z]{1,2}\d{8}(?![\w-])", re.IGNORECASE)
+_TICKET_DASH_HINT = re.compile(r"-[0-9]")
+_TICKET_PATTERN = re.compile(r"(?<![\w-])(?:[A-Z][A-Z0-9]{1,9}-\d{2,7}|DTS\d{10,16})(?![\w-])")
+
+
+_ASCII_WS_RE = re.compile(r"\s")
+
+
+def ascii_digit_window(text: str) -> int | None:
+    """For ASCII text, return slice end just past the token containing the last digit."""
+    if not text.isascii():
+        return None
+    last = -1
+    for d in _DIGITS:
+        pos = text.rfind(d)
+        if pos > last:
+            last = pos
+    if last < 0:
+        return 0
+    ws = _ASCII_WS_RE.search(text, last)
+    return (ws.start() + 1) if ws is not None else None
+
+
+def _employee_id_spans(text: str) -> Iterator[tuple[int, int]]:
+    hint = _EIGHT_ASCII_DIGITS_HINT if text.isascii() else _EIGHT_DIGITS_HINT
+    if hint.search(text) is None:
+        return
+    for m in _EMPLOYEE_ID_PATTERN.finditer(text):
+        yield m.span()
+
+
+def _ticket_id_spans(text: str) -> Iterator[tuple[int, int]]:
+    if "DTS" not in text and _TICKET_DASH_HINT.search(text) is None:
+        return
+    for m in _TICKET_PATTERN.finditer(text):
+        yield m.span()
+
+
+def _internal_domain_spans(text: str) -> Iterator[tuple[int, int]]:
+    if _INTERNAL_TLD_HINT.search(text) is None:
+        return
+    for m in _INTERNAL_DOMAIN_PATTERN.finditer(text):
+        yield m.span()
+
+
 def _ipv4_spans(text: str) -> Iterator[tuple[int, int]]:
-    versions = _package_version_spans(text)
+    if _IPV4_DOT_HINT.search(text) is None:
+        return
+    versions: set[tuple[int, int]] | None = None
     for m in _IPV4_PATTERN.finditer(text):
+        if versions is None:
+            versions = _package_version_spans(text)
         if m.span() in versions:
             continue
         yield m.span()
@@ -325,6 +423,7 @@ RULES: tuple[Rule, ...] = (
         description="private-key block, including incomplete fragments",
         hint="never submit private keys or fragments",
         finder=_private_key_blocks,
+        any_substrings=("PRIVATE KEY-----",),
     ),
     Rule(
         id="credential-known-format",
@@ -344,18 +443,23 @@ RULES: tuple[Rule, ...] = (
             r"|-----BEGIN [A-Z ]*PRIVATE KEY-----"
             r")"
         ),
+        any_substrings=(
+            "gh", "glpat-", "AKIA", "sk-", "xox", "hf_", "AIza", "eyJ", "-----BEGIN ",
+        ),
     ),
     Rule(
         id="credential-url-userinfo",
         description="user:password embedded in a URL",
         hint="strip the userinfo part of the URL",
         pattern=re.compile(r"[a-z][a-z0-9+.-]*://[^/\s:@]+:[^/\s@]+@", re.IGNORECASE),
+        any_substrings=("://",),
     ),
     Rule(
         id="credential-bearer",
         description="bearer token",
         hint="never submit credentials",
         pattern=re.compile(r"\bbearer\s+([A-Za-z0-9._~+/=-]{8,})", re.IGNORECASE),
+        any_lower_substrings=("bearer",),
     ),
     Rule(
         id="credential-assignment",
@@ -367,6 +471,10 @@ RULES: tuple[Rule, ...] = (
             r"credentials?)\b\s*[:=]\s*[\"']?" + _PLACEHOLDER_START + r"([^\s,;)\"']{6,})",
             re.IGNORECASE,
         ),
+        any_substrings=(":", "="),
+        any_lower_substrings=(
+            "api", "secret", "access", "private", "token", "passw", "pwd", "auth", "credential",
+        ),
     ),
     Rule(
         id="credential-cjk-assignment",
@@ -376,22 +484,22 @@ RULES: tuple[Rule, ...] = (
             r"(?:密码|口令|访问令牌|密钥)\s*(?:都是|均为|是|为|[:：=])\s*"
             r"[\"'`]?([A-Za-z0-9!@#$%^&*()_+={}\[\]:;.,/?~-]{6,})"
         ),
+        any_substrings=("密码", "口令", "访问令牌", "密钥"),
     ),
     # --- network identifiers ------------------------------------------------
     Rule(
         id="mac-address",
         description="MAC address",
         hint="hardware addresses identify a specific machine; remove them",
-        pattern=re.compile(
-            r"(?<![0-9a-f:.-])(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}(?![0-9a-f:.-])",
-            re.IGNORECASE,
-        ),
+        finder=_mac_spans,
+        any_substrings=(":", "-"),
     ),
     Rule(
         id="ipv6-address",
         description="IPv6 address",
         hint="describe the network role instead of the address",
         finder=_ipv6_spans,
+        any_substrings=(":",),
     ),
     Rule(
         id="ipv4-address",
@@ -400,6 +508,7 @@ RULES: tuple[Rule, ...] = (
         "4-part version outside package-version grammar still needs an "
         "explicit allowlist entry",
         finder=_ipv4_spans,
+        any_substrings=_DIGITS,
     ),
     # --- people -------------------------------------------------------------
     Rule(
@@ -407,12 +516,14 @@ RULES: tuple[Rule, ...] = (
         description="e-mail address",
         hint="refer to people by GitHub handle in verified_by, nowhere else",
         pattern=re.compile(r"(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+(?![\w.-])"),
+        any_substrings=("@",),
     ),
     Rule(
         id="username-at-host",
         description="user@host login target",
         hint="remove login targets; they name both a user and a machine",
         finder=_username_at_host_spans,
+        any_substrings=("@",),
     ),
     Rule(
         id="user-path",
@@ -422,6 +533,7 @@ RULES: tuple[Rule, ...] = (
             r"(?<![\w/])(?:file://)?(?:/home|/Users|/export/home|/data/home|/root|/mnt/[a-z]/Users)/"
             + _PLACEHOLDER_START + r"[^\s\"'`,;:()\[\]]+"
         ),
+        any_substrings=("/home/", "/Users/", "/root/"),
     ),
     Rule(
         id="user-path-windows",
@@ -431,12 +543,14 @@ RULES: tuple[Rule, ...] = (
             r"\b[A-Za-z]:[\\/]Users[\\/]" + _PLACEHOLDER_START + r"([^\\/\s\"']+)",
             re.IGNORECASE,
         ),
+        any_substrings=(":\\", ":/"),
     ),
     Rule(
         id="user-tilde-path",
         description="~user home directory reference",
         hint="use ~ or $HOME without a user name",
         pattern=re.compile(r"(?<![\w/])~(?![/\s<$\{])([a-z_][\w.-]*)", re.IGNORECASE),
+        any_substrings=("~",),
     ),
     Rule(
         id="username-assignment",
@@ -447,6 +561,8 @@ RULES: tuple[Rule, ...] = (
             + _PLACEHOLDER_START + r"([a-z_][\w.-]{1,31})",
             re.IGNORECASE,
         ),
+        any_substrings=(":", "="),
+        any_lower_substrings=("user", "login", "account", "owner", "uid"),
     ),
     Rule(
         id="username-flag",
@@ -456,6 +572,7 @@ RULES: tuple[Rule, ...] = (
             r"(?<![\w-])--(?:user|login)[= ]" + _PLACEHOLDER_START + r"([a-z_][\w-]{1,31})",
             re.IGNORECASE,
         ),
+        any_lower_substrings=("--user", "--login"),
     ),
     # --- machines -----------------------------------------------------------
     Rule(
@@ -469,6 +586,7 @@ RULES: tuple[Rule, ...] = (
             r"(?:-{1,2}[\w-]+(?:=\S+)?\s+)*" + _PLACEHOLDER_START + r"([A-Za-z0-9][\w.-]+)",
             re.IGNORECASE,
         ),
+        any_lower_substrings=("docker", "podman", "nerdctl", "ctr"),
     ),
     Rule(
         id="container-name-flag",
@@ -479,6 +597,7 @@ RULES: tuple[Rule, ...] = (
             + _PLACEHOLDER_START + r"([A-Za-z0-9][\w.-]+)",
             re.IGNORECASE,
         ),
+        any_lower_substrings=("--name", "--hostname", "--container"),
     ),
     Rule(
         id="container-name-assignment",
@@ -489,16 +608,15 @@ RULES: tuple[Rule, ...] = (
             + _PLACEHOLDER_START + r"(?=[\w.-]*[\d_-])([A-Za-z0-9][\w.-]{2,})",
             re.IGNORECASE,
         ),
+        any_substrings=(":", "="),
+        any_lower_substrings=("container",),
     ),
     Rule(
         id="hostname-internal-domain",
         description="host name under an internal-looking domain",
         hint="describe the machine role instead of naming it",
-        pattern=re.compile(
-            r"(?<![\w.-])(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:"
-            + _INTERNAL_TLDS + r")(?![\w-])",
-            re.IGNORECASE,
-        ),
+        finder=_internal_domain_spans,
+        any_substrings=(".",),
     ),
     Rule(
         id="hostname-numbered",
@@ -509,6 +627,9 @@ RULES: tuple[Rule, ...] = (
             r"(?:[a-z][a-z0-9]*)?(?![a-z0-9])",
             re.IGNORECASE,
         ),
+        any_substrings=_DIGITS,
+        any_lower_substrings=_HOST_PREFIX_TUPLE,
+        digit_bounded=True,
     ),
     Rule(
         id="internal-machine-identifier",
@@ -525,6 +646,9 @@ RULES: tuple[Rule, ...] = (
             r"|(?<=_)\d{1,4}(?=_npu\d))",
             re.IGNORECASE,
         ),
+        any_substrings=_DIGITS,
+        any_lower_substrings=_MACHINE_WORD_SPACED + ("_npu",),
+        digit_bounded=True,
     ),
     Rule(
         id="hostname-assignment",
@@ -535,26 +659,34 @@ RULES: tuple[Rule, ...] = (
             + _PLACEHOLDER_START + r"(?=[\w.-]*[\d.-])([A-Za-z0-9][\w.-]+)",
             re.IGNORECASE,
         ),
+        any_substrings=(":", "="),
+        any_lower_substrings=("host", "server", "node", "machine"),
     ),
     # --- identifiers --------------------------------------------------------
     Rule(
         id="employee-id",
         description="employee-style identifier (letter(s) + 8 digits)",
         hint="remove personal identifiers",
-        pattern=re.compile(r"(?<![\w-])[a-z]{1,2}\d{8}(?![\w-])", re.IGNORECASE),
+        finder=_employee_id_spans,
+        any_substrings=_DIGITS,
+        digit_bounded=True,
     ),
     Rule(
         id="ticket-id",
         description="ticket / tracker identifier (ABC-1234, DTS...)",
         hint="internal tickets are not followable evidence; reference a public "
         "issue, PR or commit instead",
-        pattern=re.compile(r"(?<![\w-])(?:[A-Z][A-Z0-9]{1,9}-\d{2,7}|DTS\d{10,16})(?![\w-])"),
+        finder=_ticket_id_spans,
+        any_substrings=("-", "DTS"),
+        digit_bounded=True,
     ),
     Rule(
         id="credential-high-entropy",
         description="long mixed-case alphanumeric blob (possible secret)",
         hint="if this is not a secret, allowlist it explicitly",
         finder=_high_entropy_tokens,
+        any_substrings=_DIGITS,
+        digit_bounded=True,
     ),
 )
 

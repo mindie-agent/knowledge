@@ -1,0 +1,143 @@
+{
+  "build_elapsed_ms": 3.530499991029501,
+  "closure": {
+    "unit-ascend-aclgraph-bucket-padding-and-varlen-axioms": [],
+    "unit-ascend-op-abi-binding-and-single-op-repro-sop": []
+  },
+  "generation": "6c6d68477b8f26464500498ee1d55c1582f064714df881a3d4f1ca5f08b3f724",
+  "id_path": {
+    "unit-ascend-aclgraph-bucket-padding-and-varlen-axioms": "_common/unit-ascend-aclgraph-bucket-padding-and-varlen-axioms.md",
+    "unit-ascend-op-abi-binding-and-single-op-repro-sop": "operators/api-abi/single-op-repro/unit-ascend-op-abi-binding-and-single-op-repro-sop.md"
+  },
+  "query_budget_excludes_build": true,
+  "schema_version": "mindie-routing-manifest/1",
+  "token_estimator": "utf8_bytes_div_4_ceiling",
+  "unit_count": 2,
+  "units": [
+    {
+      "category": "axiom",
+      "conditions": {
+        "accelerator": "ascend",
+        "cann": ">=9.0,<10",
+        "execution_mode": "aclgraph",
+        "framework": [
+          "vllm-ascend>=0.10,<0.12"
+        ],
+        "soc": [
+          "Ascend910B",
+          "Ascend910B4",
+          "Ascend910_93",
+          "Ascend950"
+        ],
+        "workload_phase": [
+          "decode",
+          "prefill"
+        ]
+      },
+      "domain_path": "_common",
+      "evidence_strength": "hardware_spec",
+      "id": "unit-ascend-aclgraph-bucket-padding-and-varlen-axioms",
+      "inherits_from": [],
+      "inherits_from_closure": [],
+      "path": "_common/unit-ascend-aclgraph-bucket-padding-and-varlen-axioms.md",
+      "provenance": {
+        "evidence_refs": [
+          "cann/ops-transformer@4891cf6a210bf08a4a9bb26f7c1e2277ed43c860:attention/fused_infer_attention_score/docs/aclnnFusedInferAttentionScoreV3.md",
+          "gitcode.com/cann/ops-transformer@308a15f56d4af213e86871b8fb9747e1494571dd:attention/quant_lightning_indexer/docs/aclnnQuantLightningIndexer.md"
+        ],
+        "source_digest": "cbfc50be1e2eef6c7f9b366a780b1bf7937c1e38eb38f7979c060a5baa05a598",
+        "source_locator": "cann/ops-transformer@4891cf6a210bf08a4a9bb26f7c1e2277ed43c860:attention/fused_infer_attention_score/docs/aclnnFusedInferAttentionScoreV3.md",
+        "source_type": "operator_abi_and_graph_capture_contract"
+      },
+      "revision": 3,
+      "tier": "L1",
+      "title": "ACLGraph bucket padding classes and exact varlen operator contracts",
+      "token_estimate": 1267,
+      "triggers": {
+        "error_signatures": [
+          "queryT (12) != last element of actualSequenceLengthQ (9)",
+          "grouped matmul reads padded tail rows because group_list ends at M_bucket",
+          "ACLGraph replay latency is flat inside a bucket and jumps at the next bucket",
+          "AllReduce or AllGather time is unchanged when the logical token count drops"
+        ],
+        "keywords": [
+          "aclgraph",
+          "bucket padding",
+          "masked_varlen",
+          "grouped_prefix",
+          "full_padded_tensor",
+          "actual_seq_lens_q",
+          "actual_seq_lens_kv",
+          "FusedInferAttentionScore",
+          "FlashAttentionVarLenScore",
+          "QuantLightningIndexer",
+          "GroupedMatmulV4",
+          "group_list",
+          "M_bucket",
+          "M_logical"
+        ]
+      }
+    },
+    {
+      "category": "sop",
+      "conditions": {
+        "accelerator": "ascend",
+        "cann": ">=9.0,<10",
+        "execution_mode": "aclgraph",
+        "framework": [
+          "vllm-ascend>=0.10,<0.12"
+        ],
+        "measurement_gear": "deep",
+        "soc": [
+          "Ascend910B",
+          "Ascend910B4",
+          "Ascend910_93",
+          "Ascend950"
+        ]
+      },
+      "domain_path": "operators/api-abi/single-op-repro",
+      "evidence_strength": "hardware_spec",
+      "id": "unit-ascend-op-abi-binding-and-single-op-repro-sop",
+      "inherits_from": [],
+      "inherits_from_closure": [],
+      "path": "operators/api-abi/single-op-repro/unit-ascend-op-abi-binding-and-single-op-repro-sop.md",
+      "provenance": {
+        "evidence_refs": [
+          "cann/ops-transformer@4891cf6a210bf08a4a9bb26f7c1e2277ed43c860:attention/fused_infer_attention_score/docs/aclnnFusedInferAttentionScoreV3.md",
+          "vllm-project/vllm-ascend@175ef4d49c2072f9233619636f0309f4f88b4e2c:vllm_ascend/device/device_op.py"
+        ],
+        "source_digest": "95a54b37c47aebeaafa09d3fec860ed53d91a8f83de364619094f85599367cb6",
+        "source_locator": "vllm-project/vllm-ascend@175ef4d49c2072f9233619636f0309f4f88b4e2c:vllm_ascend/device/device_op.py",
+        "source_type": "profiling_tool_and_operator_catalog_contract"
+      },
+      "revision": 3,
+      "tier": "L2",
+      "title": "Named operator ABI binding, FRACTAL_NZ storage, and single-op reproduction",
+      "token_estimate": 1314,
+      "triggers": {
+        "error_signatures": [
+          "msprof op_summary positional Input Shapes cannot be mapped back to named API arguments",
+          "repro script passes an ND tensor to a FRACTAL_NZ slot or fails with format mismatch",
+          "actual_seq_lens_q is non-monotonic or its last element differs from queryT",
+          "block_table contains -1, an unallocated block id, or too few columns",
+          "standalone repro is more than 2x slower than the captured operator without a clock or shape change"
+        ],
+        "keywords": [
+          "mindie-profiler inspect-op-abi",
+          "mindie-profiler repro-op",
+          "op_api_catalog.json",
+          "MSPTI tensor descriptor",
+          "named ABI",
+          "FRACTAL_NZ",
+          "format 29",
+          "actual_seq_lens",
+          "group_list",
+          "block_table",
+          "slot_mapping",
+          "single-op reproduction",
+          "workspace"
+        ]
+      }
+    }
+  ]
+}

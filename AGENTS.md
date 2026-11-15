@@ -1,6 +1,6 @@
 # MindIE Knowledge (`mindie-knowledge`) — Agent Architecture & Operating Guide
 
-`mindie-knowledge` owns domain knowledge retrieval, deterministic transcript redaction, incremental LangMem indexing, and consent-gated Git/GitHub community contribution for MindIE Agent.
+`mindie-knowledge` owns graded domain knowledge retrieval (`mindie-graded-unit/1`), hierarchical shard routing, evidence-driven distillation (`knowledge_distill`), deterministic transcript redaction, incremental LangMem block indexing, and consent-gated Git/GitHub community contribution for MindIE Agent.
 
 ---
 
@@ -13,6 +13,12 @@
   - [`redact.py`](mindie_knowledge/redact.py): Deterministic regex/structural PII, credential, IP/endpoint, and path scanner (`REDACTION_PROFILE = "mindie-redaction/1"`).
   - [`retrieval.py`](mindie_knowledge/retrieval.py): Technical tokenizer (`TechnicalTokenizerV1` preserving API/version/CJK tokens) and Markdown corpus sync/search helpers.
   - [`publication_check.py`](mindie_knowledge/publication_check.py): Streaming `git ls-tree` + `git cat-file --batch` validator for community PR commits.
+- **Graded Knowledge Units, Shard Routing & Distillation (`mindie_knowledge/graded/`)**:
+  - [`units.py`](mindie_knowledge/graded/units.py): `GradedUnit` (`mindie-graded-unit/1`) parser and validator enforcing `L1` (`axiom`/`measurement`), `L2` (`sop`), `L3` (`workflow`), and `L4` (`mutator`) contracts, provenance locators, and explicit revisions.
+  - [`index.py`](mindie_knowledge/graded/index.py) & [`repository.py`](mindie_knowledge/graded/repository.py): Hierarchical shard routing (`RoutingIndex`), `inherits_from` DAG closure, condition-aware BM25 retrieval (`GradedRepository`), and `token_budget` outward delivery bounds.
+  - [`explore.py`](mindie_knowledge/graded/explore.py), [`rsi_loop.py`](mindie_knowledge/graded/rsi_loop.py) & [`rsi_crossover.py`](mindie_knowledge/graded/rsi_crossover.py): De-biased `explore` delivery (retaining `L1/L2` invariants while stripping unverified `L3/L4` prescriptions), automatic `reuse -> explore` promotion, and multi-parent crossover context preparation.
+  - [`distill.py`](mindie_knowledge/graded/distill.py), [`ablation.py`](mindie_knowledge/graded/ablation.py) & [`publication.py`](mindie_knowledge/graded/publication.py): Authorized-evidence distillation (`knowledge_distill`), `mindie-bench-ablation/2` receipt verification (`verified_v2`), and deterministic local publication proposal preparation.
+  - [`maintenance.py`](mindie_knowledge/graded/maintenance.py), [`reviewed_change.py`](mindie_knowledge/graded/reviewed_change.py) & [`cannbot_ingest.py`](mindie_knowledge/graded/cannbot_ingest.py): Routing-index generation (`build_routing_index`), non-mutating corpus linting (`lint_corpus`), reviewed whole-file corpus edits, and external corpus ingestion adapters.
 - **Canonical Material Store & ReMe Index (`mindie_knowledge/materials/`)**:
   - [`store.py`](mindie_knowledge/materials/store.py): Canonical Markdown package store (`MaterialStore`), candidate staging, and `current.json` dual-channel pointer promotion.
   - [`reme_index.py`](mindie_knowledge/materials/reme_index.py): Embedded ReMe chunker (`VerifiedMarkdownFileChunker`), file graph (`StrictFileGraph`), and BM25 lexical index (`StrictBM25Index`).
@@ -33,7 +39,8 @@
 
 ## 2. Core Data Contracts & Invariants
 
-1. **Canonical Markdown Material Packages (`MaterialStore`)**:
+1. **Graded Knowledge Units (`GradedUnit`) & Canonical Material Packages (`MaterialStore`)**:
+   - Graded corpus units (`schema: mindie-graded-unit/1`) carry validated `tier`/`category` pairs, structured `conditions`, `inherits_from` parent closures, and traceable `provenance`; routing manifests (`index/routing-manifest.json` and `index/shard-topology.json`) are deterministic projections validated by `lint_corpus`.
    - Durable task bodies live exclusively in ordinary Markdown files under `materials/`:
      - `tasks/<64-hex-task_id>/index.md`: YAML frontmatter (`schema: mindie-material-task/1`, `entry` with `schema: mindie-entry/3`, `material_digest`, `revision`, ordered `blocks` descriptors, `navigation`, `status`) + generated navigation Markdown body.
      - `tasks/<64-hex-task_id>/blocks/<64-hex-block_id>.md`: Immutable `<= 16 KB` (`MAX_BLOCK_BYTES = 16384`) UTF-8 redacted source blocks (`schema: mindie-material-block/1`) bound by `sha256` and `source_range`.
@@ -41,16 +48,16 @@
      - New revisions stage under `candidates/<revision>/` first; SQLite commits queue/header metadata inside `Store._write_txn()`; `MaterialStore.retain_current(task_id, {"draft": rev, "feed": rev})` atomically promotes `current.json` pointers and retires unreferenced candidate directories.
      - `.reme-index/` is a disposable derived BM25 + file-graph checkpoint bound to `catalog.generation`; it never stores authoritative state that cannot be rebuilt from `current.json` and `tasks/`.
 2. **Incremental Transcript Capture, Manual Session Entry (`entry_enabled = 1`) & Redaction**:
-   - `Admission.activate(..., automatic=False)` sets `entry_enabled = 1` on the session lease in `admission.sqlite3`; Fresh `Admission.associate(...)` bindings do not grant manual entry (`entry_enabled = 0`); an existing manual grant is preserved, and legacy leases upgraded in place default to `entry_enabled = 0`. `knowledge_lease` (read-only; never creates the DB or migrates schema on read), `capture_lease`, `capture_authorization`, `resolve_capture_lease`, and `allows_hash` all require `enabled == 1` and `entry_enabled == 1`.
+   - `Admission.activate(..., automatic=False)` sets `entry_enabled = 1` on the session lease in `admission.sqlite3`; fresh `Admission.associate(...)` bindings do not grant manual entry (`entry_enabled = 0`); an existing manual grant is preserved, and legacy leases upgraded in place default to `entry_enabled = 0`. `knowledge_lease` (read-only; never creates the DB or migrates schema on read), `capture_lease`, `capture_authorization`, `resolve_capture_lease`, and `allows_hash` all require `enabled == 1` and `entry_enabled = 1`.
    - Stop hooks call `handoff.handoff()` to record lightweight `captures` rows without opening transcripts or calling models.
    - `transcript_capture.capture()` reads complete transcript increments, carries open PEM private-key state (`{'private_key': ...}`) across chunk boundaries, unions Gitleaks + `redact.scan_text` + private path spans, and commits redacted blocks with `model_calls=0`.
 3. **External Write Receipts (`completed` / `failed` / `unknown`)**:
-   - **Paid LLM Indexing (`SummaryLedger`)**: `material_summary_attempts` records `prepared -> invoking -> returned / failed / outcome_unknown`. Once `returned` is persisted via `on_result=save_result`, any subsequent local redaction or file-promotion failure records `local_failure` and retries local application only—never replaying the LLM call. If the worker crashes or times out after spawn without `not_started` proof, the attempt stays `outcome_unknown` until explicit operator retry.
+   - **Paid LLM Indexing & Distillation (`SummaryLedger`)**: `material_summary_attempts` records `prepared -> invoking -> returned / failed / outcome_unknown`. Once `returned` is persisted via `on_result=save_result`, any subsequent local redaction or file-promotion failure records `local_failure` and retries local application only—never replaying the LLM call. If the worker crashes or times out after spawn without `not_started` proof, the attempt stays `outcome_unknown` until explicit operator retry.
    - **GitHub PR Publication (`community/publish.py` & `Ledger`)**: Records `intent` and step receipts before each external Git push or GitHub API write. Interrupted writes stay `unknown` and resolve strictly via read-only reconciliation (`_resolve_unknown`). If a remote write succeeds (`submitted` / `updated`) and the local receipt update fails, the succeeded remote result is preserved on the error (`mindie_publication_result` / `recording_failed=True`) rather than overwritten as failed.
 
 ---
 
-## 3. Timeout & Anti-Over-Defensive Rules (`v0.0.2` Four Iron Rules)
+## 3. Timeout & Anti-Over-Defensive Rules (Four Iron Rules)
 
 1. **Lightweight SQLite & Lock Discipline**:
    - `open_database` configures `PRAGMA journal_mode=WAL` and `timeout=5.0s` once per connection; `ConsentError(state="locked")` and `StartLock` use bounded waits (`5.0s`, `WAKE_PROBE_SECONDS = 2.0`). Never run per-`SELECT` `.owner` `lstat` loops or `:memory:` schema reflection on hot paths (`_declared_columns` is `@lru_cache`d).

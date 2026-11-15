@@ -42,6 +42,13 @@ class StubTransport:
 
 
 def _settings_dict(tmp_path, **extra):
+    if "dev_remotes" not in extra:
+        bare = tmp_path / "_bare_remote.git"
+        if not bare.exists():
+            bare.mkdir(parents=True, exist_ok=True)
+            _git(["init", "-q", "--bare"], bare)
+        extra["dev_remotes"] = {REPO: str(bare)}
+        extra.setdefault("transport", "file")
     settings = write_settings(tmp_path / "community.json", consent_choice="contribute", enabled=True,
                               roots=[tmp_path], repository=REPO, **extra)
     return settings, settings.as_dict()
