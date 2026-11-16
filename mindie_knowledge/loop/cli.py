@@ -517,6 +517,23 @@ def _open_existing_store(config):
     return Store(config["root"], config["domain"])
 
 
+def _legacy_storage_maintenance():
+    """Best-effort cross-harness reclamation once per cooldown window.
+
+    Runs after this service owns its store but before it publishes readiness.
+    A cleanup warning must never turn a healthy serve into a startup failure;
+    the storage module keeps its own 600 s cooldown and bounded budget.
+    """
+    try:
+        from ..storage.legacy import sweep_legacy_installations
+
+        sweep_legacy_installations(budget_seconds=5.0)
+    except TimeoutError:
+        return  # Best-effort maintenance; the bounded sweep already gave up.
+    except Exception:
+        return
+
+
 def _serve(config_path, config):
     """Record only failures before this owned service publishes readiness.
 
@@ -552,6 +569,9 @@ def _serve(config_path, config):
                           admission=admission, feeds=_feeds(config, store),
                           config_path=config_path,
                           config_fingerprint=config_fingerprint(config_path, config))
+        stage = "storage"
+        _legacy_storage_maintenance()
+        stage = "service"
         service.serve()
         return 0
     except Exception as exc:

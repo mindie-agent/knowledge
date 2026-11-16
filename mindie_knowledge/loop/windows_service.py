@@ -14,7 +14,6 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import hashlib
-import json
 import os
 from pathlib import Path
 import re
@@ -24,15 +23,16 @@ import time
 import uuid
 from xml.etree import ElementTree as ET
 
-from ..filesystem import filesystem_path, git_path, path_identity, resolved_path
+from ..filesystem import git_path, path_identity, resolved_path
 from ..windows_interpreter import require_windowless
 from . import service_context
 
 MARKER = "mindie-knowledge.windows-service/1"
 NS = "http://schemas.microsoft.com/windows/2004/02/mit/task"
 _TRANSIENT = {"Running", "Queued"}
-from .service_host import (LIMIT, SAFE_CODES, SAFE_STAGES, ServiceHostError,
-                           _read, _write, _result_path, read_result, run_owned)
+from .service_host import (ServiceHostError, _read, _write,
+                           _result_path, prune_attempt_receipts,  # noqa: F401
+                           read_result, run_owned)
 
 
 def _private(root):
@@ -477,6 +477,9 @@ def _request_start(config_path, config):
         old_context.unlink(missing_ok=True)
     else:
         task = None
+    # Pruning runs only after launch.json reconciliation, so the active
+    # attempt (and any pending/unreconciled receipt) is already excluded.
+    prune_attempt_receipts(root)
     record = _record(config_path, config, root, sid)
     loaded = _task(record["label"])
     if loaded is not None and existing is None:

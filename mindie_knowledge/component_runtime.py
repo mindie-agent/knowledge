@@ -3,10 +3,18 @@
 [Invariants] Published adapter inputs stay unchanged. A separate uv project
 locks the selected component combination; only a verified candidate is returned.
 Native adapters retain ownership of their existing idle switch and rollback.
-[Timeouts & Locks] The caller supplies one enclosing build budget. A nonblocking
-OS lock coalesces the same generation; process cleanup has an extra 10s allowance.
-[Side-Effect Policy] Writes only under the caller's runtime-generation directory.
-No knowledge service, corpus, model, transcript or native configuration is used.
+A manifest published by ``os.replace`` is never removed if a later cleanup or
+interrupt aborts the call; only a fresh, unlocked, unpublished generation is
+discarded.
+[Timeouts & Locks] The caller supplies one enclosing build budget measured from
+entry: pre-build GC (<= 5 s or 10%), ``uv sync``, inventory verification and the
+post-build sweep share one absolute deadline and reserve cleanup grace. A
+nonblocking OS lock coalesces the same generation; process cleanup has an extra
+10s allowance. A bounded pre-build GC runs before that lock and never blocks
+the build.
+[Side-Effect Policy] Writes only under the caller's runtime-generation directory
+and a same-volume uv cache; reclaims only disposable sibling generations. No
+knowledge service, corpus, model, transcript or native configuration is used.
 """
 from __future__ import annotations
 
@@ -25,6 +33,14 @@ from .component_releases import runtime_identity
 from .loop.locks import lock_file, unlock_file
 from .loop.process import bounded_run
 from .runtime_inventory import validate_targets
+from .storage.lifecycle import configure_same_volume_uv_cache, prune_component_runtimes
+
+WINDOWS_SHORT_KEY_LENGTH = 24
+WINDOWS_FALLBACK_KEY_LENGTH = 32
+_IS_WINDOWS = os.name == "nt"
+PRE_BUILD_GC_CEILING_SECONDS = 5.0
+BUILD_CLEANUP_GRACE_SECONDS = 10.0
+POST_BUILD_SWEEP_CEILING_SECONDS = 3.0
 
 
 _TEXT_SUFFIXES = frozenset({
@@ -140,9 +156,143 @@ def project_text(source, targets, *, adapter_distribution=None):
 
 
 def generation_key(baseline, targets):
+    """Full 64-hex content identity; external callers depend on this shape."""
     value = dict(source=baseline["source_sha256"], runtime=targets,
                  abi=sys.implementation.cache_tag, platform=sysconfig.get_platform())
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
+def _manifest_generation_key(path: Path) -> str | None:
+    """The full key a completed manifest belongs to, or ``None`` if unknown."""
+    manifest = Path(path) / "components.json"
+    try:
+        value = json.loads(manifest.read_text(encoding="utf-8"))
+    except TimeoutError:
+        raise
+    except (OSError, ValueError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    declared = value.get("generation_key")
+    if isinstance(declared, str):
+        return declared
+    source = value.get("adapter_source_sha256")
+    targets = value.get("runtime")
+    if not isinstance(source, str) or not isinstance(targets, dict):
+        return None
+    try:
+        return generation_key({"source_sha256": source}, targets)
+    except (TypeError, ValueError, KeyError):
+        return None
+
+
+def _generation_matches(path: Path, key: str) -> bool:
+    manifest = Path(path) / "components.json"
+    if not manifest.is_file():
+        return False
+    existing = _manifest_generation_key(path)
+    # A legacy manifest without a derivable key was complete for every
+    # practical purpose; only a positively different key is a collision.
+    return existing is None or existing == key
+
+
+def generation_dir(root: Path, key: str) -> Path:
+    """Reuse a full-key directory; otherwise use a Windows-safe short key.
+
+    ``<root>/<24hex>/runtime/.venv/Scripts/pythonw.exe`` stays well under the
+    Windows 260-character Task Scheduler limit. A pre-existing 64-hex
+    directory is always reused verbatim. A short directory with a completed
+    manifest is reused only when its stored ``generation_key`` (or a key
+    recomputed from ``adapter_source_sha256``/``runtime``) matches; a
+    positively different key is a short-key collision, so 32 hex and then the
+    full key are tried instead of crashing the build in the wrong tree.
+    """
+    root = Path(root)
+    full = root / key
+    if full.exists() or not _IS_WINDOWS:
+        return full
+    short = root / key[:WINDOWS_SHORT_KEY_LENGTH]
+    if not short.exists():
+        return short
+    if _generation_matches(short, key) or (
+            (short / "prepare.lock").is_file()
+            and not (short / "components.json").is_file()):
+        return short
+    fallback = root / key[:WINDOWS_FALLBACK_KEY_LENGTH]
+    if fallback.exists():
+        if _generation_matches(fallback, key) or (
+                (fallback / "prepare.lock").is_file()
+                and not (fallback / "components.json").is_file()):
+            return fallback
+        return full
+    return fallback
+
+
+def _discard(path: Path) -> None:
+    """Best-effort removal of a failed build; never masks the original error."""
+    try:
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path, ignore_errors=True)
+            return
+        path.unlink(missing_ok=True)
+    except TimeoutError:
+        raise
+    except OSError:
+        pass
+
+
+def _post_build_sweep(deadline=None) -> None:
+    """Silently reclaim cross-harness legacy baggage after a component update.
+
+    This is how an installed user with only a background component auto-update
+    still receives 0.13.21 reclamation before host plugins themselves update.
+    The sweep owns a 600 s cooldown and a bounded slice of the build deadline;
+    a non-timeout cleanup warning can never turn a verified build into a
+    failure (or abort returning its already-published result).
+    """
+    from .storage.legacy import sweep_legacy_installations
+
+    budget = POST_BUILD_SWEEP_CEILING_SECONDS
+    if deadline is not None:
+        budget = min(budget, max(0.0, deadline - time.monotonic()))
+    if budget <= 0:
+        return
+    try:
+        sweep_legacy_installations(budget_seconds=budget, deadline=deadline)
+    except TimeoutError:
+        return
+    except Exception:  # noqa: BLE001 - best-effort cleanup after a verified build
+        return
+
+
+def _pre_build_prune(root: Path, generation: Path, budget: float,
+                     deadline: float | None = None) -> None:
+    """Free space before uv sync; a cleanup warning never blocks the build."""
+    from .storage.legacy import collect_global_protected_roots
+    from .storage.leases import live_process_prefixes
+
+    if deadline is None:
+        deadline = time.monotonic() + max(0.0, budget)
+    budget = min(max(0.0, budget), max(0.0, deadline - time.monotonic()))
+    if budget <= 0:
+        return
+    stop = min(deadline, time.monotonic() + budget)
+    try:
+        live_paths, complete = live_process_prefixes(
+            timeout=min(1.0, max(0.05, stop - time.monotonic())))
+        protected = collect_global_protected_roots(live_paths=live_paths,
+                                                   deadline=stop)
+        protected.add(generation)
+        prune_component_runtimes(
+            root, keep_paths=protected, keep_recent_verified=2,
+            staging_grace_seconds=1800.0,
+            budget_seconds=max(0.0, stop - time.monotonic()),
+            live_paths=live_paths, inspection_complete=complete,
+            include_global_roots=False, deadline=stop)
+    except TimeoutError:
+        return  # The bounded budget expired; the build keeps whatever space it has.
+    except Exception:  # noqa: BLE001 - best-effort cleanup never blocks a build
+        return
 
 
 def read_inventory(python, *, timeout=15):
@@ -160,27 +310,49 @@ def read_versions(python, names, *, timeout=15):
 
 def build(source, root, baseline, targets, *, python=sys.executable,
           adapter_distribution=None, timeout=420, env=None, files=None):
-    """Prepare and verify; publication of a native binding stays with its owner."""
+    """Prepare and verify; publication of a native binding stays with its owner.
+
+    One absolute deadline covers ``source_files``, pre-build GC, ``uv sync``,
+    inventory verification and the post-build sweep. Every inner budget is
+    derived from the same remaining time and reserves cleanup grace, so
+    ``outer_timeout >= sum(inner_budgets) + cleanup_grace``.
+    """
+    started = time.monotonic()
+    deadline = started + max(0.0, float(timeout))
     source, root = Path(source).resolve(), Path(root).resolve()
     files = source_files(source) if files is None else [Path(item) for item in files]
     validate_targets(targets)
     if not set(baseline["runtime"]) <= set(targets):
         raise ValueError("component selection omits an adapter dependency")
-    generation = root / generation_key(baseline, targets)
+    key = generation_key(baseline, targets)
+    generation = generation_dir(root, key)
     if generation.is_relative_to(source):
         raise ValueError("component generations must be outside the adapter source")
+    # Free legacy and failed-build space before uv sync starts on a nearly full
+    # volume. GC holds no generation lock, so a slow/unavailable cleanup cannot
+    # coalesce or delay the real build.
+    _pre_build_prune(
+        root, generation,
+        min(PRE_BUILD_GC_CEILING_SECONDS, max(0.0, float(timeout) * 0.1)),
+        deadline)
     generation.mkdir(parents=True, exist_ok=True)
+    runtime = generation / "runtime"
     manifest_file = generation / "components.json"
+    temporary = manifest_file.with_suffix(".pending.json")
     descriptor = os.open(generation / "prepare.lock", os.O_CREAT | os.O_RDWR, 0o600)
     locked = False
+    fresh = False
+    published = False
     try:
         lock_file(descriptor, exclusive=True)
         locked = True
-        started = time.monotonic()
-        runtime = generation / "runtime"
-        selected_python = runtime / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-        if manifest_file.is_file():
+        selected_python = runtime / ".venv" / (
+            "Scripts/python.exe" if os.name == "nt" else "bin/python")
+        fresh = not manifest_file.is_file()
+        if not fresh:
             components = json.loads(manifest_file.read_text(encoding="utf-8"))
+            if components.get("generation_key") not in (None, key):
+                raise ValueError("completed component runtime belongs to a different generation")
             if (components["adapter_source_sha256"] != baseline["source_sha256"]
                     or components["runtime"] != targets):
                 raise ValueError("completed component runtime differs from its generation")
@@ -227,13 +399,19 @@ def build(source, root, baseline, targets, *, python=sys.executable,
                 for idx, (k, v) in enumerate(git_pairs):
                     environment[f"GIT_CONFIG_KEY_{idx}"] = k
                     environment[f"GIT_CONFIG_VALUE_{idx}"] = v
+            # A cross-device uv cache silently turns clonefile/hardlinks into a
+            # full 250 MB copy per generation. An explicit caller value wins.
+            environment = configure_same_volume_uv_cache(root, environment)
+            sync_budget = deadline - time.monotonic() - BUILD_CLEANUP_GRACE_SECONDS
+            if sync_budget <= 0:
+                raise TimeoutError("component runtime build budget exhausted")
             bounded_run([uv, "sync", "--project", str(runtime), "--no-editable", "--no-dev",
-                         "--python", str(python)], "", timeout=timeout - 20,
+                         "--python", str(python)], "", timeout=sync_budget,
                         max_output=256 * 1024, child_env=environment)
             components = dict(schema="mindie-component-runtime/1",
-                              adapter_source_sha256=baseline["source_sha256"], runtime=targets,
+                              adapter_source_sha256=baseline["source_sha256"],
+                              runtime=targets, generation_key=key,
                               lock_sha256=hashlib.sha256((runtime / "uv.lock").read_bytes()).hexdigest())
-            temporary = manifest_file.with_suffix(".pending.json")
             temporary.write_text(json.dumps(components, sort_keys=True), encoding="utf-8", newline="\n")
         # A completed marker is not proof that the retained adapter stayed
         # intact. Compare only source inputs; native generated config is outside
@@ -242,18 +420,42 @@ def build(source, root, baseline, targets, *, python=sys.executable,
         for relative in files:
             if _read_source_bytes(source / relative) != _read_source_bytes(retained / relative):
                 raise ValueError("retained component adapter source changed")
-        remaining = timeout - (time.monotonic() - started) - 10
-        if remaining <= 0:
+        remaining = deadline - time.monotonic()
+        verify_budget = min(15.0, max(0.0, remaining - POST_BUILD_SWEEP_CEILING_SECONDS))
+        if verify_budget <= 0:
             raise TimeoutError("component runtime verification budget exhausted")
         script = Path(__file__).with_name("runtime_inventory.py")
         candidate_manifest = manifest_file if manifest_file.exists() else temporary
         actual = json.loads(bounded_run([str(selected_python), "-I", "-X", "utf8", str(script), str(candidate_manifest)], "",
-                                       timeout=min(15, remaining), max_output=64 * 1024))
+                                       timeout=verify_budget, max_output=64 * 1024))
         if candidate_manifest != manifest_file:
             os.replace(candidate_manifest, manifest_file)
+            published = True
+        else:
+            published = manifest_file.is_file()
+        # A post-publish cleanup warning (or any ordinary cleanup error) must
+        # never hide the already-verified result.
+        try:
+            _post_build_sweep(deadline)
+        except TimeoutError:
+            pass
+        except Exception:  # noqa: BLE001 - the build result is already verified
+            pass
+        verified_components = {name: value for name, value in components.items()
+                               if name != "generation_key"}
         return dict(generation=str(generation), source=str(generation / "source"),
                     python=str(selected_python), components=components,
-                    identity=runtime_identity(baseline, components), installed=actual)
+                    identity=runtime_identity(baseline, verified_components),
+                    installed=actual)
+    except BaseException:
+        # A failed fresh build must not leave a 250 MiB unverified .venv without
+        # components.json behind. A previously completed generation is
+        # untouched, and a just-published manifest is never removed.
+        if locked and fresh and not published and not manifest_file.is_file():
+            _discard(runtime)
+            _discard(generation / "source")
+            _discard(temporary)
+        raise
     finally:
         # Closing also releases a lock when acquisition itself failed.
         try:
@@ -277,6 +479,24 @@ def main():
         result = build(request["source"], request["root"], request["baseline"], request["runtime"],
                        python=request["python"], adapter_distribution=request.get("adapter_distribution"),
                        timeout=request.get("timeout", 420), files=request.get("files"))
+    elif request["operation"] == "prune":
+        # ``prune_component_runtimes`` inspects the live process table when no
+        # snapshot is supplied and unions the caller's keep paths with every
+        # global host binding unless isolation is explicit.
+        keep = [Path(item) for item in request.get("keep_paths", ())]
+        result = prune_component_runtimes(
+            Path(request["root"]), keep_paths=keep,
+            keep_recent_verified=request.get("keep_recent_verified", 2),
+            budget_seconds=request.get("budget_seconds", 5.0),
+            include_global_roots=request.get("include_global_roots", True))
+    elif request["operation"] == "sweep_legacy":
+        from .storage.legacy import sweep_legacy_installations
+
+        result = sweep_legacy_installations(
+            config_home=request.get("config_home"), data_home=request.get("data_home"),
+            codex_home=request.get("codex_home"),
+            budget_seconds=request.get("budget_seconds", 8.0),
+            force=request.get("force", False))
     else:
         raise ValueError("unsupported component update operation")
     print(json.dumps(result, sort_keys=True))

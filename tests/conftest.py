@@ -107,6 +107,7 @@ def _drop_linux_root_dac_override():
 _drop_linux_root_dac_override()
 
 _explicit_root = os.environ.get("_MINDIE_KNOWLEDGE_BASE_TEST_ROOT") or os.environ.get("MINDIE_KNOWLEDGE_TEST_ROOT")
+_owns_base_root = not _explicit_root
 if _explicit_root:
     _base_root = Path(_explicit_root).expanduser().resolve()
 else:
@@ -186,8 +187,26 @@ if not _real_gitleaks.is_dir():
 _isolated_gitleaks = _home / ".cache" / "mindie-agent" / "gitleaks"
 if _real_gitleaks.is_dir() and not _isolated_gitleaks.exists():
     import shutil as _shutil
+
+    def _link_cache_tree(source, destination):
+        """Hardlink the 28 MB scanner cache; copy only across filesystems."""
+        destination.mkdir(parents=True, exist_ok=True)
+        for directory, _children, names in os.walk(source):
+            target_dir = destination / Path(directory).relative_to(source)
+            target_dir.mkdir(parents=True, exist_ok=True)
+            for name in names:
+                origin = Path(directory) / name
+                target = target_dir / name
+                try:
+                    os.link(origin, target)
+                except TimeoutError:
+                    raise
+                except OSError:
+                    # EXDEV (or a filesystem without hardlinks): one bounded copy.
+                    _shutil.copy2(origin, target)
+
     _isolated_gitleaks.parent.mkdir(parents=True, exist_ok=True)
-    _shutil.copytree(_real_gitleaks, _isolated_gitleaks)
+    _link_cache_tree(_real_gitleaks, _isolated_gitleaks)
 os.environ.setdefault("MINDIE_DISABLE_FSYNC", "1")
 # Prevent Git reflog/receive-pack ident_default_email() from blocking 5s on DNS
 # when HOME/.gitconfig is redirected to an empty isolated test directory.
@@ -255,7 +274,12 @@ _AUTO_BASETEMP_ROOT: Path | None = None
 
 
 def pytest_sessionfinish(session, exitstatus):
-    """Leave no synthetic diagnostics tree behind, even after a failed run."""
+    """Leave no synthetic diagnostics or ``mk-iso-*`` root behind.
+
+    An xdist worker must not delete the shared base root while sibling workers
+    are still running, so only the controller (no ``workerinput``) removes the
+    ``mk-iso-*`` tree, and only when this session created it.
+    """
     import shutil
     import stat
 
@@ -271,6 +295,17 @@ def pytest_sessionfinish(session, exitstatus):
                 pass
 
         shutil.rmtree(_AUTO_BASETEMP_ROOT, onerror=_writable)
+    if not hasattr(session.config, "workerinput") and _owns_base_root:
+        def _retry_writable(func, target, _exc):
+            try:
+                os.chmod(target, stat.S_IWRITE)
+                func(target)
+            except TimeoutError:
+                raise
+            except OSError:
+                pass
+
+        shutil.rmtree(_base_root, onerror=_retry_writable)
 
 
 @pytest.hookimpl(tryfirst=True)

@@ -24,7 +24,9 @@ import uuid
 
 from ..filesystem import path_identity, resolved_path
 from . import service_context
-from .service_host import ServiceHostError, LIMIT, _read, _write, _result_path, read_result, run_owned
+from .service_host import (ServiceHostError, LIMIT, _read, _write,
+                           _result_path, prune_attempt_receipts,  # noqa: F401
+                           read_result, run_owned)
 
 MARKER = "mindie-knowledge.systemd-service/1"
 _LIVE = {"active", "activating", "deactivating", "reloading", "refreshing"}
@@ -379,6 +381,9 @@ def _request_start(config_path, config):
             raise ServiceHostError("launch_operation_invalid", stage="reconcile", uncertain=True)
         _remove_unit(root, existing, unit)
         (root / (existing["attempt"] + ".context")).unlink(missing_ok=True)
+    # Pruning runs only after launch.json reconciliation, so the active
+    # attempt (and any pending/unreconciled receipt) is already excluded.
+    prune_attempt_receipts(root)
     record = _record(config_path, config, root, uid)
     if _unit(record["label"]) is not None:
         raise ServiceHostError("foreign_task", stage="ownership")

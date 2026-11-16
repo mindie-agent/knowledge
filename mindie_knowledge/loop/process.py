@@ -291,6 +291,9 @@ def bounded_run(command, payload, *, timeout=None, max_output, cancel=None,
                 scratch = summary_scratch.create_root()
             process = _spawn(command, input_file, scratch, child_env)
         except TimeoutError:
+            # A timed-out launch has no owned process to clean its scratch.
+            if scratch is not None:
+                shutil.rmtree(scratch, ignore_errors=True)
             raise
         except (OSError, posix_owner.LaunchError) as exc:
             if not hasattr(exc, "mindie_execution"):
@@ -310,6 +313,12 @@ def bounded_run(command, payload, *, timeout=None, max_output, cancel=None,
                         cleanup_receipt['cleanup_failed'] = True
             raise annotated_error(exc, getattr(exc, "mindie_category", "configuration"),
                                   started, stage='start')
+        except BaseException:
+            # Any other launch failure (interrupt, unexpected spawn error) must
+            # not strand the freshly created summary profile.
+            if scratch is not None:
+                shutil.rmtree(scratch, ignore_errors=True)
+            raise
         chunks = queue.Queue(maxsize=max(2, max_output // 4096 + 1))
         readers_stop = threading.Event()
         read_errors = []
@@ -434,11 +443,30 @@ def bounded_run(command, payload, *, timeout=None, max_output, cancel=None,
                 for reader, stream in zip(readers, (process.stdout, process.stderr)):
                     if not reader.is_alive():
                         stream.close()
-                if any(reader.is_alive() for reader in readers):
-                    raise RuntimeError('owned protocol pipes did not close during cleanup')
-                if scratch is not None:
-                    cleanup_stage = "scratch-cleanup"
-                    shutil.rmtree(scratch)
+                try:
+                    if any(reader.is_alive() for reader in readers):
+                        raise RuntimeError('owned protocol pipes did not close during cleanup')
+                finally:
+                    # Even when a reader refuses to close, the owned scratch
+                    # profile must not accumulate in TMPDIR. A real cleanup
+                    # failure stays visible (receipt/DFX), then the best-effort
+                    # ignore_errors pass guarantees the retry.
+                    if scratch is not None:
+                        cleanup_stage = "scratch-cleanup"
+                        try:
+                            shutil.rmtree(scratch)
+                        except TimeoutError:
+                            raise
+                        except OSError as scratch_error:
+                            failure("organizer.process", stage="scratch-cleanup",
+                                    category="cleanup", exception=scratch_error)
+                            if cleanup_receipt is not None:
+                                cleanup_receipt['cleanup_failed'] = True
+                            else:
+                                raise
+                        finally:
+                            if scratch.exists():
+                                shutil.rmtree(scratch, ignore_errors=True)
             except Exception as cleanup_error:
                 failure(
                     "organizer.process",

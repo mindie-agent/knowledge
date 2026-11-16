@@ -18,7 +18,7 @@ import http.client
 import json
 import os
 from pathlib import Path
-import shutil
+import re
 import subprocess
 import tempfile
 import time
@@ -27,6 +27,63 @@ import urllib.parse
 import urllib.request
 
 PUBLIC_HEADERS = ("ETag", "Link", "Content-Length", "Content-Type", "Last-Modified")
+CACHE_ENTRY_LIMIT = 128
+CACHE_BYTE_LIMIT = 64 * 1024 * 1024
+STALE_TEMPORARY_SECONDS = 3600.0
+_CACHE_NAME = re.compile(r"(?:http-[0-9a-f]{64}|[0-9a-f]{64})\.json")
+
+
+def _prune_http_cache(root, *, deadline=None):
+    """Cap live cache bytes; also retire legacy v1 entries and stale temp files.
+
+    Legacy ``<64hex>.json`` files predate the ``http-`` prefix but occupy the
+    same cache. A crashed writer's ``*.tmp`` file is invisible to readers and
+    is removed only after an hour, so an in-flight write is never stolen.
+    """
+    now = time.time()
+    entries, stale = [], []
+    try:
+        candidates = list(Path(root).iterdir())
+    except TimeoutError:
+        raise
+    except OSError:
+        return {"removed": 0, "stale": 0, "remaining": 0}
+    for file in candidates:
+        try:
+            stat = file.stat()
+        except FileNotFoundError:
+            continue
+        except TimeoutError:
+            raise
+        except OSError:
+            continue
+        if file.suffix == ".tmp" and now - stat.st_mtime > STALE_TEMPORARY_SECONDS:
+            stale.append(file)
+        elif _CACHE_NAME.fullmatch(file.name):
+            entries.append((stat.st_mtime, stat.st_size, file))
+    for file in stale:
+        try:
+            file.unlink(missing_ok=True)
+        except TimeoutError:
+            raise
+        except OSError:
+            pass
+    entries.sort()
+    total = sum(size for _, size, _ in entries)
+    removed = 0
+    while entries and (len(entries) > CACHE_ENTRY_LIMIT or total > CACHE_BYTE_LIMIT):
+        if deadline is not None and time.monotonic() >= deadline:
+            break
+        _, size, file = entries.pop(0)
+        try:
+            file.unlink(missing_ok=True)
+        except TimeoutError:
+            raise
+        except OSError:
+            continue
+        total -= size
+        removed += 1
+    return {"removed": removed, "stale": len(stale), "remaining": len(entries)}
 
 
 class ReleaseResponseTooLarge(ValueError):
@@ -138,17 +195,5 @@ def read(url, *, maximum, timeout, accept, redirects, directory=None, force=Fals
         os.replace(temporary, path)
     finally:
         Path(temporary).unlink(missing_ok=True)
-    entries = []
-    for file in root.glob("http-*.json"):
-        try:
-            stat = file.stat()
-        except FileNotFoundError:
-            continue  # Another updater may have pruned the same cache entry.
-        entries.append((stat.st_mtime, stat.st_size, file))
-    entries.sort()
-    total = sum(size for _, size, _ in entries)
-    while entries and (len(entries) > 128 or total > 64 * 1024 * 1024):
-        _, size, file = entries.pop(0)
-        file.unlink(missing_ok=True)
-        total -= size
+    _prune_http_cache(root)
     return body, public

@@ -177,7 +177,7 @@ def test_foreign_named_job_is_not_scratch_authority(monkeypatch):
         monkeypatch.setenv(scratch.ENVIRONMENT_KEY, json.dumps(value))
         with pytest.raises(scratch.ScratchOwnershipError):
             scratch.create_profile(prefix="must-not-create-")
-        assert list(root.iterdir()) == []
+        assert [entry.name for entry in root.iterdir()] == [scratch.OWNER_MARKER]
         assert child.poll() is None
     finally:
         terminate_owned(child, wait=True)

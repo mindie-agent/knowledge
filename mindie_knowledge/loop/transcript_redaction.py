@@ -17,6 +17,7 @@
 """
 from __future__ import annotations
 
+import atexit
 import hashlib
 import hmac
 import io
@@ -170,6 +171,9 @@ def _scanner_config() -> tuple[Path, Path]:
         except OSError:
             pass
     _CONFIG_DIR = tempfile.TemporaryDirectory(prefix="mindie-redaction-")
+    # Normal exit and signal-driven cleanup both run atexit handlers, so the
+    # scanner config never becomes a permanent TMPDIR leak.
+    atexit.register(_CONFIG_DIR.cleanup)
     temp = Path(_CONFIG_DIR.name)
     config = temp / "config.toml"
     config.write_text(GITLEAKS_CONFIG, encoding="utf-8")
