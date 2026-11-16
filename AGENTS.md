@@ -57,7 +57,7 @@
 
 ---
 
-## 3. Timeout & Anti-Over-Defensive Rules (Four Iron Rules)
+## 3. Timeout & Anti-Over-Defensive Rules (Five Iron Rules)
 
 1. **Lightweight SQLite & Lock Discipline**:
    - `open_database` configures `PRAGMA journal_mode=WAL` and `timeout=5.0s` once per connection; `ConsentError(state="locked")` and `StartLock` use bounded waits (`5.0s`, `WAKE_PROBE_SECONDS = 2.0`). Never run per-`SELECT` `.owner` `lstat` loops or `:memory:` schema reflection on hot paths (`_declared_columns` is `@lru_cache`d).
@@ -69,7 +69,9 @@
    - Do not reintroduce ancestor `is_symlink()` directory-walking loops on temp/test paths or `ctypes` Win32 ACL / DPAPI ceremonies.
 4. **Module Header Contract & Pre-PR Review**:
    - Core modules maintain a top-of-file docstring declaring `[Role]`, `[Invariants]`, `[Timeouts & Locks]`, and `[Side-Effect Policy]`.
-   - Before submitting or updating any PR, complete the [MindIE Agent Pre-PR Review Checklist](../docs/design-principles.md#三开发-pr-提交前自查清单pre-pr-review).
+   - Before submitting or updating any PR, complete the [MindIE Agent Pre-PR Review Checklist](../mindie-agent/docs/design-principles.md#三开发-pr-提交前自查清单pre-pr-review).
+5. **Strict Session/Consent Gate Reserved Exclusively for Knowledge & Outbound Exports (`P2.1` & `P2.7`)**:
+   - `Admission.knowledge_lease` (`entry_enabled = 1`) and `mindie-consent/1` govern `knowledge_*` retrieval/distillation, `Stop` transcript capture, and GitHub PR publication—never deterministic engineering tools (`remote-dev`, `coordinator`, `profiler`, `sim`, `debugger`, `diagnostics`).
 
 ---
 
