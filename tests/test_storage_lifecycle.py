@@ -396,7 +396,9 @@ def test_multi_harness_retroactive_sweep_protects_every_live_root(tmp_path, monk
     assert cc["runtimes"][1].is_dir()
     assert cc["runtimes"][4].is_dir() and cc["runtimes"][3].is_dir()
     assert not cc["runtimes"][0].exists() and not cc["runtimes"][2].exists()
-    assert len(list(cc["installations"].iterdir())) == 2
+    assert sorted(p.name for p in cc["installations"].iterdir() if p.is_dir()) == [
+        "installation-3", "installation-4",
+    ]
     cc_state = tmp_path / "data" / "cc" / "adapter-state" / "component-runtimes"
     assert (cc_state / _key("cc-state", 3)).is_dir()
     assert (cc_state / _key("cc-state", 2)).is_dir()
