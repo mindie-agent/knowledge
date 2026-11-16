@@ -3,6 +3,7 @@
 from copy import deepcopy
 import base64
 import hashlib
+import http.client
 import io
 import json
 import urllib.error
@@ -197,6 +198,108 @@ def test_pagination_limit_is_not_a_partial_success(monkeypatch):
 def test_ambiguous_or_invalid_json_rejected(body):
     with pytest.raises(reader.ReleaseFetchError):
         reader._json(body)
+
+
+@pytest.mark.parametrize("bad", [b'{', b'\xff', b'{"a":1,"a":2}', b'{"a":NaN}'])
+def test_invalid_http_200_is_not_cached_and_next_check_recovers(monkeypatch, tmp_path, bad):
+    calls = []
+
+    class Response(io.BytesIO):
+        status = 200
+        headers = {"ETag": '"bad-response"'}
+
+    class Opener:
+        def open(self, request, **_kwargs):
+            calls.append(request)
+            return Response(bad if len(calls) == 1 else b'[]')
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *_: Opener())
+    with pytest.raises(reader.ReleaseFetchError) as caught:
+        reader.fetch_releases(REPO)
+    assert caught.value.category == "temporary_network"
+    assert not list((tmp_path / "release-cache").glob("http-*.json"))
+    assert reader.fetch_releases(REPO) == []
+    assert len(calls) == 2
+    assert calls[1].get_header("If-none-match") is None
+
+
+def test_legacy_invalid_cache_is_refetched_without_its_etag(monkeypatch):
+    from mindie_knowledge import release_http
+    calls = []
+
+    class Response(io.BytesIO):
+        status = 200
+        headers = {"ETag": '"legacy-invalid"'}
+
+    class Opener:
+        def open(self, request, **_kwargs):
+            calls.append(request)
+            return Response(b'{' if len(calls) == 1 else b'[]')
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *_: Opener())
+    url = f"https://api.github.com/repos/{REPO}/releases?per_page=100&page=1"
+    # Seed exactly the unvalidated entry written by the released HTTP cache.
+    release_http.read(url, maximum=1000, timeout=1, accept="application/vnd.github+json",
+                      redirects=reader._OfficialRedirects())
+    assert reader.fetch_releases(REPO) == []
+    assert len(calls) == 2
+    assert calls[1].get_header("If-none-match") is None
+
+
+def test_local_parser_fault_does_not_evict_or_refetch_a_valid_cache(monkeypatch, tmp_path):
+    calls = []
+
+    class Response(io.BytesIO):
+        status = 200
+        headers = {}
+
+    class Opener:
+        def open(self, request, **_kwargs):
+            calls.append(request)
+            return Response(b'[]')
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *_: Opener())
+    assert reader.fetch_releases(REPO) == []
+    cache = next((tmp_path / "release-cache").glob("http-*.json"))
+    before = cache.read_bytes()
+    error = ValueError("local parser failure")
+
+    def broken(_body):
+        raise error
+
+    monkeypatch.setattr(reader, "_json", broken)
+    with pytest.raises(ValueError) as caught:
+        reader.fetch_releases(REPO)
+    assert caught.value is error
+    assert len(calls) == 1
+    assert cache.read_bytes() == before
+
+
+def test_content_length_truncation_fails_before_json_or_cache(monkeypatch, tmp_path):
+    class Socket:
+        def makefile(self, *_args):
+            return io.BytesIO(b'HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n[]')
+
+    class Opener:
+        def open(self, *_args, **_kwargs):
+            response = http.client.HTTPResponse(Socket())
+            response.begin()
+            return response
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *_: Opener())
+    assert_error("release_transport_unavailable", lambda: reader.fetch_releases(REPO))
+    assert not list((tmp_path / "release-cache").glob("http-*.json"))
+
+
+@pytest.mark.parametrize("error", [ValueError("local parser failure"), RecursionError(), RuntimeError()])
+def test_local_parser_failure_is_not_relabelled_as_remote_json(monkeypatch, error):
+    def broken(*_args, **_kwargs):
+        raise error
+
+    monkeypatch.setattr(reader.json, "loads", broken)
+    with pytest.raises(type(error)) as caught:
+        reader._json(b'[]')
+    assert caught.value is error
 
 
 @pytest.mark.parametrize("target", [

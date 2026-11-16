@@ -7,6 +7,7 @@ import urllib.request
 import pytest
 
 from mindie_knowledge import release_http
+from mindie_knowledge.releases_io import _remote_json
 
 
 def test_etag_304_reuses_body_without_persisting_auth_or_private_headers(tmp_path, monkeypatch):
@@ -24,7 +25,7 @@ def test_etag_304_reuses_body_without_persisting_auth_or_private_headers(tmp_pat
     def read(**extra):
         return release_http.read("https://api.github.com/repos/mindie-agent/knowledge/releases/latest",
                                  maximum=1000, timeout=1, accept="application/json", redirects=None,
-                                 directory=tmp_path, credential="private-token", **extra)
+                                 directory=tmp_path, credential="private-token", validate=_remote_json, **extra)
     first = read()
     assert read() == first
     assert len(calls) == 1

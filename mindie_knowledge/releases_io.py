@@ -21,6 +21,7 @@ import urllib.request
 from .releases import (
     REPOSITORIES, ReleaseValidationError, validate_compatibility, validate_release_metadata,
 )
+from .release_http import ReleaseResponseInvalid
 
 
 ASSET_NAME = "mindie-plugin-release.json"
@@ -47,6 +48,10 @@ class ReleaseFetchError(RuntimeError):
         super().__init__(code)
 
 
+class ReleaseJSONError(ReleaseFetchError, ReleaseResponseInvalid):
+    """Strict JSON rejection; transport provenance is assigned at HTTP reads."""
+
+
 class _OfficialRedirects(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         try:
@@ -69,7 +74,7 @@ def _get(url, *, maximum, timeout, accept):
     from .release_http import ReleaseResponseTooLarge, read
     try:
         return read(url, maximum=maximum, timeout=timeout, accept=accept,
-                    redirects=_OfficialRedirects())
+                    redirects=_OfficialRedirects(), validate=_remote_json)
     except urllib.error.HTTPError as exc:
         raise ReleaseFetchError("release_http_error", status=exc.code) from None
     except ReleaseResponseTooLarge:
@@ -85,16 +90,25 @@ def _json(body):
         result = {}
         for key, value in pairs:
             if key in result:
-                raise ReleaseFetchError("duplicate_release_json_key")
+                raise ReleaseJSONError("duplicate_release_json_key")
             result[key] = value
         return result
     def reject_constant(_value):
-        raise ReleaseFetchError("invalid_release_json")
+        raise ReleaseJSONError("invalid_release_json")
     try:
         return json.loads(body.decode("utf-8"), object_pairs_hook=unique,
                           parse_constant=reject_constant)
-    except (UnicodeError, ValueError, RecursionError):
-        raise ReleaseFetchError("invalid_release_json") from None
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ReleaseJSONError("invalid_release_json") from None
+
+
+def _remote_json(body):
+    """Mark only JSON rejected at the public HTTP boundary as a feed failure."""
+    try:
+        return _json(body)
+    except ReleaseJSONError as exc:
+        exc.category = "temporary_network"
+        raise exc from None
 
 
 def _next_page(headers, *, repository, page):

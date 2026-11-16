@@ -21,7 +21,7 @@ import urllib.parse
 from semantic_version import Version
 
 from .runtime_inventory import COMPONENTS, SHA, validate_targets
-from .releases_io import _OfficialRedirects
+from .releases_io import _OfficialRedirects, _json, _remote_json
 from .release_http import read as http_read
 
 MAX_RESPONSE = 2 * 1024 * 1024
@@ -44,8 +44,8 @@ class Catalog:
         raw, _ = http_read("https://api.github.com" + path, maximum=MAX_RESPONSE,
                            timeout=self.remaining(), accept="application/vnd.github+json",
                            redirects=_OfficialRedirects(), directory=self.cache,
-                           force=force, credential=self.token)
-        return json.loads(raw.decode("utf-8"))
+                           force=force, credential=self.token, validate=_remote_json)
+        return _json(raw)
 
     def latest(self, name, *, force=False):
         repository = COMPONENTS[name]
