@@ -12,14 +12,139 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 import sys
 import tempfile
+import time
+from pathlib import Path
 
 from ..filesystem import filesystem_path, resolved_path
 from . import service_context
 
 LIMIT = 256 * 1024
+ATTEMPT_RETENTION = 32
+ATTEMPT_MAX_AGE_SECONDS = 24 * 3600.0
+_ATTEMPT_SUFFIXES = (".claimed", ".result.json", ".cleanup.json")
+_TERMINAL_RESULT_STATUSES = frozenset({"finished", "failed"})
+_ACTIVE_OPERATION_PHASES = frozenset({
+    "prepared", "registering", "registered", "starting", "started",
+})
+_UNREADABLE = object()
+
+
+def _attempt_id(value):
+    return value if isinstance(value, str) and re.fullmatch(r"[a-f0-9]{32}", value) else None
+
+
+def _optional_record(path):
+    """A launch/operation record, or ``_UNREADABLE`` when it cannot be trusted."""
+    try:
+        value = _read(path)
+    except TimeoutError:
+        raise
+    except (OSError, ServiceHostError):
+        return _UNREADABLE
+    return value if value is not None else None
+
+
+def _active_attempts(root: Path):
+    """Attempts that launch.json, an active operation, or a claim still owns."""
+    active = set()
+    record = _optional_record(root / "launch.json")
+    if record is _UNREADABLE:
+        return _UNREADABLE
+    if isinstance(record, dict):
+        attempt = _attempt_id(record.get("attempt"))
+        if attempt is not None:
+            active.add(attempt)
+    operation = _optional_record(root / "operation.json")
+    if operation is _UNREADABLE:
+        return _UNREADABLE
+    if isinstance(operation, dict) and operation.get("phase") in _ACTIVE_OPERATION_PHASES:
+        attempt = _attempt_id(operation.get("attempt"))
+        if attempt is not None:
+            active.add(attempt)
+    return active
+
+
+def _terminal_result(root: Path, attempt: str) -> bool:
+    """Only a cleanly parsed, definitively terminal result is prunable."""
+    try:
+        result = _read(root / (attempt + ".result.json"))
+    except TimeoutError:
+        raise
+    except (OSError, ServiceHostError):
+        return False
+    if not isinstance(result, dict) or result.get("attempt") != attempt:
+        return False
+    if result.get("status") not in _TERMINAL_RESULT_STATUSES:
+        return False
+    return type(result.get("exit_code")) is int
+
+
+def prune_attempt_receipts(root, *, keep: int = ATTEMPT_RETENTION,
+                           max_age: float = ATTEMPT_MAX_AGE_SECONDS) -> dict:
+    """Cap terminal launch-attempt receipts at the newest 32 or 24 hours.
+
+    ``launch.json`` and any active operation marker are read before any entry
+    is considered, and their attempt is never touched. An attempt is prunable
+    only when ``<attempt>.result.json`` parses cleanly as ``finished`` or
+    ``failed`` with an integer exit code; missing, pending, malformed or
+    unreconciled receipts are kept regardless of count or age.
+    """
+    root = Path(root)
+    now = time.time()
+    active = _active_attempts(root)
+    if active is _UNREADABLE:
+        return {"removed": 0, "attempts": 0}
+    groups = {}
+    try:
+        entries = list(root.iterdir())
+    except TimeoutError:
+        raise
+    except OSError:
+        return {"removed": 0, "attempts": 0}
+    for entry in entries:
+        for suffix in _ATTEMPT_SUFFIXES:
+            if not entry.name.endswith(suffix):
+                continue
+            attempt = entry.name[: -len(suffix)]
+            if _attempt_id(attempt) is None:
+                break
+            try:
+                mtime = entry.stat().st_mtime
+            except FileNotFoundError:
+                break
+            except TimeoutError:
+                raise
+            except OSError:
+                break
+            groups.setdefault(attempt, []).append((mtime, entry))
+            break
+    ordered = sorted(groups.items(),
+                     key=lambda item: max(mtime for mtime, _entry in item[1]),
+                     reverse=True)
+    removed = 0
+    for index, (attempt, files) in enumerate(ordered):
+        if attempt in active:
+            continue
+        newest = max(mtime for mtime, _entry in files)
+        terminal = _terminal_result(root, attempt) and (
+            newest <= now - max_age or index >= keep)
+        if not terminal:
+            continue
+        for _mtime, entry in files:
+            try:
+                entry.unlink(missing_ok=True)
+                removed += 1
+            except TimeoutError:
+                raise
+            except OSError:
+                pass
+    return {"removed": removed, "attempts": len(ordered)}
+
+
 _contained_pid = None
 SAFE_STAGES = {"identity", "ownership", "read", "write", "query", "interpreter",
                "reconcile", "register", "start", "readiness", "remove", "context", "service"}

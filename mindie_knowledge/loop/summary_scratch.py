@@ -11,11 +11,16 @@ or a worker-provided deletion target. Only the core deletes its own fresh root.
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
 import tempfile
+import time
 import uuid
 
 ENVIRONMENT_KEY = "MINDIE_SUMMARY_SCRATCH"
+OWNER_MARKER = ".mindie-owner.json"
+STALE_OWNER_SECONDS = 3600.0
+_STALE_PREFIXES = ("mindie-summary-owner-", "mindie-distill-")
 
 
 class ScratchOwnershipError(ValueError):
@@ -24,9 +29,78 @@ class ScratchOwnershipError(ValueError):
     mindie_category = "configuration"
 
 
+def _writer_exited(pid) -> bool:
+    """Prove a recorded writer process is gone; a live/unknown pid is not proof."""
+    if type(pid) is not int or pid <= 0 or pid == os.getpid():
+        return False
+    if os.name == "nt":
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return ctypes.get_last_error() == 87  # ERROR_INVALID_PARAMETER
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value != 259  # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except TimeoutError:
+        raise
+    except (OSError, OverflowError):
+        pass
+    return False
+
+
+def _sweep_stale_roots(parent: Path) -> None:
+    """Remove only dirs carrying our explicit owner marker, dead and >1h old."""
+    try:
+        entries = list(parent.iterdir())
+    except TimeoutError:
+        raise
+    except OSError:
+        return
+    now = time.time()
+    for entry in entries:
+        if not entry.name.startswith(_STALE_PREFIXES):
+            continue
+        marker = entry / OWNER_MARKER
+        try:
+            value = json.loads(marker.read_text(encoding="utf-8"))
+            if type(value) is not dict or set(value) != {"pid", "created_at"}:
+                continue
+            if type(value["pid"]) is not int or not isinstance(value["created_at"], (int, float)):
+                continue
+            if now - value["created_at"] < STALE_OWNER_SECONDS:
+                continue
+            if not _writer_exited(value["pid"]):
+                continue
+            info = entry.lstat()
+            if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) \
+                    or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+                continue
+            shutil.rmtree(entry, ignore_errors=True)
+        except TimeoutError:
+            raise
+        except (OSError, ValueError, TypeError):
+            continue
+
+
 def create_root():
-    root = Path(tempfile.gettempdir()) / ("mindie-summary-owner-" + uuid.uuid4().hex)
+    parent = Path(tempfile.gettempdir())
+    _sweep_stale_roots(parent)
+    root = parent / ("mindie-summary-owner-" + uuid.uuid4().hex)
     root.mkdir(mode=0o700, parents=True, exist_ok=False)
+    (root / OWNER_MARKER).write_text(
+        json.dumps({"pid": os.getpid(), "created_at": time.time()}), encoding="utf-8",
+        newline="\n")
     return root
 
 

@@ -364,6 +364,12 @@ class Feed:
         if staging.exists():
             shutil.rmtree(staging)
 
+    def _clear_commit_staging(self, commit):
+        """Drop one interrupted commit's staged bytes without touching another."""
+        directory = self._staging_dir(commit)
+        if directory.exists():
+            shutil.rmtree(filesystem_path(directory), ignore_errors=True)
+
     def _staged_count(self, commit):
         directory = self._staging_dir(commit)
         return sum(1 for _ in directory.rglob("*.md")) if directory.exists() else 0
@@ -516,7 +522,19 @@ class Feed:
                     installed, installed_entries = self._sync_graded(commit, deadline, cancel)
                 else:
                     listing = self._validate_listing(commit, deadline)
-                    self._stage_tree_docs(commit, listing, deadline)
+                    try:
+                        self._stage_tree_docs(commit, listing, deadline)
+                    except (TimeoutError, InterruptedError):
+                        # Deadline/cancellation during staging must not leave a
+                        # half-populated staging/<commit> tree behind. The
+                        # original failure stays the reported primary outcome.
+                        try:
+                            self._clear_commit_staging(commit)
+                        except TimeoutError:
+                            raise
+                        except OSError:
+                            pass
+                        raise
                     # The candidate switched atomically only when every blob of
                     # the exact commit was verified and staged; the switch itself
                     # is a short local transaction with no Git IO inside.
