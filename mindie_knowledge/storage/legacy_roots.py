@@ -74,6 +74,8 @@ def _scandir_walk(root: Path, *, deadline=None, max_depth: int = _MAX_WALK_DEPTH
     never overrun the caller's protected-pin budget. Directory links/junctions
     are followed read-only (a protection pin may live behind one) with a
     visited ``(st_dev, st_ino)`` guard against cycles and a hard depth cap.
+    A filesystem without usable inode identity (Windows ``DirEntry``, FAT/
+    exFAT) relies on the depth cap instead of treating ``(0, 0)`` as a cycle.
     """
     base = Path(root)
     try:
@@ -103,15 +105,22 @@ def _scandir_walk(root: Path, *, deadline=None, max_depth: int = _MAX_WALK_DEPTH
                     if not is_dir or depth + 1 >= max_depth:
                         continue
                     try:
-                        info = item.stat(follow_symlinks=True)
+                        # ``DirEntry.stat`` reports ``(0, 0)`` for every
+                        # directory on Windows; a real ``os.stat`` populates
+                        # the NTFS FileIndex/volume serial identity instead.
+                        info = os.stat(filesystem_path(child))
                     except TimeoutError:
                         raise
                     except OSError:
                         continue
                     key = (info.st_dev, info.st_ino)
-                    if key not in visited:
+                    if key != (0, 0):
+                        # FAT/exFAT may expose no usable inode identity. Never
+                        # treat that as a cycle: bound the walk by max_depth.
+                        if key in visited:
+                            continue
                         visited.add(key)
-                        stack.append((child, depth + 1))
+                    stack.append((child, depth + 1))
         except TimeoutError:
             raise
         except OSError:

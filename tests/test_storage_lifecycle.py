@@ -455,6 +455,9 @@ def test_multi_harness_retroactive_sweep_protects_every_live_root(tmp_path, monk
     assert cooled["reclaimed_dirs"] == 0
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX ps argv inspection; Windows uses image path and runtime lease")
 def test_unreferenced_component_runtime_is_kept_while_subprocess_runs(tmp_path):
     root = tmp_path / "component-runtimes"
     generation = _runtime(root, "live", 0, mtime=1000)
@@ -521,7 +524,8 @@ def test_windows_permission_error_defers_without_deleting_a_single_file(tmp_path
     real_replace = lifecycle.os.replace
 
     def deny(source, destination):
-        if Path(source) == Path(generation):
+        # On Windows ``source`` carries the ``\\?\`` extended prefix.
+        if filesystem.path_identity(source) == filesystem.path_identity(generation):
             raise PermissionError(13, "WinError 5: in use")
         return real_replace(source, destination)
 
@@ -563,12 +567,17 @@ def test_failed_fresh_build_removes_unverified_venv_and_pending_manifest(tmp_pat
         "revision": "a" * 40,
     }}
     baseline = {"source_sha256": component_runtime.source_identity(source), "runtime": {}}
-    root = tmp_path / "component-runtimes"
+    root = (tmp_path / "component-runtimes").resolve()
     key = component_runtime.generation_key(baseline, targets)
-    generation = root / key
-    monkeypatch.setattr(component_runtime.shutil, "which", lambda name: "/tools/uv")
-    monkeypatch.setattr(uv_cache, "_device",
-                        lambda path: 1 if str(path).startswith(str(Path.home())) else 2)
+    generation = component_runtime.generation_dir(root, key)
+    monkeypatch.delenv("UV_CACHE_DIR", raising=False)
+    monkeypatch.setattr(component_runtime.shutil, "which",
+                        lambda name: str(tmp_path / "tools" / "uv"))
+    foreign_cache = tmp_path / "foreign-volume-uv-cache"
+    monkeypatch.setattr(uv_cache, "_uv_default_cache", lambda env=None: foreign_cache)
+    monkeypatch.setattr(
+        uv_cache, "_device",
+        lambda path: 1 if "foreign-volume-uv-cache" in str(path) else 2)
     observed = {}
 
     def failing_download(command, payload, **kwargs):
@@ -592,8 +601,12 @@ def test_failed_fresh_build_removes_unverified_venv_and_pending_manifest(tmp_pat
 def test_cross_volume_uv_cache_selection_and_explicit_override(tmp_path, monkeypatch):
     target = tmp_path / "component-runtimes"
     target.mkdir()
-    monkeypatch.setattr(uv_cache, "_device",
-                        lambda path: 1 if str(path).startswith(str(Path.home())) else 2)
+    monkeypatch.delenv("UV_CACHE_DIR", raising=False)
+    foreign_cache = tmp_path / "foreign-volume-uv-cache"
+    monkeypatch.setattr(uv_cache, "_uv_default_cache", lambda env=None: foreign_cache)
+    monkeypatch.setattr(
+        uv_cache, "_device",
+        lambda path: 1 if "foreign-volume-uv-cache" in str(path) else 2)
     env = {}
     configured = configure_same_volume_uv_cache(target, env)
     assert configured["UV_CACHE_DIR"] == str(target.parent / ".uv-cache")
@@ -602,10 +615,12 @@ def test_cross_volume_uv_cache_selection_and_explicit_override(tmp_path, monkeyp
     monkeypatch.setattr(uv_cache, "_device", lambda path: 7)
     assert configure_same_volume_uv_cache(target, same_volume) == {"UV_CACHE_DIR": ""}
 
-    explicit = {"UV_CACHE_DIR": "/mnt/shared/uv"}
+    explicit_path = str(tmp_path / "shared" / "uv")
+    explicit = {"UV_CACHE_DIR": explicit_path}
     monkeypatch.setattr(uv_cache, "_device",
                         lambda path: (_ for _ in ()).throw(AssertionError("must not inspect")))
-    assert configure_same_volume_uv_cache(target, explicit) == {"UV_CACHE_DIR": "/mnt/shared/uv"}
+    assert configure_same_volume_uv_cache(target, explicit) == {
+        "UV_CACHE_DIR": explicit_path}
 
 
 def test_windows_short_generation_directory_reuse_and_collision_fallback(tmp_path, monkeypatch):
@@ -1005,14 +1020,29 @@ def test_retirement_holds_exclusive_locks_across_rename(tmp_path, monkeypatch):
     real_replace = lifecycle.os.replace
 
     def probe(source, destination):
-        if Path(source) == generation:
-            observed["lease_held"] = leases.is_lease_held(generation)
+        if filesystem.path_identity(source) == filesystem.path_identity(generation):
+            if os.name == "nt":
+                # Windows holds one sibling lock and no handle inside the
+                # generation, because NTFS refuses to rename an open directory.
+                sibling = generation.parent / leases.RETIRE_LOCK_NAME
+                descriptor = os.open(sibling, os.O_RDWR)
+                try:
+                    with pytest.raises((BlockingIOError, OSError)):
+                        lock_file(descriptor, exclusive=True)
+                    observed["retire_lock_held"] = True
+                finally:
+                    os.close(descriptor)
+            else:
+                observed["lease_held"] = leases.is_lease_held(generation)
         return real_replace(source, destination)
 
     monkeypatch.setattr(lifecycle.os, "replace", probe)
     outcome = retire_directory(generation)
     assert outcome["status"] == "retired"
-    assert observed["lease_held"] is True
+    if os.name == "nt":
+        assert observed["retire_lock_held"] is True
+    else:
+        assert observed["lease_held"] is True
 
     trash_named = tmp_path / ".trash-already-retired"
     trash_named.mkdir()
@@ -1048,10 +1078,11 @@ def _build_fixture(tmp_path, monkeypatch):
         "revision": "a" * 40,
     }}
     baseline = {"source_sha256": component_runtime.source_identity(source), "runtime": {}}
-    root = tmp_path / "component-runtimes"
+    root = (tmp_path / "component-runtimes").resolve()
     key = component_runtime.generation_key(baseline, targets)
-    generation = root / key
-    monkeypatch.setattr(component_runtime.shutil, "which", lambda name: "/tools/uv")
+    generation = component_runtime.generation_dir(root, key)
+    monkeypatch.setattr(component_runtime.shutil, "which",
+                        lambda name: str(tmp_path / "tools" / "uv"))
 
     def successful(command, payload, **kwargs):
         if Path(command[0]).name == "uv":
@@ -1079,7 +1110,9 @@ def test_published_manifest_survives_post_publish_interrupt(tmp_path, monkeypatc
         component_runtime.build(source, root, baseline, targets, timeout=120)
     assert (generation / "components.json").is_file()
     manifest = json.loads((generation / "components.json").read_text(encoding="utf-8"))
-    assert manifest["generation_key"] == generation.name
+    # Windows reuses a 24-hex directory alias; the manifest keeps the full key.
+    assert manifest["generation_key"] == component_runtime.generation_key(
+        baseline, targets)
     selected = generation / "runtime" / ".venv" / (
         "Scripts/python.exe" if os.name == "nt" else "bin/python")
     assert selected.is_file()
@@ -1179,6 +1212,7 @@ def test_uv_cache_defaults_and_mountpoint_fallback(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("UV_CACHE_DIR", raising=False)
     target = tmp_path / "mountpoint"
     target.mkdir()
 
@@ -1398,14 +1432,34 @@ def test_windows_retirement_defers_on_builder_lock_without_handles(tmp_path, mon
 
 def test_builder_rejects_generation_moved_after_prepare_lock(tmp_path, monkeypatch):
     source, root, baseline, targets, generation = _build_fixture(tmp_path, monkeypatch)
-    real_lock_file = component_runtime.lock_file
+    trash = root / (".trash-" + generation.name[:16])
+    if os.name == "nt":
+        # NTFS refuses to rename a directory while prepare.lock is open inside
+        # it. The equivalent Windows race window is between the pre-lock stat
+        # and os.open; move the generation exactly there, then let the real
+        # lock acquire the replacement directory's prepare.lock.
+        real_open = component_runtime.os.open
+        moved = False
 
-    def swapping_lock(descriptor, *, exclusive, blocking=False):
-        real_lock_file(descriptor, exclusive=exclusive, blocking=blocking)
-        os.replace(generation, root / (".trash-" + generation.name[:16]))
-        generation.mkdir()
+        def moving_open(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal moved
+            if (not moved and filesystem.path_identity(path) == filesystem.path_identity(
+                    generation / "prepare.lock")):
+                moved = True
+                os.replace(generation, trash)
+                generation.mkdir()
+            return real_open(path, flags, mode, dir_fd=dir_fd)
 
-    monkeypatch.setattr(component_runtime, "lock_file", swapping_lock)
+        monkeypatch.setattr(component_runtime.os, "open", moving_open)
+    else:
+        real_lock_file = component_runtime.lock_file
+
+        def swapping_lock(descriptor, *, exclusive, blocking=False):
+            real_lock_file(descriptor, exclusive=exclusive, blocking=blocking)
+            os.replace(generation, trash)
+            generation.mkdir()
+
+        monkeypatch.setattr(component_runtime, "lock_file", swapping_lock)
 
     with pytest.raises(RuntimeError, match="moved while its builder lock"):
         component_runtime.build(source, root, baseline, targets, timeout=120)
@@ -1508,15 +1562,98 @@ def test_workbuddy_scan_checks_deadline_on_every_entry(tmp_path, isolated_machin
     with pytest.raises(TimeoutError):
         legacy_roots._scan_workbuddy(set(), deadline=time.monotonic() - 1)
 
+    tool_paths = [(tmp_path / f"opt/tool-{index}/bin/python").resolve()
+                  for index in range(2)]
     for index in range(2):
         plugin = cache / f"filler-{index}" / "mindie-agent" / "plugin"
         (plugin / "mcp.json").write_text(
-            json.dumps({"command": f"/opt/tool-{index}/bin/python"}),
+            json.dumps({"command": str(tool_paths[index])}),
             encoding="utf-8")
     protected = set()
     legacy_roots._scan_workbuddy(protected, deadline=time.monotonic() + 60)
-    assert Path("/opt/tool-0/bin/python") in protected
-    assert Path("/opt/tool-1/bin/python") in protected
+    for tool_path in tool_paths:
+        assert Path(os.path.normpath(str(tool_path))) in protected
+
+
+def _zero_identity(info):
+    class ZeroIdentity:
+        st_dev = 0
+        st_ino = 0
+
+        def __getattr__(self, name):
+            return getattr(info, name)
+
+    return ZeroIdentity()
+
+
+def test_scandir_walk_traverses_when_direntry_stat_has_no_identity(
+        tmp_path, monkeypatch):
+    """Windows ``DirEntry.stat`` reports ``(0, 0)`` for every directory."""
+    from mindie_knowledge.storage import legacy_roots
+
+    root = tmp_path / "plugins"
+    target = root / "releases" / "0.1.23" / "entry.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("", encoding="utf-8")
+
+    class ZeroStatEntry:
+        def __init__(self, entry):
+            self._entry = entry
+
+        def __getattr__(self, name):
+            return getattr(self._entry, name)
+
+        def stat(self, *, follow_symlinks=True):
+            return _zero_identity(
+                self._entry.stat(follow_symlinks=follow_symlinks))
+
+    class ZeroStatScandir:
+        def __init__(self, iterator):
+            self._iterator = iterator
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return ZeroStatEntry(next(self._iterator))
+
+        def __enter__(self):
+            self._iterator.__enter__()
+            return self
+
+        def __exit__(self, *exc_info):
+            return self._iterator.__exit__(*exc_info)
+
+    real_scandir = os.scandir
+    monkeypatch.setattr(
+        legacy_roots.os, "scandir",
+        lambda path=".": ZeroStatScandir(real_scandir(path)))
+
+    entries = list(legacy_roots._scandir_walk(root, max_depth=6))
+
+    assert (root / "releases" / "0.1.23", True) in entries
+    assert (target, False) in entries
+
+
+def test_scandir_walk_never_skips_directories_on_a_zero_inode_filesystem(
+        tmp_path, monkeypatch):
+    """FAT/exFAT ``os.stat`` returns ``(0, 0)``; depth is the only bound."""
+    from mindie_knowledge.storage import legacy_roots
+
+    root = tmp_path / "plugins"
+    target = root / "releases" / "0.1.23" / "entry.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("", encoding="utf-8")
+    real_stat = legacy_roots.os.stat
+    monkeypatch.setattr(
+        legacy_roots.os, "stat",
+        lambda path, *args, **kwargs: _zero_identity(
+            real_stat(path, *args, **kwargs)))
+
+    entries = list(legacy_roots._scandir_walk(root, max_depth=6))
+
+    assert (root / "releases" / "0.1.23", True) in entries
+    assert (target, False) in entries
 
 
 def test_legacy_entry_scan_honours_deadline(tmp_path):
