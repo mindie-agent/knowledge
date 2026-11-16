@@ -7,9 +7,9 @@
   ``<codex_home>/plugins/data/mindie-agent-mindie-agent`` and
   ``~/.cache/mindie-agent-dsh/uv-cache``). ``source_root``/``package_dir`` and
   every other config value are protected pins only, never scan roots.
-- No candidate is retired when its path or any ancestor up to the filesystem
-  root contains ``.git``, or when it lies inside a protected user
-  ``source_root``.
+- No candidate is retired or file unlinked when its path or any ancestor up to
+  the filesystem root contains ``.git``, or when it lies inside or around a
+  protected user ``source_root``.
 - A managed target whose own path, or an intermediate directory under its
   managed home, is a symlink/junction is skipped before any trash sweep or
   handler runs; the external target is never read or deleted.
@@ -137,6 +137,27 @@ def _has_git_ancestor(entry: Path) -> bool:
     return has_git_ancestor(entry)
 
 
+def _protected_leaf(entry: Path, forbidden_roots) -> bool:
+    """True when ``entry`` is a Git tree or inside a protected source root.
+
+    Every leaf deletion in this module goes through this gate. ``has_git_ancestor``
+    covers ordinary checkouts, ``lexists`` catches a dangling ``.git`` link, and
+    the explicit ``.git``/``RemoteReceipts`` component checks keep the metadata
+    tree itself (and retry receipts) undeletable even when passed directly.
+    """
+    candidate = Path(entry)
+    if ".git" in candidate.parts or "RemoteReceipts" in candidate.parts:
+        return True
+    if os.path.lexists(filesystem_path(candidate / ".git")):
+        return True
+    if _has_git_ancestor(candidate):
+        return True
+    if not forbidden_roots:
+        return False
+    return (is_within_roots(candidate, forbidden_roots)
+            or is_protected_path(candidate, forbidden_roots))
+
+
 def _recent(entry: Path, grace_seconds: float) -> bool:
     if grace_seconds <= 0:
         return False
@@ -150,11 +171,13 @@ def _retire_path(entry: Path, deadline, account, *, protected, live, complete,
     if _keep(entry, protected, live):
         account["kept_dirs"] += 1
         return False
-    if is_within_roots(entry, forbidden_roots):
+    if is_within_roots(entry, forbidden_roots) \
+            or is_protected_path(entry, forbidden_roots):
         account["kept_dirs"] += 1
         account["warnings"].append("protected source root: " + entry.name[:32])
         return False
     if _has_git_ancestor(entry) or ".git" in entry.parts \
+            or os.path.lexists(filesystem_path(entry / ".git")) \
             or "RemoteReceipts" in entry.parts:
         account["kept_dirs"] += 1
         account["warnings"].append("protected checkout: " + entry.name[:32])
@@ -177,7 +200,10 @@ def _retire_path(entry: Path, deadline, account, *, protected, live, complete,
                            and not is_own_runtime_path(entry)
                            and not is_path_used_by_live_process(entry, live)
                            and not is_within_roots(entry, forbidden_roots)
-                           and not _has_git_ancestor(entry))
+                           and not is_protected_path(entry, forbidden_roots)
+                           and not _has_git_ancestor(entry)
+                           and not os.path.lexists(
+                               filesystem_path(entry / ".git")))
     outcome = retire_directory(entry, deadline=deadline, recheck=recheck)
     if outcome["status"] in {"retired", "trashed_partial"}:
         account["reclaimed_dirs"] += 1
@@ -193,10 +219,13 @@ def _retire_path(entry: Path, deadline, account, *, protected, live, complete,
     return False
 
 
-def _unlink_file(entry: Path, account, deadline=None) -> None:
+def _unlink_file(entry: Path, account, deadline=None, forbidden_roots=()) -> None:
     if _expired(deadline):
         account["partial"] = True
         account["warnings"].append("budget exhausted")
+        return
+    if _protected_leaf(entry, forbidden_roots):
+        account["warnings"].append("protected file: " + entry.name[:32])
         return
     try:
         entry.unlink(missing_ok=True)
@@ -284,11 +313,17 @@ def _sweep_generations(target, protected, live, complete, deadline, account,
         # Never follow it into an external target to unlink its asset.
         if _is_link(entry) or not entry.is_dir():
             continue
+        if _protected_leaf(entry, forbidden_roots):
+            # A kept generation may itself be the configured source root or a
+            # Git checkout: its extracted archive is not disposable either.
+            account["warnings"].append(
+                "protected generation: " + entry.name[:32])
+            continue
         asset = entry / "asset.tgz"
         if is_junction(asset) or not (asset.is_symlink() or asset.is_file()):
             continue
         if (entry / "package").is_dir() or (entry / ".venv").is_dir():
-            _unlink_file(asset, account, deadline)
+            _unlink_file(asset, account, deadline, forbidden_roots)
 
 
 def _sweep_launch(target, protected, live, complete, deadline, account,
@@ -330,7 +365,7 @@ def _sweep_receipts(target, protected, live, complete, deadline, account,
                 or entry.stem in protected_shas:
             account["kept_dirs"] += 1
             continue
-        _unlink_file(entry, account, deadline)
+        _unlink_file(entry, account, deadline, forbidden_roots)
 
 
 def _sweep_runtimes(target, protected, live, complete, deadline, account,
@@ -365,7 +400,7 @@ def _sweep_cc_runtimes(target, protected, live, complete, deadline, account,
             owner = entry.name[: -len(".ready.json")]
             if owner not in kept and not (entry.parent / owner).is_dir() \
                     and _mtime(entry) < time.time() - 86400:
-                _unlink_file(entry, account, deadline)
+                _unlink_file(entry, account, deadline, forbidden_roots)
 
 
 def _version_key(name: str):
@@ -421,7 +456,7 @@ def _sweep_releases(target, protected, live, complete, deadline, account,
         if entry.is_file() and entry.name.startswith("prepare-") \
                 and entry.suffix == ".log" \
                 and _mtime(entry) < time.time() - LOG_GRACE_SECONDS:
-            _unlink_file(entry, account, deadline)
+            _unlink_file(entry, account, deadline, forbidden_roots)
 
 
 def _sweep_newest(target, protected, live, complete, deadline, account,
@@ -453,7 +488,7 @@ def _sweep_engines(target, protected, live, complete, deadline, account,
         if index < 2 or referenced or _mtime(entry) > time.time() - LOG_GRACE_SECONDS:
             account["kept_dirs"] += 1
             continue
-        _unlink_file(entry, account, deadline)
+        _unlink_file(entry, account, deadline, forbidden_roots)
 
 
 def _sweep_oc_engines(target, protected, live, complete, deadline, account,
@@ -471,7 +506,7 @@ def _sweep_oc_engines(target, protected, live, complete, deadline, account,
         if index < VERIFIED_RETENTION or _protected_name(entry, protected):
             account["kept_dirs"] += 1
             continue
-        _unlink_file(entry, account, deadline)
+        _unlink_file(entry, account, deadline, forbidden_roots)
 
 
 def _sweep_superseded(target, protected, live, complete, deadline, account,
@@ -486,7 +521,7 @@ def _sweep_superseded(target, protected, live, complete, deadline, account,
             account["partial"] = True
             account["warnings"].append("budget exhausted")
             return
-        _unlink_file(entry, account, deadline)
+        _unlink_file(entry, account, deadline, forbidden_roots)
 
 
 def _sweep_uv_cache(target, protected, live, complete, deadline, account,
@@ -530,6 +565,13 @@ def _sweep_single(target, protected, live, complete, deadline, account,
     entry = target["path"]
     if _keep(entry, protected, live):
         account["kept_dirs"] += 1
+        return
+    if _protected_leaf(entry, forbidden_roots):
+        # ``_retire_path`` repeats this gate; keeping it here means a single
+        # target that is itself a source root or Git checkout is never even
+        # considered for the two-phase rename.
+        account["kept_dirs"] += 1
+        account["warnings"].append("protected single: " + entry.name[:32])
         return
     _retire_path(entry, deadline, account, protected=protected, live=live,
                  complete=complete, verified=True,

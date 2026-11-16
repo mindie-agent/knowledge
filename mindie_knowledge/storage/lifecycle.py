@@ -13,7 +13,7 @@
   ``.mindie-retire.lock`` is held instead and every lease/builder probe opens
   and closes its descriptor before the rename.
 - A symlink/junction, Git-checkout, or configured source-tree ``.trash-*``
-  parent is refused outright: none of its entries are scanned or deleted.
+  parent is refused outright; every candidate is re-checked before deletion.
 - A verified generation is ``components.json``; a younger-than-grace directory
   without one is an in-flight staging build and is kept. An incomplete
   generation older than the staging grace is a failed build and is reclaimed,
@@ -134,6 +134,12 @@ def _remove_link(path: Path) -> None:
         _rmdir(path)
 
 
+def _git_checkout(directory: Path) -> bool:
+    """True when ``directory`` is, contains, or lies inside Git metadata."""
+    return (".git" in directory.parts or directory.name == ".git"
+            or os.path.lexists(fs_path(directory / ".git")))
+
+
 def _snapshot(path: Path, deadline=None):
     """Names and non-followed directory flags for one bounded enumeration.
 
@@ -168,7 +174,7 @@ def _snapshot(path: Path, deadline=None):
 
 
 def _bounded_rmtree(root: Path, deadline) -> bool:
-    """Delete ``root`` bottom-up without ever descending into a link.
+    """Delete ``root`` bottom-up without descending into links or Git trees.
 
     The iterative top-down ``scandir`` stack checks ``is_symlink`` and
     ``is_junction`` before pushing a child, so Windows NTFS junction
@@ -176,6 +182,10 @@ def _bounded_rmtree(root: Path, deadline) -> bool:
     deadline left a resumable remainder.
     """
     root = Path(root)
+    if _git_checkout(root):
+        # Hard invariant: a Git repository is never deleted, even when a
+        # caller places one inside a disposable ``.trash-*`` tree.
+        return False
     if _is_link(root):
         _remove_link(root)
         return True
@@ -209,6 +219,8 @@ def _bounded_rmtree(root: Path, deadline) -> bool:
         if _is_link(child):
             _remove_link(child)
         elif is_dir:
+            if _git_checkout(child):
+                return False
             nested = _snapshot(child, deadline)
             if nested is _SNAPSHOT_EXPIRED or nested is _SNAPSHOT_UNREADABLE:
                 return False
@@ -266,6 +278,14 @@ def sweep_trash(parent: Path, *, deadline: float | None = None,
             remaining += 1
             partial = True
             warnings.append("trash budget exhausted")
+            continue
+        if (has_git_ancestor(entry) or _git_checkout(entry)
+                or is_within_roots(entry, forbidden_roots)
+                or is_protected_path(entry, forbidden_roots)):
+            # A candidate that is itself a configured source root or a Git
+            # checkout is never recursively deleted, even by this sweep.
+            remaining += 1
+            warnings.append("trash protected: " + entry.name[:32])
             continue
         try:
             if _is_link(entry):
@@ -543,6 +563,7 @@ def _retire(entry: Path, deadline, accounting: dict, *, keep_paths, live_paths,
     linked = _is_link(entry)
     if (is_protected_path(entry, keep_paths) or is_own_runtime_path(entry)
             or is_within_roots(entry, forbidden_roots)
+            or is_protected_path(entry, forbidden_roots)
             or ".git" in entry.parts or has_git_ancestor(entry)):
         accounting["kept_dirs"] += 1
         return
@@ -565,6 +586,7 @@ def _retire(entry: Path, deadline, accounting: dict, *, keep_paths, live_paths,
         recheck=(None if linked else
                  (lambda: not is_protected_path(entry, keep_paths)
                   and not is_within_roots(entry, forbidden_roots)
+                  and not is_protected_path(entry, forbidden_roots)
                   and not is_own_runtime_path(entry)
                   and ".git" not in entry.parts
                   and not has_git_ancestor(entry)

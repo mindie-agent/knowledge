@@ -1672,3 +1672,218 @@ def test_stepped_clock_expiry_in_discovery_and_leftover_is_partial(
     assert leftover["partial"] is True
     assert leftover["status"] == "partial"
     assert leftover_clock.now - 2000.0 <= 1.0
+
+
+# --------------------------------------------------------------------------- #
+# R6 surgical regressions: per-generation source-root/.git protection before
+# asset unlinking, and per-candidate trash / bounded-rmtree Git exclusion.
+# --------------------------------------------------------------------------- #
+
+def _kept_dsh_generation(data: Path, name: str = "v0.1.0"):
+    entry = data / "dsh" / "update" / "generations" / name
+    (entry / "package").mkdir(parents=True)
+    (entry / "asset.tgz").write_text("tarball", encoding="utf-8")
+    os.utime(entry, (1000, 1000))
+    return entry, entry / "asset.tgz"
+
+
+def test_kept_dsh_generation_in_source_root_keeps_asset(tmp_path):
+    data = tmp_path / "data"
+    entry, asset = _kept_dsh_generation(data)
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "codex.json").write_text(
+        json.dumps({"source_root": str(entry)}), encoding="utf-8")
+
+    result = legacy.sweep_legacy_installations(
+        config_home=config, data_home=data, codex_home=tmp_path / "codex",
+        budget_seconds=30.0, force=True)
+
+    assert result["reclaimed_files"] == 0
+    assert result["reclaimed_dirs"] == 0
+    assert entry.is_dir()
+    assert asset.is_file()
+    assert asset.read_text(encoding="utf-8") == "tarball"
+
+
+def test_kept_dsh_generation_containing_git_keeps_asset(tmp_path):
+    data = tmp_path / "data"
+    entry, asset = _kept_dsh_generation(data, "v0.1.1")
+    (entry / ".git" / "objects").mkdir(parents=True)
+    head = entry / ".git" / "HEAD"
+    head.write_text("ref: refs/heads/main\n", encoding="utf-8")
+
+    result = legacy.sweep_legacy_installations(
+        config_home=tmp_path / "config", data_home=data,
+        codex_home=tmp_path / "codex", budget_seconds=30.0, force=True)
+
+    assert result["reclaimed_files"] == 0
+    assert result["reclaimed_dirs"] == 0
+    assert entry.is_dir()
+    assert asset.is_file()
+    assert head.is_file()
+
+
+def _trash_candidates(root: Path):
+    user_trash = root / ".trash-user-data"
+    (user_trash / "nested").mkdir(parents=True)
+    user_keep = user_trash / "nested" / "keep.txt"
+    user_keep.write_text("keep", encoding="utf-8")
+
+    git_trash = root / ".trash-git"
+    (git_trash / ".git" / "objects").mkdir(parents=True)
+    (git_trash / ".git" / "HEAD").write_text(
+        "ref: refs/heads/main\n", encoding="utf-8")
+    git_keep = git_trash / ".git" / "objects" / "pack.idx"
+    git_keep.write_text("keep", encoding="utf-8")
+    worktree = git_trash / "worktree.txt"
+    worktree.write_text("keep", encoding="utf-8")
+    return user_trash, user_keep, git_trash, git_keep, worktree
+
+
+def _assert_trash_untouched(user_trash, user_keep, git_trash, git_keep,
+                            worktree):
+    assert user_trash.is_dir() and user_keep.is_file()
+    assert git_trash.is_dir() and git_keep.is_file() and worktree.is_file()
+
+
+def test_trash_and_prune_protect_candidate_root_and_git_marker(tmp_path):
+    root = tmp_path / "component-runtimes"
+    root.mkdir()
+    user_trash, user_keep, git_trash, git_keep, worktree = \
+        _trash_candidates(root)
+    forbidden = [user_trash, git_trash / ".git"]
+
+    swept = sweep_trash(root, forbidden_roots=forbidden)
+    assert swept["removed"] == 0
+    assert swept["remaining"] == 2
+    assert swept["partial"] is False
+    assert any("trash protected" in warning for warning in swept["warnings"])
+    _assert_trash_untouched(user_trash, user_keep, git_trash, git_keep,
+                            worktree)
+
+    pruned = prune_component_runtimes(
+        root, keep_paths=[], keep_recent_verified=0, budget_seconds=5.0,
+        live_paths=leases.LivePaths(), inspection_complete=True,
+        include_global_roots=False, forbidden_roots=forbidden)
+    assert pruned["reclaimed_trash"] == 0
+    assert pruned["reclaimed_dirs"] == 0
+    _assert_trash_untouched(user_trash, user_keep, git_trash, git_keep,
+                            worktree)
+
+
+def test_trash_git_marker_is_protected_without_forbidden_root(tmp_path):
+    root = tmp_path / "component-runtimes"
+    root.mkdir()
+    git_trash = root / ".trash-git"
+    (git_trash / ".git" / "objects").mkdir(parents=True)
+    keep = git_trash / ".git" / "objects" / "pack.idx"
+    keep.write_text("keep", encoding="utf-8")
+
+    swept = sweep_trash(root)
+    assert swept["removed"] == 0
+    assert swept["remaining"] == 1
+    assert git_trash.is_dir() and keep.is_file()
+
+    pruned = prune_component_runtimes(
+        root, keep_paths=[], keep_recent_verified=0, budget_seconds=5.0,
+        live_paths=leases.LivePaths(), inspection_complete=True,
+        include_global_roots=False)
+    assert pruned["reclaimed_trash"] == 0
+    assert git_trash.is_dir() and keep.is_file()
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_bounded_rmtree_never_deletes_a_git_tree(tmp_path, nested):
+    root = tmp_path / ".trash-git"
+    repo = root / "worktree" if nested else root
+    (repo / ".git" / "objects").mkdir(parents=True)
+    head = repo / ".git" / "HEAD"
+    head.write_text("ref: refs/heads/main\n", encoding="utf-8")
+
+    assert lifecycle._bounded_rmtree(root, time.monotonic() + 60) is False
+    assert repo.is_dir() and head.is_file()
+
+
+def test_bounded_rmtree_refuses_a_path_inside_git_metadata(tmp_path):
+    objects = tmp_path / ".git" / "objects"
+    objects.mkdir(parents=True)
+    pack = objects / "pack.idx"
+    pack.write_text("keep", encoding="utf-8")
+
+    assert lifecycle._bounded_rmtree(objects, time.monotonic() + 60) is False
+    assert objects.is_dir() and pack.is_file()
+
+
+def test_nested_source_root_inside_an_excess_generation_is_kept(tmp_path):
+    data = tmp_path / "data"
+    generations = data / "dsh" / "update" / "generations"
+    oldest, asset = _kept_dsh_generation(data, "v0.1.0")
+    nested_source = oldest / "exported-source"
+    nested_source.mkdir()
+    sentinel = nested_source / "main.c"
+    sentinel.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    # Creating the nested source refreshed the parent mtime: restore the
+    # ordering so this generation is the one retention would otherwise retire.
+    os.utime(oldest, (1000, 1000))
+    for index, name in enumerate(("v0.1.1", "v0.1.2"), start=1):
+        newer = generations / name
+        (newer / "package").mkdir(parents=True)
+        os.utime(newer, (1000 + index, 1000 + index))
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "codex.json").write_text(
+        json.dumps({"source_root": str(nested_source)}), encoding="utf-8")
+
+    result = legacy.sweep_legacy_installations(
+        config_home=config, data_home=data, codex_home=tmp_path / "codex",
+        budget_seconds=30.0, force=True)
+
+    assert result["reclaimed_dirs"] == 0
+    assert result["reclaimed_files"] == 0
+    assert oldest.is_dir() and sentinel.is_file() and asset.is_file()
+
+
+def test_component_entry_containing_a_nested_source_root_is_kept(tmp_path):
+    root = tmp_path / "component-runtimes"
+    entry = _runtime(root, "nested-source", 0, mtime=1000)
+    nested_source = entry / "exported-source"
+    nested_source.mkdir()
+    sentinel = nested_source / "main.c"
+    sentinel.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+
+    result = prune_component_runtimes(
+        root, keep_paths=[], keep_recent_verified=0, budget_seconds=5.0,
+        live_paths=leases.LivePaths(), inspection_complete=True,
+        include_global_roots=False, forbidden_roots=[nested_source])
+
+    assert result["reclaimed_dirs"] == 0
+    assert entry.is_dir() and sentinel.is_file()
+
+
+def test_leaf_unlink_and_single_sweep_refuse_git_and_forbidden_paths(tmp_path):
+    source = tmp_path / "source"
+    protected_file = source / "state.json"
+    protected_file.parent.mkdir(parents=True)
+    protected_file.write_text("keep", encoding="utf-8")
+    git_file = tmp_path / "checkout" / ".git" / "config"
+    git_file.parent.mkdir(parents=True)
+    git_file.write_text("keep", encoding="utf-8")
+    account = {"reclaimed_dirs": 0, "reclaimed_files": 0, "kept_dirs": 0,
+               "warnings": [], "partial": False}
+
+    legacy._unlink_file(protected_file, account, forbidden_roots=[source])
+    legacy._unlink_file(git_file, account)
+    assert account["reclaimed_files"] == 0
+    assert protected_file.is_file() and git_file.is_file()
+
+    single = tmp_path / "dsh" / "venv"
+    (single / "bin").mkdir(parents=True)
+    (single / "bin" / "python").write_text("", encoding="utf-8")
+    os.utime(single, (1000, 1000))
+    legacy._sweep_single(
+        {"kind": "dsh-venv", "path": single}, [], leases.LivePaths(), True,
+        time.monotonic() + 60, account, forbidden_roots=[single])
+    assert single.is_dir()
+    assert account["reclaimed_dirs"] == 0
+    assert account["kept_dirs"] == 1
