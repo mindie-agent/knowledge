@@ -1,4 +1,5 @@
-"""[Role] Protected-pin discovery for historical MindIE runtime baggage.
+"""[Role] Protected-pin discovery and bounded managed-target enumeration for
+historical MindIE runtime baggage.
 
 [Invariants]
 - ``source_root``/``package_dir`` and every other configuration value are read
@@ -40,7 +41,7 @@ import time
 from xml.etree import ElementTree
 
 from ..filesystem import filesystem_path
-from .lifecycle import is_junction
+from .lifecycle import _expired, is_junction
 
 MARKER_SCHEMA = "mindie-storage-gc/1"
 HARNESSES = ("codex", "cc", "kimi", "dsh", "agy", "wb", "oc")
@@ -170,6 +171,110 @@ def _data_homes(data_home) -> list[Path]:
             values.append(Path(base) / "mindie-agent")
         values.append(_home() / ".local" / "share" / "mindie-agent")
     return _unique(values)
+
+
+def _state_roots(config_homes, data_homes, codex_home) -> list[tuple[str, Path, Path]]:
+    roots: list[tuple[str, Path, Path]] = []
+    for data in data_homes:
+        roots.append(("data", data, data))
+        for name in ("kimi", "cc", "dsh", "wb-state", "agy-state", "oc-state",
+                     "runtimes"):
+            roots.append((name, data / name, data))
+        roots.extend((("kimi", data / "kimi" / "adapter-state", data),
+                      ("cc", data / "cc" / "adapter-state", data)))
+    for config in config_homes:
+        roots.extend((("config", config, config), ("kimi", config / "state", config)))
+        for name in ("kimi", "cc", "dsh", "agy", "wb", "oc"):
+            roots.append((name, config / name, config))
+        roots.extend((("dsh", config / "diagnostics.runtime", config),
+                      ("dsh", config / "dsh" / "engines", config),
+                      ("oc", config / "generations", config)))
+    codex_data = Path(codex_home) / "plugins" / "data" / "mindie-agent-mindie-agent"
+    roots.extend((("codex", codex_data, Path(codex_home)),
+                  ("codex", codex_data / "codex.updates", Path(codex_home))))
+    for config in config_homes:
+        roots.append(("codex", config / "codex.updates", config))
+    return roots
+
+
+def _add_target(targets, seen, kind, path, harness=None, root=None) -> None:
+    path = Path(os.path.normpath(str(path)))
+    key = os.path.normcase(os.path.abspath(str(path)))
+    if key not in seen:
+        seen.add(key)
+        targets.append({"kind": kind, "path": path, "harness": harness,
+                        "root": Path(root) if root is not None else None})
+
+
+def _discover_targets(config_homes, data_homes, codex_home, *,
+                      include_home_roots: bool = True,
+                      deadline: float | None = None) -> list[dict]:
+    """Managed scan roots, bounded by ``deadline`` and scoped to explicit homes."""
+    targets: list[dict] = []
+    seen: set[str] = set()
+    for harness, root, home in _state_roots(config_homes, data_homes, codex_home):
+        for kind, relative in (
+            ("component-runtimes", "component-runtimes"),
+            ("component-runtimes", "update/component-runtimes"),
+            ("generations", "update/generations"),
+            ("launch", "update/launch"),
+            ("receipts", "update/receipts"),
+            ("cc-runtimes", "runtimes/cc"),
+            ("runtimes", "runtimes"),
+            ("installations", "adapter-state/installations"),
+            ("installations", "installations"),
+            ("sources", "wb-source"), ("sources", "agy-source"),
+            ("sources", "oc-source"), ("engines", "engines"),
+            ("releases", "releases"),
+        ):
+            _check(deadline)
+            if (root / relative).is_dir():
+                _add_target(targets, seen, kind, root / relative, harness, home)
+        if root.name.casefold() == "dsh" and (root / "venv").is_dir():
+            _check(deadline)
+            _add_target(targets, seen, "dsh-venv", root / "venv", harness, home)
+    for config in config_homes:
+        _check(deadline)
+        diagnostics = config / "diagnostics.runtime"
+        if (diagnostics / "generations").is_dir():
+            _add_target(targets, seen, "generations",
+                        diagnostics / "generations", "diagnostics", config)
+        updates = config / "codex.updates"
+        if updates.is_dir():
+            _add_target(targets, seen, "superseded", updates, "codex", config)
+        generations = config / "generations"
+        if generations.is_dir() and any(
+                entry.name.startswith("oc.engine.") and entry.name.endswith(".json")
+                for entry in _entries(generations, deadline=deadline)):
+            _add_target(targets, seen, "oc-engines", generations, "oc", config)
+    if include_home_roots:
+        _check(deadline)
+        if (uv_cache := _home() / ".cache" / "mindie-agent-dsh" / "uv-cache").is_dir():
+            _add_target(targets, seen, "uv-cache", uv_cache, "dsh", _home())
+    return targets
+
+
+def _entries(directory, *, deadline=None) -> list[Path]:
+    """Sorted direct children; every entry checks the caller deadline.
+
+    A 10,000-entry generation directory must not materialize past the sweep
+    budget, so expiry raises ``TimeoutError`` (the per-target handler reports
+    it as ``partial``) instead of returning a truncated ranking.
+    """
+    base = Path(directory)
+    entries: list[Path] = []
+    try:
+        with os.scandir(filesystem_path(base)) as iterator:
+            for item in iterator:
+                if _expired(deadline):
+                    raise TimeoutError("storage scan budget exhausted")
+                entries.append(base / item.name)
+    except TimeoutError:
+        raise
+    except OSError:
+        return []
+    entries.sort(key=lambda item: item.name)
+    return entries
 
 
 def _read_value(path, *, limit=2 * 1024 * 1024, deadline=None):

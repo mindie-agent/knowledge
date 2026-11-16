@@ -1527,3 +1527,148 @@ def test_legacy_entry_scan_honours_deadline(tmp_path):
     with pytest.raises(TimeoutError):
         legacy._entries(root, deadline=time.monotonic() - 1)
     assert len(legacy._entries(root, deadline=time.monotonic() + 60)) == 10
+
+
+# --------------------------------------------------------------------------- #
+# R5 surgical regressions: linked target roots, forbidden trash parents and
+# end-of-sweep deadline accounting.
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("link_kind", ["symlink", "intermediate", "junction"])
+def test_linked_generations_root_is_refused_before_any_sweep(
+        tmp_path, monkeypatch, link_kind):
+    data = tmp_path / "data"
+    generations = data / "dsh" / "update" / "generations"
+    if link_kind == "intermediate":
+        (data / "dsh").mkdir(parents=True)
+        external = tmp_path / "external-update"
+        (data / "dsh" / "update").symlink_to(external, target_is_directory=True)
+        target_root = external / "generations"
+    else:
+        generations.parent.mkdir(parents=True)
+        if link_kind == "symlink":
+            external = tmp_path / "external-generations"
+            generations.symlink_to(external, target_is_directory=True)
+            target_root = external
+        else:
+            # NTFS junctions are directory reparse points: keep the real
+            # directory and expose only the junction metadata to the sweep.
+            generations.mkdir()
+            target_root = generations
+            monkeypatch.setattr(legacy, "is_junction",
+                                lambda path: Path(path) == generations)
+    kept = target_root / "v0.1.0"
+    (kept / "package").mkdir(parents=True)
+    asset = kept / "asset.tgz"
+    asset.write_text("precious", encoding="utf-8")
+    os.utime(kept, (1000, 1000))
+    trash = target_root / ".trash-kept"
+    trash.mkdir()
+    sentinel = trash / "keep.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+
+    result = legacy.sweep_legacy_installations(
+        config_home=tmp_path / "config", data_home=data,
+        codex_home=tmp_path / "codex", budget_seconds=30.0, force=True)
+
+    assert result["reclaimed_files"] == 0
+    assert asset.is_file()
+    assert asset.read_text(encoding="utf-8") == "precious"
+    assert sentinel.is_file()
+    assert any("protected target" in warning for warning in result["warnings"])
+
+
+def test_component_prune_refuses_protected_trash_before_sweeping(
+        tmp_path, isolated_machine_home):
+    source = tmp_path / "exported-source"          # deliberately no .git
+    root = source / "component-runtimes"
+    trash = root / ".trash-user-data"
+    trash.mkdir(parents=True)
+    keep = trash / "keep.txt"
+    keep.write_text("keep", encoding="utf-8")
+
+    explicit = prune_component_runtimes(
+        root, keep_paths=[], keep_recent_verified=0, budget_seconds=5.0,
+        live_paths=leases.LivePaths(), inspection_complete=True,
+        include_global_roots=False, forbidden_roots=[source])
+    assert explicit["reclaimed_trash"] == 0
+    assert keep.is_file()
+    assert sweep_trash(root, forbidden_roots=[source])["removed"] == 0
+    assert keep.is_file()
+
+    config_home = isolated_machine_home / ".config" / "mindie-agent"
+    config_home.mkdir(parents=True)
+    (config_home / "codex.json").write_text(
+        json.dumps({"source_root": str(source)}), encoding="utf-8")
+    configured = prune_component_runtimes(
+        root, keep_paths=[], keep_recent_verified=0, budget_seconds=5.0,
+        live_paths=leases.LivePaths(), inspection_complete=True)
+    assert configured["reclaimed_trash"] == 0
+    assert keep.is_file()
+
+    git_source = tmp_path / "git-source"
+    (git_source / ".git").mkdir(parents=True)
+    git_root = git_source / "component-runtimes"
+    git_trash = git_root / ".trash-user-data"
+    git_trash.mkdir(parents=True)
+    git_keep = git_trash / "keep.txt"
+    git_keep.write_text("keep", encoding="utf-8")
+    git_result = prune_component_runtimes(
+        git_root, keep_paths=[], keep_recent_verified=0, budget_seconds=5.0,
+        live_paths=leases.LivePaths(), inspection_complete=True,
+        include_global_roots=False)
+    assert git_result["status"] == "protected_root"
+    assert git_keep.is_file()
+
+
+class _SteppedClock:
+    def __init__(self, start=1000.0, step=0.1):
+        self.now = start
+        self.step = step
+
+    def monotonic(self):
+        value = self.now
+        self.now += self.step
+        return value
+
+    def time(self):
+        return time.time()
+
+
+def test_stepped_clock_expiry_in_discovery_and_leftover_is_partial(
+        tmp_path, monkeypatch):
+    from mindie_knowledge.storage import legacy_roots
+
+    def install(clock):
+        monkeypatch.setattr(legacy, "time", clock)
+        monkeypatch.setattr(lifecycle, "time", clock)
+        monkeypatch.setattr(legacy_roots, "time", clock)
+
+    discover_clock = _SteppedClock(start=1000.0, step=0.1)
+    install(discover_clock)
+    discovered = legacy.sweep_legacy_installations(
+        config_home=tmp_path / "config", data_home=tmp_path / "data",
+        codex_home=tmp_path / "codex", budget_seconds=0.35, force=True)
+    assert discovered["partial"] is True
+    assert discovered["status"] == "partial"
+    assert discover_clock.now - 1000.0 <= 1.0
+
+    target = tmp_path / "data" / "runtimes"
+    target.mkdir(parents=True)
+    for index in range(5):
+        (target / f"entry-{index}").mkdir()
+    monkeypatch.setattr(
+        legacy, "_discover_targets",
+        lambda *args, **kwargs: [{"kind": "runtimes", "path": target,
+                                  "harness": "dsh", "root": tmp_path / "data"}])
+    marker = tmp_path / "data" / legacy.STATE_MARKER
+    marker.write_text(json.dumps({"schema": legacy.MARKER_SCHEMA,
+                                  "at": time.time()}), encoding="utf-8")
+    leftover_clock = _SteppedClock(start=2000.0, step=0.1)
+    install(leftover_clock)
+    leftover = legacy.sweep_legacy_installations(
+        config_home=tmp_path / "config", data_home=tmp_path / "data",
+        codex_home=tmp_path / "codex", budget_seconds=0.25, force=False)
+    assert leftover["partial"] is True
+    assert leftover["status"] == "partial"
+    assert leftover_clock.now - 2000.0 <= 1.0

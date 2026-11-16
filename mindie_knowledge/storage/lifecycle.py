@@ -12,8 +12,8 @@
   rejects the rename even when the holder is the same process), so one sibling
   ``.mindie-retire.lock`` is held instead and every lease/builder probe opens
   and closes its descriptor before the rename.
-- A symlink/junction ``.trash-*`` parent or component-runtimes root is refused
-  outright: the link target is foreign storage and is never scanned or swept.
+- A symlink/junction, Git-checkout, or configured source-tree ``.trash-*``
+  parent is refused outright: none of its entries are scanned or deleted.
 - A verified generation is ``components.json``; a younger-than-grace directory
   without one is an in-flight staging build and is kept. An incomplete
   generation older than the staging grace is a failed build and is reclaimed,
@@ -220,7 +220,8 @@ def _bounded_rmtree(root: Path, deadline) -> bool:
     return True
 
 
-def sweep_trash(parent: Path, *, deadline: float | None = None) -> dict:
+def sweep_trash(parent: Path, *, deadline: float | None = None,
+                forbidden_roots=()) -> dict:
     """Finish deleting leftover two-phase retirement directories."""
     parent = Path(parent)
     removed = 0
@@ -232,6 +233,12 @@ def sweep_trash(parent: Path, *, deadline: float | None = None) -> dict:
         # ``parent/.trash-*`` through the link.
         return {"removed": 0, "remaining": 0,
                 "warnings": ["trash parent is a link: " + parent.name[:32]],
+                "partial": False}
+    if has_git_ancestor(parent) or is_within_roots(parent, forbidden_roots):
+        # The parent belongs to a Git checkout or a configured source tree:
+        # its ``.trash-*`` entries are not disposable MindIE storage.
+        return {"removed": 0, "remaining": 0,
+                "warnings": ["trash parent is protected: " + parent.name[:32]],
                 "partial": False}
     if not parent.is_dir():
         return {"removed": 0, "remaining": 0, "warnings": warnings,
@@ -582,7 +589,7 @@ def prune_component_runtimes(root: Path, *, keep_paths=(),
                              include_global_roots: bool = True,
                              forbidden_roots=(),
                              deadline: float | None = None) -> dict:
-    """Sweep trash, then reclaim failed and obsolete component generations.
+    """Refuse protected roots, sweep trash, then reclaim failed/obsolete generations.
 
     With ``live_paths=None`` the process table is inspected here instead of
     assuming an empty (and therefore complete) snapshot. Caller keep paths are
@@ -623,10 +630,6 @@ def prune_component_runtimes(root: Path, *, keep_paths=(),
     if not root.is_dir():
         accounting["status"] = "absent"
         return accounting
-    trash = sweep_trash(root, deadline=limit)
-    accounting["reclaimed_trash"] = trash["removed"]
-    accounting["warnings"].extend(trash["warnings"])
-    accounting["partial"] = accounting["partial"] or bool(trash.get("partial"))
     keep = list(keep_paths or ())
     forbidden = list(forbidden_roots or ())
     if include_global_roots:
@@ -643,10 +646,21 @@ def prune_component_runtimes(root: Path, *, keep_paths=(),
             accounting["inspection_complete"] = False
             accounting["warnings"].append("protected roots budget exhausted")
             return accounting
+    if has_git_ancestor(root) or is_within_roots(root, forbidden):
+        # The entire runtimes root belongs to a Git checkout or a configured
+        # source/package tree. Refuse before touching its ``.trash-*`` too.
+        accounting["status"] = "protected_root"
+        accounting["warnings"].append(
+            "component root is protected: " + root.name[:32])
+        return accounting
     if sys.prefix not in keep:
         keep.append(sys.prefix)
     if sys.executable not in keep:
         keep.append(sys.executable)
+    trash = sweep_trash(root, deadline=limit, forbidden_roots=forbidden)
+    accounting["reclaimed_trash"] = trash["removed"]
+    accounting["warnings"].extend(trash["warnings"])
+    accounting["partial"] = accounting["partial"] or bool(trash.get("partial"))
     entries: list[Path] = []
     try:
         with os.scandir(fs_path(root)) as iterator:

@@ -10,6 +10,9 @@
 - No candidate is retired when its path or any ancestor up to the filesystem
   root contains ``.git``, or when it lies inside a protected user
   ``source_root``.
+- A managed target whose own path, or an intermediate directory under its
+  managed home, is a symlink/junction is skipped before any trash sweep or
+  handler runs; the external target is never read or deleted.
 - Nothing is retired until every protection source is checked: the running
   interpreter/prefix, every MindIE config pin, current/previous update
   pointers, the immediate rollback receipt, hidden host launcher pins, live OS
@@ -50,14 +53,14 @@ import uuid
 from ..filesystem import filesystem_path, path_identity
 from .leases import is_lease_held, is_path_used_by_live_process, live_process_prefixes
 from .legacy_roots import (
-    MARKER_SCHEMA, _config_documents, _config_homes, _data_homes,
-    _env, _home, _read_json, _strings, collect_global_protected_roots,
-    owning_dir, protected_source_roots,
+    MARKER_SCHEMA, _check, _config_documents, _config_homes, _data_homes,
+    _discover_targets, _entries, _env, _home, _read_json, _strings,
+    collect_global_protected_roots, owning_dir, protected_source_roots,
 )
 from .lifecycle import (
-    _builder_locked, _expired, is_junction, is_own_runtime_path,
-    is_protected_path, is_within_roots, prune_component_runtimes,
-    retire_directory, sweep_trash,
+    _builder_locked, _expired, has_git_ancestor, is_junction,
+    is_own_runtime_path, is_protected_path, is_within_roots,
+    prune_component_runtimes, retire_directory, sweep_trash,
 )
 
 COOLDOWN_SECONDS, STAGING_GRACE_SECONDS = 600.0, 1800.0
@@ -70,107 +73,6 @@ _SHA = re.compile(r"[0-9a-f]{40,64}")
 # --------------------------------------------------------------------------- #
 # Managed targets: only fixed MindIE-owned storage directories.
 # --------------------------------------------------------------------------- #
-
-def _state_roots(config_homes, data_homes, codex_home) -> list[tuple[str, Path]]:
-    roots: list[tuple[str, Path]] = []
-    for data in data_homes:
-        roots.append(("data", data))
-        for name in ("kimi", "cc", "dsh", "wb-state", "agy-state", "oc-state",
-                     "runtimes"):
-            roots.append((name, data / name))
-        roots.extend((("kimi", data / "kimi" / "adapter-state"),
-                      ("cc", data / "cc" / "adapter-state")))
-    for config in config_homes:
-        roots.extend((("config", config), ("kimi", config / "state")))
-        for name in ("kimi", "cc", "dsh", "agy", "wb", "oc"):
-            roots.append((name, config / name))
-        roots.extend((("dsh", config / "diagnostics.runtime"),
-                      ("dsh", config / "dsh" / "engines"),
-                      ("oc", config / "generations")))
-    codex_data = Path(codex_home) / "plugins" / "data" / "mindie-agent-mindie-agent"
-    roots.extend((("codex", codex_data),
-                  ("codex", codex_data / "codex.updates")))
-    for config in config_homes:
-        roots.append(("codex", config / "codex.updates"))
-    return roots
-
-
-def _add_target(targets, seen, kind, path, harness=None) -> None:
-    path = Path(os.path.normpath(str(path)))
-    key = os.path.normcase(os.path.abspath(str(path)))
-    if key not in seen:
-        seen.add(key)
-        targets.append({"kind": kind, "path": path, "harness": harness})
-
-
-def _discover_targets(config_homes, data_homes, codex_home, *,
-                      include_home_roots: bool = True) -> list[dict]:
-    """Managed scan roots; real ``~`` roots only in default production mode.
-
-    ``include_home_roots`` is false when the caller passed any explicit
-    ``config_home``/``data_home``/``codex_home``: an isolated test must never
-    add (and later delete) the real user's ``~/.cache/mindie-agent-dsh``.
-    """
-    targets: list[dict] = []
-    seen: set[str] = set()
-    for harness, root in _state_roots(config_homes, data_homes, codex_home):
-        for kind, relative in (
-            ("component-runtimes", "component-runtimes"),
-            ("component-runtimes", "update/component-runtimes"),
-            ("generations", "update/generations"),
-            ("launch", "update/launch"),
-            ("receipts", "update/receipts"),
-            ("cc-runtimes", "runtimes/cc"),
-            ("runtimes", "runtimes"),
-            ("installations", "adapter-state/installations"),
-            ("installations", "installations"),
-            ("sources", "wb-source"), ("sources", "agy-source"),
-            ("sources", "oc-source"), ("engines", "engines"),
-            ("releases", "releases"),
-        ):
-            if (root / relative).is_dir():
-                _add_target(targets, seen, kind, root / relative, harness)
-        if root.name.casefold() == "dsh" and (root / "venv").is_dir():
-            _add_target(targets, seen, "dsh-venv", root / "venv", harness)
-    for config in config_homes:
-        diagnostics = config / "diagnostics.runtime"
-        if (diagnostics / "generations").is_dir():
-            _add_target(targets, seen, "generations",
-                        diagnostics / "generations", "diagnostics")
-        updates = config / "codex.updates"
-        if updates.is_dir():
-            _add_target(targets, seen, "superseded", updates, "codex")
-        generations = config / "generations"
-        if generations.is_dir() and any(generations.glob("oc.engine.*.json")):
-            _add_target(targets, seen, "oc-engines", generations, "oc")
-    if include_home_roots \
-            and (uv_cache := _home() / ".cache" / "mindie-agent-dsh" / "uv-cache").is_dir():
-        _add_target(targets, seen, "uv-cache", uv_cache, "dsh")
-    return targets
-
-
-def _entries(directory, *, deadline=None) -> list[Path]:
-    """Sorted direct children; every entry checks the caller deadline.
-
-    A 10,000-entry generation directory must not materialize past the sweep
-    budget, so expiry raises ``TimeoutError`` (the per-target handler reports
-    it as ``partial``) instead of returning a truncated ranking.
-    """
-    base = Path(directory)
-    entries: list[Path] = []
-    try:
-        with os.scandir(filesystem_path(base)) as iterator:
-            for item in iterator:
-                if _expired(deadline):
-                    raise TimeoutError("storage scan budget exhausted")
-                entries.append(base / item.name)
-    except TimeoutError:
-        raise
-    except OSError:
-        return []
-    entries.sort(key=lambda item: item.name)
-    return entries
-
 
 def _mtime(path: Path) -> float:
     try:
@@ -206,6 +108,20 @@ def _is_link(entry: Path) -> bool:
     return entry.is_symlink() or is_junction(entry)
 
 
+def _target_has_link(path: Path, stop_at: Path | None = None) -> bool:
+    """True when ``path`` or an intermediate directory up to ``stop_at`` is a link."""
+    current = Path(os.path.abspath(os.fspath(path)))
+    if stop_at is None:
+        return _is_link(current)
+    stop = Path(os.path.abspath(os.fspath(stop_at)))
+    while True:
+        if _is_link(current):
+            return True
+        if current == stop or current.parent == current:
+            return False
+        current = current.parent
+
+
 def _keep(entry: Path, protected, live) -> bool:
     if _protected_name(entry, protected) or is_own_runtime_path(entry):
         return True
@@ -218,18 +134,7 @@ def _keep(entry: Path, protected, live) -> bool:
 
 
 def _has_git_ancestor(entry: Path) -> bool:
-    probe = Path(os.path.abspath(os.fspath(entry)))
-    while True:
-        try:
-            if (probe / ".git").exists():
-                return True
-        except TimeoutError:
-            raise
-        except OSError:
-            return True  # Unknown inspection is a keep.
-        if probe.parent == probe:
-            return False
-        probe = probe.parent
+    return has_git_ancestor(entry)
 
 
 def _recent(entry: Path, grace_seconds: float) -> bool:
@@ -361,6 +266,8 @@ def _verified_generation(entry: Path) -> bool:
 
 def _sweep_generations(target, protected, live, complete, deadline, account,
                        forbidden_roots=()) -> None:
+    if _is_link(target["path"]):
+        return
     directory = target["path"]
     recent = 1 if target.get("harness") == "kimi" else VERIFIED_RETENTION
     entries = [entry for entry in _entries(directory, deadline=deadline)
@@ -386,6 +293,8 @@ def _sweep_generations(target, protected, live, complete, deadline, account,
 
 def _sweep_launch(target, protected, live, complete, deadline, account,
                   forbidden_roots=()) -> None:
+    if _is_link(target["path"]):
+        return
     directory = target["path"]
     generations = directory.parent / "generations"
     shas = {entry.name for entry in _entries(generations, deadline=deadline)
@@ -405,6 +314,8 @@ def _sweep_launch(target, protected, live, complete, deadline, account,
 
 def _sweep_receipts(target, protected, live, complete, deadline, account,
                     forbidden_roots=()) -> None:
+    if _is_link(target["path"]):
+        return
     files = [entry for entry in _entries(target["path"], deadline=deadline) if entry.suffix == ".json"
              and entry.is_file()]
     files.sort(key=lambda entry: (_mtime(entry), entry.name), reverse=True)
@@ -424,6 +335,8 @@ def _sweep_receipts(target, protected, live, complete, deadline, account,
 
 def _sweep_runtimes(target, protected, live, complete, deadline, account,
                     forbidden_roots=()) -> None:
+    if _is_link(target["path"]):
+        return
     entries = [entry for entry in _entries(target["path"], deadline=deadline)
                if entry.is_dir() and entry.name.casefold() != "cc"]
     marker = lambda entry: _is_link(entry) or any(
@@ -435,6 +348,8 @@ def _sweep_runtimes(target, protected, live, complete, deadline, account,
 
 def _sweep_cc_runtimes(target, protected, live, complete, deadline, account,
                        forbidden_roots=()) -> None:
+    if _is_link(target["path"]):
+        return
     entries = [entry for entry in _entries(target["path"], deadline=deadline) if entry.is_dir()]
     marker = lambda entry: entry.with_name(entry.name + ".ready.json").is_file()
     kept = {entry.name for entry in _sweep_ranked(
@@ -473,6 +388,8 @@ def _active_native_versions(config_homes, codex_home) -> set[str]:
 
 def _sweep_releases(target, protected, live, complete, deadline, account,
                     forbidden_roots=()) -> None:
+    if _is_link(target["path"]):
+        return
     directory = target["path"]
     active = target.get("active_versions") or set()
     entries = [entry for entry in _entries(directory, deadline=deadline) if entry.is_dir()
@@ -509,6 +426,8 @@ def _sweep_releases(target, protected, live, complete, deadline, account,
 
 def _sweep_newest(target, protected, live, complete, deadline, account,
                   forbidden_roots=()) -> None:
+    if _is_link(target["path"]):
+        return
     entries = [entry for entry in _entries(target["path"], deadline=deadline) if entry.is_dir()]
     _sweep_ranked(entries, protected, live, complete, deadline, account,
                   recent=VERIFIED_RETENTION, marker=lambda entry: True,
@@ -518,6 +437,8 @@ def _sweep_newest(target, protected, live, complete, deadline, account,
 def _sweep_engines(target, protected, live, complete, deadline, account,
                    runtime_names: set[str], configs_text: str,
                    forbidden_roots=()) -> None:
+    if _is_link(target["path"]):
+        return
     files = [entry for entry in _entries(target["path"], deadline=deadline) if entry.suffix == ".json"
              and entry.is_file()]
     files.sort(key=lambda entry: (_mtime(entry), entry.name), reverse=True)
@@ -537,6 +458,8 @@ def _sweep_engines(target, protected, live, complete, deadline, account,
 
 def _sweep_oc_engines(target, protected, live, complete, deadline, account,
                       forbidden_roots=()) -> None:
+    if _is_link(target["path"]):
+        return
     files = [entry for entry in _entries(target["path"], deadline=deadline)
              if entry.is_file() and entry.name.startswith("oc.engine.")]
     files.sort(key=lambda entry: (_mtime(entry), entry.name), reverse=True)
@@ -553,6 +476,8 @@ def _sweep_oc_engines(target, protected, live, complete, deadline, account,
 
 def _sweep_superseded(target, protected, live, complete, deadline, account,
                       forbidden_roots=()) -> None:
+    if _is_link(target["path"]):
+        return
     files = [entry for entry in _entries(target["path"], deadline=deadline)
              if entry.is_file() and entry.name.startswith("superseded-")]
     files.sort(key=lambda entry: (_mtime(entry), entry.name), reverse=True)
@@ -566,6 +491,8 @@ def _sweep_superseded(target, protected, live, complete, deadline, account,
 
 def _sweep_uv_cache(target, protected, live, complete, deadline, account,
                     configs_text: str, forbidden_roots=()) -> None:
+    if _is_link(target["path"]):
+        return
     entry = target["path"]
     if is_path_used_by_live_process(entry, live) or "uv-cache" in configs_text \
             or _mtime(entry) > time.time() - 86400:
@@ -577,6 +504,8 @@ def _sweep_uv_cache(target, protected, live, complete, deadline, account,
 
 def _sweep_component(target, protected, live, complete, deadline, account,
                      forbidden_roots=()) -> None:
+    if _is_link(target["path"]):
+        return
     result = prune_component_runtimes(
         target["path"], keep_paths=protected,
         keep_recent_verified=VERIFIED_RETENTION,
@@ -596,6 +525,8 @@ def _sweep_component(target, protected, live, complete, deadline, account,
 
 def _sweep_single(target, protected, live, complete, deadline, account,
                   forbidden_roots=()) -> None:
+    if _is_link(target["path"]):
+        return
     entry = target["path"]
     if _keep(entry, protected, live):
         account["kept_dirs"] += 1
@@ -624,17 +555,12 @@ def _write_marker(path: Path, value: dict) -> None:
 
 
 def _leftover_trash(targets, deadline=None) -> bool:
-    """Whether any target holds ``.trash-*``; bounded and conservative.
-
-    Expiry returns True (an unverified leftover may exist): this only bypasses
-    the cooldown so a real sweep can retry; it never suppresses reclamation.
-    """
+    """Whether any target holds ``.trash-*``; raises ``TimeoutError`` on expiry."""
     for target in targets:
         try:
             with os.scandir(filesystem_path(target["path"])) as iterator:
                 for item in iterator:
-                    if _expired(deadline):
-                        return True
+                    _check(deadline)
                     if item.name.startswith(".trash-"):
                         return True
         except TimeoutError:
@@ -644,8 +570,9 @@ def _leftover_trash(targets, deadline=None) -> bool:
     return False
 
 
-def _sweep_target_trash(target, deadline, account) -> None:
-    result = sweep_trash(target["path"], deadline=deadline)
+def _sweep_target_trash(target, deadline, account, forbidden_roots=()) -> None:
+    result = sweep_trash(target["path"], deadline=deadline,
+                         forbidden_roots=forbidden_roots)
     account["reclaimed_trash"] += result["removed"]
     account["warnings"].extend(result["warnings"])
     if result.get("partial"):
@@ -671,86 +598,123 @@ def sweep_legacy_installations(*, config_home=None, data_home=None, codex_home=N
     # Only default production mode may scan the real user's ``~`` roots.
     include_home_roots = all(value is None for value in
                              (config_home, data_home, codex_home))
-    targets = _discover_targets(config_homes, data_homes, codex,
-                                include_home_roots=include_home_roots)
+    stop = False
+    try:
+        targets = _discover_targets(config_homes, data_homes, codex,
+                                    include_home_roots=include_home_roots,
+                                    deadline=limit)
+    except TimeoutError:
+        targets = []
+        account["partial"], account["inspection_complete"] = True, False
+        account["warnings"].append("budget exhausted")
+        stop = True
     marker = data_homes[0] / STATE_MARKER
     state = _read_json(marker)
     recent = isinstance(state, dict) and isinstance(state.get("at"), (int, float)) \
         and time.time() - state["at"] < COOLDOWN_SECONDS
-    if not force and recent and not _leftover_trash(targets, deadline=limit):
-        account["status"] = "skipped_cooldown"
-        return account
-    if _expired(limit):
-        account["status"] = "partial"
+    if not stop and not force and recent:
+        try:
+            leftover = _leftover_trash(targets, deadline=limit)
+        except TimeoutError:
+            leftover, stop = True, True
+            account["partial"], account["inspection_complete"] = True, False
+            account["warnings"].append("budget exhausted")
+        if not leftover:
+            account["status"] = "skipped_cooldown"
+            account["elapsed_seconds"] = round(time.monotonic() - started, 3)
+            return account
+    if not stop and _expired(limit):
         account["partial"] = True
         account["warnings"].append("budget exhausted")
-        return account
-    live_paths, complete = live_process_prefixes(
-        timeout=max(0.1, min(2.0, limit - time.monotonic())))
-    account["inspection_complete"] = complete
-    try:
-        protected = collect_global_protected_roots(
-            config_home=config_homes, data_home=data_homes, codex_home=codex,
-            live_paths=live_paths, deadline=limit)
-        forbidden_roots = protected_source_roots(config_home=config_homes,
-                                                  deadline=limit)
-    except TimeoutError:
-        account["status"] = "partial"
-        account["partial"] = True
-        account["inspection_complete"] = False
-        account["warnings"].append("protected roots budget exhausted")
-        account["elapsed_seconds"] = round(time.monotonic() - started, 3)
-        return account
-    account["protected_roots"] = len(protected)
-    documents = _config_documents(config_homes, deadline=limit)
-    configs_text = " ".join(" ".join(_strings(document[1])) for document in documents)
-    runtime_names: set[str] = set()
-    for target in targets:
-        if target["kind"] in {"runtimes", "cc-runtimes"}:
-            runtime_names.update(entry.name for entry in _entries(target["path"]))
-    active_versions = _active_native_versions(config_homes, codex)
-    handlers = {
-        "component-runtimes": _sweep_component,
-        "generations": _sweep_generations, "launch": _sweep_launch,
-        "receipts": _sweep_receipts, "runtimes": _sweep_runtimes,
-        "cc-runtimes": _sweep_cc_runtimes, "installations": _sweep_newest,
-        "sources": _sweep_newest, "oc-engines": _sweep_oc_engines,
-        "superseded": _sweep_superseded, "dsh-venv": _sweep_single,
-        "releases": lambda t, p, l, c, d, a, f: _sweep_releases(
-            dict(t, active_versions=active_versions), p, l, c, d, a, f),
-        "engines": lambda t, p, l, c, d, a, f: _sweep_engines(
-            t, p, l, c, d, a, runtime_names, configs_text, f),
-        "uv-cache": lambda t, p, l, c, d, a, f: _sweep_uv_cache(
-            t, p, l, c, d, a, configs_text, f),
-    }
-    for target in targets:
-        if _expired(limit):
-            account["partial"] = True
-            account["deferred_dirs"] += 1
-            account["warnings"].append("budget exhausted")
-            break
-        remaining = max(0.1, min(2.0, limit - time.monotonic()))
-        target_deadline = min(limit, time.monotonic() + remaining)
+        stop = True
+    if not stop:
         try:
-            _sweep_target_trash(target, target_deadline, account)
-            handler = handlers.get(target["kind"])
-            if handler is not None:
-                handler(target, protected, live_paths, complete, target_deadline,
-                        account, forbidden_roots)
+            live_paths, complete = live_process_prefixes(
+                timeout=max(0.1, min(2.0, limit - time.monotonic())))
+            account["inspection_complete"] = complete
+            protected = collect_global_protected_roots(
+                config_home=config_homes, data_home=data_homes, codex_home=codex,
+                live_paths=live_paths, deadline=limit)
+            forbidden_roots = protected_source_roots(config_home=config_homes,
+                                                      deadline=limit)
+            documents = _config_documents(config_homes, deadline=limit)
         except TimeoutError:
-            account["deferred_dirs"] += 1
+            account["partial"], account["inspection_complete"] = True, False
+            account["warnings"].append("protected roots budget exhausted")
+            stop = True
+    if not stop:
+        account["protected_roots"] = len(protected)
+        configs_text = " ".join(" ".join(_strings(document[1]))
+                                for document in documents)
+        runtime_names: set[str] = set()
+        try:
+            for target in targets:
+                if target["kind"] in {"runtimes", "cc-runtimes"}:
+                    runtime_names.update(entry.name for entry in
+                                         _entries(target["path"], deadline=limit))
+        except TimeoutError:
             account["partial"] = True
-            account["warnings"].append("timeout: " + target["kind"])
-        except Exception as exc:  # noqa: BLE001 - cleanup must never brick a caller
-            account["warnings"].append(target["kind"] + ": " + type(exc).__name__)
-    if not complete:
-        account["status"] = "inspection_incomplete"
-    if account["partial"] and account["status"] == "completed":
-        account["status"] = "partial"
+            account["warnings"].append("budget exhausted")
+        active_versions = _active_native_versions(config_homes, codex)
+        handlers = {
+            "component-runtimes": _sweep_component,
+            "generations": _sweep_generations, "launch": _sweep_launch,
+            "receipts": _sweep_receipts, "runtimes": _sweep_runtimes,
+            "cc-runtimes": _sweep_cc_runtimes, "installations": _sweep_newest,
+            "sources": _sweep_newest, "oc-engines": _sweep_oc_engines,
+            "superseded": _sweep_superseded, "dsh-venv": _sweep_single,
+            "releases": lambda t, p, l, c, d, a, f: _sweep_releases(
+                dict(t, active_versions=active_versions), p, l, c, d, a, f),
+            "engines": lambda t, p, l, c, d, a, f: _sweep_engines(
+                t, p, l, c, d, a, runtime_names, configs_text, f),
+            "uv-cache": lambda t, p, l, c, d, a, f: _sweep_uv_cache(
+                t, p, l, c, d, a, configs_text, f),
+        }
+        for target in targets:
+            if _expired(limit):
+                account["partial"] = True
+                account["deferred_dirs"] += 1
+                account["warnings"].append("budget exhausted")
+                break
+            if is_within_roots(target["path"], forbidden_roots):
+                account["kept_dirs"] += 1
+                account["warnings"].append(
+                    "protected source root: " + target["kind"])
+                continue
+            if _target_has_link(target["path"], target.get("root")) \
+                    or has_git_ancestor(target["path"]):
+                account["kept_dirs"] += 1
+                account["warnings"].append("protected target: " + target["kind"])
+                continue
+            remaining = max(0.1, min(2.0, limit - time.monotonic()))
+            target_deadline = min(limit, time.monotonic() + remaining)
+            try:
+                _sweep_target_trash(target, target_deadline, account,
+                                    forbidden_roots)
+                handler = handlers.get(target["kind"])
+                if handler is not None:
+                    handler(target, protected, live_paths, complete,
+                            target_deadline, account, forbidden_roots)
+            except TimeoutError:
+                account["deferred_dirs"] += 1
+                account["partial"] = True
+                account["warnings"].append("timeout: " + target["kind"])
+                break
+            except Exception as exc:  # noqa: BLE001 - cleanup must never brick a caller
+                account["warnings"].append(
+                    target["kind"] + ": " + type(exc).__name__)
+    try:
+        account["trash_remaining"] = sum(
+            1 for target in targets
+            for entry in _entries(target["path"], deadline=limit)
+            if entry.name.startswith(".trash-"))
+    except TimeoutError:
+        account["partial"] = True
+        account["warnings"].append("budget exhausted")
+    account["status"] = "partial" if account["partial"] else (
+        "inspection_incomplete" if not account["inspection_complete"]
+        else "completed")
     account["elapsed_seconds"] = round(time.monotonic() - started, 3)
-    account["trash_remaining"] = sum(
-        1 for target in targets
-        for entry in _entries(target["path"]) if entry.name.startswith(".trash-"))
     try:
         _write_marker(marker, dict(schema=MARKER_SCHEMA, at=time.time(),
                                    reclaimed_dirs=account["reclaimed_dirs"],
