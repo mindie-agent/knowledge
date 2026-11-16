@@ -37,6 +37,10 @@ class ReleaseResponseInvalid(RuntimeError):
     """The caller rejected response bytes; a derived cache may discard them."""
 
 
+class ReleaseResponseFramingError(http.client.HTTPException):
+    """Remote framing cannot describe a complete bounded response."""
+
+
 @cache
 def token():
     from ._host_exec import which_native
@@ -54,9 +58,16 @@ def token():
 
 def _validate_body(body, headers, validate):
     length = headers.get("Content-Length")
-    if length is not None and len(body) != int(length):
-        # read(n) may return a short body without raising IncompleteRead.
-        raise http.client.IncompleteRead(b"", max(0, int(length) - len(body)))
+    if length is not None:
+        if not isinstance(length, str) or not length.strip(" \t").isascii() or not length.strip(" \t").isdecimal():
+            raise ReleaseResponseFramingError("invalid release Content-Length")
+        try:
+            expected = int(length)
+        except ValueError:
+            raise ReleaseResponseFramingError("invalid release Content-Length") from None
+        if len(body) != expected:
+            # read(n) may return a short body without raising IncompleteRead.
+            raise http.client.IncompleteRead(b"", max(0, expected - len(body)))
     if validate is not None:
         validate(body)
 
@@ -87,7 +98,7 @@ def read(url, *, maximum, timeout, accept, redirects, directory=None, force=Fals
             raise ReleaseResponseTooLarge("release response exceeds its byte limit")
         try:
             _validate_body(body, saved["headers"], validate)
-        except (ReleaseResponseInvalid, http.client.IncompleteRead):
+        except (ReleaseResponseInvalid, ReleaseResponseFramingError, http.client.IncompleteRead):
             # Old versions cached HTTP 200 bytes before parsing JSON. Do
             # not let their ETag revalidate a body we cannot consume.
             saved = None
