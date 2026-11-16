@@ -2,12 +2,13 @@
 import copy
 import json
 import io
+from collections import Counter
 from pathlib import Path
 import urllib.request
 
 import pytest
 
-from mindie_knowledge.component_releases import Catalog, runtime_identity, select
+from mindie_knowledge.component_releases import Catalog, ReleaseAssetError, runtime_identity, select
 from mindie_knowledge.releases_io import ReleaseFetchError
 
 FIXTURE = Path(__file__).with_name("fixtures") / "component-releases"
@@ -52,8 +53,52 @@ class CapturedCatalog(Catalog):
             file = "knowledge-project.json"
         return json.loads((FIXTURE / file).read_text())
 
-    def asset(self, name, tag, filename):
-        return (FIXTURE / ("knowledge-" + filename)).read_bytes()
+    def asset(self, name, tag, filename, *, force=False, validate=None):
+        body = (FIXTURE / ("knowledge-" + filename)).read_bytes()
+        if validate is not None:
+            validate(body)
+        return body
+
+
+@pytest.mark.parametrize("filename", ["SHA256SUMS", "benchmark-results.json"])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_asset_validation_precedes_cache_and_recovers_legacy_bodies(tmp_path, monkeypatch, filename, legacy):
+    from mindie_knowledge.release_http import read
+    from mindie_knowledge.releases_io import _OfficialRedirects
+    calls = Counter()
+
+    class Response(io.BytesIO):
+        status = 200
+        headers = {}
+
+    class Opener:
+        def open(self, request, **_kwargs):
+            url = request.full_url
+            calls[url] += 1
+            if "/releases/download/" in url:
+                asset = url.rsplit("/", 1)[1]
+                body = b'{' if asset == filename and calls[url] == 1 else (FIXTURE / ("knowledge-" + asset)).read_bytes()
+            else:
+                fixture = ("knowledge-release.json" if url.endswith("/latest") else
+                           "knowledge-ref.json" if "/git/ref/" in url else
+                           "knowledge-tag.json" if "/git/tags/" in url else "knowledge-project.json")
+                body = (FIXTURE / fixture).read_bytes()
+            return Response(body)
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *_: Opener())
+    catalog = Catalog(cache=tmp_path, token="")
+    url = f"https://github.com/mindie-agent/knowledge/releases/download/v0.13.2/{filename}"
+    if legacy:
+        read(url, maximum=2 * 1024 * 1024, timeout=1, accept="application/octet-stream",
+             redirects=_OfficialRedirects(), directory=tmp_path, credential="")
+    else:
+        with pytest.raises(ReleaseAssetError) as caught:
+            catalog.latest("mindie-knowledge")
+        assert getattr(caught.value, "category", None) is None
+    assert catalog.latest("mindie-knowledge")["version"] == "0.13.2"
+    assert calls[url] == 2
+    catalog.latest("mindie-knowledge", force=True)
+    assert calls[url] == 3
 
 
 def test_annotated_release_resolves_to_the_actual_source_package():

@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import json
 import re
 import tomllib
 import time
@@ -22,9 +21,48 @@ from semantic_version import Version
 
 from .runtime_inventory import COMPONENTS, SHA, validate_targets
 from .releases_io import _OfficialRedirects, _json, _remote_json
-from .release_http import read as http_read
+from .release_http import ReleaseResponseInvalid, read as http_read
 
 MAX_RESPONSE = 2 * 1024 * 1024
+
+
+class ReleaseAssetError(ReleaseResponseInvalid, ValueError):
+    """Rejected public artifact bytes remain a reportable integrity failure."""
+
+    def __init__(self, code):
+        self.code = code
+        super().__init__(code)
+
+
+def _checksums(body, required):
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ReleaseAssetError("invalid_release_checksums") from None
+    result = {}
+    for line in text.splitlines():
+        fields = line.split(maxsplit=1)
+        if len(fields) != 2 or not re.fullmatch(r"[0-9a-f]{64}", fields[0]):
+            raise ReleaseAssetError("invalid_release_checksums")
+        filename = fields[1].lstrip("*")
+        if not filename or filename in result:
+            raise ReleaseAssetError("invalid_release_checksums")
+        result[filename] = fields[0]
+    if not required <= result.keys():
+        raise ReleaseAssetError("incomplete_release_checksums")
+    return result
+
+
+def _validate_asset(body, record, *, checksum=None, parse=None):
+    if len(body) != record["size"]:
+        raise ReleaseAssetError("release_asset_size_mismatch")
+    digest = hashlib.sha256(body).hexdigest()
+    if checksum is not None and digest != checksum:
+        raise ReleaseAssetError("release_asset_digest_mismatch")
+    if record.get("digest") is not None and record["digest"] != "sha256:" + digest:
+        raise ReleaseAssetError("release_asset_digest_mismatch")
+    if parse is not None:
+        parse(body)
 
 
 class Catalog:
@@ -80,20 +118,14 @@ class Catalog:
         selected = self.source(name, revision)
         if Version(selected["version"]) != version:
             raise ValueError(f"component tag and package version differ: {name}")
-        sums = self.asset(name, tag, "SHA256SUMS").decode("utf-8")
-        checksums = {}
-        for line in sums.splitlines():
-            digest, filename = line.split(maxsplit=1)
-            if not re.fullmatch(r"[0-9a-f]{64}", digest):
-                raise ValueError(f"component release checksum is invalid: {name}")
-            checksums[filename.lstrip("*")] = digest
         expected_files = (required - {"SHA256SUMS"}) | {wheel}
-        if not expected_files <= set(checksums):
-            raise ValueError(f"component release checksums are incomplete: {name}")
-        raw = self.asset(name, tag, "benchmark-results.json")
-        if hashlib.sha256(raw).hexdigest() != checksums["benchmark-results.json"]:
-            raise ValueError(f"component release benchmark digest differs: {name}")
-        benchmark = json.loads(raw.decode("utf-8"))
+        sums = self.asset(name, tag, "SHA256SUMS", force=force, validate=lambda body:
+            _validate_asset(body, assets["SHA256SUMS"], parse=lambda raw: _checksums(raw, expected_files)))
+        checksums = _checksums(sums, expected_files)
+        raw = self.asset(name, tag, "benchmark-results.json", force=force, validate=lambda body:
+            _validate_asset(body, assets["benchmark-results.json"],
+                            checksum=checksums["benchmark-results.json"], parse=_json))
+        benchmark = _json(raw)
         valid_source = all(isinstance(benchmark.get(field), dict)
                            and benchmark[field].get("revision") == revision
                            and benchmark[field].get("dirty") is False
@@ -103,11 +135,11 @@ class Catalog:
             raise ValueError(f"component release benchmark does not validate this source: {name}")
         return selected
 
-    def asset(self, name, tag, filename):
+    def asset(self, name, tag, filename, *, force=False, validate=None):
         url = f"https://github.com/{COMPONENTS[name]}/releases/download/{urllib.parse.quote(tag, safe='')}/{filename}"
         raw, _ = http_read(url, maximum=MAX_RESPONSE, timeout=self.remaining(),
                            accept="application/octet-stream", redirects=_OfficialRedirects(),
-                           directory=self.cache, credential="")
+                           directory=self.cache, credential="", force=force, validate=validate)
         return raw
 
     def source(self, name, revision):

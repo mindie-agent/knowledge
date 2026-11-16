@@ -291,6 +291,44 @@ def test_content_length_truncation_fails_before_json_or_cache(monkeypatch, tmp_p
     assert not list((tmp_path / "release-cache").glob("http-*.json"))
 
 
+def test_invalid_http_framing_is_not_a_local_parser_fault(monkeypatch, tmp_path):
+    class Socket:
+        def makefile(self, *_args):
+            return io.BytesIO(b'HTTP/1.1 200 OK\r\nContent-Length: invalid\r\n\r\n[]')
+    class Opener:
+        def open(self, *_args, **_kwargs):
+            response = http.client.HTTPResponse(Socket())
+            response.begin()
+            return response
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *_: Opener())
+    assert_error("release_transport_unavailable", lambda: reader.fetch_releases(REPO))
+    assert not list((tmp_path / "release-cache").glob("http-*.json"))
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_invalid_legacy_content_length_is_evicted_before_forced_or_cached_read(monkeypatch, tmp_path, force):
+    from mindie_knowledge import release_http
+    monkeypatch.setenv("MINDIE_RELEASE_FORCE", "1" if force else "0")
+    url = f"https://api.github.com/repos/{REPO}/releases?per_page=100&page=1"
+    cache = tmp_path / "release-cache"
+    cache.mkdir()
+    entry = cache / ("http-" + hashlib.sha256(url.encode()).hexdigest() + ".json")
+    entry.write_text(json.dumps(dict(body=base64.b64encode(b'[]').decode(),
+                                    headers={"Content-Length": "invalid", "ETag": '"bad"'},
+                                    checked_at=release_http.time.time())))
+    calls = []
+    class Response(io.BytesIO):
+        status = 200
+        headers = {"Content-Length": "2"}
+    class Opener:
+        def open(self, request, **_kwargs):
+            calls.append(request)
+            return Response(b'[]')
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *_: Opener())
+    assert reader.fetch_releases(REPO) == []
+    assert len(calls) == 1 and calls[0].get_header("If-none-match") is None
+
+
 @pytest.mark.parametrize("error", [ValueError("local parser failure"), RecursionError(), RuntimeError()])
 def test_local_parser_failure_is_not_relabelled_as_remote_json(monkeypatch, error):
     def broken(*_args, **_kwargs):
