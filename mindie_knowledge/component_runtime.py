@@ -23,6 +23,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import sys
 import sysconfig
 import time
@@ -30,6 +31,7 @@ import tomllib
 from pathlib import Path
 
 from .component_releases import runtime_identity
+from .filesystem import filesystem_path
 from .loop.locks import lock_file, unlock_file
 from .loop.process import bounded_run
 from .runtime_inventory import validate_targets
@@ -241,6 +243,27 @@ def _discard(path: Path) -> None:
         pass
 
 
+def _verify_generation_identity(generation: Path, expected) -> None:
+    """Refuse a build whose locked generation was already moved to ``.trash-*``.
+
+    A concurrent retirement renames the directory while a builder is between
+    ``mkdir`` and the ``prepare.lock`` acquisition. The lock file would then
+    belong to a detached trash copy; comparing the directory identity after the
+    lock closes that window instead of publishing into a retired generation.
+    """
+    try:
+        current = os.stat(filesystem_path(generation))
+    except TimeoutError:
+        raise
+    except OSError:
+        raise RuntimeError(
+            "component generation moved while its builder lock was acquired") from None
+    if (not stat.S_ISDIR(current.st_mode)
+            or (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino)):
+        raise RuntimeError(
+            "component generation moved while its builder lock was acquired")
+
+
 def _post_build_sweep(deadline=None) -> None:
     """Silently reclaim cross-harness legacy baggage after a component update.
 
@@ -269,6 +292,7 @@ def _pre_build_prune(root: Path, generation: Path, budget: float,
                      deadline: float | None = None) -> None:
     """Free space before uv sync; a cleanup warning never blocks the build."""
     from .storage.legacy import collect_global_protected_roots
+    from .storage.legacy_roots import protected_source_roots
     from .storage.leases import live_process_prefixes
 
     if deadline is None:
@@ -282,13 +306,15 @@ def _pre_build_prune(root: Path, generation: Path, budget: float,
             timeout=min(1.0, max(0.05, stop - time.monotonic())))
         protected = collect_global_protected_roots(live_paths=live_paths,
                                                    deadline=stop)
+        forbidden = protected_source_roots(deadline=stop)
         protected.add(generation)
         prune_component_runtimes(
             root, keep_paths=protected, keep_recent_verified=2,
             staging_grace_seconds=1800.0,
             budget_seconds=max(0.0, stop - time.monotonic()),
             live_paths=live_paths, inspection_complete=complete,
-            include_global_roots=False, deadline=stop)
+            include_global_roots=False, forbidden_roots=forbidden,
+            deadline=stop)
     except TimeoutError:
         return  # The bounded budget expired; the build keeps whatever space it has.
     except Exception:  # noqa: BLE001 - best-effort cleanup never blocks a build
@@ -336,16 +362,27 @@ def build(source, root, baseline, targets, *, python=sys.executable,
         min(PRE_BUILD_GC_CEILING_SECONDS, max(0.0, float(timeout) * 0.1)),
         deadline)
     generation.mkdir(parents=True, exist_ok=True)
+    try:
+        before = os.stat(filesystem_path(generation))
+    except TimeoutError:
+        raise
+    except OSError:
+        raise RuntimeError(
+            "component generation disappeared before its build") from None
     runtime = generation / "runtime"
     manifest_file = generation / "components.json"
     temporary = manifest_file.with_suffix(".pending.json")
-    descriptor = os.open(generation / "prepare.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    descriptor = os.open(filesystem_path(generation / "prepare.lock"),
+                         os.O_CREAT | os.O_RDWR, 0o600)
     locked = False
     fresh = False
     published = False
     try:
         lock_file(descriptor, exclusive=True)
         locked = True
+        # A retirement that renamed this generation while the lock was being
+        # taken must be detected before any retained manifest is trusted.
+        _verify_generation_identity(generation, before)
         selected_python = runtime / ".venv" / (
             "Scripts/python.exe" if os.name == "nt" else "bin/python")
         fresh = not manifest_file.is_file()

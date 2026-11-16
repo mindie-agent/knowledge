@@ -5,16 +5,22 @@
   ``os.replace`` into a sibling ``.trash-*`` name. If that rename fails (a
   live Windows handle, a scanner, a race), the source directory is untouched:
   it is never deleted in place.
-- The rename holds non-blocking exclusive ``.inuse.lock`` and
+- On POSIX the rename holds non-blocking exclusive ``.inuse.lock`` and
   ``prepare.lock``/``.lock`` handles across eligibility re-verification and
-  ``os.replace``; they are released only after the directory left the
-  reusable namespace.
+  ``os.replace``; they are released only after the directory left the reusable
+  namespace. On Windows no handle inside the directory may stay open (NTFS
+  rejects the rename even when the holder is the same process), so one sibling
+  ``.mindie-retire.lock`` is held instead and every lease/builder probe opens
+  and closes its descriptor before the rename.
+- A symlink/junction ``.trash-*`` parent or component-runtimes root is refused
+  outright: the link target is foreign storage and is never scanned or swept.
 - A verified generation is ``components.json``; a younger-than-grace directory
   without one is an in-flight staging build and is kept. An incomplete
   generation older than the staging grace is a failed build and is reclaimed,
   but only after the same lease/live/builder/grace checks as a verified excess.
 - Leases, live process paths, ``prepare.lock`` holders, explicit keep paths,
-  and the current interpreter prefix always win over any retention count.
+  configured ``source_root``/``package_dir`` trees, and the current interpreter
+  prefix always win over any retention count.
 - Symlinks and NTFS directory junctions are checked with ``is_symlink`` and
   ``is_junction`` (reparse metadata on every supported Python) before any
   descent. Their target contents are never read or deleted; the link itself is
@@ -27,9 +33,11 @@
 
 [Timeouts & Locks]
 - ``deadline`` (absolute ``time.monotonic``) bounds every scan and deletion.
-  Expiry stops immediately mid-directory, leaves the remainder under
-  ``.trash-*`` for the next sweep, and is reported as ``partial``. No lock is
-  waited on; contention is a keep.
+  Enumeration itself checks the deadline entry by entry; expiry stops
+  immediately mid-directory, leaves the remainder under ``.trash-*`` for the
+  next sweep, and is reported as ``partial``. A truncated prune enumeration
+  retires nothing rather than ranking retention from a partial table. No lock
+  is waited on; contention is a keep.
 
 [Side-Effect Policy]
 - Deletes only caller-named disposable generations and their own ``.trash-*``
@@ -51,11 +59,17 @@ from .leases import (
     BUILDER_LOCK_NAMES, acquire_retirement_locks, is_lease_held,
     is_path_used_by_live_process, windows_lease_present,
 )
+from .uv_cache import (
+    UV_CACHE_DIRECTORY, _device, configure_same_volume_uv_cache,
+    same_volume_cache_dir,
+)
 
 TRASH_PREFIX = ".trash-"
 STAGING_GRACE_SECONDS = 1800.0
 DEFAULT_PRUNE_BUDGET_SECONDS = 5.0
-UV_CACHE_DIRECTORY = ".uv-cache"
+_SNAPSHOT_GONE = object()
+_SNAPSHOT_UNREADABLE = object()
+_SNAPSHOT_EXPIRED = object()
 
 
 def fs_path(path: Path) -> Path:
@@ -120,12 +134,23 @@ def _remove_link(path: Path) -> None:
         _rmdir(path)
 
 
-def _snapshot(path: Path):
-    """Names and non-followed directory flags; ``None`` when unreadable."""
+def _snapshot(path: Path, deadline=None):
+    """Names and non-followed directory flags for one bounded enumeration.
+
+    Returns the item list, or ``_SNAPSHOT_GONE`` (the directory vanished),
+    ``_SNAPSHOT_UNREADABLE`` (an OS error means its parent cannot be finished)
+    and ``_SNAPSHOT_EXPIRED`` (the deadline stopped the enumeration; the
+    remainder is resumable). The three cases must never collapse into the same
+    value: only "gone" lets a caller report a completed deletion.
+    """
+    if _expired(deadline):
+        return _SNAPSHOT_EXPIRED
     items = []
     try:
         with os.scandir(fs_path(path)) as iterator:
             for item in iterator:
+                if _expired(deadline):
+                    return _SNAPSHOT_EXPIRED
                 try:
                     is_dir = item.is_dir(follow_symlinks=False)
                 except TimeoutError:
@@ -134,11 +159,11 @@ def _snapshot(path: Path):
                     is_dir = False
                 items.append((item.name, is_dir))
     except FileNotFoundError:
-        return None
+        return _SNAPSHOT_GONE
     except TimeoutError:
         raise
     except OSError:
-        return None
+        return _SNAPSHOT_UNREADABLE
     return items
 
 
@@ -159,10 +184,14 @@ def _bounded_rmtree(root: Path, deadline) -> bool:
         return True
     if _expired(deadline):
         return False
-    children = _snapshot(root)
-    if children is None:
+    snapshot = _snapshot(root, deadline)
+    if snapshot is _SNAPSHOT_EXPIRED:
+        return False
+    if snapshot is _SNAPSHOT_GONE:
         return True
-    stack: list[list] = [[root, children, 0]]
+    if snapshot is _SNAPSHOT_UNREADABLE:
+        return False
+    stack: list[list] = [[root, snapshot, 0]]
     while stack:
         frame = stack[-1]
         directory, entries, index = frame
@@ -180,8 +209,10 @@ def _bounded_rmtree(root: Path, deadline) -> bool:
         if _is_link(child):
             _remove_link(child)
         elif is_dir:
-            nested = _snapshot(child)
-            if nested is None:
+            nested = _snapshot(child, deadline)
+            if nested is _SNAPSHOT_EXPIRED or nested is _SNAPSHOT_UNREADABLE:
+                return False
+            if nested is _SNAPSHOT_GONE:
                 continue
             stack.append([child, nested, 0])
         else:
@@ -196,17 +227,31 @@ def sweep_trash(parent: Path, *, deadline: float | None = None) -> dict:
     remaining = 0
     partial = False
     warnings: list[str] = []
+    if _is_link(parent):
+        # A symlinked/junction root is a foreign target: never scan or delete
+        # ``parent/.trash-*`` through the link.
+        return {"removed": 0, "remaining": 0,
+                "warnings": ["trash parent is a link: " + parent.name[:32]],
+                "partial": False}
     if not parent.is_dir():
         return {"removed": 0, "remaining": 0, "warnings": warnings,
                 "partial": False}
+    entries: list[Path] = []
     try:
-        entries = sorted(parent.iterdir(), key=lambda item: item.name)
+        with os.scandir(fs_path(parent)) as iterator:
+            for item in iterator:
+                if _expired(deadline):
+                    return {"removed": 0, "remaining": 0,
+                            "warnings": ["trash budget exhausted"],
+                            "partial": True}
+                entries.append(parent / item.name)
     except TimeoutError:
         raise
     except OSError as exc:
         return {"removed": 0, "remaining": 0,
                 "warnings": ["trash scan: " + type(exc).__name__],
                 "partial": True}
+    entries.sort(key=lambda item: item.name)
     for entry in entries:
         if not entry.name.startswith(TRASH_PREFIX):
             continue
@@ -257,8 +302,14 @@ def retire_directory(entry: Path, *, trash_root: Path | None = None,
     directory (or any open handle without ``FILE_SHARE_DELETE``) makes it fail
     with ``PermissionError`` before a single file inside is touched.
 
-    ``recheck`` runs while the exclusive lease/builder locks are held, directly
-    before ``os.replace``. A false result leaves the directory untouched.
+    POSIX holds the exclusive lease/builder locks inside ``entry`` across the
+    rename. Windows must not: NTFS rejects the rename while *any* handle inside
+    the directory is open, even this process's own. There the caller holds one
+    sibling ``.mindie-retire.lock`` and probes every lease/builder lock with
+    descriptors that are closed before ``os.replace``.
+
+    ``recheck`` runs while the locks are held, directly before ``os.replace``.
+    A false result leaves the directory untouched.
     """
     entry = Path(entry)
     result = {"status": "absent", "path": str(entry), "reclaimed": False,
@@ -289,13 +340,25 @@ def retire_directory(entry: Path, *, trash_root: Path | None = None,
         result.update(status="deferred_in_use", error="LockContention")
         return result
     try:
-        if windows_lease_present(entry):
+        if locks.sibling_only:
+            # Windows: every probe opens and closes a descriptor inside
+            # ``entry``; a single surviving handle would block the rename.
+            if (is_lease_held(entry) or windows_lease_present(entry)
+                    or _builder_locked(entry)):
+                result.update(status="deferred_in_use", error="LeaseHeld")
+                return result
+        elif windows_lease_present(entry):
             result.update(status="deferred_in_use", error="LeaseHeld")
             return result
         if recheck is not None and not recheck():
             result.update(status="deferred_in_use", error="EligibilityChanged")
             return result
         if not os.path.lexists(fs_path(entry)):
+            return result
+        if locks.sibling_only and locks.descriptors_inside_entry:
+            # Invariant guard: a leaked entry descriptor would make the rename
+            # fail after touching nothing; refuse instead of looping forever.
+            result.update(status="deferred_in_use", error="LockInsideEntry")
             return result
         try:
             os.replace(fs_path(entry), fs_path(trash))
@@ -524,7 +587,10 @@ def prune_component_runtimes(root: Path, *, keep_paths=(),
     With ``live_paths=None`` the process table is inspected here instead of
     assuming an empty (and therefore complete) snapshot. Caller keep paths are
     unioned with every global host binding unless ``include_global_roots`` is
-    explicitly disabled for an isolated unit test.
+    explicitly disabled for an isolated unit test. Global discovery also adds
+    every configured ``source_root``/``package_dir`` as a forbidden ancestor
+    root: a candidate *inside* an exported source tree is never retired, even
+    when that tree has no ``.git`` and contains no keep pin.
     """
     root = Path(root)
     started = time.monotonic()
@@ -548,6 +614,12 @@ def prune_component_runtimes(root: Path, *, keep_paths=(),
     elif inspection_complete is None:
         inspection_complete = True
     accounting["inspection_complete"] = bool(inspection_complete)
+    if _is_link(root):
+        # The configured runtimes root is itself a symlink/junction: its target
+        # is foreign storage and must never be scanned or swept through it.
+        accounting["status"] = "refused_link"
+        accounting["warnings"].append("component root is a link: " + root.name[:32])
+        return accounting
     if not root.is_dir():
         accounting["status"] = "absent"
         return accounting
@@ -556,11 +628,15 @@ def prune_component_runtimes(root: Path, *, keep_paths=(),
     accounting["warnings"].extend(trash["warnings"])
     accounting["partial"] = accounting["partial"] or bool(trash.get("partial"))
     keep = list(keep_paths or ())
+    forbidden = list(forbidden_roots or ())
     if include_global_roots:
-        from .legacy_roots import collect_global_protected_roots
+        from .legacy_roots import (
+            collect_global_protected_roots, protected_source_roots,
+        )
 
         try:
             keep.extend(collect_global_protected_roots(deadline=limit))
+            forbidden.extend(protected_source_roots(deadline=limit))
         except TimeoutError:
             accounting["status"] = "partial"
             accounting["partial"] = True
@@ -571,16 +647,27 @@ def prune_component_runtimes(root: Path, *, keep_paths=(),
         keep.append(sys.prefix)
     if sys.executable not in keep:
         keep.append(sys.executable)
+    entries: list[Path] = []
     try:
-        entries = sorted((item for item in root.iterdir()
-                          if item.is_dir() or _is_link(item)),
-                         key=lambda item: item.name)
+        with os.scandir(fs_path(root)) as iterator:
+            for item in iterator:
+                if _expired(limit):
+                    # A partial enumeration cannot rank retained generations;
+                    # retire nothing rather than guess from a truncated table.
+                    accounting["status"] = "partial"
+                    accounting["partial"] = True
+                    accounting["warnings"].append("budget exhausted")
+                    return accounting
+                entry = root / item.name
+                if item.is_dir() or _is_link(entry):
+                    entries.append(entry)
     except TimeoutError:
         raise
     except OSError as exc:
         accounting["status"] = "unreadable"
         accounting["warnings"].append("scan: " + type(exc).__name__)
         return accounting
+    entries.sort(key=lambda item: item.name)
     verified: list[tuple[float, float, Path]] = []
     now = time.time()
     for entry in entries:
@@ -595,11 +682,11 @@ def prune_component_runtimes(root: Path, *, keep_paths=(),
         if linked:
             _retire(entry, limit, accounting, keep_paths=keep,
                     live_paths=live_paths, grace_seconds=staging_grace_seconds,
-                    forbidden_roots=forbidden_roots)
+                    forbidden_roots=forbidden)
             continue
         if is_protected_path(entry, keep) or is_path_used_by_live_process(entry, live_paths) \
                 or is_lease_held(entry) or _builder_locked(entry) \
-                or is_within_roots(entry, forbidden_roots):
+                or is_within_roots(entry, forbidden):
             accounting["kept_dirs"] += 1
             continue
         manifest = entry / "components.json"
@@ -623,7 +710,7 @@ def prune_component_runtimes(root: Path, *, keep_paths=(),
                 _retire(entry, limit, accounting, keep_paths=keep,
                         live_paths=live_paths,
                         grace_seconds=staging_grace_seconds,
-                        forbidden_roots=forbidden_roots)
+                        forbidden_roots=forbidden)
             continue
         try:
             entry_time = os.stat(fs_path(entry)).st_mtime
@@ -649,121 +736,8 @@ def prune_component_runtimes(root: Path, *, keep_paths=(),
             break
         _retire(entry, limit, accounting, keep_paths=keep,
                 live_paths=live_paths, grace_seconds=staging_grace_seconds,
-                forbidden_roots=forbidden_roots)
+                forbidden_roots=forbidden)
     return accounting
-
-
-def _uv_default_cache(env=None) -> Path:
-    env = env if isinstance(env, dict) else {}
-    xdg = env.get("XDG_CACHE_HOME")
-    if isinstance(xdg, str) and xdg.strip():
-        return Path(xdg) / "uv"
-    if os.name == "nt":
-        base = env.get("LOCALAPPDATA") or os.environ.get("LOCALAPPDATA") \
-            or str(Path.home() / "AppData" / "Local")
-        return Path(base) / "uv" / "cache"
-    home = Path.home()
-    if sys.platform == "darwin":
-        legacy = home / ".cache" / "uv"
-        try:
-            if legacy.exists() or legacy.is_symlink():
-                return legacy
-        except TimeoutError:
-            raise
-        except OSError:
-            pass
-        return home / "Library" / "Caches" / "uv"
-    return home / ".cache" / "uv"
-
-
-def _existing_ancestor(path: Path) -> Path | None:
-    probe = Path(path)
-    while True:
-        try:
-            os.stat(fs_path(probe))
-            return probe
-        except FileNotFoundError:
-            if probe.parent == probe:
-                return None
-            probe = probe.parent
-        except TimeoutError:
-            raise
-        except OSError:
-            return None
-
-
-def _device(path: Path) -> int | None:
-    ancestor = _existing_ancestor(path)
-    if ancestor is None:
-        return None
-    try:
-        return os.stat(fs_path(ancestor)).st_dev
-    except TimeoutError:
-        raise
-    except OSError:
-        return None
-
-
-def _same_filesystem(first: Path, second: Path) -> bool:
-    left, right = _device(first), _device(second)
-    return left is not None and left == right
-
-
-def same_volume_cache_dir(target_dir: Path) -> Path:
-    """A uv cache on the target's own device (clone/hardlink safe).
-
-    When ``target_dir`` is itself a mountpoint root, its parent is a different
-    device, so the cache is placed inside the target instead of outside it.
-    """
-    target = Path(target_dir)
-    try:
-        resolved = target.resolve()
-    except TimeoutError:
-        raise
-    except OSError:
-        resolved = target.absolute()
-    for candidate in (resolved.parent / UV_CACHE_DIRECTORY,
-                      resolved / UV_CACHE_DIRECTORY):
-        if _same_filesystem(candidate, resolved):
-            return candidate
-    return resolved.parent / UV_CACHE_DIRECTORY
-
-
-def configure_same_volume_uv_cache(target_dir: Path, env: dict[str, str]) -> dict[str, str]:
-    """Pin uv's cache to the target device when the default would cross it.
-
-    A cross-device cache turns ``clonefile``/hardlinks into a full copy per
-    generation. An explicit non-empty ``UV_CACHE_DIR`` is the caller's choice
-    and is left byte-for-byte unchanged. Default resolution follows uv's
-    precedence using the passed child ``env``: ``XDG_CACHE_HOME`` first, then
-    uv's platform default (both ``~/.cache/uv`` and ``~/Library/Caches/uv`` are
-    considered on macOS).
-    """
-    if not isinstance(env, dict):
-        return env
-    explicit = env.get("UV_CACHE_DIR")
-    if isinstance(explicit, str) and explicit.strip():
-        return env
-    cache = _uv_default_cache(env)
-    target_device = _device(Path(target_dir))
-    if target_device is None:
-        return env
-    cache_devices = {_device(cache)}
-    try:
-        real_cache = cache.resolve()
-    except TimeoutError:
-        raise
-    except OSError:
-        real_cache = None
-    if real_cache is not None:
-        cache_devices.add(_device(real_cache))
-    if target_device in cache_devices:
-        return env
-    chosen = same_volume_cache_dir(Path(target_dir))
-    if not _same_filesystem(chosen, Path(target_dir)):
-        return env
-    env["UV_CACHE_DIR"] = str(chosen)
-    return env
 
 
 __all__ = [
@@ -771,6 +745,7 @@ __all__ = [
     "DEFAULT_PRUNE_BUDGET_SECONDS",
     "STAGING_GRACE_SECONDS",
     "TRASH_PREFIX",
+    "UV_CACHE_DIRECTORY",
     "configure_same_volume_uv_cache",
     "fs_path",
     "is_junction",

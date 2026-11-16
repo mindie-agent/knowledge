@@ -17,7 +17,10 @@
 [Timeouts & Locks]
 - Every reader accepts an absolute ``deadline``; expiry raises ``TimeoutError``
   so a caller can report a partial sweep instead of deleting with incomplete
-  protection. No lock is acquired here.
+  protection. Recursive scanning is an explicit iterative ``os.scandir`` walk
+  that checks the deadline before every entry (no unbounded ``rglob`` /
+  ``**`` glob), so a huge plugin tree cannot overrun a startup budget. No lock
+  is acquired here.
 
 [Side-Effect Policy]
 - Read-only inspection of configuration, launcher and package metadata. Never
@@ -53,11 +56,65 @@ _ABSOLUTE = re.compile(r"(?:[A-Za-z]:[\\/]|/)[^\s\"'`<>|;&,()\[\]]*")
 _QUOTED = re.compile(r'"([^"\n]+)"|\'([^\'\n]+)\'')
 _SHA = re.compile(r"[0-9a-f]{40,64}")
 _PATH_PUNCTUATION = ".,;:'\")]}>"
+_MAX_WALK_DEPTH = 12
+_WORKBUDDY_FILES = ("mcp.json", ".mcp.json", "hooks.json")
 
 
 def _check(deadline) -> None:
     if deadline is not None and time.monotonic() >= deadline:
         raise TimeoutError("protected-root scan budget exhausted")
+
+
+def _scandir_walk(root: Path, *, deadline=None, max_depth: int = _MAX_WALK_DEPTH):
+    """Yield every ``(path, is_dir)`` under ``root`` without recursion.
+
+    This replaces unbounded ``Path.glob("**/*")`` recursion: the deadline is
+    checked before every single entry, so a huge plugin or marketplace tree can
+    never overrun the caller's protected-pin budget. Directory links/junctions
+    are followed read-only (a protection pin may live behind one) with a
+    visited ``(st_dev, st_ino)`` guard against cycles and a hard depth cap.
+    """
+    base = Path(root)
+    try:
+        if not base.is_dir():
+            return
+        root_info = os.stat(filesystem_path(base))
+    except TimeoutError:
+        raise
+    except OSError:
+        return
+    visited = {(root_info.st_dev, root_info.st_ino)}
+    stack = [(base, 0)]
+    while stack:
+        directory, depth = stack.pop()
+        try:
+            with os.scandir(filesystem_path(directory)) as iterator:
+                for item in iterator:
+                    _check(deadline)
+                    child = directory / item.name
+                    try:
+                        is_dir = item.is_dir(follow_symlinks=True)
+                    except TimeoutError:
+                        raise
+                    except OSError:
+                        is_dir = False
+                    yield child, is_dir
+                    if not is_dir or depth + 1 >= max_depth:
+                        continue
+                    try:
+                        info = item.stat(follow_symlinks=True)
+                    except TimeoutError:
+                        raise
+                    except OSError:
+                        continue
+                    key = (info.st_dev, info.st_ino)
+                    if key not in visited:
+                        visited.add(key)
+                        stack.append((child, depth + 1))
+        except TimeoutError:
+            raise
+        except OSError:
+            continue
 
 
 def _env(name: str) -> str | None:
@@ -374,14 +431,14 @@ def _scan_claude(protected: set[Path], *, deadline=None) -> None:
         roots.insert(0, Path(explicit).expanduser())
     for root in roots:
         _check(deadline)
-        try:
-            entries = list(root.glob("*/releases/*/entry.py"))
-            if (root / "releases").is_dir():
-                entries.extend(root.glob("releases/*/entry.py"))
-        except TimeoutError:
-            raise
-        except OSError:
-            continue
+        entries: list[Path] = []
+        for path, is_dir in _scandir_walk(root, deadline=deadline, max_depth=5):
+            if is_dir or path.name != "entry.py":
+                continue
+            parts = path.relative_to(root).parts
+            if (len(parts) == 3 and parts[0] == "releases") \
+                    or (len(parts) == 4 and parts[1] == "releases"):
+                entries.append(path)
         for entry in entries:
             _add_file(protected, entry, deadline=deadline)
 
@@ -411,48 +468,44 @@ def _scan_kimi(protected: set[Path], config_homes, data_homes, *,
 
 def _scan_dsh(protected: set[Path], *, deadline=None) -> None:
     profiles = _home() / ".dsh" / "profiles"
-    try:
-        for path in profiles.glob("*/package.json"):
-            _check(deadline)
+    for path, is_dir in _scandir_walk(profiles, deadline=deadline, max_depth=4):
+        relative = path.relative_to(profiles).parts
+        if not is_dir and len(relative) == 2 and relative[1] == "package.json":
             value = _read_value(path, deadline=deadline)
             if value is not None:
                 _add_document(protected, value)
-        links = list(profiles.glob("*/node_modules/*")) \
-            + list(profiles.glob("*/node_modules/*/*"))
+        elif 3 <= len(relative) <= 4 and relative[1] == "node_modules":
+            _add_dsh_link(protected, path)
+
+
+def _add_dsh_link(protected: set[Path], link: Path) -> None:
+    try:
+        if not (link.is_symlink() or is_junction(link)):
+            return
+        target = Path(os.path.realpath(link))
     except TimeoutError:
         raise
     except OSError:
         return
-    for link in links:
-        _check(deadline)
-        try:
-            if not (link.is_symlink() or is_junction(link)):
-                continue
-            target = Path(os.path.realpath(link))
-        except TimeoutError:
-            raise
-        except OSError:
-            continue
-        parts = {part.casefold() for part in target.parts} if target else set()
-        if {"mindie-agent", "dsh"} <= parts:
-            protected.add(target)
-            if (owner := owning_dir(str(target))) is not None:
-                protected.add(owner)
+    parts = {part.casefold() for part in target.parts} if target else set()
+    if {"mindie-agent", "dsh"} <= parts:
+        protected.add(target)
+        if (owner := owning_dir(str(target))) is not None:
+            protected.add(owner)
 
 
 def _scan_workbuddy(protected: set[Path], *, deadline=None) -> None:
     root = _home() / ".workbuddy" / "plugins"
-    patterns = tuple(f"{area}/**/mindie-agent/**/{name}"
-                     for area in ("cache", "marketplaces")
-                     for name in ("mcp.json", ".mcp.json", "hooks.json"))
-    try:
-        paths = [path for pattern in patterns for path in root.glob(pattern)]
-        if (root / "known_marketplaces.json").is_file():
-            paths.append(root / "known_marketplaces.json")
-    except TimeoutError:
-        raise
-    except OSError:
-        return
+    paths: list[Path] = []
+    for area in ("cache", "marketplaces"):
+        base = root / area
+        for path, is_dir in _scandir_walk(base, deadline=deadline):
+            if is_dir or path.name not in _WORKBUDDY_FILES:
+                continue
+            if "mindie-agent" in path.relative_to(base).parts[:-1]:
+                paths.append(path)
+    if (known := root / "known_marketplaces.json").is_file():
+        paths.append(known)
     for path in paths:
         _add_file(protected, path, deadline=deadline)
 
@@ -474,13 +527,20 @@ def _config_protected_roots(config_homes, *, deadline=None) -> set[Path]:
 
 
 def protected_source_roots(*, config_home=None, deadline=None) -> set[Path]:
-    """User ``source_root`` trees that no candidate may ever be retired inside."""
+    """Configured source/package trees that no candidate may be retired inside.
+
+    ``source_root`` and ``package_dir`` are user pins. A candidate *equal to or
+    inside* one of these trees is protected even when the tree has no ``.git``
+    marker: an exported source tree with ``component-runtimes/old`` inside it
+    must never be reclaimed.
+    """
     roots: set[Path] = set()
     for _path, value in _config_documents(_config_homes(config_home),
                                           deadline=deadline):
-        item = value.get("source_root")
-        if isinstance(item, str) and _looks_absolute(item):
-            roots.add(Path(os.path.normpath(item)))
+        for name in ("source_root", "package_dir"):
+            item = value.get(name)
+            if isinstance(item, str) and _looks_absolute(item):
+                roots.add(Path(os.path.normpath(item)))
     return roots
 
 

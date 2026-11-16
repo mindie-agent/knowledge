@@ -22,7 +22,7 @@ from mindie_knowledge import _host_exec, component_runtime, release_http
 from mindie_knowledge import filesystem
 from mindie_knowledge.loop import process, service_host, summary_scratch
 from mindie_knowledge.loop.locks import lock_file, unlock_file
-from mindie_knowledge.storage import leases, legacy, lifecycle
+from mindie_knowledge.storage import leases, legacy, lifecycle, uv_cache
 from mindie_knowledge.storage.lifecycle import (
     configure_same_volume_uv_cache, prune_component_runtimes, retire_directory,
     sweep_trash,
@@ -567,7 +567,7 @@ def test_failed_fresh_build_removes_unverified_venv_and_pending_manifest(tmp_pat
     key = component_runtime.generation_key(baseline, targets)
     generation = root / key
     monkeypatch.setattr(component_runtime.shutil, "which", lambda name: "/tools/uv")
-    monkeypatch.setattr(lifecycle, "_device",
+    monkeypatch.setattr(uv_cache, "_device",
                         lambda path: 1 if str(path).startswith(str(Path.home())) else 2)
     observed = {}
 
@@ -592,18 +592,18 @@ def test_failed_fresh_build_removes_unverified_venv_and_pending_manifest(tmp_pat
 def test_cross_volume_uv_cache_selection_and_explicit_override(tmp_path, monkeypatch):
     target = tmp_path / "component-runtimes"
     target.mkdir()
-    monkeypatch.setattr(lifecycle, "_device",
+    monkeypatch.setattr(uv_cache, "_device",
                         lambda path: 1 if str(path).startswith(str(Path.home())) else 2)
     env = {}
     configured = configure_same_volume_uv_cache(target, env)
     assert configured["UV_CACHE_DIR"] == str(target.parent / ".uv-cache")
 
     same_volume = {"UV_CACHE_DIR": ""}
-    monkeypatch.setattr(lifecycle, "_device", lambda path: 7)
+    monkeypatch.setattr(uv_cache, "_device", lambda path: 7)
     assert configure_same_volume_uv_cache(target, same_volume) == {"UV_CACHE_DIR": ""}
 
     explicit = {"UV_CACHE_DIR": "/mnt/shared/uv"}
-    monkeypatch.setattr(lifecycle, "_device",
+    monkeypatch.setattr(uv_cache, "_device",
                         lambda path: (_ for _ in ()).throw(AssertionError("must not inspect")))
     assert configure_same_volume_uv_cache(target, explicit) == {"UV_CACHE_DIR": "/mnt/shared/uv"}
 
@@ -1182,14 +1182,14 @@ def test_uv_cache_defaults_and_mountpoint_fallback(tmp_path, monkeypatch):
     target = tmp_path / "mountpoint"
     target.mkdir()
 
-    monkeypatch.setattr(lifecycle, "_device", lambda path: 2)
+    monkeypatch.setattr(uv_cache, "_device", lambda path: 2)
     xdg = tmp_path / "xdg-cache"
-    assert lifecycle._uv_default_cache({"XDG_CACHE_HOME": str(xdg)}) == xdg / "uv"
+    assert uv_cache._uv_default_cache({"XDG_CACHE_HOME": str(xdg)}) == xdg / "uv"
     assert configure_same_volume_uv_cache(target, {"XDG_CACHE_HOME": str(xdg)}) \
         == {"XDG_CACHE_HOME": str(xdg)}
 
     monkeypatch.setattr(
-        lifecycle, "_device",
+        uv_cache, "_device",
         lambda path: 2 if str(path).startswith(str(target)) else 1)
     configured = configure_same_volume_uv_cache(target, {})
     assert configured["UV_CACHE_DIR"] == str(target / ".uv-cache")
@@ -1211,3 +1211,319 @@ def test_sweep_trash_runs_on_every_managed_target(tmp_path):
     assert result["reclaimed_trash"] >= 1
     assert not stale.exists()
     assert live.is_dir()
+
+
+# --------------------------------------------------------------------------- #
+# R4 surgical regressions: link safety, source-root ancestry, Windows handles,
+# truncated ps, scoped-home scans and deadline-bounded enumeration.
+# --------------------------------------------------------------------------- #
+
+def test_symlinked_generation_never_deletes_asset_in_external_target(tmp_path):
+    data = tmp_path / "data"
+    generations = data / "dsh" / "update" / "generations"
+    generations.mkdir(parents=True)
+    external = tmp_path / "external-generation"
+    (external / "package").mkdir(parents=True)
+    asset = external / "asset.tgz"
+    asset.write_text("precious", encoding="utf-8")
+    os.utime(external, (1000, 1000))
+    link = generations / "v0.1.0"
+    link.symlink_to(external, target_is_directory=True)
+
+    assert legacy._verified_generation(link) is True
+    result = legacy.sweep_legacy_installations(
+        config_home=tmp_path / "config", data_home=data,
+        codex_home=tmp_path / "codex", budget_seconds=30.0, force=True)
+
+    assert result["status"] == "completed"
+    assert result["kept_dirs"] >= 1
+    assert asset.is_file()
+    assert asset.read_text(encoding="utf-8") == "precious"
+    assert link.is_symlink()
+
+
+def test_junction_asset_is_never_unlinked(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    entry = data / "dsh" / "update" / "generations" / "v0.1.1"
+    (entry / "package").mkdir(parents=True)
+    asset = entry / "asset.tgz"
+    asset.write_text("keep", encoding="utf-8")
+    os.utime(entry, (1000, 1000))
+    monkeypatch.setattr(legacy, "is_junction",
+                        lambda path: Path(path) == asset)
+
+    legacy.sweep_legacy_installations(
+        config_home=tmp_path / "config", data_home=data,
+        codex_home=tmp_path / "codex", budget_seconds=30.0, force=True)
+
+    assert asset.is_file()
+    assert (entry / "package").is_dir()
+
+
+def test_trash_sweep_and_prune_refuse_a_symlinked_root(tmp_path):
+    external = tmp_path / "external"
+    trash = external / ".trash-old"
+    (trash / "nested").mkdir(parents=True)
+    victim = trash / "nested" / "file.txt"
+    victim.write_text("do not delete", encoding="utf-8")
+    parent = tmp_path / "component-runtimes"
+    parent.symlink_to(external, target_is_directory=True)
+
+    swept = sweep_trash(parent)
+    assert swept["removed"] == 0
+    assert victim.is_file()
+
+    pruned = prune_component_runtimes(
+        parent, keep_paths=[], keep_recent_verified=0, budget_seconds=5.0,
+        live_paths=leases.LivePaths(), inspection_complete=True)
+    assert pruned["status"] == "refused_link"
+    assert pruned["reclaimed_dirs"] == 0
+    assert victim.is_file()
+    assert trash.is_dir()
+
+
+def test_component_prune_protects_exported_source_root_without_git(
+        tmp_path, isolated_machine_home):
+    source = tmp_path / "exported-source"          # deliberately no .git
+    protected_root = source / "component-runtimes"
+    protected = [_runtime(protected_root, "exported", index, mtime=1000 + index)
+                 for index in range(2)]
+    config_home = isolated_machine_home / ".config" / "mindie-agent"
+    config_home.mkdir(parents=True)
+    (config_home / "codex.json").write_text(
+        json.dumps({"source_root": str(source)}), encoding="utf-8")
+
+    result = prune_component_runtimes(
+        protected_root, keep_paths=[], keep_recent_verified=0, budget_seconds=5.0,
+        live_paths=leases.LivePaths(), inspection_complete=True)
+    assert result["reclaimed_dirs"] == 0
+    assert all(entry.is_dir() for entry in protected)
+
+    control_root = tmp_path / "unprotected" / "component-runtimes"
+    control = [_runtime(control_root, "control", index, mtime=1000 + index)
+               for index in range(2)]
+    control_result = prune_component_runtimes(
+        control_root, keep_paths=[], keep_recent_verified=0, budget_seconds=5.0,
+        live_paths=leases.LivePaths(), inspection_complete=True)
+    assert control_result["reclaimed_dirs"] == 2
+    assert not any(entry.exists() for entry in control)
+
+
+def test_legacy_component_prune_protects_exported_source_root_without_git(tmp_path):
+    project = tmp_path / "exported-source"          # deliberately no .git
+    runtimes = project / "component-runtimes"
+    generations = [_runtime(runtimes, "exported", index, mtime=1000 + index)
+                   for index in range(4)]
+    (project / "codex.json").write_text(
+        json.dumps({"source_root": str(project)}), encoding="utf-8")
+
+    result = legacy.sweep_legacy_installations(
+        config_home=project, data_home=project / "data",
+        codex_home=tmp_path / "codex", budget_seconds=60.0, force=True)
+
+    assert result["reclaimed_dirs"] == 0
+    assert all(entry.is_dir() for entry in generations)
+
+
+def test_windows_retirement_holds_no_handle_inside_entry(tmp_path, monkeypatch):
+    root = tmp_path / "component-runtimes"
+    generation = _runtime(root, "windows", 0, mtime=1000)
+    open_paths = {}
+    real_open, real_close, real_replace = os.open, os.close, os.replace
+
+    def tracking_open(path, flags, mode=0o777, *, dir_fd=None):
+        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        open_paths[descriptor] = Path(os.fsdecode(path))
+        return descriptor
+
+    def tracking_close(descriptor):
+        open_paths.pop(descriptor, None)
+        real_close(descriptor)
+
+    def guarded_replace(source, destination):
+        target = Path(os.fsdecode(source))
+        if any(path == target or target in path.parents
+               for path in open_paths.values()):
+            # NTFS rejects a directory rename while any handle inside is open,
+            # even when the holder is this very process.
+            raise PermissionError(13, "WinError 32: the directory is in use")
+        return real_replace(source, destination)
+
+    observed = {}
+    real_acquire = leases.acquire_retirement_locks
+
+    def tracking_acquire(directory):
+        locks = real_acquire(directory)
+        if locks is not None:
+            observed["sibling_only"] = locks.sibling_only
+            observed["inside"] = locks.descriptors_inside_entry
+            observed["sibling"] = (
+                Path(directory).parent / leases.RETIRE_LOCK_NAME).is_file()
+        return locks
+
+    monkeypatch.setattr(leases, "_IS_WINDOWS", True)
+    monkeypatch.setattr(lifecycle, "acquire_retirement_locks", tracking_acquire)
+    monkeypatch.setattr(os, "open", tracking_open)
+    monkeypatch.setattr(os, "close", tracking_close)
+    monkeypatch.setattr(os, "replace", guarded_replace)
+
+    outcome = retire_directory(generation)
+
+    assert outcome["status"] == "retired"
+    assert outcome["trash_removed"] is True
+    assert not generation.exists()
+    assert not list(root.glob(".trash-*"))
+    assert not open_paths
+    assert observed == {"sibling_only": True, "inside": (), "sibling": True}
+
+
+def test_windows_retirement_defers_on_builder_lock_without_handles(tmp_path, monkeypatch):
+    root = tmp_path / "component-runtimes"
+    generation = _runtime(root, "windows-lock", 0, mtime=1000)
+    descriptor = os.open(generation / "prepare.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    lock_file(descriptor, exclusive=True)
+    try:
+        monkeypatch.setattr(leases, "_IS_WINDOWS", True)
+        outcome = retire_directory(generation)
+    finally:
+        unlock_file(descriptor)
+        os.close(descriptor)
+
+    assert outcome["status"] == "deferred_in_use"
+    assert outcome["error"] == "LeaseHeld"
+    assert generation.is_dir()
+    assert not list(root.glob(".trash-*"))
+    assert (root / leases.RETIRE_LOCK_NAME).is_file()
+
+
+def test_builder_rejects_generation_moved_after_prepare_lock(tmp_path, monkeypatch):
+    source, root, baseline, targets, generation = _build_fixture(tmp_path, monkeypatch)
+    real_lock_file = component_runtime.lock_file
+
+    def swapping_lock(descriptor, *, exclusive, blocking=False):
+        real_lock_file(descriptor, exclusive=exclusive, blocking=blocking)
+        os.replace(generation, root / (".trash-" + generation.name[:16]))
+        generation.mkdir()
+
+    monkeypatch.setattr(component_runtime, "lock_file", swapping_lock)
+
+    with pytest.raises(RuntimeError, match="moved while its builder lock"):
+        component_runtime.build(source, root, baseline, targets, timeout=120)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX ps command-line inspection")
+def test_posix_ps_never_falls_back_to_a_truncated_table(tmp_path, monkeypatch):
+    executable = tmp_path / "fake-ps"
+    record = tmp_path / "ps-calls.txt"
+    executable.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$*\" >> \"$FAKE_PS_RECORD\"\n"
+        "case \" $* \" in\n"
+        "  *\" -ww \"*) exit 1 ;;\n"
+        "esac\n"
+        "printf '%s\\n' '/tmp/truncated/component-runtimes/old'\n",
+        encoding="utf-8")
+    executable.chmod(0o755)
+    monkeypatch.setenv("FAKE_PS_RECORD", str(record))
+    monkeypatch.setattr(_host_exec, "which_native", lambda name: str(executable))
+
+    live, complete = leases._posix_live_paths(timeout=10)
+
+    assert complete is False
+    assert not live
+    calls = record.read_text(encoding="utf-8").splitlines()
+    assert calls == ["-ww -axo command="]
+
+
+def test_explicit_scoped_roots_never_scan_real_home_uv_cache(
+        tmp_path, isolated_machine_home):
+    cache = isolated_machine_home / ".cache" / "mindie-agent-dsh" / "uv-cache"
+    cache.mkdir(parents=True)
+    payload = cache / "blob.bin"
+    payload.write_text("keep", encoding="utf-8")
+    os.utime(cache, (1000, 1000))
+
+    result = legacy.sweep_legacy_installations(
+        config_home=tmp_path / "config", data_home=tmp_path / "data",
+        codex_home=tmp_path / "codex", budget_seconds=60.0, force=True)
+
+    assert result["status"] == "completed"
+    assert cache.is_dir()
+    assert payload.is_file()
+    discovered = legacy._discover_targets(
+        [tmp_path / "config"], [tmp_path / "data"], tmp_path / "codex",
+        include_home_roots=False)
+    assert all(target["path"] != cache for target in discovered)
+
+
+def test_default_production_mode_still_reclaims_home_uv_cache(
+        isolated_machine_home):
+    cache = isolated_machine_home / ".cache" / "mindie-agent-dsh" / "uv-cache"
+    (cache / "vendor").mkdir(parents=True)
+    (cache / "vendor" / "blob.bin").write_text("x", encoding="utf-8")
+    os.utime(cache, (1000, 1000))
+
+    result = legacy.sweep_legacy_installations(budget_seconds=60.0, force=True)
+
+    assert result["status"] in {"completed", "partial", "inspection_incomplete"}
+    assert not cache.exists()
+
+
+def test_deadline_expiry_during_snapshot_is_partial_not_success(tmp_path, monkeypatch):
+    root = tmp_path / "trash-tree"
+    (root / "nested").mkdir(parents=True)
+    victim = root / "nested" / "file.txt"
+    victim.write_text("x", encoding="utf-8")
+
+    assert lifecycle._snapshot(root, deadline=time.monotonic() - 1) \
+        is lifecycle._SNAPSHOT_EXPIRED
+    real_snapshot = lifecycle._snapshot
+
+    def expiring(path, deadline=None):
+        if Path(path).name == "nested":
+            return lifecycle._SNAPSHOT_EXPIRED
+        return real_snapshot(path, deadline)
+
+    monkeypatch.setattr(lifecycle, "_snapshot", expiring)
+    assert lifecycle._bounded_rmtree(root, time.monotonic() + 60) is False
+    assert victim.is_file()
+
+    monkeypatch.setattr(lifecycle, "_snapshot",
+                        lambda path, deadline=None: lifecycle._SNAPSHOT_UNREADABLE)
+    assert lifecycle._bounded_rmtree(root, None) is False
+    assert root.is_dir()
+
+
+def test_workbuddy_scan_checks_deadline_on_every_entry(tmp_path, isolated_machine_home):
+    from mindie_knowledge.storage import legacy_roots
+
+    cache = isolated_machine_home / ".workbuddy" / "plugins" / "cache"
+    for index in range(50):
+        plugin = cache / f"filler-{index}" / "mindie-agent" / "plugin"
+        plugin.mkdir(parents=True)
+        (plugin / "notes.txt").write_text("x", encoding="utf-8")
+
+    # No matching filename exists yet: an expired budget must still stop the
+    # enumeration instead of walking every directory and returning a clean scan.
+    with pytest.raises(TimeoutError):
+        legacy_roots._scan_workbuddy(set(), deadline=time.monotonic() - 1)
+
+    for index in range(2):
+        plugin = cache / f"filler-{index}" / "mindie-agent" / "plugin"
+        (plugin / "mcp.json").write_text(
+            json.dumps({"command": f"/opt/tool-{index}/bin/python"}),
+            encoding="utf-8")
+    protected = set()
+    legacy_roots._scan_workbuddy(protected, deadline=time.monotonic() + 60)
+    assert Path("/opt/tool-0/bin/python") in protected
+    assert Path("/opt/tool-1/bin/python") in protected
+
+
+def test_legacy_entry_scan_honours_deadline(tmp_path):
+    root = tmp_path / "runtimes"
+    for index in range(10):
+        (root / f"generation-{index}").mkdir(parents=True)
+
+    with pytest.raises(TimeoutError):
+        legacy._entries(root, deadline=time.monotonic() - 1)
+    assert len(legacy._entries(root, deadline=time.monotonic() + 60)) == 10

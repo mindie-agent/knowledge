@@ -21,15 +21,18 @@
   is never a target.
 - Incomplete POSIX process inspection keeps verified executable generations;
   only trash and stale broken staging are reclaimed.
+- A caller-supplied ``config_home``/``data_home``/``codex_home`` scopes the
+  sweep to those roots: the real user's ``~`` cache roots are added only in
+  default production mode, never for an isolated test or IPC prune.
 - A cleanup failure never becomes a primary-operation failure and no marker or
   tombstone suppresses a later honest retry.
 
 [Timeouts & Locks]
 - One absolute deadline bounds the sweep; every managed target gets a bounded
-  slice, and every scan/deletion loop stops immediately on expiry and reports
-  ``partial``. No lock is waited on; busy leases and builder locks only cause a
-  keep. The cooldown marker is advisory (600 s) and is bypassed by
-  ``force=True`` or leftover ``.trash-*``.
+  slice, and every scan/deletion loop checks the deadline entry by entry and
+  stops immediately on expiry, reporting ``partial``. No lock is waited on;
+  busy leases and builder locks only cause a keep. The cooldown marker is
+  advisory (600 s) and is bypassed by ``force=True`` or leftover ``.trash-*``.
 
 [Side-Effect Policy]
 - Deletes only disposable managed directories and writes the cooldown marker
@@ -100,7 +103,14 @@ def _add_target(targets, seen, kind, path, harness=None) -> None:
         targets.append({"kind": kind, "path": path, "harness": harness})
 
 
-def _discover_targets(config_homes, data_homes, codex_home) -> list[dict]:
+def _discover_targets(config_homes, data_homes, codex_home, *,
+                      include_home_roots: bool = True) -> list[dict]:
+    """Managed scan roots; real ``~`` roots only in default production mode.
+
+    ``include_home_roots`` is false when the caller passed any explicit
+    ``config_home``/``data_home``/``codex_home``: an isolated test must never
+    add (and later delete) the real user's ``~/.cache/mindie-agent-dsh``.
+    """
     targets: list[dict] = []
     seen: set[str] = set()
     for harness, root in _state_roots(config_homes, data_homes, codex_home):
@@ -133,18 +143,33 @@ def _discover_targets(config_homes, data_homes, codex_home) -> list[dict]:
         generations = config / "generations"
         if generations.is_dir() and any(generations.glob("oc.engine.*.json")):
             _add_target(targets, seen, "oc-engines", generations, "oc")
-    if (uv_cache := _home() / ".cache" / "mindie-agent-dsh" / "uv-cache").is_dir():
+    if include_home_roots \
+            and (uv_cache := _home() / ".cache" / "mindie-agent-dsh" / "uv-cache").is_dir():
         _add_target(targets, seen, "uv-cache", uv_cache, "dsh")
     return targets
 
 
-def _entries(directory) -> list[Path]:
+def _entries(directory, *, deadline=None) -> list[Path]:
+    """Sorted direct children; every entry checks the caller deadline.
+
+    A 10,000-entry generation directory must not materialize past the sweep
+    budget, so expiry raises ``TimeoutError`` (the per-target handler reports
+    it as ``partial``) instead of returning a truncated ranking.
+    """
+    base = Path(directory)
+    entries: list[Path] = []
     try:
-        return sorted(Path(directory).iterdir(), key=lambda item: item.name)
+        with os.scandir(filesystem_path(base)) as iterator:
+            for item in iterator:
+                if _expired(deadline):
+                    raise TimeoutError("storage scan budget exhausted")
+                entries.append(base / item.name)
     except TimeoutError:
         raise
     except OSError:
         return []
+    entries.sort(key=lambda item: item.name)
+    return entries
 
 
 def _mtime(path: Path) -> float:
@@ -338,7 +363,7 @@ def _sweep_generations(target, protected, live, complete, deadline, account,
                        forbidden_roots=()) -> None:
     directory = target["path"]
     recent = 1 if target.get("harness") == "kimi" else VERIFIED_RETENTION
-    entries = [entry for entry in _entries(directory)
+    entries = [entry for entry in _entries(directory, deadline=deadline)
                if entry.is_dir() and entry.name != "bootstrap"]
     kept = _sweep_ranked(entries, protected, live, complete, deadline, account,
                          recent=recent, marker=_verified_generation,
@@ -348,8 +373,14 @@ def _sweep_generations(target, protected, live, complete, deadline, account,
             account["partial"] = True
             account["warnings"].append("budget exhausted")
             return
+        # A kept entry may itself be a symlink/junction selected by retention.
+        # Never follow it into an external target to unlink its asset.
+        if _is_link(entry) or not entry.is_dir():
+            continue
         asset = entry / "asset.tgz"
-        if asset.is_file() and ((entry / "package").is_dir() or (entry / ".venv").is_dir()):
+        if is_junction(asset) or not (asset.is_symlink() or asset.is_file()):
+            continue
+        if (entry / "package").is_dir() or (entry / ".venv").is_dir():
             _unlink_file(asset, account, deadline)
 
 
@@ -357,13 +388,9 @@ def _sweep_launch(target, protected, live, complete, deadline, account,
                   forbidden_roots=()) -> None:
     directory = target["path"]
     generations = directory.parent / "generations"
-    try:
-        shas = {entry.name for entry in generations.iterdir() if entry.is_dir()}
-    except TimeoutError:
-        raise
-    except OSError:
-        shas = set()
-    for entry in _entries(directory):
+    shas = {entry.name for entry in _entries(generations, deadline=deadline)
+            if entry.is_dir()}
+    for entry in _entries(directory, deadline=deadline):
         if _expired(deadline):
             account["partial"] = True
             account["warnings"].append("budget exhausted")
@@ -378,7 +405,7 @@ def _sweep_launch(target, protected, live, complete, deadline, account,
 
 def _sweep_receipts(target, protected, live, complete, deadline, account,
                     forbidden_roots=()) -> None:
-    files = [entry for entry in _entries(target["path"]) if entry.suffix == ".json"
+    files = [entry for entry in _entries(target["path"], deadline=deadline) if entry.suffix == ".json"
              and entry.is_file()]
     files.sort(key=lambda entry: (_mtime(entry), entry.name), reverse=True)
     protected_names = {item.name for item in protected}
@@ -397,7 +424,7 @@ def _sweep_receipts(target, protected, live, complete, deadline, account,
 
 def _sweep_runtimes(target, protected, live, complete, deadline, account,
                     forbidden_roots=()) -> None:
-    entries = [entry for entry in _entries(target["path"])
+    entries = [entry for entry in _entries(target["path"], deadline=deadline)
                if entry.is_dir() and entry.name.casefold() != "cc"]
     marker = lambda entry: _is_link(entry) or any(
         (entry / name).exists()
@@ -408,13 +435,13 @@ def _sweep_runtimes(target, protected, live, complete, deadline, account,
 
 def _sweep_cc_runtimes(target, protected, live, complete, deadline, account,
                        forbidden_roots=()) -> None:
-    entries = [entry for entry in _entries(target["path"]) if entry.is_dir()]
+    entries = [entry for entry in _entries(target["path"], deadline=deadline) if entry.is_dir()]
     marker = lambda entry: entry.with_name(entry.name + ".ready.json").is_file()
     kept = {entry.name for entry in _sweep_ranked(
         entries, protected, live, complete, deadline, account,
         recent=VERIFIED_RETENTION, marker=marker,
         forbidden_roots=forbidden_roots)}
-    for entry in _entries(target["path"]):
+    for entry in _entries(target["path"], deadline=deadline):
         if _expired(deadline):
             account["partial"] = True
             account["warnings"].append("budget exhausted")
@@ -448,7 +475,7 @@ def _sweep_releases(target, protected, live, complete, deadline, account,
                     forbidden_roots=()) -> None:
     directory = target["path"]
     active = target.get("active_versions") or set()
-    entries = [entry for entry in _entries(directory) if entry.is_dir()
+    entries = [entry for entry in _entries(directory, deadline=deadline) if entry.is_dir()
                and re.match(r"^[0-9]+(?:\.[0-9]+)+", entry.name)]
     entries.sort(key=lambda entry: _version_key(entry.name), reverse=True)
     newest = entries[0] if entries else None
@@ -469,7 +496,7 @@ def _sweep_releases(target, protected, live, complete, deadline, account,
             _retire_path(entry, deadline, account, protected=protected, live=live,
                          complete=complete, verified=True, grace_seconds=0.0,
                          forbidden_roots=forbidden_roots)
-    for entry in _entries(directory):
+    for entry in _entries(directory, deadline=deadline):
         if _expired(deadline):
             account["partial"] = True
             account["warnings"].append("budget exhausted")
@@ -482,7 +509,7 @@ def _sweep_releases(target, protected, live, complete, deadline, account,
 
 def _sweep_newest(target, protected, live, complete, deadline, account,
                   forbidden_roots=()) -> None:
-    entries = [entry for entry in _entries(target["path"]) if entry.is_dir()]
+    entries = [entry for entry in _entries(target["path"], deadline=deadline) if entry.is_dir()]
     _sweep_ranked(entries, protected, live, complete, deadline, account,
                   recent=VERIFIED_RETENTION, marker=lambda entry: True,
                   forbidden_roots=forbidden_roots)
@@ -491,7 +518,7 @@ def _sweep_newest(target, protected, live, complete, deadline, account,
 def _sweep_engines(target, protected, live, complete, deadline, account,
                    runtime_names: set[str], configs_text: str,
                    forbidden_roots=()) -> None:
-    files = [entry for entry in _entries(target["path"]) if entry.suffix == ".json"
+    files = [entry for entry in _entries(target["path"], deadline=deadline) if entry.suffix == ".json"
              and entry.is_file()]
     files.sort(key=lambda entry: (_mtime(entry), entry.name), reverse=True)
     for index, entry in enumerate(files):
@@ -510,7 +537,7 @@ def _sweep_engines(target, protected, live, complete, deadline, account,
 
 def _sweep_oc_engines(target, protected, live, complete, deadline, account,
                       forbidden_roots=()) -> None:
-    files = [entry for entry in _entries(target["path"])
+    files = [entry for entry in _entries(target["path"], deadline=deadline)
              if entry.is_file() and entry.name.startswith("oc.engine.")]
     files.sort(key=lambda entry: (_mtime(entry), entry.name), reverse=True)
     for index, entry in enumerate(files):
@@ -526,7 +553,7 @@ def _sweep_oc_engines(target, protected, live, complete, deadline, account,
 
 def _sweep_superseded(target, protected, live, complete, deadline, account,
                       forbidden_roots=()) -> None:
-    files = [entry for entry in _entries(target["path"])
+    files = [entry for entry in _entries(target["path"], deadline=deadline)
              if entry.is_file() and entry.name.startswith("superseded-")]
     files.sort(key=lambda entry: (_mtime(entry), entry.name), reverse=True)
     for entry in files[SUPERSEDED_RETENTION:]:
@@ -596,11 +623,20 @@ def _write_marker(path: Path, value: dict) -> None:
             pass
 
 
-def _leftover_trash(targets) -> bool:
+def _leftover_trash(targets, deadline=None) -> bool:
+    """Whether any target holds ``.trash-*``; bounded and conservative.
+
+    Expiry returns True (an unverified leftover may exist): this only bypasses
+    the cooldown so a real sweep can retry; it never suppresses reclamation.
+    """
     for target in targets:
         try:
-            if any(entry.name.startswith(".trash-") for entry in target["path"].iterdir()):
-                return True
+            with os.scandir(filesystem_path(target["path"])) as iterator:
+                for item in iterator:
+                    if _expired(deadline):
+                        return True
+                    if item.name.startswith(".trash-"):
+                        return True
         except TimeoutError:
             raise
         except OSError:
@@ -631,12 +667,17 @@ def sweep_legacy_installations(*, config_home=None, data_home=None, codex_home=N
                    deferred_dirs=0, kept_dirs=0, reclaimed_trash=0,
                    reclaimed_files=0, warnings=[], inspection_complete=True,
                    protected_roots=0, partial=False, elapsed_seconds=0.0)
-    targets = _discover_targets(config_homes, data_homes, codex)
+    # Explicit scoped roots mean an isolated caller (tests, an IPC prune).
+    # Only default production mode may scan the real user's ``~`` roots.
+    include_home_roots = all(value is None for value in
+                             (config_home, data_home, codex_home))
+    targets = _discover_targets(config_homes, data_homes, codex,
+                                include_home_roots=include_home_roots)
     marker = data_homes[0] / STATE_MARKER
     state = _read_json(marker)
     recent = isinstance(state, dict) and isinstance(state.get("at"), (int, float)) \
         and time.time() - state["at"] < COOLDOWN_SECONDS
-    if not force and recent and not _leftover_trash(targets):
+    if not force and recent and not _leftover_trash(targets, deadline=limit):
         account["status"] = "skipped_cooldown"
         return account
     if _expired(limit):

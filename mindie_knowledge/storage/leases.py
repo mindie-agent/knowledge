@@ -18,12 +18,14 @@
 
 [Timeouts & Locks]
 - ``live_process_prefixes`` bounds ``ps``/snapshot work by its caller timeout
-  (default 2.0 s) and caps output at 8 MiB. POSIX runs ``ps -ww -axo command=``
-  with ``COLUMNS`` removed so procps cannot truncate a long command line.
+  (default 2.0 s) and caps output at 8 MiB. POSIX reads only
+  ``ps -ww -axo command=`` with ``COLUMNS`` removed; a non-zero exit, timeout
+  or capped output is incomplete and never falls back to a truncated table.
   ``is_lease_held`` is one non-blocking lock probe per candidate file; nothing
-  waits. ``acquire_retirement_locks`` holds non-blocking exclusive
-  ``.inuse.lock`` and ``prepare.lock`` handles until the caller's
-  ``os.replace`` has completed.
+  waits. ``acquire_retirement_locks`` is non-blocking: POSIX holds the entry
+  lease/builder handles until the caller's ``os.replace`` completed, while
+  Windows holds a sibling ``.mindie-retire.lock`` and zero entry handles so
+  the NTFS rename can succeed.
 
 [Side-Effect Policy]
 - Read-only process inspection. ``acquire_runtime_lease`` creates and removes
@@ -48,7 +50,9 @@ from ..loop.locks import lock_file, unlock_file
 
 LEASE_NAME = ".inuse.lock"
 PREPARE_LOCK_NAME = "prepare.lock"
+RETIRE_LOCK_NAME = ".mindie-retire.lock"
 BUILDER_LOCK_NAMES = (PREPARE_LOCK_NAME, ".lock")
+_IS_WINDOWS = os.name == "nt"
 _TRASH_PREFIX = ".trash-"
 _LEASE_GLOB = ".inuse.*.lease"
 _MAX_COMMAND_OUTPUT = 8 * 1024 * 1024
@@ -214,10 +218,20 @@ def acquire_runtime_lease(directory):
 
 
 class RetirementLocks:
-    """Exclusive builder/lease locks held across an atomic directory rename."""
+    """Exclusive locks held across one atomic directory rename.
 
-    def __init__(self, descriptors=()):
+    POSIX holds ``.inuse.lock``/``prepare.lock`` inside the candidate; Windows
+    holds only the sibling ``.mindie-retire.lock`` and zero entry descriptors
+    (NTFS rejects a rename while any handle inside is open, even this process).
+    """
+
+    def __init__(self, descriptors=(), *, sibling_only: bool = False):
         self._descriptors = list(descriptors)
+        self.sibling_only = sibling_only
+
+    @property
+    def descriptors_inside_entry(self) -> tuple[int, ...]:
+        return () if self.sibling_only else tuple(self._descriptors)
 
     def release(self):
         descriptors, self._descriptors = self._descriptors, []
@@ -258,14 +272,42 @@ def _release_descriptors(descriptors) -> None:
 
 
 def acquire_retirement_locks(directory):
-    """Hold non-blocking exclusive lease/builder locks for one candidate.
+    """Hold non-blocking exclusive locks for one candidate retirement.
 
-    Returns ``None`` on contention or an uncreatable lock; the caller must
-    treat that as "in use" and leave the directory untouched. The caller
-    releases the handles only after ``os.replace`` moved the directory out of
-    the reusable namespace, so a cooperating builder can no longer enter the
-    check/rename window.
+    Returns ``None`` on contention or an uncreatable lock (treat as "in use").
+    POSIX locks the lease/builder files inside the candidate; Windows locks one
+    sibling ``.mindie-retire.lock`` and never creates a handle inside it.
     """
+    directory = Path(directory)
+    if _IS_WINDOWS:
+        return _acquire_sibling_lock(directory)
+    return _acquire_entry_locks(directory)
+
+
+def _acquire_sibling_lock(directory):
+    """One non-blocking sibling lock descriptor; no handle inside ``directory``."""
+    descriptor = None
+    try:
+        descriptor = os.open(
+            filesystem_path(Path(directory).parent / RETIRE_LOCK_NAME),
+            os.O_CREAT | os.O_RDWR, 0o600)
+        lock_file(descriptor, exclusive=True)
+    except BlockingIOError:
+        os.close(descriptor)
+        return None
+    except TimeoutError:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise
+    except OSError:
+        if descriptor is not None:
+            os.close(descriptor)
+        return None
+    return RetirementLocks([descriptor], sibling_only=True)
+
+
+def _acquire_entry_locks(directory):
+    """POSIX lease/builder locks that may stay open across a directory rename."""
     directory = Path(directory)
     try:
         before = os.stat(filesystem_path(directory))
@@ -337,7 +379,7 @@ def acquire_retirement_locks(directory):
             raise
         except OSError:
             pass
-    return RetirementLocks(descriptors)
+    return RetirementLocks(descriptors, sibling_only=False)
 
 
 def _windows_lease_held(lease_file):
@@ -376,7 +418,7 @@ def _windows_lease_held(lease_file):
 
 def windows_lease_present(directory) -> bool:
     """True when a Windows private lease handle still blocks directory rename."""
-    if os.name != "nt":
+    if not _IS_WINDOWS:
         return False
     try:
         return any(_windows_lease_held(lease)
@@ -512,7 +554,7 @@ def is_path_used_by_live_process(candidate_dir, live_paths) -> bool:
 
 
 class _PsCommandFailed(Exception):
-    """``ps`` exited non-zero; only then may the caller drop ``-ww``."""
+    """``ps`` exited non-zero; the inspection stays incomplete."""
 
 
 def _run_ps(executable, arguments, timeout):
@@ -588,12 +630,12 @@ def _posix_live_paths(timeout):
     if executable is None:
         return LivePaths(), False
     try:
+        # ``-ww`` is supported by macOS, BSD and Linux procps. Never fall back
+        # to the 80-column ``ps -axo`` form: its truncated command lines silently
+        # hide live generations, so a failure here must stay incomplete.
         output = _run_ps(executable, ["-ww", "-axo", "command="], timeout)
     except _PsCommandFailed:
-        try:
-            output = _run_ps(executable, ["-axo", "command="], timeout)
-        except _PsCommandFailed:
-            return LivePaths(), False
+        return LivePaths(), False
     if output is None:
         return LivePaths(), False
     result = LivePaths()
@@ -739,6 +781,7 @@ __all__ = [
     "LEASE_NAME",
     "LivePaths",
     "PREPARE_LOCK_NAME",
+    "RETIRE_LOCK_NAME",
     "RetirementLocks",
     "RuntimeLease",
     "acquire_retirement_locks",
