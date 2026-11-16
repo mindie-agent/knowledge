@@ -1,7 +1,8 @@
 """[Role] Share bounded ETag release reads across component and plugin updaters.
 
 [Invariants] Cache entries contain public response bytes and selected public
-headers only. An expired cache never conceals a failed network read. Credentials
+headers only. Caller validation precedes cache use and publication, including
+legacy entries. An expired cache never conceals a failed network read. Credentials
 stay in memory and are sent only to api.github.com.
 [Timeouts & Locks] HTTP and credential discovery have explicit caller/5s limits.
 Atomic replacement permits concurrent readers without an extra update authority.
@@ -13,6 +14,7 @@ from __future__ import annotations
 import base64
 from functools import cache
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
@@ -31,6 +33,10 @@ class ReleaseResponseTooLarge(ValueError):
     """A bounded release body cannot be treated as a complete catalog."""
 
 
+class ReleaseResponseInvalid(RuntimeError):
+    """The caller rejected response bytes; a derived cache may discard them."""
+
+
 @cache
 def token():
     from ._host_exec import which_native
@@ -46,7 +52,17 @@ def token():
     return result.stdout.decode("utf-8", "replace").strip() if result.returncode == 0 else None
 
 
-def read(url, *, maximum, timeout, accept, redirects, directory=None, force=False, credential=None):
+def _validate_body(body, headers, validate):
+    length = headers.get("Content-Length")
+    if length is not None and len(body) != int(length):
+        # read(n) may return a short body without raising IncompleteRead.
+        raise http.client.IncompleteRead(b"", max(0, int(length) - len(body)))
+    if validate is not None:
+        validate(body)
+
+
+def read(url, *, maximum, timeout, accept, redirects, directory=None, force=False, credential=None,
+         validate=None):
     force = force or os.environ.get("MINDIE_RELEASE_FORCE") == "1"
     parsed = urllib.parse.urlsplit(url)
     if (parsed.scheme != "https" or parsed.username or parsed.password
@@ -65,13 +81,22 @@ def read(url, *, maximum, timeout, accept, redirects, directory=None, force=Fals
         # This is derived public metadata, not an update or authorization
         # receipt. A corrupt entry is replaced by a fresh authoritative read.
         saved = None
+    if saved is not None:
+        body = base64.b64decode(saved["body"], validate=True)
+        if len(body) > maximum:
+            raise ReleaseResponseTooLarge("release response exceeds its byte limit")
+        try:
+            _validate_body(body, saved["headers"], validate)
+        except (ReleaseResponseInvalid, http.client.IncompleteRead):
+            # Old versions cached HTTP 200 bytes before parsing JSON. Do
+            # not let their ETag revalidate a body we cannot consume.
+            saved = None
+            path.unlink(missing_ok=True)
     immutable = any(part in parsed.path for part in ("/git/", "/contents/", "/releases/download/"))
     available = token() if credential is None else credential
     ttl = 86400 if immutable else (300 if available else 900)
     if saved is not None and not force and time.time() - saved["checked_at"] < ttl:
         body = base64.b64decode(saved["body"], validate=True)
-        if len(body) > maximum:
-            raise ReleaseResponseTooLarge("release response exceeds its byte limit")
         return body, saved["headers"]
     headers = {"Accept": accept, "User-Agent": "mindie-release-updater"}
     if parsed.hostname == "api.github.com":
@@ -92,6 +117,7 @@ def read(url, *, maximum, timeout, accept, redirects, directory=None, force=Fals
         body, public = base64.b64decode(saved["body"], validate=True), saved["headers"]
     if len(body) > maximum:
         raise ReleaseResponseTooLarge("release response exceeds its byte limit")
+    _validate_body(body, public, validate)
     root.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(dir=root, suffix=".tmp")
     try:

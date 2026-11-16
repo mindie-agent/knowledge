@@ -1,13 +1,38 @@
 """Independent updates use captured official Release/tag/source protocol data."""
 import copy
 import json
+import io
 from pathlib import Path
+import urllib.request
 
 import pytest
 
 from mindie_knowledge.component_releases import Catalog, runtime_identity, select
+from mindie_knowledge.releases_io import ReleaseFetchError
 
 FIXTURE = Path(__file__).with_name("fixtures") / "component-releases"
+
+
+def test_component_catalog_does_not_reuse_an_invalid_json_response(tmp_path, monkeypatch):
+    calls = []
+
+    class Response(io.BytesIO):
+        status = 200
+        headers = {}
+
+    class Opener:
+        def open(self, request, **_kwargs):
+            calls.append(request)
+            return Response(b'{' if len(calls) == 1 else b'{}')
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *_: Opener())
+    catalog = Catalog(cache=tmp_path, token="")
+    with pytest.raises(ReleaseFetchError) as caught:
+        catalog.read("/repos/mindie-agent/knowledge/releases/latest")
+    assert caught.value.category == "temporary_network"
+    assert not list(tmp_path.glob("http-*.json"))
+    assert catalog.read("/repos/mindie-agent/knowledge/releases/latest") == {}
+    assert len(calls) == 2
 
 
 class CapturedCatalog(Catalog):
