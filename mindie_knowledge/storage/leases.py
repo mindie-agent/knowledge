@@ -88,11 +88,7 @@ def _identity(value) -> str:
         raise
     except (OSError, RuntimeError):
         text = os.path.normpath(os.fspath(value))
-        if os.name == "nt":
-            import ntpath
-
-            return ntpath.normcase(ntpath.normpath(text))
-        return text
+        return ntpath.normcase(text) if os.name == "nt" else text
 
 
 class RuntimeLease:
@@ -386,29 +382,25 @@ def _windows_lease_held(lease_file):
     """A live lease cannot be opened without share-delete, locked, or unlinked."""
     try:
         descriptor = os.open(filesystem_path(lease_file), os.O_RDWR)
+    except FileNotFoundError:
+        return False
     except TimeoutError:
         raise
     except OSError:
         return True
     try:
-        try:
-            lock_file(descriptor, exclusive=True)
-        except BlockingIOError:
-            return True
-        except TimeoutError:
-            raise
-        except OSError:
-            return True
-        try:
-            unlock_file(descriptor)
-        except TimeoutError:
-            raise
-        except OSError:
-            return True
+        lock_file(descriptor, exclusive=True)
+        unlock_file(descriptor)
+    except TimeoutError:
+        raise
+    except (BlockingIOError, OSError):
+        return True
     finally:
         os.close(descriptor)
     try:
-        Path(lease_file).unlink()
+        os.unlink(filesystem_path(lease_file))
+    except FileNotFoundError:
+        return False
     except TimeoutError:
         raise
     except OSError:
@@ -420,9 +412,14 @@ def windows_lease_present(directory) -> bool:
     """True when a Windows private lease handle still blocks directory rename."""
     if not _IS_WINDOWS:
         return False
+    directory = Path(directory)
     try:
-        return any(_windows_lease_held(lease)
-                   for lease in Path(directory).glob(_LEASE_GLOB))
+        with os.scandir(filesystem_path(directory)) as iterator:
+            leases = [directory / item.name for item in iterator
+                      if item.name.startswith(".inuse.") and item.name.endswith(".lease")]
+        return any(_windows_lease_held(lease) for lease in leases)
+    except FileNotFoundError:
+        return False
     except TimeoutError:
         raise
     except OSError:

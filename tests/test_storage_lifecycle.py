@@ -492,21 +492,41 @@ def test_unreferenced_component_runtime_is_kept_while_subprocess_runs(tmp_path):
     assert not generation.exists()
 
 
+def _terminate_test_child(child: subprocess.Popen, holder_pid: int | None) -> None:
+    if os.name == "nt":
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        for pid in {child.pid, holder_pid} - {None}:
+            handle = kernel32.OpenProcess(0x00100001, False, int(pid))
+            if handle:
+                try:
+                    kernel32.TerminateProcess(handle, 1)
+                    kernel32.WaitForSingleObject(handle, 5000)
+                finally:
+                    kernel32.CloseHandle(handle)
+    child.terminate()
+    child.wait(timeout=10)
+
+
 def test_cross_process_shared_lease_blocks_exclusive_retirement(tmp_path):
     generation = _runtime(tmp_path / "component-runtimes", "lease", 0)
     holder = tmp_path / "holder.py"
     holder.write_text(
-        "import time\n"
+        "import os, time\n"
         "from mindie_knowledge.storage.leases import acquire_runtime_lease\n"
         f"with acquire_runtime_lease({str(generation)!r}):\n"
-        "    print('held', flush=True)\n"
+        "    print('held', os.getpid(), flush=True)\n"
         "    time.sleep(60)\n", encoding="utf-8")
     repository = Path(__file__).resolve().parents[1]
     child = subprocess.Popen([sys.executable, str(holder)], stdout=subprocess.PIPE,
                              text=True,
                              env={**os.environ, "PYTHONPATH": str(repository)})
+    holder_pid = None
     try:
-        assert child.stdout.readline().strip() == "held"
+        ready = child.stdout.readline().strip().split()
+        assert ready[0] == "held"
+        holder_pid = int(ready[1])
         assert leases.is_lease_held(generation) is True
         result = prune_component_runtimes(
             tmp_path / "component-runtimes", keep_paths=[], keep_recent_verified=0,
@@ -514,8 +534,9 @@ def test_cross_process_shared_lease_blocks_exclusive_retirement(tmp_path):
         assert result["reclaimed_dirs"] == 0
         assert generation.is_dir()
     finally:
-        child.terminate()
-        child.wait(timeout=10)
+        if child.stdout is not None:
+            child.stdout.close()
+        _terminate_test_child(child, holder_pid)
     assert leases.is_lease_held(generation) is False
 
 
