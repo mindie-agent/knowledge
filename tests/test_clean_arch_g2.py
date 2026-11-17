@@ -289,7 +289,7 @@ def test_linked_git_worktree_supported_across_git_layout_publication_and_gitops(
         text=True,
     ).stdout.strip()
     subprocess.run(["git", "-C", str(linked_wt), "remote", "add", "origin", remote_url], env=env, check=True)
-    assert gitops.ensure_clone(remote_url, linked_wt, gitops.Deadline(5.0), env=env) == linked_wt
+    assert gitops.ensure_clone(remote_url, linked_wt, gitops.Deadline(5.0), env=env) == linked_wt.resolve()
 
     bare_remote = tmp_path / "remote.git"
     subprocess.run(["git", "clone", "--bare", str(origin_repo), str(bare_remote)], env=env, check=True, capture_output=True)
@@ -335,7 +335,7 @@ def test_file_source_allows_in_root_symlinks_and_rejects_escaping_symlinks(tmp_p
     unit_dir.mkdir(parents=True)
 
     real_inside = shared_dir / "axiom.md"
-    real_inside.write_text("# Inside Root\n", encoding="utf-8")
+    real_inside.write_text("# Inside Root\n", encoding="utf-8", newline="\n")
     outside_secret = tmp_path / "outside-secret.md"
     outside_secret.write_text("TOP SECRET OUTSIDE ROOT\n", encoding="utf-8")
 
