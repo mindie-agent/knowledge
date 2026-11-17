@@ -289,7 +289,8 @@ def test_linked_git_worktree_supported_across_git_layout_publication_and_gitops(
         text=True,
     ).stdout.strip()
     subprocess.run(["git", "-C", str(linked_wt), "remote", "add", "origin", remote_url], env=env, check=True)
-    assert gitops.ensure_clone(remote_url, linked_wt, gitops.Deadline(5.0), env=env) == linked_wt.resolve()
+    cloned_wt = gitops.ensure_clone(remote_url, linked_wt, gitops.Deadline(5.0), env=env)
+    assert os.path.samefile(cloned_wt, linked_wt)
 
     bare_remote = tmp_path / "remote.git"
     subprocess.run(["git", "clone", "--bare", str(origin_repo), str(bare_remote)], env=env, check=True, capture_output=True)
