@@ -622,7 +622,9 @@ class FileTransport(Transport):
                 raise CommunityError(f"dev merge {operation} failed: {result.err_text[:200]}")
             return result.out_text.strip()
 
-        if (work / ".git").is_dir():
+        from mindie_knowledge.git_layout import resolve_git_dir
+
+        if resolve_git_dir(work) is not None:
             git("fetch", "-C", git_path(work), "fetch", "origin", "--prune")
         else:
             work.parent.mkdir(parents=True, exist_ok=True)

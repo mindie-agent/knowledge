@@ -14,7 +14,7 @@ runs experiments, or changes a unit revision or conditions.
 """
 from __future__ import annotations
 
-import argparse, json, math, os, stat, sys
+import argparse, json, math, sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -22,7 +22,9 @@ from typing import Any
 from .conditions import match_conditions
 from .explore_support import (
     build_citation_feedback_record, enforce_direction_budget, flagged,
-    guard_regression, legacy_evaluate, select_pareto_candidates, stage_budget_guidance,
+    guard_regression, has_prior_reuse_audit, legacy_evaluate, read_bounded_jsonl,
+    resolve_workspace_audit_paths, resolve_workspace_ledger, select_pareto_candidates,
+    stage_budget_guidance,
 )
 from .units import CATEGORY_TO_TIER
 
@@ -168,139 +170,6 @@ def assess_stagnation(ledger_entries: Sequence[Mapping[str, Any]], *,
             "promotion_ready": promotion_ready,
             "unverified_hypotheses_remaining": unverified, "budget_exhausted": budget_exhausted,
             "should_escalate": bool(stalled), "escalation_reason": reason}
-
-
-def _regular_ledger_stat(path: Path) -> os.stat_result | None:
-    try:
-        st = os.lstat(path)
-    except FileNotFoundError:
-        return None
-    except TimeoutError:
-        raise
-    except OSError as exc:
-        raise ValueError(f"{path}: cannot read experiment ledger: {type(exc).__name__}: {exc}") from exc
-    if not stat.S_ISREG(st.st_mode):
-        raise ValueError(f"{path}: cannot read experiment ledger: not a regular file")
-    return st
-
-
-def read_bounded_jsonl(path: Path, *, max_bytes: int = 262144, max_rows: int = 128) -> list[dict]:
-    """Read trailing JSON object lines. Missing files are empty; damaged files raise."""
-    st = _regular_ledger_stat(path)
-    if st is None:
-        return []
-    try:
-        offset = max(0, st.st_size - max_bytes)
-        with path.open("rb") as fh:
-            if offset > 0:
-                fh.seek(offset)
-                fh.readline()
-            raw = fh.read(max_bytes)
-        if len(raw) == max_bytes and not raw.endswith(b"\n"):
-            raw = raw.rsplit(b"\n", 1)[0] if b"\n" in raw else b""
-        body = raw.decode("utf-8")
-    except TimeoutError:
-        raise
-    except (OSError, UnicodeError) as exc:
-        raise ValueError(f"{path}: cannot read experiment ledger: {type(exc).__name__}: {exc}") from exc
-    lines = body.splitlines()
-    rows: list[dict] = []
-    for index, line in enumerate(lines[-max_rows:], start=1):
-        text = line.strip()
-        if not text:
-            continue
-        try:
-            obj = json.loads(text)
-        except ValueError as exc:
-            raise ValueError(f"{path}: trailing JSONL row {index} is not valid JSON: {exc}") from exc
-        if not isinstance(obj, dict):
-            raise ValueError(f"{path}: trailing JSONL row {index} must be an object")
-        rows.append(obj)
-    return rows
-
-
-def _resolved_path(path: Path) -> Path:
-    try:
-        return path.resolve()
-    except TimeoutError:
-        raise
-    except OSError:
-        return path
-
-
-def _path_within(root: Path, candidate: Path) -> bool:
-    try:
-        _resolved_path(candidate).relative_to(_resolved_path(root))
-    except TimeoutError:
-        raise
-    except (OSError, ValueError):
-        return False
-    return True
-
-
-def resolve_workspace_ledger(ws_env: str | None, cwd: Path) -> tuple[Path, Path | None, bool]:
-    """Return ``(workspace_root, ledger_or_none, workspace_gated)`` without falling through an explicit bench root."""
-    if ws_env:
-        root = Path(ws_env)
-        ledger = root / "logs" / "experiment-ledger.jsonl"
-        return root, ledger if _regular_ledger_stat(ledger) is not None else None, True
-    for root in (cwd, cwd.parent / "workspace", cwd.parent / "work"):
-        ledger = root / "logs" / "experiment-ledger.jsonl"
-        if _regular_ledger_stat(ledger) is not None:
-            return root, ledger, True
-    return cwd, None, False
-
-
-def resolve_workspace_audit_paths(workspace_root: Path, *, persist_root: bool = False) -> tuple[str, list[Path], list[Path]]:
-    """Audit path under this workspace only (`logs/` preferred; root file only when gated)."""
-    root = _resolved_path(workspace_root)
-    if (workspace_root / "logs").is_dir():
-        audit = workspace_root / "logs" / "knowledge_query_audit.jsonl"
-    elif persist_root and workspace_root.is_dir():
-        audit = workspace_root / "knowledge_query_audit.jsonl"
-    else:
-        return str(root), [], []
-    resolved = _resolved_path(audit)
-    paths = [resolved] if _path_within(root, resolved) else []
-    return str(root), list(paths), list(paths)
-
-
-def _reuse_record_matches_scope(obj: Any, scope_key: str) -> bool:
-    if not isinstance(obj, dict) or obj.get("effective_mode") != "reuse":
-        return False
-    recorded = obj.get("workspace_scope")
-    return recorded == scope_key if isinstance(recorded, str) and recorded.strip() else True
-
-
-def has_prior_reuse_audit(audit_paths: Sequence[Path], *, scope_key: str, memory_scopes: set[str], max_bytes: int = 262144) -> bool:
-    """True when this workspace already recorded reuse in memory or its own audit file."""
-    if scope_key in memory_scopes:
-        return True
-    root = Path(scope_key)
-    for audit_file in audit_paths:
-        if not _path_within(root, audit_file) or not audit_file.is_file():
-            continue
-        seen: list[dict] = []
-        try:
-            with audit_file.open("rb") as fh:
-                head_text = fh.read(max_bytes).decode("utf-8", errors="replace")
-        except TimeoutError:
-            raise
-        except OSError:
-            head_text = ""
-        for line in head_text.splitlines():
-            try:
-                obj = json.loads(line.strip()) if line.strip() else None
-            except ValueError:
-                obj = None
-            if isinstance(obj, dict):
-                seen.append(obj)
-        if audit_file.stat().st_size > max_bytes:
-            seen.extend(read_bounded_jsonl(audit_file, max_bytes=max_bytes, max_rows=64))
-        if any(_reuse_record_matches_scope(obj, scope_key) for obj in seen):
-            memory_scopes.add(scope_key)
-            return True
-    return False
 
 
 def _compact_unit(unit: dict) -> dict | None:
@@ -716,26 +585,28 @@ def build_strategy_navigation_cards(
     return cards
 
 
-from .experiment_ledger import (
-    append,
-    check_trials,
-    evaluate_rsi_axes,
-    evaluate_rsi_candidate_gates,
-    fingerprint,
-    fold,
-    gate,
-    judge,
-    main as _ledger_main,
-    read_ledger,
-    render_progress,
-    render_progress_file,
-)
+_LEDGER_EXPORTS = frozenset({
+    "append", "check_trials", "evaluate_rsi_axes", "evaluate_rsi_candidate_gates",
+    "fingerprint", "fold", "gate", "judge", "read_ledger", "render_progress", "render_progress_file",
+})
+
+
+def __getattr__(name: str):
+    if name in _LEDGER_EXPORTS:
+        from . import experiment_ledger as _ledger
+
+        value = getattr(_ledger, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def main(argv=None) -> int:
     args_list = list(sys.argv[1:] if argv is None else argv)
     if args_list and args_list[0] in ("fingerprint", "judge", "append", "render", "gate"):
-        return _ledger_main(args_list)
+        from . import experiment_ledger as _ledger
+
+        return _ledger.main(args_list)
     parser = argparse.ArgumentParser(prog="python -m mindie_knowledge.graded.explore")
     sub = parser.add_subparsers(dest="command", required=True)
     for name in ("stagnation", "context", "evaluate"):

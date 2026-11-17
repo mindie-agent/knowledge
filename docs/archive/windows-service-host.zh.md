@@ -1,6 +1,11 @@
+> **[历史归档文档 / Archived Historical Spec]**
+> - **归档基准提交（Baseline SHA）**：`c991b64a1ead` · **原路径**：`docs/windows-service-host.zh.md`
+> - **状态说明**：本文档记录早期过渡阶段的服务宿主与子进程模型设计，仅作历史溯源参考，不再作为当前发版或架构门禁依据。
+> - **当前生效规范（Living Spec）**：请参阅 [`../release-compatibility.zh.md`](../release-compatibility.zh.md) 与共享宿主底座 `mindie-harness` 规范。
+
 # Windows 知识服务宿主（Windows Knowledge Service Host）
 
-**中文** | [English](windows-service-host.md) · [返回文档中心](README.md)
+**中文** | [English](windows-service-host.md) · [返回文档中心](../README.md)
 
 在原生 Windows 环境下，当宿主客户端（如 Codex 或 Claude Code）触发回合结束的 `Stop Hook` 时，外层宿主往往会把整个 Hook 放在一个带有 `KILL_ON_JOB_CLOSE` 且禁止脱离（No Breakaway）的祖先 Windows Job 中。一旦短短几百毫秒的 Hook 退出，它直接启动的任何普通后台子进程都会被 Windows 内核一并强行杀死。
 

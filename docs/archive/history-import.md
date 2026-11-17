@@ -1,6 +1,11 @@
+> **[Archived Historical Specification]**
+> - **Archived from baseline SHA**: `c991b64a1ead` · **Original path**: `docs/history-import.md`
+> - **Status**: Retained strictly for historical design provenance; this file is not an active architecture or release gate.
+> - **Current living specification**: See [`../public-transcript-capture.md`](../public-transcript-capture.md) and the shared `mindie-harness` host substrate documentation.
+
 # Explicit Historical Transcript Import
 
-[中文](history-import.zh.md) | **English** · [Back to Documentation Center](README.en.md)
+[中文](history-import.zh.md) | **English** · [Back to Documentation Center](../README.en.md)
 
 By default, `mindie-knowledge` captures only live sessions that run after you opt into community sharing—**it never automatically scans or backfills older session history**.
 

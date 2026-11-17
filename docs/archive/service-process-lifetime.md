@@ -1,6 +1,11 @@
+> **[Archived Historical Specification]**
+> - **Archived from baseline SHA**: `c991b64a1ead` · **Original path**: `docs/service-process-lifetime.md`
+> - **Status**: Retained strictly for historical design provenance; this file is not an active architecture or release gate.
+> - **Current living specification**: See [`../release-compatibility.md`](../release-compatibility.md) and the shared `mindie-harness` host substrate documentation.
+
 # Service & Attempt Process Lifetime
 
-[中文](service-process-lifetime.zh.md) | **English** · [Back to Documentation Center](README.en.md)
+[中文](service-process-lifetime.zh.md) | **English** · [Back to Documentation Center](../README.en.md)
 
 During normal MindIE Agent operation, three execution scopes with very different lifetimes interact:
 1. **Short-lived foreground calls and Hooks** (such as a `Stop Hook` that exits in milliseconds);

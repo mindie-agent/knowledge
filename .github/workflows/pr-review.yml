@@ -19,6 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
@@ -27,9 +28,18 @@ jobs:
         run: python -m pip install -e '.[test]'
       - name: Test package
         env:
+          HOME: ${{ runner.temp }}/knowledge-ci-home
+          XDG_CONFIG_HOME: ${{ runner.temp }}/knowledge-ci-home/.config
+          XDG_DATA_HOME: ${{ runner.temp }}/knowledge-ci-home/.local/share
+          XDG_CACHE_HOME: ${{ runner.temp }}/knowledge-ci-home/.cache
+          MINDIE_CONFIG_HOME: ${{ runner.temp }}/knowledge-ci-home/.config/mindie
+          MINDIE_DATA_HOME: ${{ runner.temp }}/knowledge-ci-home/.local/share/mindie
+          MINDIE_DIAGNOSTICS_ROOT: ${{ runner.temp }}/knowledge-ci-home/diagnostics
           MINDIE_FRAMEWORK_SOURCE: tests/fixtures/production-parsers
           PYTHONDONTWRITEBYTECODE: '1'
-        run: python -B -m pytest -q -n auto --dist worksteal --durations=20 -p no:cacheprovider tests -m "not live_npu"
+        run: |
+          mkdir -p "$HOME"
+          python -B -m pytest -q -n auto --dist worksteal --durations=20 -p no:cacheprovider tests -m "not live_npu"
       - name: Scan packaged public docs and data for accidental private data
         run: >
           python -B -m mindie_knowledge.redact --check
@@ -37,11 +47,49 @@ jobs:
           corpus/README.md corpus/knowledge-vllm-ascend/README.md corpus/knowledge-operators/README.md
           corpus/knowledge-infer-distributed/README.md corpus/knowledge-infer-observability/README.md
 
+  wheel-smoke:
+    name: Installed wheel smoke check (outside source tree)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Build wheel and verify installed CLI & lazy surface outside checkout
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel --outdir "$RUNNER_TEMP/dist"
+          python -m venv "$RUNNER_TEMP/smoke-venv"
+          "$RUNNER_TEMP/smoke-venv/bin/pip" install "$RUNNER_TEMP"/dist/mindie_knowledge-*.whl
+          mkdir -p "$RUNNER_TEMP/empty-cwd" "$RUNNER_TEMP/smoke-home"
+          cd "$RUNNER_TEMP/empty-cwd"
+          HOME="$RUNNER_TEMP/smoke-home" "$RUNNER_TEMP/smoke-venv/bin/python" -I -c "
+          import sys, time
+          t0 = time.perf_counter()
+          import mindie_knowledge as mk
+          dt_ms = (time.perf_counter() - t0) * 1000.0
+          eager = [m for m in sys.modules if m.startswith('mindie_knowledge.')]
+          assert not eager, f'unexpected eager submodules: {eager}'
+          assert dt_ms < 200.0, f'import too slow: {dt_ms:.2f}ms'
+          assert len(mk.__all__) >= 20
+          "
+          HOME="$RUNNER_TEMP/smoke-home" "$RUNNER_TEMP/smoke-venv/bin/python" -I -m mindie_knowledge.redact --profile
+          HOME="$RUNNER_TEMP/smoke-home" "$RUNNER_TEMP/smoke-venv/bin/python" -I -m mindie_knowledge.runtime_inventory --include-substrate --allow-wheel-provenance
+          HOME="$RUNNER_TEMP/smoke-home" "$RUNNER_TEMP/smoke-venv/bin/mindie-knowledge" --help >/dev/null
+
+  desktop-contracts:
+    uses: ./.github/workflows/windows.yml
+
   release-ready:
     name: release-ready
-    needs: [checks]
+    needs: [checks, wheel-smoke, desktop-contracts]
     if: always()
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - env:
           RESULTS: ${{ toJSON(needs) }}

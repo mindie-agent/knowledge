@@ -60,6 +60,8 @@ def _posix_rel_within_verified_root(
             cur = cur + '/' + part
             if stat.S_ISLNK(os.lstat(cur).st_mode):
                 return False
+    except TimeoutError:
+        raise
     except OSError:
         return False
     return True
@@ -69,16 +71,18 @@ def checked_bytes(
     path, root, *, _real_root: str | None = None, _root_id: tuple[int, int] | None = None
 ):
     path_str, root_str = _io_path(path), _io_path(root)
-    st = os.lstat(path_str)
-    if stat.S_ISLNK(st.st_mode):
-        raise ValueError('material source is not a regular file within its bound root')
-    if not _posix_rel_within_verified_root(path_str, root_str, _root_id):
+    if _posix_rel_within_verified_root(path_str, root_str, _root_id) and not stat.S_ISLNK(os.lstat(path_str).st_mode):
+        target_str = path_str
+    else:
         real_root = _real_root if _real_root is not None else os.path.realpath(root_str)
-        if not _within_root(os.path.realpath(path_str), real_root):
+        real_target = os.path.realpath(path_str)
+        if not _within_root(real_target, real_root):
             raise ValueError('material source is not a regular file within its bound root')
+        target_str = _io_path(real_target)
+    st = os.lstat(target_str)
     if not stat.S_ISREG(st.st_mode):
         raise ValueError('material source must be a regular file')
-    descriptor = os.open(path_str, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
+    descriptor = os.open(target_str, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
     with os.fdopen(descriptor, 'rb') as source:
         info = os.fstat(source.fileno())
         if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_FILE_BYTES:
@@ -115,6 +119,8 @@ class FileText(Mapping):
             try:
                 rst = os.stat(self._real_root)
                 self._root_id = (rst.st_dev, rst.st_ino)
+            except TimeoutError:
+                raise
             except OSError:
                 self._root_id = None
         self._metadata = dict(metadata or {})

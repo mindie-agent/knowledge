@@ -79,7 +79,7 @@ if result["status"] == "candidate":
 
 ## 2. 独立组件 Release 发现与并排（Side-by-Side）运行时构建
 
-`runtime_inventory.COMPONENTS` 登记了 9 个官方第一方组件（`mindie-knowledge`、`remote-dev`、`mindie-diagnostics`、`mindie-debugger`、`mindie-profiler`、`mindie-sim`、`npu-top`、`mindie-coordinator` 与 `mindie-bench`）。宿主插件更新器通过 `mindie_knowledge.component_releases`、`mindie_knowledge.component_runtime` 与 `mindie_knowledge.runtime_inventory` 发现、核验并准备组件运行时：
+`runtime_inventory.COMPONENTS` 登记了 9 个 v1 官方第一方组件（`mindie-knowledge`、`remote-dev`、`mindie-diagnostics`、`mindie-debugger`、`mindie-profiler`、`mindie-sim`、`npu-top`、`mindie-coordinator` 与 `mindie-bench`）以保持对已部署 v1 调用方的完全兼容；`COMPONENTS_V2`（`include_substrate=True`）在此基础上纳入共享宿主底座 `"mindie-harness": "mindie-agent/harness"` 并支持正式版 Wheel 溯源核验（`allow_wheel_provenance=True`）。宿主插件更新器通过 `mindie_knowledge.component_releases`、`mindie_knowledge.component_runtime` 与 `mindie_knowledge.runtime_inventory` 发现、核验并准备组件运行时：
 
 ### 2.1 组件正式版发现与基准门禁核验（`component_releases.py` & `component_runtime.discover`）
 

@@ -1,6 +1,11 @@
+> **[历史归档文档 / Archived Historical Spec]**
+> - **归档基准提交（Baseline SHA）**：`c991b64a1ead` · **原路径**：`docs/history-import.zh.md`
+> - **状态说明**：本文档记录早期过渡阶段的服务宿主与子进程模型设计，仅作历史溯源参考，不再作为当前发版或架构门禁依据。
+> - **当前生效规范（Living Spec）**：请参阅 [`../public-transcript-capture.zh.md`](../public-transcript-capture.zh.md) 与共享宿主底座 `mindie-harness` 规范。
+
 # 显式历史会话导入（Explicit Historical Transcript Import）
 
-**中文** | [English](history-import.md) · [返回文档中心](README.md)
+**中文** | [English](history-import.md) · [返回文档中心](../README.md)
 
 在默认情况下，`mindie-knowledge` 只采集你在开启社区共享之后新产生的活跃任务，**绝不会在后台自动翻阅或导入你以前的历史会话**。
 

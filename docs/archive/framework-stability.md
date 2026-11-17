@@ -1,6 +1,11 @@
+> **[Archived Historical Specification]**
+> - **Archived from baseline SHA**: `c991b64a1ead` · **Original path**: `docs/framework-stability.md`
+> - **Status**: Retained strictly for historical design provenance; this file is not an active architecture or release gate.
+> - **Current living specification**: See [`../mindie-loop.md`](../mindie-loop.md) and the shared `mindie-harness` host substrate documentation.
+
 # Framework Stability & Verification Boundaries
 
-[中文](framework-stability.zh.md) | **English** · [Back to Documentation Center](README.en.md)
+[中文](framework-stability.zh.md) | **English** · [Back to Documentation Center](../README.en.md)
 
 This guide summarizes the stability mechanisms built into `mindie-knowledge` for everyday use: deterministic transcript parser isolation, self-healing ReMe derived indexes, non-blocking atomic configuration updates on Windows, and the clear boundary between component fixture tests and live host acceptance.
 

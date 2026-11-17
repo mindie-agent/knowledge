@@ -7,8 +7,9 @@ are never inferred from a unit's tier, corpus path or unrelated nearby axioms.
 Shared parents are charged once per response; explain_closure never truncates a
 unit body and reports every budget miss explicitly.
 [Timeouts & Locks] No model/network work; build time is separate from query time.
-[Side-Effect Policy] Reads explicit corpus roots and appends one audit line under
-that workspace only. A bench workspace never reads another tree's ledger. No task import.
+[Side-Effect Policy] Reads explicit corpus roots; writes query audit lines only under
+an explicitly configured benchmark workspace (`MINDIE_BENCH_WORKSPACE`) or MindIE's
+owned data directory, never into an arbitrary caller `Path.cwd()`.
 """
 from __future__ import annotations
 
@@ -214,7 +215,9 @@ class RoutingIndex:
             resolve_workspace_ledger,
         )
         _workspace_root, disk_ledger, workspace_gated = resolve_workspace_ledger(ws_env, cwd)
-        scope_key, audit_candidates, audit_targets = resolve_workspace_audit_paths(_workspace_root, persist_root=workspace_gated)
+        scope_key, audit_candidates, audit_targets = resolve_workspace_audit_paths(
+            _workspace_root, persist_root=workspace_gated, explicit_workspace=bool(ws_env)
+        )
         disk_rows = read_bounded_jsonl(disk_ledger) if disk_ledger is not None else []
         if disk_rows:
             ledger_entries = disk_rows
@@ -277,6 +280,18 @@ class RoutingIndex:
         rejected = Counter()
         archived_excluded = 0
         suspect_excluded = 0
+        def bm25_for(ident: str) -> float:
+            score = 0.0
+            count = self.counts[ident]
+            headers = self.header_terms[ident]
+            for term in terms:
+                frequency = count[term]
+                if frequency:
+                    inverse = math.log(1 + (len(self.units) - self.frequencies[term] + .5) / (self.frequencies[term] + .5))
+                    weight = 1.25 if term in headers else 1.0
+                    score += weight * inverse * frequency * 2.2 / (frequency + 1.2 * (.25 + .75 * self.lengths[ident] / self.average))
+            return score
+
         for ident, unit in self.units.items():
             # Archived, superseded and suspect units remain addressable by
             # reference but do not enter ordinary discovery. Suspect is a
@@ -292,16 +307,7 @@ class RoutingIndex:
             if status == "mismatch" or (status == "unknown" and not include_unknown):
                 rejected[status] += 1
                 continue
-            score = 0.0
-            count = self.counts[ident]
-            headers = self.header_terms[ident]
-            for term in terms:
-                frequency = count[term]
-                if frequency:
-                    inverse = math.log(1 + (len(self.units) - self.frequencies[term] + .5) / (self.frequencies[term] + .5))
-                    weight = 1.25 if term in headers else 1.0
-                    score += weight * inverse * frequency * 2.2 / (frequency + 1.2 * (.25 + .75 * self.lengths[ident] / self.average))
-            scores[ident] = score
+            scores[ident] = bm25_for(ident)
         # A matched L1 premise in _common (or the requested domain) is part of
         # the task foundation even without lexical overlap. Mount each one once,
         # unless a higher-scoring matched unit already injects it as a parent.
@@ -442,15 +448,7 @@ class RoutingIndex:
                             continue
                         if any(r.endswith("source applicability is unknown") for r in applicability[ident].reasons):
                             continue
-                        score = 0.0
-                        count = self.counts[ident]
-                        headers = self.header_terms[ident]
-                        for term in terms:
-                            frequency = count[term]
-                            if frequency:
-                                inverse = math.log(1 + (len(self.units) - self.frequencies[term] + .5) / (self.frequencies[term] + .5))
-                                weight = 1.25 if term in headers else 1.0
-                                score += weight * inverse * frequency * 2.2 / (frequency + 1.2 * (.25 + .75 * self.lengths[ident] / self.average))
+                        score = bm25_for(ident)
                         if score <= 0:
                             continue
                         path = unit.metadata["domain_path"]
@@ -537,6 +535,7 @@ class RoutingIndex:
                 }
                 for target_file in audit_targets:
                     try:
+                        target_file.parent.mkdir(parents=True, exist_ok=True)
                         with target_file.open("a", encoding="utf-8") as fh:
                             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
                     except TimeoutError:

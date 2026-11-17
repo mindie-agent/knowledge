@@ -1,11 +1,6 @@
 name: Native desktop contracts
 on:
-  pull_request:
-  push:
-    branches: [main]
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  workflow_call:
 permissions:
   contents: read
 jobs:
@@ -25,6 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           persist-credentials: false
       - uses: astral-sh/setup-uv@v6
         with:

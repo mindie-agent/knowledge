@@ -40,20 +40,12 @@ import time
 from pathlib import Path
 
 from ..owned_state import (
-    SQLITE_BUSY_FLOOR_SECONDS,
-    SQLITE_BUSY_TIMEOUT_MS,
-    SqliteBudgetExhausted,
-    sqlite_busy_timeout_ms,
+    SQLITE_BUSY_FLOOR_SECONDS, SQLITE_BUSY_TIMEOUT_MS, SqliteBudgetExhausted, sqlite_busy_timeout_ms,
 )
 from .activation import Admission, AdmissionUnavailable
 from .diagnostics import _DELIVERY_RECOVERY as _RECOVERY
 from .locks import StartInProgress
-from .store import (
-    _UNPROCESSED_CAPTURE,
-    commit_capture,
-    digest,
-    session_key,
-)
+from .store import _UNPROCESSED_CAPTURE, commit_capture, digest, session_key
 
 WAKE_PROBE_SECONDS = 2.0  # Control-plane observation; never a business deadline.
 STOP_TIMEOUT_SECONDS = 6.0  # Fits inside native 8s/10s Hook wrapper deadlines.
@@ -66,17 +58,11 @@ def _wake_probe_seconds():
 
 _HARNESS = __import__("re").compile(r"[a-z][a-z0-9_-]{0,31}\Z")
 _TERMINAL = {
-    "organized": "organized",
-    "no-new-material": "no-new-material",
-    "no-shareable-material": "no-shareable-material",
-    "failed": "failed",
-    "cancelled": "cancelled",
-    "discarded": "discarded",
+    k: k for k in (
+        "organized", "no-new-material", "no-shareable-material", "failed", "cancelled", "discarded",
+    )
 }
-_KEYS = (
-    "stage", "capture_id", "duplicate", "wake", "runtime", "reason",
-    "cause", "summary_dropped", "recovery",
-)
+_KEYS = ("stage", "capture_id", "duplicate", "wake", "runtime", "reason", "cause", "summary_dropped", "recovery")
 
 
 class SchemaNotReady(Exception):
@@ -104,8 +90,9 @@ def _result(**kwargs):
     return result
 
 
-def _unavailable_accept(config, cause, *, event, dropped, with_recovery=True):
-    _record(config, stage="accept", cause=cause, event=event)
+def _unavailable_accept(config, cause, *, event, dropped, with_recovery=True, deadline=None):
+    if deadline is None or time.monotonic() < deadline:
+        _record(config, stage="accept", cause=cause, event=event)
     return _result(
         stage="unavailable", reason=cause, cause=cause, summary_dropped=dropped,
         recovery=_RECOVERY[cause] if with_recovery else None,
@@ -213,7 +200,9 @@ def _probe(config, timeout, *, config_path=None):
         except OSError:
             return 'unknown'
         else:
-            return 'unknown'
+            owner = lock_held(consumer)
+            if owner is None:
+                return 'unknown'
     if owner is False:
         return "absent"
     try:
@@ -334,11 +323,7 @@ def request_wake(config_path, *, session_id, event=None, timeout=None):
     if not inspected.get("enabled"):
         out.update(wake="not-applicable", reason="not-activated")
         return out
-    probe_wait = (
-        _wake_probe_seconds()
-        if wake_deadline is None
-        else min(_wake_probe_seconds(), max(0.0, wake_deadline - time.monotonic()))
-    )
+    probe_wait = _wake_probe_seconds() if wake_deadline is None else min(_wake_probe_seconds(), max(0.0, wake_deadline - time.monotonic()))
     if wake_deadline is not None and probe_wait <= 0:
         out.update(wake="not-requested", runtime="unavailable", reason="budget-exhausted")
         return out
@@ -347,16 +332,14 @@ def request_wake(config_path, *, session_id, event=None, timeout=None):
         out.update(wake="running", runtime="ready", reason="worker-ready")
         return out
     if state != "absent":
-        runtime = "unavailable" if state == "worker-dead" else "unknown"
-        out.update(wake="not-requested", runtime=runtime, reason=state)
+        out.update(wake="not-requested", runtime="unavailable" if state == "worker-dead" else "unknown", reason=state)
         return out
     if wake_deadline is not None and time.monotonic() >= wake_deadline:
         out.update(wake="not-requested", runtime="unavailable", reason="budget-exhausted")
         return out
     lock = StartLock(_store_path(config).with_name("wake.request.lock"))
     try:
-        # Other callers keep the historical non-blocking probe; only an
-        # explicit Stop budget may wait for the single wake starter.
+        # Only an explicit Stop budget waits for the single wake starter.
         lock.acquire(wait=0 if wake_deadline is None else max(0.0, wake_deadline - time.monotonic()))
     except StartInProgress:
         out.update(wake="coalesced", runtime="unavailable", reason="coalesced")
@@ -366,13 +349,8 @@ def request_wake(config_path, *, session_id, event=None, timeout=None):
             out.update(wake="not-requested", runtime="unavailable", reason="budget-exhausted")
             return out
         require_active(config_path, config)
-        # wake.json pids are diagnostic. Ownership is wake.request.lock here
-        # and start.lock / consumer.lock in the helper. A reused pid is not
-        # a running service and must not suppress this wake.
-        argv = [
-            sys.executable, "-m", "mindie_knowledge.loop.cli", "wake",
-            "--config", str(Path(config_path).resolve()),
-        ]
+        # Ownership is wake.request.lock here and start.lock/consumer.lock in the helper.
+        argv = [sys.executable, "-m", "mindie_knowledge.loop.cli", "wake", "--config", str(Path(config_path).resolve())]
         if isinstance(event, str) and len(event) == 64:
             argv.extend(["--event", event])
         try:
@@ -387,16 +365,7 @@ def request_wake(config_path, *, session_id, event=None, timeout=None):
                     out.update(wake="coalesced", runtime="unavailable", reason="coalesced")
                     return out
                 try:
-                    if wake_deadline is not None and time.monotonic() >= wake_deadline:
-                        out.update(wake="not-requested", runtime="unavailable", reason="budget-exhausted")
-                        return out
-                    # A query starter may have won while the wake lock was
-                    # acquired; the scheduler never replaces a live consumer.
-                    current_wait = (
-                        _wake_probe_seconds()
-                        if wake_deadline is None
-                        else min(_wake_probe_seconds(), max(0.0, wake_deadline - time.monotonic()))
-                    )
+                    current_wait = _wake_probe_seconds() if wake_deadline is None else min(_wake_probe_seconds(), max(0.0, wake_deadline - time.monotonic()))
                     if wake_deadline is not None and current_wait <= 0:
                         out.update(wake="not-requested", runtime="unavailable", reason="budget-exhausted")
                         return out
@@ -500,12 +469,25 @@ def _record_hook_failure(config_path, cause, event=None):
         )
 
 
-def run_stop_hook(config_path):
-    """Native Stop adapter: record failures, print ``{}``, return 0."""
+def _stop_deadline(timeout=None) -> float:
+    stop_timeout = (
+        float(timeout)
+        if timeout is not None
+        else float(getattr(os, "environ", {}).get("MINDIE_KNOWLEDGE_STOP_TIMEOUT_SECONDS", STOP_TIMEOUT_SECONDS))
+    )
+    if not math.isfinite(stop_timeout):
+        raise ValueError("Stop timeout must be a finite number")
+    return time.monotonic() + stop_timeout
+
+
+def run_stop_hook(config_path, *, timeout=None):
+    """Native Stop adapter: enforce one outer deadline, record failures, print ``{}``, return 0."""
     from .transport import MAX_BODY
 
     event = None
+    deadline = None
     try:
+        deadline = _stop_deadline(timeout)
         raw = sys.stdin.buffer.read(MAX_BODY + 1)
         if len(raw) > MAX_BODY:
             raise ValueError("Stop hook stdin exceeds the 2 MiB transport limit")
@@ -514,28 +496,31 @@ def run_stop_hook(config_path):
         session = payload.get("session_id")
         if kind and _text(session, 256) and _text(key, 256):
             event = _event_hash(payload.get("harness") or "", kind, session, key)
-        result = accept_stop(config_path, payload)
+        result = accept_stop(config_path, payload, timeout=timeout, deadline=deadline)
         if isinstance(result, dict) and result.get("stage") in {"rejected", "unavailable"}:
-            _record_hook_failure(
-                config_path, result.get("cause") or result.get("reason") or "internal",
-                event=event,
-            )
+            if deadline is None or time.monotonic() < deadline:
+                _record_hook_failure(
+                    config_path, result.get("cause") or result.get("reason") or "internal",
+                    event=event,
+                )
             print(
                 f"mindie-knowledge hook: {result.get('stage')}: {result.get('reason')}",
                 file=sys.stderr,
             )
     except TimeoutError as exc:
         print(f"mindie-knowledge hook: TimeoutError: {exc}", file=sys.stderr)
-        _record_hook_failure(config_path, "budget-exhausted", event=event)
+        if deadline is None or time.monotonic() < deadline:
+            _record_hook_failure(config_path, "budget-exhausted", event=event)
     except _HOOK_ERRORS as exc:
         print(f"mindie-knowledge hook: {type(exc).__name__}: {exc}", file=sys.stderr)
-        _record_hook_failure(config_path, "internal", event=event)
+        if deadline is None or time.monotonic() < deadline:
+            _record_hook_failure(config_path, "internal", event=event)
     print("{}")
     return 0
 
 
-def accept_stop(config_path, event, *, timeout=None):
-    """Durable Stop handoff. See the shared contract for the returned stage."""
+def accept_stop(config_path, event, *, timeout=None, deadline=None):
+    """Durable Stop handoff governed by a single monotonic outer deadline."""
     from . import settings as settings_mod
     from .cli import config_at
     from .diagnostics import clear_delivery_event
@@ -545,6 +530,10 @@ def accept_stop(config_path, event, *, timeout=None):
         return _result(stage="inert", reason="not-stop")
     if event.get("stop_hook_active", False) is not False:
         return _result(stage="inert", reason="recursive-stop")
+    if deadline is None:
+        deadline = _stop_deadline(timeout)
+    elif timeout is not None:
+        deadline = min(deadline, _stop_deadline(timeout))
     for key, limit in (
         ("session_id", 256), ("turn_id", 256), ("event_id", 256), ("mindie_activation", 512),
     ):
@@ -629,17 +618,9 @@ def accept_stop(config_path, event, *, timeout=None):
     admission_path = config.get("admission_path")
     if not isinstance(admission_path, str):
         return _result(stage="inert", reason="not-activated", summary_dropped=dropped)
-    stop_timeout = (
-        float(timeout)
-        if timeout is not None
-        else float(os.environ.get("MINDIE_KNOWLEDGE_STOP_TIMEOUT_SECONDS", STOP_TIMEOUT_SECONDS))
-    )
-    if not math.isfinite(stop_timeout):
-        raise ValueError("Stop timeout must be a finite number")
-    deadline = time.monotonic() + stop_timeout
     remaining = deadline - time.monotonic()
     if sqlite_busy_timeout_ms(remaining) is None:
-        return _unavailable_accept(config, "budget-exhausted", event=event_id, dropped=dropped)
+        return _unavailable_accept(config, "budget-exhausted", event=event_id, dropped=dropped, deadline=deadline)
     auth_timeout = min(6.0, remaining - 5.5) if remaining >= 11.5 else remaining
     try:
         admission = Admission(admission_path)
@@ -655,7 +636,7 @@ def accept_stop(config_path, event, *, timeout=None):
         raise
     except AdmissionUnavailable as exc:
         cause = "budget-exhausted" if _is_admission_budget_exhausted(exc, deadline) else "admission-unreadable"
-        return _unavailable_accept(config, cause, event=event_id, dropped=dropped)
+        return _unavailable_accept(config, cause, event=event_id, dropped=dropped, deadline=deadline)
     if auth["state"] == "inactive":
         return _result(stage="inert", reason="not-activated", summary_dropped=dropped)
     if auth["state"] == "schema":
@@ -664,11 +645,11 @@ def accept_stop(config_path, event, *, timeout=None):
         return _result(stage="inert", reason="out-of-scope", summary_dropped=dropped)
     path = _store_path(config)
     if not path.is_file():
-        return _unavailable_accept(config, "store-not-ready", event=event_id, dropped=dropped)
+        return _unavailable_accept(config, "store-not-ready", event=event_id, dropped=dropped, deadline=deadline)
     db = None
     try:
         if sqlite_busy_timeout_ms(deadline - time.monotonic()) is None:
-            return _unavailable_accept(config, "budget-exhausted", event=event_id, dropped=dropped)
+            return _unavailable_accept(config, "budget-exhausted", event=event_id, dropped=dropped, deadline=deadline)
         db = sqlite3.connect(path, timeout=SQLITE_BUSY_FLOOR_SECONDS)
         db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
         db.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
@@ -678,20 +659,20 @@ def accept_stop(config_path, event, *, timeout=None):
             db.set_progress_handler(None, 0)
             db.close()
             db = None
-            return _unavailable_accept(config, "budget-exhausted", event=event_id, dropped=dropped)
+            return _unavailable_accept(config, "budget-exhausted", event=event_id, dropped=dropped, deadline=deadline)
     except sqlite3.OperationalError as exc:
         if db is not None:
             db.set_progress_handler(None, 0)
             db.close()
         cause = _store_op_cause(exc, deadline)
         if cause is not None:
-            return _unavailable_accept(config, cause, event=event_id, dropped=dropped)
-        return _unavailable_accept(config, "store-not-ready", event=event_id, dropped=dropped, with_recovery=False)
+            return _unavailable_accept(config, cause, event=event_id, dropped=dropped, deadline=deadline)
+        return _unavailable_accept(config, "store-not-ready", event=event_id, dropped=dropped, with_recovery=False, deadline=deadline)
     except sqlite3.Error:
         if db is not None:
             db.set_progress_handler(None, 0)
             db.close()
-        return _unavailable_accept(config, "store-not-ready", event=event_id, dropped=dropped, with_recovery=False)
+        return _unavailable_accept(config, "store-not-ready", event=event_id, dropped=dropped, with_recovery=False, deadline=deadline)
     db.row_factory = sqlite3.Row
     try:
         try:
@@ -707,11 +688,11 @@ def accept_stop(config_path, event, *, timeout=None):
                 epoch=auth["epoch"], kind=kind, event_key=event_key,
             )
         except SchemaNotReady:
-            return _unavailable_accept(config, "schema-not-ready", event=event_id, dropped=dropped)
+            return _unavailable_accept(config, "schema-not-ready", event=event_id, dropped=dropped, deadline=deadline)
         except sqlite3.OperationalError as exc:
             cause = _store_op_cause(exc, deadline)
             if cause is not None:
-                return _unavailable_accept(config, cause, event=event_id, dropped=dropped)
+                return _unavailable_accept(config, cause, event=event_id, dropped=dropped, deadline=deadline)
             raise
     finally:
         db.set_progress_handler(None, 0)
@@ -725,12 +706,22 @@ def accept_stop(config_path, event, *, timeout=None):
             reason=accepted["revoked"], summary_dropped=dropped,
         )
     if status in _TERMINAL:
-        clear_delivery_event(config, event_id)
+        if time.monotonic() < deadline:
+            clear_delivery_event(config, event_id)
         return _result(
             stage=_TERMINAL[status], capture_id=capture_id, duplicate=duplicate,
             reason="stored", summary_dropped=dropped,
         )
-    probe_budget = min(_wake_probe_seconds(), max(0.0, deadline - time.monotonic() - 0.25))
+    remaining_after_commit = deadline - time.monotonic()
+    if remaining_after_commit <= 0:
+        stage_name = "apply-pending" if status == "apply-pending" else ("processing" if status == "processing" else "accepted-local")
+        return _result(
+            stage=stage_name, capture_id=capture_id, duplicate=duplicate,
+            wake="not-requested", runtime="unavailable",
+            reason="budget-exhausted", cause="budget-exhausted",
+            summary_dropped=dropped,
+        )
+    probe_budget = min(_wake_probe_seconds(), max(0.0, remaining_after_commit - 0.25))
     if status == "processing":
         state = _probe(config, probe_budget, config_path=config_path) if probe_budget > 0 else "unknown"
         return _result(
@@ -739,12 +730,7 @@ def accept_stop(config_path, event, *, timeout=None):
             runtime="unavailable" if state != "ready" else "ready",
             reason="reserved", summary_dropped=dropped,
         )
-    if status == "apply-pending":
-        stage_name = "apply-pending"
-    elif status in _UNPROCESSED_CAPTURE or status == "pending":
-        stage_name = "accepted-local"
-    else:
-        stage_name = "accepted-local"
+    stage_name = "apply-pending" if status == "apply-pending" else "accepted-local"
     state = _probe(config, probe_budget, config_path=config_path) if probe_budget > 0 else "unknown"
     if state == "ready" and status in _UNPROCESSED_CAPTURE | {"pending", "deferred", "queued"}:
         clear_delivery_event(config, event_id)

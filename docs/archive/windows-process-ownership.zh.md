@@ -1,6 +1,11 @@
+> **[历史归档文档 / Archived Historical Spec]**
+> - **归档基准提交（Baseline SHA）**：`c991b64a1ead` · **原路径**：`docs/windows-process-ownership.zh.md`
+> - **状态说明**：本文档记录早期过渡阶段的服务宿主与子进程模型设计，仅作历史溯源参考，不再作为当前发版或架构门禁依据。
+> - **当前生效规范（Living Spec）**：请参阅 [`../release-compatibility.zh.md`](../release-compatibility.zh.md) 与共享宿主底座 `mindie-harness` 规范。
+
 # Windows 进程树强归属（Windows Process Tree Ownership）
 
-**中文** | [English](windows-process-ownership.md) · [返回文档中心](README.md)
+**中文** | [English](windows-process-ownership.md) · [返回文档中心](../README.md)
 
 在 Windows 上管理子进程树有两个经典陷阱：
 1. **快孙进程逃逸（Fast Descendant Escape）**：如果先以普通方式启动子进程，再去创建并绑定 Windows Job Object，子进程在绑定完成前快速拉起的孙进程就会逃出 Job 的管辖；

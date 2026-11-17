@@ -1,6 +1,11 @@
+> **[历史归档文档 / Archived Historical Spec]**
+> - **归档基准提交（Baseline SHA）**：`c991b64a1ead` · **原路径**：`docs/framework-stability.zh.md`
+> - **状态说明**：本文档记录早期过渡阶段的服务宿主与子进程模型设计，仅作历史溯源参考，不再作为当前发版或架构门禁依据。
+> - **当前生效规范（Living Spec）**：请参阅 [`../mindie-loop.zh.md`](../mindie-loop.zh.md) 与共享宿主底座 `mindie-harness` 规范。
+
 # 框架稳定性与验证边界（Framework Stability & Verification Boundaries）
 
-**中文** | [English](framework-stability.md) · [返回文档中心](README.md)
+**中文** | [English](framework-stability.md) · [返回文档中心](../README.md)
 
 本文汇总 `mindie-knowledge` 在日常高频使用中的稳定性保障机制：包括生产解析器确定性隔离、ReMe 派生索引的自愈重建、Windows 下无阻塞的原子配置文件读写，以及组件级测试与实机宿主验收之间的清晰边界。
 

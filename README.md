@@ -254,18 +254,13 @@ python3 -m mindie_knowledge.redact --profile
 
 | 文档主题 | 中文文档 | English | 一句话导读 |
 | --- | --- | --- | --- |
-| **文档总览索引** | [docs/README.md](docs/README.md) | [docs/README.en.md](docs/README.en.md) | 全部架构、数据流与跨平台生命周期文档导览 |
-| **领域知识闭环总览** | [mindie-loop.zh.md](docs/mindie-loop.zh.md) | [mindie-loop.md](docs/mindie-loop.md) | 从授权门禁、对话采集、BM25 检索、引用分组到同步与外发的端到端运转机制 |
-| **公开对话采集与增量索引** | [public-transcript-capture.zh.md](docs/public-transcript-capture.zh.md) | [public-transcript-capture.md](docs/public-transcript-capture.md) | 如何只提取公开可见消息、做双层脱敏并用小模型增量生成分块导航 |
-| **显式历史会话导入** | [history-import.zh.md](docs/history-import.zh.md) | [history-import.md](docs/history-import.md) | 如何把以前跑过的有价值会话安全导入知识闭环，且支持断点续导 |
+| **文档总览索引** | [docs/README.md](docs/README.md) | [docs/README.en.md](docs/README.en.md) | 全部活跃架构、数据流与版本兼容规范导览 |
+| **领域知识闭环总览** | [mindie-loop.zh.md](docs/mindie-loop.zh.md) | [mindie-loop.md](docs/mindie-loop.md) | 从授权门禁、对话采集、分层路由与 BM25 检索、引用分组到同步与外发的端到端运转机制 |
+| **公开对话采集与增量索引** | [public-transcript-capture.zh.md](docs/public-transcript-capture.zh.md) | [public-transcript-capture.md](docs/public-transcript-capture.md) | 如何只提取公开可见消息、做双层脱敏、按单调 `Stop` 预算准入并增量生成分块导航 |
 | **社区共享与发件箱对账** | [community-sharing.zh.md](docs/community-sharing.zh.md) | [community-sharing.md](docs/community-sharing.md) | 贡献者端如何隔离凭据、幂等提交 PR 以及在网络中断后只读对账 |
 | **仓库审核 Bot 规范** | [repository-bot-contract.zh.md](docs/repository-bot-contract.zh.md) | [repository-bot-contract.md](docs/repository-bot-contract.md) | `mindie-content-review/2` 审核应用如何自动校验纯内容 PR、做有限脱敏修正与处理撤下 |
-| **版本兼容、组件更新与跨平台文件锁** | [release-compatibility.zh.md](docs/release-compatibility.zh.md) | [release-compatibility.md](docs/release-compatibility.md) | 插件兼容版本选择、8 组件独立 GitHub Release 发现与并排 `uv` 运行时构建，以及 POSIX/Windows 文件锁 |
-| **服务与子进程生命周期** | [service-process-lifetime.zh.md](docs/service-process-lifetime.zh.md) | [service-process-lifetime.md](docs/service-process-lifetime.md) | Windows 计划任务、Linux systemd 254+ 与 macOS 管道守卫如何管理后台服务与子进程寿命 |
-| **摘要进程与临时目录回收** | [summary-process-ownership.zh.md](docs/summary-process-ownership.zh.md) | [summary-process-ownership.md](docs/summary-process-ownership.md) | 为什么遵循“先落盘结果、关进程树、排空管道、删临时目录”的四步顺序，消除并发清理竞态 |
-| **Windows 知识服务宿主** | [windows-service-host.zh.md](docs/windows-service-host.zh.md) | [windows-service-host.md](docs/windows-service-host.md) | 原生 Windows 下如何用 Task Scheduler + DPAPI 让知识服务跨越短 Hook 存活 |
-| **Windows 进程树强归属** | [windows-process-ownership.zh.md](docs/windows-process-ownership.zh.md) | [windows-process-ownership.md](docs/windows-process-ownership.md) | `spawn_owned` 挂起创建 + `KILL_ON_JOB_CLOSE` Job Object 如何杜绝孤儿进程与管道泄漏 |
-| **框架稳定性与验证边界** | [framework-stability.zh.md](docs/framework-stability.zh.md) | [framework-stability.md](docs/framework-stability.md) | 生产解析器夹具、ReMe 可重建索引、Windows 原子重命名与测试验收边界 |
+| **版本兼容、组件更新与跨平台文件锁** | [release-compatibility.zh.md](docs/release-compatibility.zh.md) | [release-compatibility.md](docs/release-compatibility.md) | 插件兼容版本选择、v1/v2 组件（含 `mindie-harness`）Release 发现与并排 `uv` 运行时构建，以及跨平台文件锁 |
+| **历史过渡方案归档** | [docs/archive/README.md](docs/archive/README.md) | [docs/archive/README.md](docs/archive/README.md) | 早期宿主进程监管与显式历史导入方案归档索引 |
 
 ---
 

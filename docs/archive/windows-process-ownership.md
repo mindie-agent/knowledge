@@ -1,6 +1,11 @@
+> **[Archived Historical Specification]**
+> - **Archived from baseline SHA**: `c991b64a1ead` · **Original path**: `docs/windows-process-ownership.md`
+> - **Status**: Retained strictly for historical design provenance; this file is not an active architecture or release gate.
+> - **Current living specification**: See [`../release-compatibility.md`](../release-compatibility.md) and the shared `mindie-harness` host substrate documentation.
+
 # Windows Process Tree Ownership
 
-[中文](windows-process-ownership.zh.md) | **English** · [Back to Documentation Center](README.en.md)
+[中文](windows-process-ownership.zh.md) | **English** · [Back to Documentation Center](../README.en.md)
 
 Managing subprocess trees on Windows involves two classic pitfalls:
 1. **Fast Descendant Escape**: If a parent spawns a child normally and attaches a Windows Job Object afterward, a fast child can spawn a grandchild before Job assignment completes—allowing the grandchild to escape containment;

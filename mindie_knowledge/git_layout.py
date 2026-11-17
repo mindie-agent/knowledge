@@ -7,6 +7,7 @@
 """
 import ntpath
 import os
+from pathlib import Path
 
 from .filesystem import _windows_logical
 
@@ -31,6 +32,30 @@ class UnsupportedGitLayout(OSError):
             f"limit={self.limit_bytes}; git_operation_execution=not_started; "
             "existing state preserved"
         )
+
+
+def resolve_git_dir(path) -> Path | None:
+    """Resolve the actual Git metadata directory for bare, standard, or linked-worktree roots."""
+    candidate = Path(path)
+    if (candidate / "objects").is_dir() and (candidate / "HEAD").is_file():
+        return candidate
+    dotgit = candidate / ".git"
+    try:
+        if dotgit.is_dir():
+            return dotgit
+        if dotgit.is_file():
+            raw = dotgit.read_bytes()[:4096].decode("utf-8", errors="replace").strip()
+            if raw.startswith("gitdir:"):
+                ref = raw[len("gitdir:"):].strip()
+                if ref:
+                    resolved = Path(ref) if Path(ref).is_absolute() else (candidate / ref).resolve()
+                    if resolved.is_dir():
+                        return resolved
+    except TimeoutError:
+        raise
+    except OSError:
+        return None
+    return None
 
 
 def validate_git_directory(path, *, bare, role):

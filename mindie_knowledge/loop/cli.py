@@ -184,11 +184,18 @@ def _retire_replaced_owner_if_stale(config_path, config):
         res = rpc(raw_conn, "stop_if_idle", timeout=5.0)
     except TimeoutError:
         raise
-    except (OSError, ValueError, RuntimeError):
+    except OSError as exc:
+        reason = getattr(exc, "reason", None)
+        if not isinstance(exc, (ConnectionRefusedError, ConnectionResetError)) and not isinstance(
+            reason, (ConnectionRefusedError, ConnectionResetError)
+        ):
+            return False
+    except (ValueError, RuntimeError):
         return False
-    if not isinstance(res, dict) or not res.get("idle"):
-        return False
-    deadline = time.monotonic() + 5.0
+    else:
+        if not isinstance(res, dict) or not res.get("idle"):
+            return False
+    deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
         if _probe(config, 0.25, config_path=config_path) == "absent":
             backend = backend_for_config(config)

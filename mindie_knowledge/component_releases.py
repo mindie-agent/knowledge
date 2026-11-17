@@ -19,7 +19,7 @@ import urllib.parse
 
 from semantic_version import Version
 
-from .runtime_inventory import COMPONENTS, SHA, validate_targets
+from .runtime_inventory import COMPONENTS, COMPONENTS_V2, SHA, component_registry, validate_targets
 from .releases_io import _OfficialRedirects, _json, _remote_json
 from .release_http import ReleaseResponseInvalid, read as http_read
 
@@ -66,9 +66,13 @@ def _validate_asset(body, record, *, checksum=None, parse=None):
 
 
 class Catalog:
-    def __init__(self, *, cache=None, timeout=10, token=None, budget=120):
+    def __init__(self, *, cache=None, timeout=10, token=None, budget=120, include_substrate=False):
         self.cache, self.timeout, self.token = cache, timeout, token
+        self.include_substrate = bool(include_substrate)
         self.deadline = time.monotonic() + budget
+
+    def _registry(self):
+        return COMPONENTS_V2 if getattr(self, "include_substrate", False) else COMPONENTS
 
     def remaining(self):
         available = self.deadline - time.monotonic()
@@ -86,7 +90,7 @@ class Catalog:
         return _json(raw)
 
     def latest(self, name, *, force=False):
-        repository = COMPONENTS[name]
+        repository = self._registry()[name]
         prefix = "/repos/" + repository
         release = self.read(prefix + "/releases/latest", force=force)
         if release.get("draft") is not False or release.get("prerelease") is not False:
@@ -136,7 +140,7 @@ class Catalog:
         return selected
 
     def asset(self, name, tag, filename, *, force=False, validate=None):
-        url = f"https://github.com/{COMPONENTS[name]}/releases/download/{urllib.parse.quote(tag, safe='')}/{filename}"
+        url = f"https://github.com/{self._registry()[name]}/releases/download/{urllib.parse.quote(tag, safe='')}/{filename}"
         raw, _ = http_read(url, maximum=MAX_RESPONSE, timeout=self.remaining(),
                            accept="application/octet-stream", redirects=_OfficialRedirects(),
                            directory=self.cache, credential="", force=force, validate=validate)
@@ -145,7 +149,7 @@ class Catalog:
     def source(self, name, revision):
         if not SHA.fullmatch(revision):
             raise ValueError("component source must be an immutable commit")
-        repository = COMPONENTS[name]
+        repository = self._registry()[name]
         source = self.read("/repos/" + repository + "/contents/pyproject.toml?ref=" + revision)
         if source.get("encoding") != "base64":
             raise ValueError(f"component source declaration is unavailable: {name}")
@@ -159,12 +163,12 @@ class Catalog:
         return dict(repository=repository, version=str(Version(project["version"])), revision=revision)
 
 
-def select(installed, latest, *, baseline=None):
+def select(installed, latest, *, baseline=None, include_substrate=False):
     """Keep every installed component and advance only to newer formal releases."""
-    validate_targets(installed)
+    validate_targets(installed, include_substrate=include_substrate)
     minimum = dict(installed)
     if baseline:
-        validate_targets(baseline)
+        validate_targets(baseline, include_substrate=include_substrate)
         for name, target in baseline.items():
             if (name in minimum and target["version"] == minimum[name]["version"]
                     and target["revision"] != minimum[name]["revision"]):
@@ -174,7 +178,7 @@ def select(installed, latest, *, baseline=None):
     result = {}
     for name, current in minimum.items():
         target = latest(name)
-        validate_targets({name: target})
+        validate_targets({name: target}, include_substrate=include_substrate)
         if (Version(target["version"]) == Version(current["version"])
                 and target["revision"] != current["revision"]):
             raise ValueError(f"published component source changed without a version bump: {name}")
@@ -183,15 +187,19 @@ def select(installed, latest, *, baseline=None):
     return result
 
 
-def runtime_identity(baseline, components):
+def runtime_identity(baseline, components, *, include_substrate=False):
     """Bind an adapter source receipt to an independently verified runtime plan."""
     if components is None:
         return baseline
+    allowed_schemas = {"mindie-component-runtime/1", "mindie-component-runtime/2"} if include_substrate else {"mindie-component-runtime/1"}
     if (set(components) != {"schema", "adapter_source_sha256", "runtime", "lock_sha256"}
-            or components.get("schema") != "mindie-component-runtime/1"
+            or components.get("schema") not in allowed_schemas
             or components.get("adapter_source_sha256") != baseline["source_sha256"]):
         raise ValueError("component runtime belongs to a different adapter source")
-    targets = validate_targets(components["runtime"])
+    targets = validate_targets(
+        components["runtime"],
+        include_substrate=include_substrate or components.get("schema") == "mindie-component-runtime/2",
+    )
     if not set(baseline["runtime"]) <= set(targets):
         raise ValueError("component runtime omits an adapter dependency")
     return dict(baseline, runtime={name: row["revision"] for name, row in targets.items()},

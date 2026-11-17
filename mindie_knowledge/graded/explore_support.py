@@ -1,15 +1,20 @@
-"""[Role] Legacy exploration evaluation and recursive gate-evidence helpers.
+"""[Role] Exploration evaluation, bounded workspace audit resolution, and gate-evidence helpers.
 
 [Invariants] The historical three-axis evaluator keeps its exact verdicts and
 return tier while the authoritative four-gate evaluator lives in ``explore``.
 Gate evidence is inspected recursively; only an explicit regression signal
-fails, and a missing optional key never fabricates one.
-[Timeouts & Locks] Pure in-memory validation and arithmetic; no waits or locks.
-[Side-Effect Policy] Returns derived judgments only; never writes or promotes.
+fails, and workspace audit resolution never writes into an arbitrary caller CWD.
+[Timeouts & Locks] Bounded tail-window JSONL reads (<= 256 KiB) and pure arithmetic; no locks.
+[Side-Effect Policy] Read-only workspace inspection and pure derived judgments; no writes.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import math
+import os
+from pathlib import Path
+import stat
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -525,5 +530,171 @@ def stage_budget_guidance(
         "injection_target": "tool_result_tail",
         "preserves_prompt_prefix_cache": True,
     }
+
+
+def _regular_ledger_stat(path: Path) -> os.stat_result | None:
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except TimeoutError:
+        raise
+    except OSError as exc:
+        raise ValueError(f"{path}: cannot read experiment ledger: {type(exc).__name__}: {exc}") from exc
+    if not stat.S_ISREG(st.st_mode):
+        raise ValueError(f"{path}: cannot read experiment ledger: not a regular file")
+    return st
+
+
+def read_bounded_jsonl(path: Path, *, max_bytes: int = 262144, max_rows: int = 128) -> list[dict]:
+    """Read trailing JSON object lines. Missing files are empty; damaged files raise."""
+    st = _regular_ledger_stat(path)
+    if st is None:
+        return []
+    try:
+        offset = max(0, st.st_size - max_bytes)
+        with path.open("rb") as fh:
+            if offset > 0:
+                fh.seek(offset)
+                fh.readline()
+            raw = fh.read(max_bytes)
+        if len(raw) == max_bytes and not raw.endswith(b"\n"):
+            raw = raw.rsplit(b"\n", 1)[0] if b"\n" in raw else b""
+        body = raw.decode("utf-8")
+    except TimeoutError:
+        raise
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"{path}: cannot read experiment ledger: {type(exc).__name__}: {exc}") from exc
+    rows: list[dict] = []
+    for index, line in enumerate(body.splitlines()[-max_rows:], start=1):
+        text = line.strip()
+        if not text:
+            continue
+        try:
+            obj = json.loads(text)
+        except ValueError as exc:
+            raise ValueError(f"{path}: trailing JSONL row {index} is not valid JSON: {exc}") from exc
+        if not isinstance(obj, dict):
+            raise ValueError(f"{path}: trailing JSONL row {index} must be an object")
+        rows.append(obj)
+    return rows
+
+
+def _resolved_path(path: Path) -> Path:
+    try:
+        return path.resolve()
+    except TimeoutError:
+        raise
+    except OSError:
+        return path
+
+
+def _path_within(root: Path, candidate: Path) -> bool:
+    try:
+        _resolved_path(candidate).relative_to(_resolved_path(root))
+    except TimeoutError:
+        raise
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def resolve_workspace_ledger(ws_env: str | None, cwd: Path) -> tuple[Path, Path | None, bool]:
+    """Return ``(workspace_root, ledger_or_none, workspace_gated)`` without falling through an explicit bench root."""
+    if ws_env:
+        root = Path(ws_env)
+        ledger = root / "logs" / "experiment-ledger.jsonl"
+        return root, ledger if _regular_ledger_stat(ledger) is not None else None, True
+    for root in (cwd, cwd.parent / "workspace", cwd.parent / "work"):
+        ledger = root / "logs" / "experiment-ledger.jsonl"
+        if _regular_ledger_stat(ledger) is not None:
+            return root, ledger, True
+    return cwd, None, False
+
+
+def _owned_query_audit_dir() -> Path:
+    explicit = os.environ.get("MINDIE_DATA_HOME")
+    if explicit:
+        base = Path(explicit)
+    elif os.name == "nt" and os.environ.get("LOCALAPPDATA"):
+        base = Path(os.environ["LOCALAPPDATA"]) / "mindie-agent"
+    elif os.environ.get("XDG_DATA_HOME"):
+        base = Path(os.environ["XDG_DATA_HOME"]) / "mindie-agent"
+    else:
+        base = Path.home() / ".local" / "share" / "mindie-agent"
+    return _resolved_path(base / "query-audit")
+
+
+def resolve_workspace_audit_paths(
+    workspace_root: Path, *, persist_root: bool = False, explicit_workspace: bool | None = None
+) -> tuple[str, list[Path], list[Path]]:
+    """Resolve query-audit read/write paths; never write into an arbitrary caller CWD."""
+    root = _resolved_path(workspace_root)
+    scope = str(root)
+    if explicit_workspace is None:
+        ws_env = os.environ.get("MINDIE_BENCH_WORKSPACE")
+        explicit_workspace = bool(ws_env and _resolved_path(Path(ws_env)) == root)
+    if explicit_workspace:
+        if (workspace_root / "logs").is_dir():
+            audit = workspace_root / "logs" / "knowledge_query_audit.jsonl"
+        elif persist_root and workspace_root.is_dir():
+            audit = workspace_root / "knowledge_query_audit.jsonl"
+        else:
+            return scope, [], []
+        resolved = _resolved_path(audit)
+        paths = [resolved] if _path_within(root, resolved) else []
+        return scope, list(paths), list(paths)
+    if not persist_root:
+        return scope, [], []
+    owned_dir = _owned_query_audit_dir()
+    digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:24]
+    owned_file = owned_dir / f"{digest}.jsonl"
+    candidates = [owned_file]
+    existing_local = _resolved_path(workspace_root / "logs" / "knowledge_query_audit.jsonl")
+    if _path_within(root, existing_local) and existing_local.is_file():
+        candidates.insert(0, existing_local)
+    return scope, candidates, [owned_file]
+
+
+def _reuse_record_matches_scope(obj: Any, scope_key: str) -> bool:
+    if not isinstance(obj, dict) or obj.get("effective_mode") != "reuse":
+        return False
+    recorded = obj.get("workspace_scope")
+    return recorded == scope_key if isinstance(recorded, str) and recorded.strip() else True
+
+
+def has_prior_reuse_audit(
+    audit_paths: Sequence[Path], *, scope_key: str, memory_scopes: set[str], max_bytes: int = 262144
+) -> bool:
+    """True when this workspace already recorded reuse in memory or an authorized audit file."""
+    if scope_key in memory_scopes:
+        return True
+    root = Path(scope_key)
+    owned_dir = _owned_query_audit_dir()
+    for audit_file in audit_paths:
+        if not (_path_within(root, audit_file) or _path_within(owned_dir, audit_file)) or not audit_file.is_file():
+            continue
+        seen: list[dict] = []
+        try:
+            with audit_file.open("rb") as fh:
+                head_text = fh.read(max_bytes).decode("utf-8", errors="replace")
+        except TimeoutError:
+            raise
+        except OSError:
+            head_text = ""
+        for line in head_text.splitlines():
+            try:
+                obj = json.loads(line.strip()) if line.strip() else None
+            except ValueError:
+                obj = None
+            if isinstance(obj, dict):
+                seen.append(obj)
+        if audit_file.stat().st_size > max_bytes:
+            seen.extend(read_bounded_jsonl(audit_file, max_bytes=max_bytes, max_rows=64))
+        if any(_reuse_record_matches_scope(obj, scope_key) for obj in seen):
+            memory_scopes.add(scope_key)
+            return True
+    return False
+
 
 
