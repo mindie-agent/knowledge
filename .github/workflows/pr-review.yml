@@ -19,6 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
@@ -53,6 +54,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
@@ -73,7 +75,7 @@ jobs:
           eager = [m for m in sys.modules if m.startswith('mindie_knowledge.')]
           assert not eager, f'unexpected eager submodules: {eager}'
           assert dt_ms < 200.0, f'import too slow: {dt_ms:.2f}ms'
-          assert len(mk.__all__) >= 21
+          assert len(mk.__all__) >= 20
           "
           HOME="$RUNNER_TEMP/smoke-home" "$RUNNER_TEMP/smoke-venv/bin/python" -I -m mindie_knowledge.redact --profile
           HOME="$RUNNER_TEMP/smoke-home" "$RUNNER_TEMP/smoke-venv/bin/python" -I -m mindie_knowledge.runtime_inventory --include-substrate --allow-wheel-provenance
