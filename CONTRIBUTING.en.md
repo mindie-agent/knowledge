@@ -2,54 +2,44 @@
 
 [中文](CONTRIBUTING.md) | **English** · [Back to Homepage](README.en.md)
 
-Thank you for contributing to **MindIE Knowledge** (`mindie-agent/knowledge`)! This repository powers graded domain knowledge synchronization, hierarchical shard routing, local BM25 retrieval, double fail-closed privacy redaction, and community experience sharing for MindIE Agent.
-
-To keep the codebase maintainable, leak-free, and honest under failure conditions, please review the guidelines below before opening a Pull Request.
+Thank you for contributing to **MindIE Knowledge** (`mindie-agent/knowledge`, repository class: `state-service`)! This repository powers graded domain knowledge retrieval (`L1–L4`), hierarchical shard routing, lossless task material packages (`MaterialStore`), double fail-closed privacy redaction, the unified consent store (`mindie-consent/1`), and community PR reconciliation.
 
 ---
 
-## 1. Core Engineering Guidelines
+## 1. Core Engineering Rules (`state-service` Checklist Contract)
 
-1. **Knowledge Is Reference Material, Not Authority**:
-   Search ranking, generated navigation summaries, usefulness votes, and PR merges never certify that a technical claim is universally true. Keep **public knowledge packages**, **local task drafts**, **actual task use**, and **independent feedback** cleanly separated.
-2. **Preserve Fail-Closed Privacy Redaction**:
-   Any change touching capture, indexing, outbound staging, or feed sync must guarantee that unredacted transcripts, tool traffic, hidden reasoning traces, internal IPs, `<user>@<host>` login targets, personal home paths, and credentials never enter public distribution paths.
-3. **Never Hide Errors or Degrade Silently**:
-   When a read fails, a config file is damaged, a scanner crashes, or a subprocess times out, report the failure stage and cause explicitly to the caller. Never turn a read failure into an empty search result, never treat corrupt consent/settings as first-time onboarding, and never blindly replay an `unknown` external write or paid model invocation.
-4. **Keep Package & CLI Naming Clean**:
-   The CLI entry point is `mindie-knowledge` (package `mindie-knowledge`, module `mindie_knowledge`). Do not reintroduce retired legacy aliases or duplicate state stores.
-5. **Separate Fixture Tests from Live Acceptance Evidence**:
-   Repository unit tests use deterministic fixtures to verify protocols and failure branches; claims about real models, native agent hosts, or Ascend NPU hardware must cite traceable acceptance records rather than extrapolating from synthetic fixtures.
+1. **`SVC-CONSENT` — Explicit Consent Gate & Zero Retroactive Backfill (`P2.1`)**:
+   Community sharing is opt-in by default. `knowledge_*` calls, `Stop` transcript capture, and GitHub PR publication require both an explicit session lease (`entry_enabled = 1`) and `mindie-consent/1` (`choice_revision`). Withdrawing consent cancels unsent exports immediately, and re-enabling never backfills unconsented sessions.
+2. **`SVC-STATE-COMPAT` — Rollback-Safe On-Disk Schemas & Pure Knowledge Scope**:
+   Keep `state_layout.py` (`FORMAT = 1`, `state-v4.sqlite3`), `MaterialStore` two-phase `current.json` promotion, and `mindie-graded-unit/1` rollback-safe across rolling upgrades. Canonical RSI evolution (`rsi_loop`, `experiment_ledger`, `rsi_crossover`) lives in `mindie_harness.rsi`; the matching modules in `mindie_knowledge.graded` serve strictly as Wave A->B compatibility shims. Never write query audit logs relative to unowned `Path.cwd()`.
+3. **`SVC-LIFETIME` — Single Monotonic Deadlines, Symlink/Worktree Support & Cohesive Modules (`< 800` LOC)**:
+   `Stop` capture admission enforces a single monotonic outer deadline without synchronous LLM calls or heavy transcript parsing, reporting degraded capture honestly when budget expires. Validate canonical `realpath` target boundaries rather than rejecting legitimate user/dotfile symlinks or linked Git worktree `.git` files. Keep core modules `< 800` lines with `[Role]` / `[Invariants]` / `[Timeouts & Locks]` / `[Side-Effect Policy]` headers, and keep cold `import mindie_knowledge` lazy (`< 20ms`).
+4. **`SVC-EXPORT` — Fail-Closed Redaction & Receipt Honesty**:
+   Every outbound export passes Gitleaks + `mindie_knowledge.redact` (`r3`). Distinguish `completed`, `failed`, and `unknown` (`outcome_unknown`) external effects: reconcile interrupted network writes via read-only queries without blind replay, always place `except TimeoutError: raise` before `except OSError:`, and preserve succeeded remote publication receipts if local receipt updates fail.
 
 ---
 
-## 2. Local Development & Required Checks
+## 2. Local Isolated Testing & Required Gates
 
-Run both verification commands from the repository root before pushing:
+All tests must isolate host paths (`HOME`, `USERPROFILE`, `XDG_*`, `MINDIE_*`, `UV_CACHE_DIR`, `TMPDIR`) without touching real user state:
 
 ```bash
 # 1. Install editable package and test dependencies
 python3 -m pip install -e '.[test]'
 
-# 2. Run the unit and integration test suite
-MINDIE_FRAMEWORK_SOURCE=tests/fixtures/production-parsers python3 -m pytest -q tests
+# 2. Run isolated unit and contract tests (excluding live NPU fixtures)
+MINDIE_FRAMEWORK_SOURCE=tests/fixtures/production-parsers python3 -B -m pytest -q -n auto --dist worksteal -m "not live_npu"
 
-# 3. Run the deterministic privacy scanner across all public docs and packaged skills
-python3 -m mindie_knowledge.redact --check README.md README.en.md CONTRIBUTING.md CONTRIBUTING.en.md docs mindie_knowledge/skills
+# 3. Scan public docs and packaged skills for accidental private data (use <user>@<host> or 192.0.2.x in examples)
+python3 -B -m mindie_knowledge.redact --check README.md README.en.md CONTRIBUTING.md CONTRIBUTING.en.md docs mindie_knowledge/skills
+
+# 4. Check Unix LF line endings and the state-service PR checklist
+python3 .github/scripts/check_lf_eol.py
+python3 .github/scripts/check_pr_checklist.py --profile state-service --body-file <pr_body.md>
 ```
-
-> [!TIP]
-> **Avoiding False Positives in Documentation & Fixtures**:
-> - `mindie_knowledge.redact` scans public documentation with the same strict ruleset (`r3`) used for corpus exports. When writing examples, always use angle-bracket placeholders (such as `/home/<user>/workspace`, `C:\Users\<user>\...`, `<user>@<host>`) or RFC 5737 documentation IPs (`192.0.2.x`).
-> - When `MINDIE_FRAMEWORK_SOURCE` is unset, `tests/conftest.py` uses the committed `tests/fixtures/production-parsers` directory. Passing an invalid explicit path fails immediately as a setup error rather than silently falling back to a global install.
 
 ---
 
-## 3. Design Principles Check Before PR Submission
+## 3. Submitting a Pull Request
 
-Before opening or updating any development PR (covering code, configuration, dependencies, CI, or documentation), read the [MindIE Agent Engineering Design Principles](https://github.com/mindie-agent/mindie-agent/blob/main/docs/design-principles.en.md) and include a concise Design Principles review under the required `## 设计原则 Review` heading in your PR description (matched by CI in [`.github/pull_request_template.md`](.github/pull_request_template.md)):
-
-- **What real task cost does this change reduce?** Does it avoid unnecessary background work, duplicate state, or cognitive overhead?
-- **Are component boundaries clean?** Does it reuse mature OS/host mechanisms and delete superseded paths once replaced?
-- **Are all failure branches visible to the caller?** Does it distinguish completed work, known failure, and uncertain (`unknown`) external effects?
-- **What verification commands were run, and what external boundaries remain unverified?**
+Complete [`.github/pull_request_template.md`](.github/pull_request_template.md) with concrete verification notes for `SVC-CONSENT`, `SVC-STATE-COMPAT`, `SVC-LIFETIME`, and `SVC-EXPORT`. If an item does not apply (for example, a documentation-only change), write `not-applicable: <specific reason>` rather than leaving placeholders like `N/A` or `TODO`.

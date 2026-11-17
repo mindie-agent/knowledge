@@ -87,13 +87,14 @@ def source_identity(source):
     return digest.hexdigest()
 
 
-def source_baseline(source, *, active_overrides=False):
+def source_baseline(source, *, active_overrides=False, include_substrate=False):
     """Read bootstrap pins; native owners explicitly opt into active source floors.
 
     Legacy owners compare these pins with a candidate built from requirements.
     Active pins cannot imply that the candidate interpreter already has them.
     """
-    from .runtime_inventory import COMPONENTS
+    from .runtime_inventory import COMPONENTS, COMPONENTS_V2
+    registry = COMPONENTS_V2 if include_substrate else COMPONENTS
     requirements = Path(source) / "runtime-requirements.txt"
     if requirements.is_file():
         pins = {}
@@ -103,22 +104,22 @@ def source_baseline(source, *, active_overrides=False):
         for path in paths:
             for line in path.read_text(encoding="utf-8").splitlines():
                 declared = re.match(r"([\w-]+)\s*@", line)
-                if declared is None or declared[1] not in COMPONENTS:
+                if declared is None or declared[1] not in registry:
                     continue
                 match = re.fullmatch(r"([\w-]+)\s*@\s*git\+https://github.com/([\w-]+/[\w-]+)@([0-9a-f]{40})", line)
-                if match is None or COMPONENTS[match[1]] != match[2]:
+                if match is None or registry[match[1]] != match[2]:
                     raise ValueError("adapter component source must pin an official repository and full SHA")
                 pins[match[1]] = match[3]
     else:
         project = tomllib.loads((Path(source) / "pyproject.toml").read_text(encoding="utf-8"))
         pins = {name: row["rev"] for name, row in project["tool"]["uv"]["sources"].items()
-                if name in COMPONENTS}
+                if name in registry}
     if not pins:
         raise ValueError("adapter declares no component source pins")
     return dict(source_sha256=source_identity(source), runtime=pins)
 
 
-def discover(python, minimum, *, force=False, catalog=None, required_components=None):
+def discover(python, minimum, *, force=False, catalog=None, required_components=None, include_substrate=False):
     """Select the runtime plus native-owner-declared external component CLIs.
 
     An external installation's package version is only a floor, never a source
@@ -127,17 +128,19 @@ def discover(python, minimum, *, force=False, catalog=None, required_components=
     from semantic_version import Version
 
     from .component_releases import Catalog, select
-    from .runtime_inventory import COMPONENTS
-    current = read_inventory(python)
-    catalog = catalog or Catalog()
+    from .runtime_inventory import COMPONENTS, COMPONENTS_V2
+    registry = COMPONENTS_V2 if include_substrate else COMPONENTS
+    current = read_inventory(python, include_substrate=True) if include_substrate else read_inventory(python)
+    catalog = catalog or (Catalog(include_substrate=True) if include_substrate else Catalog())
     floor = {name: catalog.source(name, revision) for name, revision in minimum.items()}
-    targets = select(current, lambda name: catalog.latest(name, force=force), baseline=floor)
+    select_kw = {"baseline": floor, **({"include_substrate": True} if include_substrate else {})}
+    targets = select(current, lambda name: catalog.latest(name, force=force), **select_kw)
     for name, version in (required_components or {}).items():
-        if name not in COMPONENTS:
+        if name not in registry:
             raise ValueError(f"unsupported required component: {name}")
         if name not in targets:
             targets[name] = catalog.latest(name, force=force)
-            validate_targets({name: targets[name]})
+            validate_targets({name: targets[name]}, include_substrate=include_substrate)
         if version is not None and Version(targets[name]["version"]) < Version(version):
             raise ValueError(
                 f"formal component {name} {targets[name]['version']} is older than "
@@ -145,8 +148,8 @@ def discover(python, minimum, *, force=False, catalog=None, required_components=
     return dict(installed=current, runtime=targets, changed=targets != current)
 
 
-def project_text(source, targets, *, adapter_distribution=None):
-    validate_targets(targets)
+def project_text(source, targets, *, adapter_distribution=None, include_substrate=False):
+    validate_targets(targets, include_substrate=include_substrate)
     requirements = [f"{name} @ git+https://github.com/{row['repository']}@{row['revision']}"
                     for name, row in sorted(targets.items())]
     dependencies = list(requirements)
@@ -321,21 +324,24 @@ def _pre_build_prune(root: Path, generation: Path, budget: float,
         return
 
 
-def read_inventory(python, *, timeout=15):
+def read_inventory(python, *, timeout=15, include_substrate=False):
     script = Path(__file__).with_name("runtime_inventory.py")
-    return json.loads(bounded_run([str(python), "-I", "-X", "utf8", str(script)], "", timeout=timeout,
+    extra = ["--include-substrate"] if include_substrate else []
+    return json.loads(bounded_run([str(python), "-I", "-X", "utf8", str(script), *extra], "", timeout=timeout,
                                   max_output=64 * 1024))
 
 
-def read_versions(python, names, *, timeout=15):
+def read_versions(python, names, *, timeout=15, include_substrate=False):
     """Read explicitly selected external CLI versions without asserting VCS origin."""
     script = Path(__file__).with_name("runtime_inventory.py")
-    return json.loads(bounded_run([str(python), "-I", "-X", "utf8", str(script), "--versions", *names],
+    extra = ["--include-substrate"] if include_substrate else []
+    return json.loads(bounded_run([str(python), "-I", "-X", "utf8", str(script), *extra, "--versions", *names],
                                   "", timeout=timeout, max_output=64 * 1024))
 
 
 def build(source, root, baseline, targets, *, python=sys.executable,
-          adapter_distribution=None, timeout=420, env=None, files=None):
+          adapter_distribution=None, timeout=420, env=None, files=None,
+          include_substrate=False):
     """Prepare and verify; publication of a native binding stays with its owner.
 
     One absolute deadline covers ``source_files``, pre-build GC, ``uv sync``,
@@ -347,7 +353,7 @@ def build(source, root, baseline, targets, *, python=sys.executable,
     deadline = started + max(0.0, float(timeout))
     source, root = Path(source).resolve(), Path(root).resolve()
     files = source_files(source) if files is None else [Path(item) for item in files]
-    validate_targets(targets)
+    validate_targets(targets, include_substrate=include_substrate)
     if not set(baseline["runtime"]) <= set(targets):
         raise ValueError("component selection omits an adapter dependency")
     key = generation_key(baseline, targets)
@@ -411,7 +417,8 @@ def build(source, root, baseline, targets, *, python=sys.executable,
                     destination.write_bytes(_read_source_bytes(src_file))
             runtime.mkdir(exist_ok=True)
             (runtime / "pyproject.toml").write_text(
-                project_text(retained, targets, adapter_distribution=adapter_distribution),
+                project_text(retained, targets, adapter_distribution=adapter_distribution,
+                             include_substrate=include_substrate),
                 encoding="utf-8", newline="\n")
             from ._host_exec import resolve_uv
             uv = shutil.which("uv") if shutil.which.__module__ != "shutil" else resolve_uv()
@@ -445,7 +452,8 @@ def build(source, root, baseline, targets, *, python=sys.executable,
             bounded_run([uv, "sync", "--project", str(runtime), "--no-editable", "--no-dev",
                          "--python", str(python)], "", timeout=sync_budget,
                         max_output=256 * 1024, child_env=environment)
-            components = dict(schema="mindie-component-runtime/1",
+            schema_ver = "mindie-component-runtime/2" if "mindie-harness" in targets else "mindie-component-runtime/1"
+            components = dict(schema=schema_ver,
                               adapter_source_sha256=baseline["source_sha256"],
                               runtime=targets, generation_key=key,
                               lock_sha256=hashlib.sha256((runtime / "uv.lock").read_bytes()).hexdigest())
@@ -463,7 +471,8 @@ def build(source, root, baseline, targets, *, python=sys.executable,
             raise TimeoutError("component runtime verification budget exhausted")
         script = Path(__file__).with_name("runtime_inventory.py")
         candidate_manifest = manifest_file if manifest_file.exists() else temporary
-        actual = json.loads(bounded_run([str(selected_python), "-I", "-X", "utf8", str(script), str(candidate_manifest)], "",
+        extra = ["--include-substrate"] if include_substrate else []
+        actual = json.loads(bounded_run([str(selected_python), "-I", "-X", "utf8", str(script), *extra, str(candidate_manifest)], "",
                                        timeout=verify_budget, max_output=64 * 1024))
         if candidate_manifest != manifest_file:
             os.replace(candidate_manifest, manifest_file)
@@ -482,7 +491,8 @@ def build(source, root, baseline, targets, *, python=sys.executable,
                                if name != "generation_key"}
         return dict(generation=str(generation), source=str(generation / "source"),
                     python=str(selected_python), components=components,
-                    identity=runtime_identity(baseline, verified_components),
+                    identity=runtime_identity(baseline, verified_components,
+                                              include_substrate=include_substrate),
                     installed=actual)
     except BaseException:
         # A failed fresh build must not leave a 250 MiB unverified .venv without
@@ -511,11 +521,13 @@ def main():
     if request["operation"] == "discover":
         result = discover(request["python"], request.get("minimum", {}),
                           force=request.get("force", False),
-                          required_components=request.get("required_components"))
+                          required_components=request.get("required_components"),
+                          include_substrate=bool(request.get("include_substrate", False)))
     elif request["operation"] == "build":
         result = build(request["source"], request["root"], request["baseline"], request["runtime"],
                        python=request["python"], adapter_distribution=request.get("adapter_distribution"),
-                       timeout=request.get("timeout", 420), files=request.get("files"))
+                       timeout=request.get("timeout", 420), files=request.get("files"),
+                       include_substrate=bool(request.get("include_substrate", False)))
     elif request["operation"] == "prune":
         # ``prune_component_runtimes`` inspects the live process table when no
         # snapshot is supplied and unions the caller's keep paths with every

@@ -1,6 +1,11 @@
+> **[历史归档文档 / Archived Historical Spec]**
+> - **归档基准提交（Baseline SHA）**：`c991b64a1ead` · **原路径**：`docs/summary-process-ownership.zh.md`
+> - **状态说明**：本文档记录早期过渡阶段的服务宿主与子进程模型设计，仅作历史溯源参考，不再作为当前发版或架构门禁依据。
+> - **当前生效规范（Living Spec）**：请参阅 [`../public-transcript-capture.zh.md`](../public-transcript-capture.zh.md) 与共享宿主底座 `mindie-harness` 规范。
+
 # 摘要进程与临时目录归属（Summary Process & Scratch Ownership）
 
-**中文** | [English](summary-process-ownership.md) · [返回文档中心](README.md)
+**中文** | [English](summary-process-ownership.md) · [返回文档中心](../README.md)
 
 当 `mindie-knowledge` 调用宿主原生 CLI（如 Codex 或 Claude Code 的轻量摘要路由）为新增分块生成导航索引时，宿主 CLI 往往会在临时配置目录（Profile / Scratch Directory）下启动多个辅助子进程。
 

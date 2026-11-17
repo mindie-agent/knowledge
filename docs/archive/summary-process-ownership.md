@@ -1,6 +1,11 @@
+> **[Archived Historical Specification]**
+> - **Archived from baseline SHA**: `c991b64a1ead` · **Original path**: `docs/summary-process-ownership.md`
+> - **Status**: Retained strictly for historical design provenance; this file is not an active architecture or release gate.
+> - **Current living specification**: See [`../public-transcript-capture.md`](../public-transcript-capture.md) and the shared `mindie-harness` host substrate documentation.
+
 # Summary Process & Temporary Profile Ownership
 
-[中文](summary-process-ownership.zh.md) | **English** · [Back to Documentation Center](README.en.md)
+[中文](summary-process-ownership.zh.md) | **English** · [Back to Documentation Center](../README.en.md)
 
 When `mindie-knowledge` invokes a host CLI (such as the Codex or Claude Code lightweight summary route) to index new material blocks, the host CLI often spawns helper subprocesses that read and write a temporary profile directory.
 

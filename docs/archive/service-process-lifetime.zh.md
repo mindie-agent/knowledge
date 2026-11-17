@@ -1,6 +1,11 @@
+> **[历史归档文档 / Archived Historical Spec]**
+> - **归档基准提交（Baseline SHA）**：`c991b64a1ead` · **原路径**：`docs/service-process-lifetime.zh.md`
+> - **状态说明**：本文档记录早期过渡阶段的服务宿主与子进程模型设计，仅作历史溯源参考，不再作为当前发版或架构门禁依据。
+> - **当前生效规范（Living Spec）**：请参阅 [`../release-compatibility.zh.md`](../release-compatibility.zh.md) 与共享宿主底座 `mindie-harness` 规范。
+
 # 服务与单次操作生命周期（Service & Attempt Process Lifetime）
 
-**中文** | [English](service-process-lifetime.md) · [返回文档中心](README.md)
+**中文** | [English](service-process-lifetime.md) · [返回文档中心](../README.md)
 
 在 AI Agent 运行过程中，存在着三种寿命完全不同的执行单元：
 1. **短生命周期的前台调用或 Hook**（如几百毫秒即退出的 `Stop Hook`）；

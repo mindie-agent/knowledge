@@ -2,54 +2,44 @@
 
 **中文** | [English](CONTRIBUTING.en.md) · [返回仓库首页](README.md)
 
-欢迎参与 **MindIE Knowledge**（`mindie-agent/knowledge`）的开发与改进！本仓库提供 MindIE Agent 的领域知识同步、本地 BM25 检索、双层隐私脱敏与社区经验外发运行时。
-
-为了让代码库始终保持高可维护性、零隐私泄漏和清晰的故障可观测性，提交 Pull Request 前请了解以下开发约定。
+欢迎参与 **MindIE Knowledge**（`mindie-agent/knowledge`，仓库分类：`state-service`）的开发与改进！本仓库负责 MindIE Agent 的分级领域知识检索（`L1–L4`）、分层分片路由、无损任务材料库（`MaterialStore`）、双层闭锁式隐私脱敏、统一同意书状态库（`mindie-consent/1`）及社区 PR 外发对账。
 
 ---
 
-## 1. 核心工程约定（为什么这么设计？）
+## 1. 核心工程准则（`state-service` 四大铁律）
 
-1. **知识仅供参考，不喧宾夺主**：
-   检索命中、小模型导航摘要、有用性投票或 PR 合入都**不代表对某条经验的权威认证**。请保持“公开知识包”、“本地任务草稿”、“实际业务使用”与“独立反馈”之间的清晰边界。
-2. **严守双层闭锁式脱敏（Fail-Closed Redaction）**：
-   任何涉及对话采集、索引、外发或同步的改动，都必须确保未脱敏原文、工具调用噪音、隐藏推理链、内网地址、`<user>@<host>` 登录目标、个人目录路径或凭据绝不会进入公开分发路径。
-3. **禁止静默降级或隐藏错误**：
-   当读取失败、配置损坏、脱敏扫描器异常或子进程超时发生时，必须向调用者如实报告失败阶段与原因——绝不能把读取失败伪装成“无匹配结果”，不能把配置损坏伪装成“首次安装引导”，更不能对结果不确定（`unknown`）的外部写入或付费模型调用做盲目自动重试。
-4. **保持简洁统一命名**：
-   当前 CLI 入口为 `mindie-knowledge`（包名 `mindie-knowledge`，模块 `mindie_knowledge`），请勿引入已废弃的旧别名或第二套状态库。
-5. **区分固定夹具测试与实机验收证据**：
-   仓库内的单元测试使用确定性夹具验证协议与异常分支；涉及真实大模型、客户端宿主或昇腾 NPU 的结论需基于可追溯的实机验证记录，不虚构验收证据。
+1. **`SVC-CONSENT` — 严格同意书门禁与零补发承诺（`P2.1`）**：
+   社区共享默认关闭（Opt-in）。`knowledge_*` 工具、`Stop` 会话采集与 GitHub PR 外发均受显式会话租约（`entry_enabled = 1`）与 `mindie-consent/1`（`choice_revision`）双重约束；撤回授权时立即停止未发送外发项，重新开启时绝不回溯补发未授权期间的历史数据。
+2. **`SVC-STATE-COMPAT` — 状态 Schema 前后向兼容与纯知识边界**：
+   保持 `state_layout.py`（`FORMAT = 1`、`state-v4.sqlite3`）、`MaterialStore` 双阶段原子指针（`current.json`）与 `mindie-graded-unit/1` 回滚安全。RSI 演化循环（`rsi_loop`、`experiment_ledger`、`rsi_crossover`）以 `mindie_harness.rsi` 为唯一演进源，本仓对应模块仅作为平滑升级桥接层。严禁向任意 `Path.cwd()` 写出查询审计日志。
+3. **`SVC-LIFETIME` — 单调预算、软链/Worktree 友好与模块内聚（`< 800` 行）**：
+   `Stop` 准入全流程服从单一单调外层截止时间（不做同步大模型调用或重型全文解析，预算不足时诚实返回降级原因）。文件读取校验 `realpath` 边界（兼容 dotfiles 软链与 Git 关联 Worktree `.git` 文件）。核心 Python 模块保持 `< 800` 行并具备 `[Role]` / `[Invariants]` / `[Timeouts & Locks]` / `[Side-Effect Policy]` 头部说明；顶层 `import mindie_knowledge` 保持懒加载（`< 20ms`）。
+4. **`SVC-EXPORT` — 双层闭锁脱敏与外部副作用诚实回执**：
+   外发前强制通过 Gitleaks + `mindie_knowledge.redact`（`r3`）双重扫描。严格区分 `completed`、`failed` 与外部写入结果未知（`unknown` / `outcome_unknown`）：遇到网络超时仅做只读对账，绝不盲目重放外部写或付费模型调用；`except OSError:` 前必须显式保留 `except TimeoutError: raise`；远端主操作成功后若本地回执写入失败，必须保留远端成功回执并附带告警。
 
 ---
 
-## 2. 本地开发环境与必跑检查
+## 2. 本地隔离测试与必跑门禁
 
-在提交代码或文档前，请在仓库根目录下运行以下两条验证命令：
+运行测试时请确保隔离宿主环境变量（`tests/conftest.py` 已内置沙箱 fixture，切勿污染宿主机 `~/.config` 或 `~/.local`）：
 
 ```bash
 # 1. 安装可编辑运行时与测试依赖
 python3 -m pip install -e '.[test]'
 
-# 2. 运行单元与集成测试套件
-MINDIE_FRAMEWORK_SOURCE=tests/fixtures/production-parsers python3 -m pytest -q tests
+# 2. 运行隔离单元与契约测试套件（排除常驻实机 NPU 用例）
+MINDIE_FRAMEWORK_SOURCE=tests/fixtures/production-parsers python3 -B -m pytest -q -n auto --dist worksteal -m "not live_npu"
 
-# 3. 运行确定性隐私脱敏扫描，确保公开文档与技能文件零敏感信息命中
-python3 -m mindie_knowledge.redact --check README.md README.en.md CONTRIBUTING.md CONTRIBUTING.en.md docs mindie_knowledge/skills
+# 3. 扫描公开文档与技能文件，确保零敏感数据命中（文档示例请使用 <user>@<host> 或 192.0.2.x）
+python3 -B -m mindie_knowledge.redact --check README.md README.en.md CONTRIBUTING.md CONTRIBUTING.en.md docs mindie_knowledge/skills
+
+# 4. 校验 Unix LF 换行符与 state-service PR 自查清单
+python3 .github/scripts/check_lf_eol.py
+python3 .github/scripts/check_pr_checklist.py --profile state-service --body-file <pr_body.md>
 ```
-
-> [!TIP]
-> **编写文档与测试数据时的防踩坑提示**：
-> - `mindie_knowledge.redact` 对公开文档同样严格执行扫描。在举例说明路径、机器名或登录串时，请使用带尖括号的占位符（如 `/home/<user>/workspace`、`C:\Users\<user>\...`、`<user>@<host>`），或使用 RFC 5737 文档专用网段（`192.0.2.x`）。
-> - 当未设置 `MINDIE_FRAMEWORK_SOURCE` 时，测试套件会自动使用仓库内的 `tests/fixtures/production-parsers`；若显式传入了不存在的路径，测试会直接报错退出，而不会静默回退到系统目录。
 
 ---
 
-## 3. 提交 PR 前的设计原则自检
+## 3. 提交 PR 说明
 
-在创建或更新开发 PR（包括代码、配置、依赖、CI 与文档改动）前，请先阅读 [MindIE Agent 工程设计原则](https://github.com/mindie-agent/mindie-agent/blob/main/docs/design-principles.md)，并在 PR 描述中按模板（[`.github/pull_request_template.md`](.github/pull_request_template.md)）简要填写 `## 设计原则 Review`：
-
-- **这次改动降低了什么实际成本？** 是否引入了不必要的常驻开销、重复计算或额外心智负担？
-- **组件边界是否清晰？** 是否复用了宿主与操作系统的成熟机制，并在替代旧实现后清理了重复状态？
-- **所有受影响的失败路径是否对调用者可见？** 是否区分了“已完成”、“失败”与“外部副作用不确定（`unknown`）”？
-- **实际运行了哪些验证命令？** 哪些外部环境边界尚未在本次变更中验证？
+提交或更新 PR 时，请按 [`.github/pull_request_template.md`](.github/pull_request_template.md) 勾选 `SVC-CONSENT`、`SVC-STATE-COMPAT`、`SVC-LIFETIME`、`SVC-EXPORT` 四项检查并填写具体核验依据（纯文档等不适用项请注明 `not-applicable: <具体原因>`，切勿填写空白或笼统的 `N/A`）。

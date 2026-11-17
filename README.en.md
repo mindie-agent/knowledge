@@ -250,18 +250,13 @@ All architecture and engineering guides under [`docs/`](docs/README.en.md) are a
 
 | Topic | English Guide | 中文文档 | What It Covers |
 | --- | --- | --- | --- |
-| **Documentation Index** | [docs/README.en.md](docs/README.en.md) | [docs/README.md](docs/README.md) | Full guide to architecture, data pipelines, and platform lifecycles |
-| **MindIE Domain Loop Overview** | [mindie-loop.md](docs/mindie-loop.md) | [mindie-loop.zh.md](docs/mindie-loop.zh.md) | End-to-end walkthrough of consent gates, capture, BM25 search, citation grouping, feedback, and sync |
-| **Public Transcript Capture & Indexing** | [public-transcript-capture.md](docs/public-transcript-capture.md) | [public-transcript-capture.zh.md](docs/public-transcript-capture.zh.md) | How public turns are projected, redacted with Gitleaks + `r3`, and indexed incrementally |
-| **Explicit Historical Transcript Import** | [history-import.md](docs/history-import.md) | [history-import.zh.md](docs/history-import.zh.md) | Importing selected past sessions safely with prefix verification and resumable intake |
+| **Documentation Index** | [docs/README.en.md](docs/README.en.md) | [docs/README.md](docs/README.md) | Living specifications for architecture, data pipelines, and release contracts |
+| **MindIE Domain Loop Overview** | [mindie-loop.md](docs/mindie-loop.md) | [mindie-loop.zh.md](docs/mindie-loop.zh.md) | End-to-end walkthrough of consent gates, capture, hierarchical routing + BM25 search, citation grouping, feedback, and sync |
+| **Public Transcript Capture & Indexing** | [public-transcript-capture.md](docs/public-transcript-capture.md) | [public-transcript-capture.zh.md](docs/public-transcript-capture.zh.md) | How public turns are projected, redacted with Gitleaks + `r3`, admitted under one monotonic `Stop` deadline, and indexed incrementally |
 | **Community Sharing & Outbox** | [community-sharing.md](docs/community-sharing.md) | [community-sharing.zh.md](docs/community-sharing.zh.md) | Contributor credential isolation, idempotent PR submission, and read-only reconciliation |
 | **Repository Review Bot Contract** | [repository-bot-contract.md](docs/repository-bot-contract.md) | [repository-bot-contract.zh.md](docs/repository-bot-contract.zh.md) | How the `mindie-content-review/2` review application validates, redacts, merges, or withdraws content PRs |
-| **Release Compatibility, Component Updates & File Locks** | [release-compatibility.md](docs/release-compatibility.md) | [release-compatibility.zh.md](docs/release-compatibility.zh.md) | Selecting compatible plugin releases, discovering/building side-by-side component runtimes, and coordinating OS file locks |
-| **Service & Attempt Process Lifetime** | [service-process-lifetime.md](docs/service-process-lifetime.md) | [service-process-lifetime.zh.md](docs/service-process-lifetime.zh.md) | Process containment across Windows Task Scheduler, Linux systemd 254+, and macOS owner pipes |
-| **Summary Process & Scratch Ownership** | [summary-process-ownership.md](docs/summary-process-ownership.md) | [summary-process-ownership.zh.md](docs/summary-process-ownership.zh.md) | Four-step teardown order: persist outcome, stop process tree, drain pipes, then delete scratch |
-| **Windows Knowledge Service Host** | [windows-service-host.md](docs/windows-service-host.md) | [windows-service-host.zh.md](docs/windows-service-host.zh.md) | Running the background service via Windows Task Scheduler + DPAPI across short Hook lifetimes |
-| **Windows Process Tree Ownership** | [windows-process-ownership.md](docs/windows-process-ownership.md) | [windows-process-ownership.zh.md](docs/windows-process-ownership.zh.md) | Using `spawn_owned` suspended creation + `KILL_ON_JOB_CLOSE` Job Objects to prevent orphan processes |
-| **Framework Stability & Verification** | [framework-stability.md](docs/framework-stability.md) | [framework-stability.zh.md](docs/framework-stability.zh.md) | Pinned parser fixtures, rebuildable ReMe indexes, Windows atomic config renames, and test boundaries |
+| **Release Compatibility, Component Updates & File Locks** | [release-compatibility.md](docs/release-compatibility.md) | [release-compatibility.zh.md](docs/release-compatibility.zh.md) | Selecting compatible plugin releases, discovering/building v1/v2 component runtimes (including `mindie-harness`), and coordinating OS file locks |
+| **Archived Historical Specifications** | [docs/archive/README.md](docs/archive/README.md) | [docs/archive/README.md](docs/archive/README.md) | Provenance index of superseded process-supervision and historical-import transition notes |
 
 ---
 

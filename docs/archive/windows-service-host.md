@@ -1,6 +1,11 @@
+> **[Archived Historical Specification]**
+> - **Archived from baseline SHA**: `c991b64a1ead` · **Original path**: `docs/windows-service-host.md`
+> - **Status**: Retained strictly for historical design provenance; this file is not an active architecture or release gate.
+> - **Current living specification**: See [`../release-compatibility.md`](../release-compatibility.md) and the shared `mindie-harness` host substrate documentation.
+
 # Windows Knowledge Service Host
 
-[中文](windows-service-host.zh.md) | **English** · [Back to Documentation Center](README.en.md)
+[中文](windows-service-host.zh.md) | **English** · [Back to Documentation Center](../README.en.md)
 
 On native Windows, when a host client (such as Codex or Claude Code) invokes a turn-ending `Stop Hook`, the host often runs that Hook inside an ancestor Windows Job configured with `KILL_ON_JOB_CLOSE` and no breakaway permission. As soon as the short-lived Hook exits, the Windows kernel terminates any ordinary child process it spawned.
 

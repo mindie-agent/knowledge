@@ -80,11 +80,13 @@ def _validator_context(domain):
     }
 
 def _default_state_path(repo):
-    repo=Path(repo)
-    gitdir=repo if (repo/'objects').is_dir() else repo/'.git'
-    if gitdir.is_dir():
-        return gitdir/_STATE_NAME
-    return Path(tempfile.gettempdir())/f'mindie-validator-{sha256_text(str(repo))}.json'
+    from .git_layout import resolve_git_dir
+
+    repo = Path(repo)
+    gitdir = resolve_git_dir(repo)
+    if gitdir is not None:
+        return gitdir / _STATE_NAME
+    return Path(tempfile.gettempdir()) / f'mindie-validator-{sha256_text(str(repo))}.json'
 
 def _load_checkpoint(path,revision,context):
     if path is None or not isinstance(context,dict):

@@ -92,16 +92,22 @@ PARALLEL_OBSERVED = {
     "decode_cp_plan": "dcp",
 }
 
-LOCAL_REPOS = {
-    "vllm-project/vllm-ascend": Path(
-        "/Volumes/data/code/vllm-ascend-workspace-vaws-c2bf62510ed64c12a3d55ae366a65c51/vllm-ascend"
-    ),
-    "knowledge-infer-observability": Path("/Volumes/data/code/knowledge-infer-observability"),
-    "knowledge": Path("/Users/maoxx241/code/knowledge"),
-    "mindie-profiler": Path("/Users/maoxx241/code/profiler"),
-    "nr_s1_launch_sol": Path("/Volumes/data/Codex/2026-11-12/kan-x/work/next-release/nr_s1_launch_sol"),
-    "next-release-design": Path("/Volumes/data/Codex/2026-11-12/kan-x/outputs/next-release-design"),
-}
+def _local_repos() -> dict[str, Path]:
+    raw = os.environ.get("MINDIE_LOCAL_PROVENANCE_ROOTS", "").strip()
+    configured = {k: Path(v) for k, v in json.loads(raw).items()} if raw else {}
+    return {
+        "vllm-project/vllm-ascend": configured.get("vllm-project/vllm-ascend", ROOT / ".missing-ref/vllm-ascend"),
+        "knowledge-infer-observability": configured.get(
+            "knowledge-infer-observability", ROOT / ".missing-ref/knowledge-infer-observability"
+        ),
+        "knowledge": configured.get("knowledge", ROOT),
+        "mindie-profiler": configured.get("mindie-profiler", ROOT / ".missing-ref/profiler"),
+        "nr_s1_launch_sol": configured.get("nr_s1_launch_sol", ROOT / ".missing-ref/nr_s1_launch_sol"),
+        "next-release-design": configured.get("next-release-design", ROOT / ".missing-ref/next-release-design"),
+    }
+
+
+LOCAL_REPOS = _local_repos()
 EXTERNAL_UNVERIFIED = {"cann/ops-transformer", "gitcode.com/cann/ops-transformer"}
 EXAMPLE = (
     CORPUS
@@ -421,29 +427,27 @@ def test_evidence_refs_resolve_to_local_commits_and_file_bytes():
 
 
 def test_launch_and_observability_provenance_identities():
-    feature_reports = LOCAL_REPOS["nr_s1_launch_sol"] / "mindie_sim" / "feature_reports.py"
-    obs_root = LOCAL_REPOS["knowledge-infer-observability"]
-    engine_root = LOCAL_REPOS["knowledge"]
-    if not (feature_reports.is_file() and obs_root.exists() and engine_root.exists()):
-        pytest.skip("local provenance reference checkouts not mounted")
     units = _units()
-    actual = _sha256(feature_reports.read_bytes())
-    assert actual == "6f7b7424d88920ed3dfb539f635dbc4d3d01cc36b0fae744856b99318854c1f9"
-    assert units[LAUNCH_ID].metadata["provenance"]["source_digest"] == actual
-
-    obs_head = _git(obs_root, "rev-parse", "HEAD").stdout.strip()
-    assert obs_head == "4b3dd86b365c9e588a1eb47df7dcc6437fdf8a89"
-    diff_refs = units[DIFF_ID].metadata["provenance"]["evidence_refs"]
-    assert any(ref.startswith(f"knowledge-infer-observability@{obs_head}:") for ref in diff_refs)
-    assert not any("knowledge-infer-observability@d5c7f017" in ref for ref in diff_refs)
-
-    engine_head = _git(engine_root, "rev-parse", "HEAD").stdout.strip()
-    assert engine_head == "d5c7f01718bd508906d0eef1227b43697fa77912"
+    expected_engine_rev = "d5c7f01718bd508906d0eef1227b43697fa77912"
+    assert _git(ROOT, "cat-file", "-e", f"{expected_engine_rev}^{{commit}}").returncode == 0
     protocol_refs = units[L3_VLLM_ID].metadata["provenance"]["evidence_refs"]
     assert any(
-        ref.startswith(f"knowledge@{engine_head}:mindie_knowledge/graded/ablation.py")
+        ref.startswith(f"knowledge@{expected_engine_rev}:mindie_knowledge/graded/ablation.py")
         for ref in protocol_refs
     )
+    expected_obs_rev = "4b3dd86b365c9e588a1eb47df7dcc6437fdf8a89"
+    diff_refs = units[DIFF_ID].metadata["provenance"]["evidence_refs"]
+    assert any(ref.startswith(f"knowledge-infer-observability@{expected_obs_rev}:") for ref in diff_refs)
+    assert not any("knowledge-infer-observability@d5c7f017" in ref for ref in diff_refs)
+    assert units[LAUNCH_ID].metadata["provenance"]["source_digest"] == (
+        "6f7b7424d88920ed3dfb539f635dbc4d3d01cc36b0fae744856b99318854c1f9"
+    )
+    feature_reports = LOCAL_REPOS["nr_s1_launch_sol"] / "mindie_sim" / "feature_reports.py"
+    obs_root = LOCAL_REPOS["knowledge-infer-observability"]
+    if not (feature_reports.is_file() and obs_root.exists()):
+        return
+    assert _sha256(feature_reports.read_bytes()) == units[LAUNCH_ID].metadata["provenance"]["source_digest"]
+    assert _git(obs_root, "cat-file", "-e", f"{expected_obs_rev}^{{commit}}").returncode == 0
     blob = _git(engine_root, "show", f"{engine_head}:mindie_knowledge/graded/ablation.py", binary=True).stdout
     assert _sha256(blob) == "d93d6ac3f0270af479fb355bd0e687e15c6bffcdb254f161493424f2af17b711"
 

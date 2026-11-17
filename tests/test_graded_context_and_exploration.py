@@ -587,10 +587,10 @@ def test_auto_promotion_outside_benchmark_layout_and_l4_disable_isolation(tmp_pa
     monkeypatch.delenv("MINDIE_BENCH_WORKSPACE", raising=False)
     monkeypatch.delenv("MINDIE_DISABLE_RSI_EXPLORE", raising=False)
 
-    # First reuse query in a normal project without any sibling profile/ directory
+    # First reuse query in a normal project without MINDIE_BENCH_WORKSPACE must NEVER write into CWD/logs
     first = index.query("workflow alpha", conditions=conds, mode="reuse", token_budget=8000)
     assert first["mode"] == "reuse"
-    assert (logs_dir / "knowledge_query_audit.jsonl").is_file()
+    assert not (logs_dir / "knowledge_query_audit.jsonl").exists()
 
     # Duplicate candidate_hash across 3 run_ids must not promote
     ledger_file = logs_dir / "experiment-ledger.jsonl"
