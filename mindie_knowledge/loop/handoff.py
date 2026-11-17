@@ -200,7 +200,9 @@ def _probe(config, timeout, *, config_path=None):
         except OSError:
             return 'unknown'
         else:
-            return 'unknown'
+            owner = lock_held(consumer)
+            if owner is None:
+                return 'unknown'
     if owner is False:
         return "absent"
     try:
