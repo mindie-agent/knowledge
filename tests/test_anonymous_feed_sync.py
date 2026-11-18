@@ -52,10 +52,10 @@ def _remote_repo(tmp_path):
 def _wrapper(tmp_path, remote, log):
     real_git = shutil.which("git")
     assert real_git
-    script = tmp_path / "bin" / "git"
-    script.parent.mkdir(parents=True, exist_ok=True)
-    source = f"""#!{sys.executable}
-import json, os, sys
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    py_script = bin_dir / "git_shim.py"
+    source = f"""import json, os, subprocess, sys
 args = sys.argv[1:]
 with open({json.dumps(str(log))}, "a", encoding="utf-8") as stream:
     stream.write(json.dumps({{
@@ -68,9 +68,16 @@ with open({json.dumps(str(log))}, "a", encoding="utf-8") as stream:
         "git_ssl_ca_info": os.environ.get("GIT_SSL_CAINFO"),
     }}) + "\\n")
 args = [{json.dumps(Path(remote).as_uri())} if a == {json.dumps(CANONICAL)} else a for a in args]
-os.execv({json.dumps(real_git)}, [{json.dumps(real_git)}, *args])
+flags = {{"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}} if os.name == "nt" else {{}}
+raise SystemExit(subprocess.run([{json.dumps(real_git)}, *args], check=False, **flags).returncode)
 """
-    script.write_text(source, encoding="utf-8", newline="\n")
+    py_script.write_text(source, encoding="utf-8", newline="\n")
+    if os.name == "nt":
+        cmd = bin_dir / "git.cmd"
+        cmd.write_text(f'@echo off\n"{sys.executable}" "{py_script}" %*\n', encoding="utf-8", newline="\n")
+        return cmd
+    script = bin_dir / "git"
+    script.write_text(f"#!{sys.executable}\n" + source, encoding="utf-8", newline="\n")
     script.chmod(0o755)
     return script
 
@@ -95,13 +102,17 @@ def test_public_clone_and_fetch_succeed_anonymously_with_broken_credentials(tmp_
         '[credential]\n\thelper = "!exit 99"\n', encoding="utf-8", newline="\n",
     )
     gh_marker = tmp_path / "gh-was-called"
-    gh = wrapper.parent / "gh"
-    quoted = "'" + str(gh_marker).replace("'", "'\"'\"'") + "'"
-    gh.write_text(
-        "#!/bin/sh\n: > " + quoted + "\nexit 99\n",
-        encoding="utf-8", newline="\n",
-    )
-    gh.chmod(0o755)
+    if os.name == "nt":
+        gh = wrapper.parent / "gh.cmd"
+        gh.write_text(f'@echo off\ntype nul > "{gh_marker}"\nexit /b 99\n', encoding="utf-8", newline="\n")
+    else:
+        gh = wrapper.parent / "gh"
+        quoted = "'" + str(gh_marker).replace("'", "'\"'\"'") + "'"
+        gh.write_text(
+            "#!/bin/sh\n: > " + quoted + "\nexit 99\n",
+            encoding="utf-8", newline="\n",
+        )
+        gh.chmod(0o755)
     (tmp_path / "ca.pem").write_text("synthetic CA\n", encoding="utf-8")
 
     monkeypatch.setenv("MINDIE_GIT_BIN", str(wrapper))
