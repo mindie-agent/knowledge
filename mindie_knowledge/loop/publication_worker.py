@@ -1,7 +1,8 @@
 """[Role] Execute publication stages; Engine owns scheduling and authority.
 
-[Invariants] Frozen batches retain their original remote intent. Returned
-remote results survive local receipt or cleanup failures.
+[Invariants] Every stage re-reads ``allows_publication`` (never the capture
+gate). Frozen batches retain their original remote intent. Returned remote
+results survive local receipt or cleanup failures.
 [Timeouts & Locks] Engine operation scopes own cancellation; transports bound
 external calls. Receipt updates use the Store's bounded SQLite transactions.
 [Side-Effect Policy] Only an admitted batch can write remotely. Reconciliation
@@ -55,7 +56,7 @@ class PublicationWorker:
 
     def _submit(self, batch_row, cancel):
         settings = self.engine._settings()
-        if not settings.allows_capture():
+        if not settings.allows_publication():
             return
         if batch_row["generation"] != settings.generation:
             self.store.mark_batch(
@@ -143,8 +144,8 @@ class PublicationWorker:
         if self.engine.community is None:
             return  # stay unresolved; the dependency failure is reported on submit
         settings = self.engine._settings()
-        if not settings.allows_capture():
-            if settings.capture_block_kind() == 'fault':
+        if not settings.allows_publication():
+            if settings.publication_block_kind() == 'fault':
                 self.engine._fault('knowledge.publish', 'authorization', 'authority_unavailable')
             return  # A paused read establishes no new fact about the original write.
         try:
@@ -181,7 +182,7 @@ class PublicationWorker:
         from ..materials.publication import CleanupReceiptError
 
         settings = self.engine._settings()
-        if not settings.allows_capture():
+        if not settings.allows_publication():
             return
         rejection = None
         try:

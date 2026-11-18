@@ -39,11 +39,39 @@ def _sharing_enabled(settings):
     return publish.sharing_enabled(settings)
 
 
+def _publication_block(settings):
+    """Resolve the publication preflight through ``publish`` (test seam)."""
+    from . import publish
+    return publish.publication_block(settings)
+
+
 def _valid_sha(value) -> bool:
     """A present Git object name: 40-char SHA-1 or 64-char SHA-256 hex."""
     if not isinstance(value, str) or len(value) not in (40, 64):
         return False
     return all(c in "0123456789abcdefABCDEF" for c in value)
+
+
+def _blocked_result(ledger, batch_id, kind, reason):
+    """A blocked publication never erases an uncertain external write.
+
+    If this batch already has an ``unknown`` ledger row, a local-only/fault
+    preflight must preserve it untouched and report ``unknown``: ``disabled``
+    would falsely assert the remote write never happened.
+    """
+    unknown = [row for row in ledger.all_for_batch(batch_id)
+               if row["status"] == "unknown"]
+    if unknown:
+        row = unknown[-1]
+        return {"status": "unknown", "batch_id": batch_id,
+                "revision": row["revision"], "pr_url": row.get("pr_url"),
+                "head_sha": row.get("head_sha"),
+                "detail": f"publication is blocked ({reason}); the external "
+                          "write outcome remains unknown and no read was issued"}
+    return {"status": "disabled" if kind == "revoked" else "unavailable",
+            "batch_id": batch_id, "revision": None,
+            "pr_url": None, "head_sha": None, "detail": reason}
+
 
 def _receipt(
     batch: Mapping[str, Any],
@@ -494,10 +522,16 @@ def inspect_batch(batch_id: str, settings: dict, state_dir: Path, *, transport: 
     ledger = Ledger(state_dir)
     result = None
     try:
+        block = _publication_block(settings)
+        if block is not None:
+            kind, reason = block
+            result = _blocked_result(ledger, batch_id, kind, reason)
+            return result
         if not _sharing_enabled(settings):
-            result = {"status": "disabled", "batch_id": batch_id, "revision": None,
-                    "pr_url": None, "head_sha": None,
-                    "detail": "community sharing is disabled or unconfigured"}
+            result = _blocked_result(
+                ledger, batch_id, "revoked",
+                "community sharing is disabled or unconfigured",
+            )
             return result
         transport = transport or transport_from_settings(settings, state_dir)
         deadline = Deadline(settings.get("transaction_seconds"),
@@ -530,10 +564,16 @@ def reconcile_batch(batch_id: str, settings: dict, state_dir: Path, *, transport
     ledger = Ledger(state_dir, authority_guard=authority_guard)
     result = None
     try:
+        block = _publication_block(settings)
+        if block is not None:
+            kind, reason = block
+            result = _blocked_result(ledger, batch_id, kind, reason)
+            return result
         if not _sharing_enabled(settings):
-            result = {"status": "disabled", "batch_id": batch_id, "revision": None,
-                    "pr_url": None, "head_sha": None,
-                    "detail": "community sharing is disabled or unconfigured"}
+            result = _blocked_result(
+                ledger, batch_id, "revoked",
+                "community sharing is disabled or unconfigured",
+            )
             return result
         transport = transport or transport_from_settings(settings, state_dir)
         deadline = Deadline(settings.get("transaction_seconds"),

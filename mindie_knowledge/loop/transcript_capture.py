@@ -10,6 +10,8 @@
   before applying headers to `MaterialStore`.
 - Any failure after worker spawn without a `not_started` marker records
   `outcome_unknown` and never automatically replays the paid model call.
+- A queued capture stamped `local-only` stays `local-only` even when the user
+  upgrades to `contribute` before its material bytes are committed.
 - A non-returned attempt is finished as `failed` or `outcome_unknown`. An
   `unknown_failure` envelope is diagnosed from that status and its model-call
   bit, never as stage `unknown`. An `invoking` attempt is not left off the queue.
@@ -50,6 +52,18 @@ def pending_header(_text):
     return 'Task experience awaiting indexing', 'Reference material; indexing is pending.'
 
 
+def capture_origin_tier(store, capture_id, settings):
+    """Never upgrade a queued ``local-only`` capture to a later ``contribute``.
+
+    The tier is stamped when the Stop event is admitted. Processing may happen
+    after the user upgrades, so the queued marker and the live authority are
+    both honored: either one being ``local-only`` keeps the material local.
+    """
+    queued = store.origin_tier_of(capture_id, scope="capture")
+    live = settings.effective_tier()
+    return "local-only" if "local-only" in (queued, live) else live
+
+
 def capture(engine, row, text, region, *, cancel):
     from .engine import CursorConflict
     store, inc = engine.store, region.get('inc') or {}
@@ -65,6 +79,13 @@ def capture(engine, row, text, region, *, cancel):
                                  executable=engine.redactor_executable, key=store.redaction_key(),
                                  private_paths=(row['scope'], str(Path.home())), cancel=cancel)
     engine._revalidate(row)
+    # Provenance is stamped from the live tier at the moment material bytes are
+    # committed, but a queued local-only capture can never be upgraded. It
+    # lives in additive state metadata, never in the entry file.
+    live_settings = engine._settings()
+    authorization = dict(row)
+    authorization["origin_tier"] = capture_origin_tier(store, row["id"], live_settings)
+    authorization["consent_revision"] = (live_settings.consent or {}).get("choice_revision")
     with store._write_txn():
         engine._revalidate(row)
         reserved = region['reserve'](inc['start'], inc['end'], inc['digest'], status='succeeded')
@@ -72,7 +93,7 @@ def capture(engine, row, text, region, *, cancel):
             raise CursorConflict('cursor changed before material commit')
         doc = store.commit_material_increment(stream_key=stream_key, entry_id=entry_id,
                                                prepared=prepared, start=inc['start'], end=inc['end'],
-                                               source_identity=inc.get('identity', ''), authorization=row,
+                                               source_identity=inc.get('identity', ''), authorization=authorization,
                                                owner=store.opaque_for(row['root_session']), observed_stream=prior)
         store.finish_region(reserved, 'succeeded', 'redacted material committed; model calls=0')
         store.record_capture_material(row['id'], dict(

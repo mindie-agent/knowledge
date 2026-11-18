@@ -440,7 +440,8 @@ class Store(MaterialMixin, OutboxMixin, QueryMixin):
     # ---------------------------------------------------------------- drafts
     def add_capture(self, *, root_session, session, turn, transcript, summary,
                     generation=None, boundary=None, scope=None, namespace="",
-                    activation_epoch=None, kind="turn", event_key=None):
+                    activation_epoch=None, kind="turn", event_key=None,
+                    origin_tier=None, consent_revision=None):
         if kind not in _IDENTITY_KINDS:
             raise ValueError("invalid identity kind")
         if kind == "notification":
@@ -467,6 +468,13 @@ class Store(MaterialMixin, OutboxMixin, QueryMixin):
                 scope=scope, activation_epoch=activation_epoch,
                 kind=kind, event_key=event_key,
             )
+            if result.get("revoked") is None and origin_tier in self.ORIGIN_TIERS:
+                # Additive provenance in the generic state table; no capture
+                # column and no schema-format change.
+                self.stamp_origin_tier(
+                    result["id"], scope="capture", origin_tier=origin_tier,
+                    generation=generation, consent_revision=consent_revision,
+                )
         if result.get("revoked") is None:
             result.pop("revoked", None)
         return result

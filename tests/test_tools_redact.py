@@ -1,4 +1,4 @@
-"""tools/redact.py — ruleset r3, scanner and allowlist."""
+"""tools/redact.py — ruleset r4, scanner and allowlist."""
 
 from __future__ import annotations
 
@@ -38,12 +38,25 @@ def rules_hit(text: str, allow: redact.Allowlist | None = None) -> set[str]:
     return {f.rule for f in redact.scan_text(text, allow)}
 
 
+def redact_password_values(text: str) -> str:
+    """Apply the production bare marker to every password-value finding."""
+    spans = sorted({
+        (finding.start, finding.end)
+        for finding in redact.scan_text(text, include_overlaps=True)
+        if finding.rule in {"credential-password-assignment", "credential-cjk-assignment"}
+        and finding.start is not None and finding.end is not None
+    }, reverse=True)
+    for start, end in spans:
+        text = text[:start] + "[REDACTED]" + text[end:]
+    return text
+
+
 class ProfileTests(unittest.TestCase):
     def test_profile_is_declared_once_and_matches_schema_pattern(self):
         self.assertRegex(redact.REDACTION_PROFILE, r"^r[0-9]+$")
-        self.assertEqual(redact.REDACTION_PROFILE, "r3")
+        self.assertEqual(redact.REDACTION_PROFILE, "r4")
         proc = run_tool("redact", "--profile")
-        self.assertEqual(proc.stdout.strip(), "r3")
+        self.assertEqual(proc.stdout.strip(), "r4")
 
     def test_rule_ids_unique(self):
         self.assertEqual(len(redact.RULE_IDS), len(set(redact.RULE_IDS)))
@@ -147,6 +160,54 @@ class DetectionTests(unittest.TestCase):
         self.assertIn("container-name-flag", rules_hit("--name " + "vaws_" + "sess_" + "12"))
         self.assertIn("container-name-assignment", rules_hit("container: " + "vaws-" + "a3-01"))
         self.assertEqual(rules_hit("docker exec -it <container> bash"), set())
+
+
+class PasswordRedactionAccuracyTests(unittest.TestCase):
+    """r4 regressions: self-redaction, JSON escapes and ssh flag prefilters."""
+
+    def test_short_password_flag_rescan_has_zero_findings(self):
+        text = "ssh host --password xy"
+        findings = redact.scan_text(text)
+        self.assertEqual([(f.rule, f.value) for f in findings],
+                         [("credential-password-assignment", "xy")])
+        redacted = redact_password_values(text)
+        self.assertEqual(redacted, "ssh host --password [REDACTED]")
+        self.assertEqual(redact.scan_text(redacted), [],
+                         "redact(redact(text)) must not report its own marker")
+
+    def test_closed_redaction_markers_are_not_secrets(self):
+        for text in (
+            "--password [REDACTED]",
+            "--password=[REDACTED]",
+            "--password <REDACTED>",
+            "--password=[REDACTED_PASSWORD]",
+            "password: ***",
+            '{"password": "[REDACTED]"}',
+        ):
+            self.assertEqual(redact.scan_text(text), [], text)
+
+    def test_json_escaped_double_quote_secret_is_fully_redacted(self):
+        text = r'{"password": "a\"bc"}'
+        findings = redact.scan_text(text)
+        self.assertEqual([(f.rule, f.value) for f in findings],
+                         [("credential-password-assignment", r'a\"bc')],
+                         "the whole escaped secret must be one span")
+        redacted = redact_password_values(text)
+        self.assertEqual(redacted, '{"password": "[REDACTED]"}')
+        self.assertEqual(redact.scan_text(redacted), [])
+
+    def test_ssh_password_forms_pass_the_fast_prefilter(self):
+        for text, expected in (
+            ("deploy --ssh-password xy", "xy"),
+            ("deploy --ssh_password=xy", "xy"),
+            ("ssh_password: xy", "xy"),
+            ("sshpass -p xy ssh host", "xy"),
+        ):
+            findings = redact.scan_text(text)
+            self.assertEqual([f.value for f in findings], [expected], text)
+            redacted = redact_password_values(text)
+            self.assertNotIn("xy", redacted, text)
+            self.assertEqual(redact.scan_text(redacted), [], text)
 
 
 class FalsePositiveGuardTests(unittest.TestCase):
@@ -259,7 +320,7 @@ class CliTests(unittest.TestCase):
             proc = run_tool("redact", "--check", "--format", "json", str(path))
         self.assertEqual(proc.returncode, 1)
         payload = json.loads(proc.stdout)
-        self.assertEqual(payload["redaction_profile"], "r3")
+        self.assertEqual(payload["redaction_profile"], "r4")
         self.assertEqual({f["rule"] for f in payload["findings"]}, {"ipv4-address", "user-path"})
 
     def test_cli_findings_are_utf8_stdio(self):

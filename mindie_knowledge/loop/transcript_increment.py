@@ -142,12 +142,15 @@ class TranscriptMixin:
             return dict(status="skipped", reason="public transcript reference is required")
         # The native transcript is the only raw source; the queue stores no body.
         summary = ""
+        consent = settings.consent or {}
         captured = self.store.add_capture(
             root_session=root_hash, session=session_id, turn=turn_id,
             transcript=transcript_path, summary=summary or "",
             generation=settings.generation, boundary=boundary, scope=scope,
             namespace=namespace,
             activation_epoch=activation_epoch(lease["token"]),
+            origin_tier=settings.effective_tier(),
+            consent_revision=consent.get("choice_revision"),
         )
         if captured.get("revoked"):
             return captured

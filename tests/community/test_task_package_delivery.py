@@ -230,7 +230,9 @@ def test_replacement_cleanup_failure_does_not_block_or_repeat_new_send(tmp_path,
         errors, sent = [], []
         engine = Engine(store)
         monkeypatch.setattr(engine, '_settings', lambda: SimpleNamespace(
-            generation="g1", repository=REPO, branch="main", allows_capture=lambda: True))
+            generation="g1", repository=REPO, branch="main",
+            allows_capture=lambda: True, allows_publication=lambda: True,
+            publication_block_kind=lambda: None))
         monkeypatch.setattr(engine, '_error', errors.append)
         worker = PublicationWorker(engine)
         monkeypatch.setattr(worker, 'submit', lambda row: sent.append(row["revision"]))

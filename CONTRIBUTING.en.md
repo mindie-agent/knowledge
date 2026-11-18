@@ -15,7 +15,7 @@ Thank you for contributing to **MindIE Knowledge** (`mindie-agent/knowledge`, re
 3. **`SVC-LIFETIME` — Single Monotonic Deadlines, Symlink/Worktree Support & Cohesive Modules (`< 800` LOC)**:
    `Stop` capture admission enforces a single monotonic outer deadline without synchronous LLM calls or heavy transcript parsing, reporting degraded capture honestly when budget expires. Validate canonical `realpath` target boundaries rather than rejecting legitimate user/dotfile symlinks or linked Git worktree `.git` files. Keep core modules `< 800` lines with `[Role]` / `[Invariants]` / `[Timeouts & Locks]` / `[Side-Effect Policy]` headers, and keep cold `import mindie_knowledge` lazy (`< 20ms`).
 4. **`SVC-EXPORT` — Fail-Closed Redaction & Receipt Honesty**:
-   Every outbound export passes Gitleaks + `mindie_knowledge.redact` (`r3`). Distinguish `completed`, `failed`, and `unknown` (`outcome_unknown`) external effects: reconcile interrupted network writes via read-only queries without blind replay, always place `except TimeoutError: raise` before `except OSError:`, and preserve succeeded remote publication receipts if local receipt updates fail.
+   Every outbound export passes Gitleaks + `mindie_knowledge.redact` (`r4`). Distinguish `completed`, `failed`, and `unknown` (`outcome_unknown`) external effects: reconcile interrupted network writes via read-only queries without blind replay, always place `except TimeoutError: raise` before `except OSError:`, and preserve succeeded remote publication receipts if local receipt updates fail.
 
 ---
 

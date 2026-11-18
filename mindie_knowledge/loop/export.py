@@ -124,9 +124,13 @@ def build_batch(store, *, settings, revision_fn=None):
     for entry_id in continued:
         store.rebase_draft_on_published(entry_id)
     drafts = store.drafts_changed(generation=settings.generation, ready_only=True, include_content=False)
-    drafts = [doc for doc in drafts if store.summary_ready(doc)]
+    # Provenance boundary: material captured while `local-only` is never
+    # backfilled into a later `contribute` export.
+    drafts = [doc for doc in drafts if store.summary_ready(doc)
+              and store.publication_origin_eligible(doc["entry_id"])]
     votes = sorted((vote for vote in store.unbatched_votes(generation=settings.generation)
                     if not vote["entry_id"].startswith("unit-")
+                    and store.publication_origin_eligible(vote["entry_id"])
                     and vote["entry_id"] in store.material_feeds().get(target["feed_ident"], {}).get("entries", {})),
                    key=lambda vote: (vote["root_opaque"], vote["entry_id"], vote["revision"]))[:MAX_BATCH_VOTES]
     if not drafts and not votes:

@@ -150,21 +150,27 @@ def live_gate(settings: Mapping[str, Any]) -> None:
 
     ``settings['config_path']`` (private, never exported into receipts or logs)
     must be the actual absolute path of the shared community JSON. The file is
-    re-validated fresh and must still match this run's admitted settings:
-    enabled, nonempty string generation, repository, branch, fork, account and
-    project_roots. Any mismatch, absence or malformation stops the write.
+    re-validated fresh and must still grant **publication** authority: a saved
+    ``contribute`` consent (never ``local-only``), no ``local_only`` flag, and
+    a valid repository/fork/account. The admitted settings must still match
+    live generation, repository, branch, fork, account and project_roots. Any
+    mismatch, absence or malformation stops the write.
     """
-    require_sharing(settings)
     path = settings.get("config_path")
     if not isinstance(path, str) or not path or not Path(path).is_absolute():
+        require_sharing(settings)
         raise SharingDisabled("publication requires the actual absolute shared config path")
-    live = load_settings_file(Path(path))
     from mindie_knowledge.loop import settings as shared
+    # Parse first so damaged JSON keeps its precise configuration error, then
+    # apply the publication authority exactly as the engine's outbox does.
+    live = load_settings_file(Path(path))
     authority = shared.load(path)
-    if authority.capture_block_kind() == 'fault':
-        raise TransientError(authority.contribution_block_reason())
-    if authority.capture_block_kind() == 'revoked':
-        raise SharingDisabled(authority.contribution_block_reason())
+    block = authority.publication_block_kind()
+    if block == 'fault':
+        raise TransientError(authority.publication_block_reason())
+    if block == 'revoked':
+        raise SharingDisabled(authority.publication_block_reason())
+    require_sharing(settings)
     if live.get(shared.CONSENT_FIELD) != settings.get(shared.CONSENT_FIELD):
         raise TransientError('publication consent authority changed since admission; no write was started')
     live_generation = live.get("generation")
@@ -177,3 +183,22 @@ def live_gate(settings: Mapping[str, Any]) -> None:
         raise SharingDisabled("community settings generation changed; restart with fresh settings")
     if list(live.get("project_roots") or []) != list(settings.get("project_roots") or []):
         raise SharingDisabled("community project scope changed since this run started")
+
+
+def publication_block(settings: Mapping[str, Any]):
+    """Live publication authority for an early outbound preflight.
+
+    Returns ``None`` when publication is authorized, or ``(kind, reason)``
+    where kind is ``"revoked"``/``"fault"``. A caller that carries no
+    discoverable absolute authority path keeps the legacy closed-by-default
+    gate; :func:`live_gate` is still required immediately before each write.
+    """
+    path = settings.get("config_path")
+    if not isinstance(path, str) or not path or not Path(path).is_absolute():
+        return None
+    from mindie_knowledge.loop import settings as shared
+    authority = shared.load(path)
+    kind = authority.publication_block_kind()
+    if kind is None:
+        return None
+    return kind, authority.publication_block_reason()

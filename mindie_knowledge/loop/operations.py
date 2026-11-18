@@ -15,6 +15,9 @@ import threading
 
 
 CONTRIBUTION = frozenset({"capture", "index", "package", "publish"})
+# Outbound/outbox work only. Local capture and distillation stay admitted under
+# ``local-only`` consent while every publication operation is revoked.
+PUBLICATION = frozenset({"package", "publish"})
 
 
 class CombinedCancellation:
@@ -72,9 +75,23 @@ class OperationOwner:
                         (keep_generation is None or operation.generation != keep_generation)):
                     operation.cancel.set()
 
+    def revoke_publication(self):
+        """Cancel outbound work only, retaining local capture/distillation."""
+        with self._lock:
+            for operation in self._active:
+                if operation.kind in PUBLICATION:
+                    operation.cancel.set()
+
     def has_foreign_contribution(self, generation):
         with self._lock:
             return any(operation.kind in CONTRIBUTION and not operation.cancel.is_set()
+                       and (generation is None or operation.generation != generation)
+                       for operation in self._active)
+
+    def has_foreign_publication(self, generation):
+        """Whether an uncancelled outbound operation belongs to another grant."""
+        with self._lock:
+            return any(operation.kind in PUBLICATION and not operation.cancel.is_set()
                        and (generation is None or operation.generation != generation)
                        for operation in self._active)
 

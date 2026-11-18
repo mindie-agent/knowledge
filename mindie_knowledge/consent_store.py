@@ -33,7 +33,7 @@ import uuid
 from pathlib import Path
 
 SCHEMA = "mindie-consent/1"
-CHOICES = ("contribute", "read-only", "later", "disabled")
+CHOICES = ("contribute", "local-only", "read-only", "later", "disabled")
 REPORTING = ("enabled", "disabled", "later")
 STATES = ("ok", "missing", "unreadable", "corrupt")
 MAX_BYTES = 64 * 1024
@@ -323,7 +323,9 @@ def record_choice(path, choice):
     preserved and reported, never silently cleared.
     """
     if choice not in CHOICES:
-        raise ValueError("choice must be contribute, read-only, later or disabled")
+        raise ValueError(
+            "choice must be contribute, local-only, read-only, later or disabled"
+        )
 
     def mutate(document):
         if document.get("choice") == choice and document.get("choice_revision"):
@@ -341,7 +343,11 @@ def activate_reporting(path, *, config, roots=None,
 
     Startup never creates consent. Legacy choices require one explicit unified
     choice, including an unchanged ``contribute``, before uploading diagnostics.
-    Configuration is not worker readiness; failed activation remains visible.
+    ``local-only`` is an explicit off: a disabled policy is written and no
+    worker is started. A failed policy write is never reported as ``disabled``
+    over a previously enabled reporter; it stays ``configuration_unavailable``
+    with the writer fault visible in ``configuration``. Configuration is not
+    worker readiness; failed activation remains visible.
     """
     from mindie_diagnostics.integration import configure_reporting
 

@@ -120,7 +120,8 @@ def _world(tmp_path, *, enabled, consent):
             consent_path = tmp_path / "mindie-consent.json"
             consent_path.write_text(
                 json.dumps(
-                    {"schema": "mindie-consent/1", "choice": "contribute", "reporting": "later"}
+                    {"schema": "mindie-consent/1", "choice": "contribute", "reporting": "later",
+                    "choice_revision": "0123456789abcdef0123456789abcdef"}
                 )
                 + "\n",
                 encoding="utf-8",
@@ -137,7 +138,8 @@ def _world(tmp_path, *, enabled, consent):
         elif consent == "relative":
             consent_path.write_text(
                 json.dumps(
-                    {"schema": "mindie-consent/1", "choice": "contribute", "reporting": "later"}
+                    {"schema": "mindie-consent/1", "choice": "contribute", "reporting": "later",
+                    "choice_revision": "0123456789abcdef0123456789abcdef"}
                 )
                 + "\n"
             )
@@ -152,6 +154,7 @@ def _world(tmp_path, *, enabled, consent):
                         "reporting": reporting,
                         "choice_at": time.time(),
                         "reporting_at": time.time(),
+                        "choice_revision": "0123456789abcdef0123456789abcdef",
                     }
                 )
                 + "\n"

@@ -11,7 +11,7 @@ This guide explains how `mindie-knowledge` extracts visible conversation turns f
 ```mermaid
 flowchart LR
   Hook["1. Stop Hook Intake<br/>Records native transcript ref"] --> Parse["2. Deterministic Projection<br/>Keeps user & visible assistant text<br/>Strips tool traffic & reasoning"]
-  Parse --> Redact["3. Double Fail-Closed Redaction<br/>Gitleaks 8.30.1 + redact(r3)<br/>Tracks private keys across pages"]
+  Parse --> Redact["3. Double Fail-Closed Redaction<br/>Gitleaks 8.30.1 + redact(r4)<br/>Tracks private keys across pages"]
   Redact --> Split["4. Lossless 16 KiB Blocks<br/>Writes materials/*.md<br/>Commits cursor & pointers"]
   Split --> Index["5. LangMem Incremental Indexing<br/>Up to 8 blocks / 64 KiB per batch<br/>Commits model output before apply"]
 ```
@@ -32,7 +32,7 @@ flowchart LR
 
 Before any text is written to `materials/` or sent to the summary worker, it must pass two local deterministic scanners:
 1. **Pinned Gitleaks (`8.30.1`)**: Verified at installation time (capture never downloads a binary over the network);
-2. **Built-in `mindie_knowledge.redact` (`r3`)**: Redacts credentials, private key blocks (tracking unclosed key boundaries across page slices), internal IPv4/IPv6 addresses, numbered machine identifiers, `<user>@<host>` login targets, personal home paths, and internal ticket IDs.
+2. **Built-in `mindie_knowledge.redact` (`r4`)**: Redacts credentials, private key blocks (tracking unclosed key boundaries across page slices), internal IPv4/IPv6 addresses, numbered machine identifiers, `<user>@<host>` login targets, personal home paths, and internal ticket IDs.
 
 ### Why Models Never Rewrite Body Text
 - Sanitized public messages are split along UTF-8 character boundaries into lossless blocks of at most **16 KiB** (`mindie-material-block/1`) under `materials/`.

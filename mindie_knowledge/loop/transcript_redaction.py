@@ -112,6 +112,13 @@ class ScannerUnavailable(OSError):
 
 _KEY_BEGIN = re.compile(r"-----BEGIN ((?:[A-Z0-9]+ )*PRIVATE KEY)-----")
 
+# Password/passphrase rules mask only the secret value; the closed
+# ``[REDACTED]`` marker preserves the surrounding JSON/quotes/prose structure.
+_BARE_REDACTION_RULES = frozenset({
+    "credential-password-assignment",
+    "credential-cjk-assignment",
+})
+
 
 def _check_cancel(cancel):
     if cancel is not None and callable(getattr(cancel, "is_set", None)) and cancel.is_set():
@@ -283,7 +290,12 @@ def _replace_spans(text, spans, key):
         token = hmac.new(key, text[start:end].encode(), hashlib.sha256).hexdigest()[:12]
         # A fixed closed token cannot itself be mistaken for a credential
         # assignment by the final outbound scan. It contains no user input.
-        placeholder = '[REDACTED_SECRET]' if rule.startswith(('secret-', 'credential-')) else f"<redacted:{rule}:{token}>"
+        if rule in _BARE_REDACTION_RULES:
+            placeholder = '[REDACTED]'
+        elif rule.startswith(('secret-', 'credential-')):
+            placeholder = '[REDACTED_SECRET]'
+        else:
+            placeholder = f"<redacted:{rule}:{token}>"
         pieces.extend((text[cursor:start], placeholder))
         cursor = end
     pieces.append(text[cursor:])

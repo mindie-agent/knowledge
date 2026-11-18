@@ -11,7 +11,7 @@
 ```mermaid
 flowchart LR
   Hook["1. Stop Hook 准入<br/>仅记录原生 Transcript 引用"] --> Parse["2. 确定性公开消息提取<br/>保留用户与助手可见文本<br/>剔除工具调用与隐藏推理"]
-  Parse --> Redact["3. 双层闭锁式脱敏<br/>Gitleaks 8.30.1 + redact(r3)<br/>跨分页跟踪私钥块边界"]
+  Parse --> Redact["3. 双层闭锁式脱敏<br/>Gitleaks 8.30.1 + redact(r4)<br/>跨分页跟踪私钥块边界"]
   Redact --> Split["4. 16 KiB 无损分块落盘<br/>写入 materials/*.md<br/>事务提交游标与指针"]
   Split --> Index["5. LangMem 增量导航索引<br/>每批最多 8 块 / 64 KiB<br/>返回结果先落盘再应用"]
 ```
@@ -32,7 +32,7 @@ flowchart LR
 
 在任何文本写入本地 `materials/` 目录或送入摘要小模型之前，必须先通过两道本地确定性脱敏防线：
 1. **固定版本 Gitleaks（`8.30.1`）**：由安装器预先校验二进制与许可证（采集过程绝不联网下载扫描器）；
-2. **内置规则集 `mindie_knowledge.redact`（`r3`）**：覆盖凭据、私钥片段（支持跨分页跟踪未闭合私钥块）、内网 IPv4/IPv6、编号机器名、`<user>@<host>` 登录串、个人主目录路径与内部工单号。
+2. **内置规则集 `mindie_knowledge.redact`（`r4`）**：覆盖凭据、私钥片段（支持跨分页跟踪未闭合私钥块）、内网 IPv4/IPv6、编号机器名、`<user>@<host>` 登录串、个人主目录路径与内部工单号。
 
 ### 为什么坚持“零大模型改写正文”？
 - 脱敏后的公开消息按 UTF-8 字符边界无损切分为最多 **16 KiB** 的不可变分块文件（`mindie-material-block/1`），存放在本地 `materials/` 目录下。

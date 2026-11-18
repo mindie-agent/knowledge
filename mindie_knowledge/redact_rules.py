@@ -22,6 +22,12 @@ import re
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Iterator
 
+from .redact_password import (
+    PASSWORD_NEEDLES,
+    password_assignment_spans,
+    password_cjk_spans,
+)
+
 
 #: Version of the ruleset declared in this file. Bump when a rule tightens.
 #:
@@ -63,7 +69,12 @@ from typing import Callable, Iterable, Iterator
 #: r3 (correction): an IPv4 token cannot end inside a longer dotted number,
 #: such as the observed firmware version 7.7.0.10.220. Sentence-final periods
 #: remain valid address boundaries. A relaxation; keep r3.
-REDACTION_PROFILE = "r3"
+#: r4: passwords and passphrases are redacted at any non-empty value length,
+#: including assignment forms (``password``/``passphrase``/``ssh_password``,
+#: plain, quoted or JSON-escaped), ``--password`` argv forms, and Chinese
+#: prose (``密码是``/``密码：``/``密码 xxx``). This is a tightening: entries
+#: cleared under r3 must be re-scanned.
+REDACTION_PROFILE = "r4"
 
 
 # --------------------------------------------------------------------------- #
@@ -158,7 +169,7 @@ def _high_entropy_tokens(text: str) -> Iterator[tuple[int, int]]:
 
 
 _OCTET = r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)"
-_PLACEHOLDER_START = r"(?![<$\{\*%])"  # <host>, $USER, {name}, *, %USERNAME%
+_PLACEHOLDER_START = r"(?![<$\{\*%\[\]])"  # <host>, $USER, {name}, *, [REDACTED]
 
 _HOST_PREFIXES = (
     "node|host|server|srv|worker|master|machine|ecs|vm|pod|box|k8s|rack|blade|"
@@ -462,6 +473,13 @@ RULES: tuple[Rule, ...] = (
         any_lower_substrings=("bearer",),
     ),
     Rule(
+        id="credential-password-assignment",
+        description="password/passphrase assignment of any non-empty length",
+        hint="never submit passwords or passphrases, not even short or escaped ones",
+        finder=password_assignment_spans,
+        any_lower_substrings=PASSWORD_NEEDLES,
+    ),
+    Rule(
         id="credential-assignment",
         description="credential-shaped key/value assignment",
         hint="replace the value with a placeholder such as <token>",
@@ -480,10 +498,7 @@ RULES: tuple[Rule, ...] = (
         id="credential-cjk-assignment",
         description="credential provided with a Chinese password or token label",
         hint="never submit credentials from natural-language setup instructions",
-        pattern=re.compile(
-            r"(?:密码|口令|访问令牌|密钥)\s*(?:都是|均为|是|为|[:：=])\s*"
-            r"[\"'`]?([A-Za-z0-9!@#$%^&*()_+={}\[\]:;.,/?~-]{6,})"
-        ),
+        finder=password_cjk_spans,
         any_substrings=("密码", "口令", "访问令牌", "密钥"),
     ),
     # --- network identifiers ------------------------------------------------

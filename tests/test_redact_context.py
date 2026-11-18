@@ -1,4 +1,4 @@
-"""r2 false-positive relaxations: MindIE refs and Python numeric slices."""
+"""r2/r4 redaction context: refs, numeric slices, and the password gap."""
 
 from __future__ import annotations
 
@@ -12,6 +12,13 @@ from mindie_knowledge.loop.transcript_redaction import redact as public_redact, 
 
 def rules_hit(text: str) -> set[str]:
     return {f.rule for f in redact.scan_text(text)}
+
+
+def masked(text: str) -> tuple[str, set[str]]:
+    clean, rules = public_redact(
+        text, executable=install_scanner(), key=b"synthetic-redaction-test-key"
+    )
+    return clean, set(rules)
 
 
 PUBLIC_REF = "mindie://vllm-ascend/c3f998fdce9eecfb@937d2219f062ff5b"
@@ -262,6 +269,78 @@ class PackageVersionIpv4Tests(unittest.TestCase):
         self.assertIn("opencv-python-headless 5.0.0.93 requires", masked)
         self.assertNotIn("http://5.0.0.93/", masked)
         self.assertIn("<redacted:ipv4-address:", masked)
+
+
+class PasswordRedactionGapTests(unittest.TestCase):
+    """r4 closes short/escaped/Chinese passwords before the first durable write."""
+
+    def test_one_character_json_password_is_detected_and_masked(self):
+        text = '{"password": "x"}'
+        findings = redact.scan_text(text)
+        self.assertEqual([finding.rule for finding in findings],
+                         ["credential-password-assignment"])
+        self.assertEqual(findings[0].value, "x")
+        clean, rules = masked(text)
+        self.assertIn("credential-password-assignment", rules)
+        self.assertIn('"password": "[REDACTED]"', clean)
+        self.assertNotIn('"x"', clean)
+
+    def test_escaped_remote_auth_arguments_preserve_structure(self):
+        text = (
+            '{"tool": "remote_auth", "arguments": '
+            '"{\\"ssh_password\\":\\"p@ss\\",\\"user\\":\\"root\\"}"}'
+        )
+        clean, rules = masked(text)
+        self.assertIn("credential-password-assignment", rules)
+        self.assertNotIn("p@ss", clean)
+        self.assertIn('\\"user\\":\\"root\\"', clean)
+        self.assertIn("[REDACTED]", clean)
+
+    def test_cli_password_flag_forms(self):
+        for text, expected in (
+            ("ssh host --password secret", "ssh host --password [REDACTED]"),
+            ("deploy --password=Ab1!", "deploy --password=[REDACTED]"),
+            ("tool --passphrase 'two words'", "tool --passphrase '[REDACTED]'"),
+        ):
+            clean, rules = masked(text)
+            self.assertIn("credential-password-assignment", rules, text)
+            self.assertEqual(clean, expected)
+
+    def test_chinese_password_prose_masks_only_the_value(self):
+        text = "账号 root，密码是 Ab1!"
+        clean, rules = masked(text)
+        self.assertIn("credential-cjk-assignment", rules)
+        self.assertEqual(clean, "账号 root，密码是 [REDACTED]")
+        self.assertNotIn("Ab1!", clean)
+        for variant, secret in (
+            ("密码：Ab1!", "Ab1!"),
+            ("密码 Ab1!", "Ab1!"),
+            ("SSH 密码是 Ab1!", "Ab1!"),
+        ):
+            clean, rules = masked(variant)
+            self.assertIn("credential-cjk-assignment", rules, variant)
+            self.assertNotIn(secret, clean, variant)
+            self.assertIn("[REDACTED]", clean, variant)
+        # An ``@`` in the secret makes the merged span report username-at-host;
+        # the value is still fully masked and never persisted.
+        clean, _rules = masked("SSH 密码是 'p@ss word'")
+        self.assertNotIn("p@ss word", clean)
+        self.assertIn("<redacted:", clean)
+
+    def test_documentation_words_are_not_false_positives(self):
+        for text in (
+            "密码输入后继续",
+            "密码学基础",
+            "密码回退策略",
+            "the password field is required",
+            "passwords are hashed",
+            "password: <your-password>",
+            '{"password": ""}',
+        ):
+            self.assertEqual(redact.scan_text(text), [], text)
+            clean, rules = masked(text)
+            self.assertEqual(clean, text, text)
+            self.assertEqual(rules, set(), text)
 
 
 if __name__ == "__main__":

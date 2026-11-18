@@ -15,7 +15,7 @@
 3. **`SVC-LIFETIME` — 单调预算、软链/Worktree 友好与模块内聚（`< 800` 行）**：
    `Stop` 准入全流程服从单一单调外层截止时间（不做同步大模型调用或重型全文解析，预算不足时诚实返回降级原因）。文件读取校验 `realpath` 边界（兼容 dotfiles 软链与 Git 关联 Worktree `.git` 文件）。核心 Python 模块保持 `< 800` 行并具备 `[Role]` / `[Invariants]` / `[Timeouts & Locks]` / `[Side-Effect Policy]` 头部说明；顶层 `import mindie_knowledge` 保持懒加载（`< 20ms`）。
 4. **`SVC-EXPORT` — 双层闭锁脱敏与外部副作用诚实回执**：
-   外发前强制通过 Gitleaks + `mindie_knowledge.redact`（`r3`）双重扫描。严格区分 `completed`、`failed` 与外部写入结果未知（`unknown` / `outcome_unknown`）：遇到网络超时仅做只读对账，绝不盲目重放外部写或付费模型调用；`except OSError:` 前必须显式保留 `except TimeoutError: raise`；远端主操作成功后若本地回执写入失败，必须保留远端成功回执并附带告警。
+   外发前强制通过 Gitleaks + `mindie_knowledge.redact`（`r4`）双重扫描。严格区分 `completed`、`failed` 与外部写入结果未知（`unknown` / `outcome_unknown`）：遇到网络超时仅做只读对账，绝不盲目重放外部写或付费模型调用；`except OSError:` 前必须显式保留 `except TimeoutError: raise`；远端主操作成功后若本地回执写入失败，必须保留远端成功回执并附带告警。
 
 ---
 

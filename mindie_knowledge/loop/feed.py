@@ -8,7 +8,9 @@ never a silent fallback. Incomplete reads never imply deletion; an actual
 removal from a fully validated snapshot withdraws the unit.
 [Timeouts & Locks] One sync lock per feed; Git work honors the caller's deadline
 or the 300 s default. ``timeout=None`` is never forwarded to subprocesses.
-Candidate attempts use persisted bounded backoff.
+Candidate attempts use persisted bounded backoff. Canonical public HTTPS
+corpora read anonymously: no prompts, credential helpers, askpass or inherited
+auth headers, while proxy/CA environment settings survive.
 [Side-Effect Policy] Local Git cache, staging files, SQLite receipts and the
 selected store snapshot only. No model, network write or remote publication.
 """
@@ -38,12 +40,40 @@ from mindie_knowledge.git_layout import feed_repository_path, validate_git_direc
 
 
 def _feed_git_env():
-    """hooksPath and credential-helper suppression, plus Windows long paths."""
+    """hooksPath and credential/askpass suppression, plus Windows long paths."""
     return {
         **scoped_git_environment([("core.hooksPath", os.devnull), ("credential.helper", "")]),
         "GIT_TERMINAL_PROMPT": "0",
+        # Git consults these environment variables before ``-c core.askPass=``.
+        # An inherited GUI/helper askpass must never open a prompt on an
+        # anonymous public feed read, so pin both to the empty helper.
+        "GIT_ASKPASS": "",
+        "SSH_ASKPASS": "",
         "GCM_INTERACTIVE": "never",
     }
+
+
+# Public canonical corpora are anonymous reads. On these URLs a broken or
+# expired host credential helper (or an inherited auth header / askpass) must
+# never turn a public feed sync into an interactive prompt or a failed clone.
+_PUBLIC_CANONICAL_URL = re.compile(
+    r"https://github\.com/mindie-agent/knowledge(?:-[a-z0-9][a-z0-9-]*)?(?:\.git)?/?",
+    re.IGNORECASE,
+)
+_ANONYMOUS_PUBLIC_GIT_OPTIONS = (
+    "-c", "credential.helper=",
+    "-c", "core.askPass=",
+    "-c", "http.extraHeader=",
+)
+
+
+def anonymous_public_read(url):
+    """True for the canonical public HTTPS corpora that must read anonymously."""
+    return isinstance(url, str) and _PUBLIC_CANONICAL_URL.fullmatch(url) is not None
+
+
+def _public_read_options(url):
+    return _ANONYMOUS_PUBLIC_GIT_OPTIONS if anonymous_public_read(url) else ()
 
 # Repeated discovery failure defers ordinary calls for one hour, the
 # updater's established post-failure cadence; it is not a new quota.
@@ -66,6 +96,9 @@ def feed_ident(repository, ref, prefix=""):
 
 
 class Feed:
+    #: Default for tests/adapters that build a Feed without __init__.
+    url = ""
+
     def __init__(self, store, config):
         self.store = store
         self.config = dict(config)
@@ -98,7 +131,8 @@ class Feed:
         maximum = 1024 * 1024
         try:
             completed = run_argv(
-            [resolve_git(), "-C", git_path(self.repo), *args],
+                [resolve_git(), *_public_read_options(self.url),
+                 "-C", git_path(self.repo), *args],
                 timeout=remaining, max_output=maximum, input_bytes=b"",
                 env=_feed_git_env(), cancel=self._cancel,
             )
@@ -125,7 +159,8 @@ class Feed:
             url = Path(git_path(filesystem_path(url).resolve())).as_uri()
         try:
             completed = run_argv(
-                [resolve_git(), "clone", "--bare", "--quiet", "--depth=1", "--single-branch", "--no-tags",
+                [resolve_git(), *_public_read_options(self.url),
+                 "clone", "--bare", "--quiet", "--depth=1", "--single-branch", "--no-tags",
                  "--branch", self.ref, url, git_path(self.repo)],
                 timeout=remaining, max_output=65536, input_bytes=b"",
                 env=_feed_git_env(), cancel=self._cancel,

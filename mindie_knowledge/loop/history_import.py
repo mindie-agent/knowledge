@@ -46,13 +46,22 @@ def import_transcript(engine, *, session_id, token, source, source_session,
     lease = engine.admission.check(session_id, token)
     settings = engine._settings()
     scope = engine.admission.scope_root(session_id)
-    authorization = dict(session=session_id, generation=settings.generation, scope=scope,
-                         activation_epoch=activation_epoch(lease['token']))
+    consent = settings.consent or {}
+    authorization = dict(
+        session=session_id, generation=settings.generation, scope=scope,
+        activation_epoch=activation_epoch(lease['token']),
+        origin_tier=settings.effective_tier(),
+        consent_revision=consent.get('choice_revision'),
+    )
 
     def gate():
         current = engine._revalidate(authorization)
         if not scope or not current.in_scope(scope) or not current.in_scope(source_scope):
             raise HistoryImportError('source or current task is outside the contribution scope')
+        # Refresh additive provenance for every committed page: a downgrade to
+        # local-only mid-import must not let later pages look publishable.
+        authorization['origin_tier'] = current.effective_tier()
+        authorization['consent_revision'] = (current.consent or {}).get('choice_revision')
 
     gate()
     source = str(resolved_path(source))

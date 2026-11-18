@@ -1,8 +1,11 @@
 """[Role] Idempotent outbound Git + GitHub PR publication state machine (`submit_batch`).
 
 [Invariants]
-- Re-verifies `live_gate(settings)` before every local Git mutation and before
+- Re-verifies `live_gate(settings)` (publication authority, never the capture
+  gate) before constructing a transport and before every local Git mutation and
   every outbound network request (`fork`, `push`, `create_pr`, `update_pr`).
+- `local-only` or any non-`contribute` consent exits before validation,
+  transport construction, `gh`, fork checks, or outbox work.
 - Durable `Ledger` records `intent` and step receipts BEFORE each external write;
   interrupted or timed-out writes stay `unknown` and are resolved strictly by
   the read-only reconciliation in `community.reconcile`, never by blind re-pushes.
@@ -43,7 +46,7 @@ from .common import (
     sha256_text,
 )
 from .ledger import Ledger
-from .settings import live_gate, sharing_enabled
+from .settings import live_gate, publication_block, sharing_enabled
 from .transport import Transport, transport_from_settings
 from mindie_knowledge.publication_contract import ContractMismatch, data_format, read_git_contract
 from .reconcile import (
@@ -104,6 +107,15 @@ def submit_batch(
         _close_ledger(ledger, result)
 
 def _submit(batch, settings, state_dir, ledger, *, cancel, transport) -> dict[str, Any]:
+    # Publication authority, never capture authority: local-only must exit
+    # before validate_batch, transport construction, node calls, fork checks,
+    # or any Git/GitHub read or write -- even with stale fork/account fields.
+    block = publication_block(settings)
+    if block is not None:
+        kind, reason = block
+        return _receipt(batch if isinstance(batch, Mapping) else {},
+                        status="disabled" if kind == "revoked" else "unavailable",
+                        detail=reason)
     if not sharing_enabled(settings):
         return _receipt(batch if isinstance(batch, Mapping) else {}, status="disabled",
                         detail="community sharing is disabled or unconfigured")

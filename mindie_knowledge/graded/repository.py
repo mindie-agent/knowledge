@@ -134,12 +134,18 @@ class GradedRepository:
         self.store.db.execute("INSERT OR REPLACE INTO state VALUES(?,?)", (CATALOG_KEY, raw))
         self._catalog_raw, self._index = raw, index
 
-    def install(self, units, *, source_identity="local-reviewed-units", generation=None, admitted_ids=None):
+    def install(self, units, *, source_identity="local-reviewed-units", generation=None,
+                admitted_ids=None, origin_tier=None, consent_revision=None):
         """Install a reviewed local snapshot; publication needs its own grant.
 
         The optional generation is supplied only by the admitted, redacted distillation
         path. Merely importing Markdown never authorizes outbound publication.
+        ``origin_tier`` is additive catalog metadata (no unit bytes change); a
+        ``local-only`` marker permanently keeps a candidate out of every later
+        ``contribute`` export.
         """
+        if origin_tier is not None and origin_tier not in ("local-only", "contribute"):
+            raise ValueError("origin_tier must be local-only or contribute")
         incoming = RoutingIndex(units)
         with self.store._write_txn():
             catalog = self._catalog()
@@ -166,6 +172,15 @@ class GradedRepository:
                         and old_descriptor.get("path") == path)
                 meta = {key: old_descriptor[key] for key in ("generation", "base", "batched_blob")
                         if same and key in old_descriptor}
+                if old_descriptor.get("origin_tier") == "local-only":
+                    # Provenance never downgrades across merges/re-distillation.
+                    meta["origin_tier"] = "local-only"
+                elif origin_tier is not None:
+                    meta["origin_tier"] = origin_tier
+                elif same and "origin_tier" in old_descriptor:
+                    meta["origin_tier"] = old_descriptor["origin_tier"]
+                if consent_revision is not None:
+                    meta["consent_revision"] = consent_revision
                 if not same:
                     meta["base"] = public
                 if generation is not None:
@@ -173,9 +188,19 @@ class GradedRepository:
                 local.append(self._descriptor(unit, **meta))
             catalog.update(local=local, source_identity=source_identity)
             index = self._save(catalog)
+        admitted_set = None if admitted_ids is None else set(admitted_ids)
+        admitted_local_only = any(
+            item.get("origin_tier") == "local-only" for item in local
+            if admitted_set is None or item["id"] in admitted_set)
+        if admitted_local_only:
+            publication = "local_only"
+        elif generation is not None:
+            publication = "eligible_for_existing_outbox"
+        else:
+            publication = "not_requested"
         return {"status": "installed", "units": len(index.units), "generation": index.generation,
                 "build_elapsed_ms": index.build_elapsed_ms, "legacy_data_preserved": True,
-                "publication": "eligible_for_existing_outbox" if generation is not None else "not_requested"}
+                "publication": publication}
 
     def install_feed(self, units, *, feed_ident, source_revision, files=None, feedback=()):
         """Replace one fully validated feed snapshot without inventing revisions.
@@ -263,6 +288,20 @@ class GradedRepository:
             return [item for item in self._catalog()["local"]
                     if generation is not None and item.get("generation") == generation
                     and item.get("batched_blob") != item["blob"]]
+
+    def local_origin_tier(self, ident):
+        """The additive origin tier of one local candidate, or ``None``."""
+        with self.store.lock:
+            if not self.available():
+                return None
+            for item in self._catalog()["local"]:
+                if item["id"] == ident:
+                    return item.get("origin_tier")
+        return None
+
+    def publication_eligible(self, ident):
+        """A local ``local-only`` candidate is never eligible for export."""
+        return self.local_origin_tier(ident) != "local-only"
 
     def mark_batched(self, descriptors):
         catalog = self._catalog()
