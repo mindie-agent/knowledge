@@ -37,7 +37,8 @@ BASE_REQUEST_KEYS = {"schema_version", "session_digest", "task_state", "evidence
 OPTIONAL_REQUEST_KEYS = {"related_units", "history_scope", "history_scope_digest", "rejected_history"}
 DIGEST_KEYS = BASE_REQUEST_KEYS | OPTIONAL_REQUEST_KEYS
 COMPACT_UNIT_FIELDS = ("id", "revision", "tier", "category", "title", "conditions", "triggers",
-                       "body_excerpt", "body_complete", "topic", "target_signature")
+                       "body_excerpt", "body_complete", "topic", "target_signature",
+                       "origin_tier")
 
 
 def _evidence_strengths():
@@ -694,7 +695,8 @@ def validate_decision(decision, request, *, check_impact=True):
     return json.loads(canonical(decision))
 
 
-def apply_decision(store, request, decision, *, generation=None):
+def apply_decision(store, request, decision, *, generation=None, origin_tier=None,
+                   consent_revision=None):
     """Admit one distillation result locally; never initiate external publication."""
     _request(request)
     try:
@@ -706,13 +708,16 @@ def apply_decision(store, request, decision, *, generation=None):
         return {"status": "noop", "decision": decision, "publication": "not_requested"}
     from .publication import PublicationError, prepare_decision
     try:
-        return _apply_validated_decision(store, request, decision, prepare_decision, generation)
+        return _apply_validated_decision(store, request, decision, prepare_decision,
+                                         generation, origin_tier=origin_tier,
+                                         consent_revision=consent_revision)
     except PublicationError as exc:
         record_rejection(store, request, decision, exc)
         raise
 
 
-def _apply_validated_decision(store, request, decision, prepare_decision, generation):
+def _apply_validated_decision(store, request, decision, prepare_decision, generation,
+                              *, origin_tier=None, consent_revision=None):
     with store._write_txn():
         current = store.graded._load() if store.graded.available() else RoutingIndex([])
         plan = prepare_decision(decision, current, authorized_publication=False)
@@ -729,10 +734,17 @@ def _apply_validated_decision(store, request, decision, prepare_decision, genera
             merged[unit.id] = unit
             admitted.append(unit.id)
         if admitted:
-            installation = store.graded.install(merged.values(), source_identity="authorized-c6:" + request["session_digest"],
-                                                 generation=generation, admitted_ids=admitted)
+            installation = store.graded.install(merged.values(),
+                                                 source_identity="authorized-c6:" + request["session_digest"],
+                                                 generation=generation, admitted_ids=admitted,
+                                                 origin_tier=origin_tier,
+                                                 consent_revision=consent_revision)
         else:
             installation = {"status": "unchanged", "units": len(merged)}
+    if admitted:
+        publication = installation.get("publication", "not_requested")
+    else:
+        publication = "not_requested"
     return {"status": "applied" if admitted else "review_or_unchanged", "admitted_unit_ids": admitted,
             "installation": installation, "publication_plan": plan,
-            "publication": "eligible_for_existing_outbox" if generation is not None and admitted else "not_requested"}
+            "publication": publication}

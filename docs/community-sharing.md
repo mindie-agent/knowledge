@@ -24,7 +24,7 @@ This guide explains how `mindie_knowledge.community` handles **contributor-side 
 
 ### Trust-Boundary Re-Verification & Zero-Model Templates
 - Outbound batches use schema `mindie-contribution/1` and carry complete `tasks/<task-id>/index.md` manifests (`mindie-material-task/1` + `mindie-entry/3`) with their exact referenced `tasks/<task-id>/blocks/*.md` files (`mindie-material-block/1`), plus optional `feedback/*.json` files (`mindie-feedback/1`).
-- Before mutating Git state, `mindie_knowledge.community` re-verifies every file's SHA-256 digest and path allowlist, generates the commit message and PR title/body from deterministic templates (zero LLM involvement), and re-scans **all file contents, PR text, and commit messages** with `mindie_knowledge.redact` (`r3`).
+- Before mutating Git state, `mindie_knowledge.community` re-verifies every file's SHA-256 digest and path allowlist, generates the commit message and PR title/body from deterministic templates (zero LLM involvement), and re-scans **all file contents, PR text, and commit messages** with `mindie_knowledge.redact` (`r4`).
 
 ### PR State Transitions
 

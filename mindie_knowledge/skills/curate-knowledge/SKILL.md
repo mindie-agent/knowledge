@@ -26,8 +26,9 @@ This skill is for **explicit corpus curation and contribution-state maintenance 
 | Surface | Authority | Entrypoint | Out of Scope |
 | --- | --- | --- | --- |
 | Retrieval, explain, feedback, distill | Active `/mindie-agent` session lease (`entry_enabled = 1`) | `knowledge_query`, `knowledge_explain`, `knowledge_feedback`, `knowledge_distill` | Unactivated sessions, deterministic MCP tools |
-| Background capture | Active session lease + saved `contribute` consent + authorized `project_root` | `Stop` notification handoff (`capture_hook`) | Unactivated turns, out-of-scope directories |
-| Offline status & feed sync | Explicit maintenance CLI | `python -m mindie_knowledge status|sharing-status|sync --config <domain.json>` | Scraping unrelated transcripts or home directories |
+| Background capture & local distillation | Active session lease + saved `local-only` or `contribute` consent (with `choice_revision`) + authorized `project_root` | `Stop` notification handoff (`capture_hook`) | Unactivated turns, out-of-scope directories |
+| GitHub publication & diagnostics upload | Saved `contribute` consent only; `local-only` material is never exported | Existing outbox / reporter workers | `local-only` or `read-only` choices, stale fork/account fields |
+| Offline status & feed sync | Explicit maintenance CLI; public canonical corpora read via anonymous HTTPS | `python -m mindie_knowledge status|sharing-status|sync --config <domain.json>` | Scraping unrelated transcripts or home directories |
 
 ## 3. Operational Status & Recovery Semantics
 

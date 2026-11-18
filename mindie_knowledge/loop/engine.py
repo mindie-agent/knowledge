@@ -4,8 +4,11 @@
 - Re-verifies shared `CommunitySettings` (`mindie-community-config/1`), profile
   consent (`mindie-consent/1`), and session `Admission` lease before every capture,
   summary worker call, and outbound publication.
+- Capture uses `allows_capture` (`local-only` or `contribute`); publication uses
+  `allows_publication` (`contribute` only). A `local-only` tier keeps local
+  capture/distillation alive while cancelling unsent outbound work.
 - `GateFault` (damaged/unreadable authority) parks queued work with bounded
-  backoff; explicit user revocation (`enabled=False` or non-`contribute` consent)
+  backoff; explicit user revocation (`enabled=False` or non-capture consent)
   cancels unsent work; `unknown` external effects reconcile read-only without replay.
 - A summary tick that raises is categorized and delayed by
   `SUMMARY_FAULT_BACKOFF_SECONDS`; that thread keeps running.
@@ -102,7 +105,12 @@ class Engine(TranscriptMixin):
     def apply_distillation(self, request, decision):
         """Apply an explicit distillation organizer result; never infer completion from Stop."""
         from ..graded.distill import apply_decision
-        return apply_decision(self.store, request, decision)
+        settings = self._settings()
+        return apply_decision(
+            self.store, request, decision,
+            origin_tier=settings.effective_tier(),
+            consent_revision=(settings.consent or {}).get("choice_revision"),
+        )
     def distill_selected(self, inputs, *, session_digest, task_state, authorization=None, cancel=None,
                          related_refs=None, proposal=None, topic=None, target_signature=None):
         """Explicit verified milestone/completion; ordinary Stop does not select it."""
@@ -162,18 +170,24 @@ class Engine(TranscriptMixin):
         # forever and preventing an otherwise idle service from stopping.
         self.summary_thread.start()
     def revoke_stale(self):
-        """Restart/poll-edge safety net: when sharing is enabled, pending
-        batches of any other generation become disabled; when it is disabled,
-        every unsent batch and publishable vote is cancelled. Old material is
-        never backfilled into a new generation. An unknown authority state
-        (fault) is not a revocation: unsent work is held, not cancelled."""
+        """Restart/poll-edge safety net for outbound work.
+
+        Publication authority is independent from local capture: under
+        ``local-only`` the unsent batches and votes from an earlier
+        ``contribute`` tier are cancelled while local captures/distillation
+        keep working. An unknown authority state (fault) is not a revocation:
+        unsent work is held, not cancelled. Old material is never backfilled
+        into a new generation."""
         settings = self._settings()
-        block = settings.capture_block_kind()
+        block = settings.publication_block_kind()
         if block is None:
             self._cancel_unsent("settings generation changed; unsent work cancelled",
                                 keep_generation=settings.generation)
         elif block == "revoked":
-            self._cancel_unsent("sharing disabled; unsent work cancelled")
+            if settings.allows_capture():
+                self._cancel_publication("publication disabled; unsent work cancelled")
+            else:
+                self._cancel_unsent("sharing disabled; unsent work cancelled")
     def run(self):
         while not self.stop.is_set():
             if self._is_frozen():
@@ -242,6 +256,10 @@ class Engine(TranscriptMixin):
         """Revoke unsent work, retaining any already admitted current generation."""
         self.operations.revoke(keep_generation=keep_generation)
         self.store.revoke_unsent(reason, keep_generation=keep_generation)
+    def _cancel_publication(self, reason):
+        """Revoke outbound work only; local capture and distillation survive."""
+        self.operations.revoke_publication()
+        self.store.revoke_unsent(reason)
     def _submit(self, batch_row):
         return self.publisher.submit(batch_row)
     def _reconcile(self, batch_row):
@@ -274,8 +292,18 @@ class Engine(TranscriptMixin):
         while not self.stop.is_set():
             try:
                 settings = self._settings()
-                block = settings.capture_block_kind()
+                # Outbound scheduling follows publication authority only. A
+                # local-only tier still captures/distills, but never packages,
+                # reconciles, submits, or starts a `gh`/Git transport.
+                block = settings.publication_block_kind()
                 generation = settings.generation if block is None else None
+                local_only = block == "revoked" and settings.allows_capture()
+                # Track ``local-only`` separately from a true revocation. Both
+                # share the same publication block kind, but transitioning
+                # local-only -> read-only/disabled must cancel capture and
+                # workers, while local-only itself keeps local capture alive.
+                authority = (("local-only", settings.generation) if local_only
+                             else (block, generation))
                 if block == "fault":
                     # Unknown authority state: hold unsent/pending work in
                     # place — no cancel edge, no send, no flush. Work resumes
@@ -285,15 +313,20 @@ class Engine(TranscriptMixin):
                     if (self.settings_path is not None or self.store.outbox_pending(limit=1)
                             or self.store.outbox_unresolved(limit=1) or self.store.outbox_unavailable(limit=1)):
                         self._fault('knowledge.publish', 'authorization', 'authority_unavailable')
-                elif ((block, generation) != self._observed_authority
-                      or self.operations.has_foreign_contribution(generation)):
-                    self._cancel_unsent(
-                        "sharing disabled; unsent work cancelled" if block == "revoked" else
-                        "settings generation changed; unsent work cancelled",
-                        keep_generation=generation,
-                    )
+                elif ((authority != self._observed_authority)
+                      or self.operations.has_foreign_publication(generation)):
+                    if local_only:
+                        # local-only: explicit off for outbound writes, while
+                        # local capture/index work keeps its admission.
+                        self._cancel_publication("publication disabled; unsent work cancelled")
+                    else:
+                        self._cancel_unsent(
+                            "sharing disabled; unsent work cancelled" if block == "revoked" else
+                            "settings generation changed; unsent work cancelled",
+                            keep_generation=generation,
+                        )
                 if block != "fault":
-                    self._observed_authority = (block, generation)
+                    self._observed_authority = authority
                     self._clear_faults('knowledge.publish', {'authorization'})
                 # ReMe refreshes on query or an explicit index operation. The
                 # retired FTS scheduler must not import/index a whole library

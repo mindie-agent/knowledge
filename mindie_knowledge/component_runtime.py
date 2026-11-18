@@ -324,9 +324,13 @@ def _pre_build_prune(root: Path, generation: Path, budget: float,
         return
 
 
-def read_inventory(python, *, timeout=15, include_substrate=False):
+def read_inventory(python, *, timeout=15, include_substrate=False, allow_wheel_provenance=False):
     script = Path(__file__).with_name("runtime_inventory.py")
-    extra = ["--include-substrate"] if include_substrate else []
+    extra = []
+    if include_substrate:
+        extra.append("--include-substrate")
+    if allow_wheel_provenance:
+        extra.append("--allow-wheel-provenance")
     return json.loads(bounded_run([str(python), "-I", "-X", "utf8", str(script), *extra], "", timeout=timeout,
                                   max_output=64 * 1024))
 

@@ -1,7 +1,9 @@
 """[Role] Freeze authorized graded-unit candidates into the contribution outbox.
 
 [Invariants] Only the original sharing generation can export a candidate.
-Local import is not consent. Frozen files bind semantic revisions and exact Git
+Local import is not consent. A candidate stamped `origin_tier=local-only` is
+permanently ineligible for outbound export (no backfill after an upgrade).
+Frozen files bind semantic revisions and exact Git
 base hashes; publication continues through the existing unknown/reconcile ledger.
 [Timeouts & Locks] Uses the Store WAL transaction; no subprocess or model calls.
 [Side-Effect Policy] Writes local frozen candidate files and existing outbox,
@@ -24,6 +26,8 @@ from .maintenance import _payloads
 
 
 def _files(store, descriptors, generation, target):
+    descriptors = [item for item in descriptors
+                   if item.get("origin_tier") != "local-only"]
     files = []
     feed = store.graded._catalog()["feeds"].get(target["feed_ident"], {})
     public = {item["id"]: item for item in feed.get("units", [])}
@@ -77,9 +81,21 @@ def build_batch(store, *, settings, revision_fn=None):
     if previous is not None and previous["status"] not in REPLACEABLE_BATCH:
         return None
     with store._write_txn():
-        descriptors = store.graded.pending(generation)
-        target_units = {item["id"] for item in store.graded._catalog()["feeds"].get(target["feed_ident"], {}).get("units", [])}
-        votes = [row for row in store.unbatched_votes(generation=generation) if row["entry_id"] in target_units][:500]
+        # Provenance boundary: candidates distilled under `local-only` never
+        # become outbound bytes, even in a later `contribute` generation.
+        catalog = store.graded._catalog()
+        ineligible = {item["id"] for item in catalog.get("local", [])
+                      if item.get("origin_tier") == "local-only"}
+        descriptors = [item for item in store.graded.pending(generation)
+                       if item.get("origin_tier") != "local-only"]
+        target_units = {item["id"] for item in catalog.get("feeds", {}).get(
+            target["feed_ident"], {}).get("units", [])}
+        # One catalog parse per export, O(1) eligibility per vote row. The
+        # store lock is held here, so reloading the catalog per vote is both
+        # quadratic and unnecessary.
+        votes = [row for row in store.unbatched_votes(generation=generation)
+                 if row["entry_id"] in target_units
+                 and row["entry_id"] not in ineligible][:500]
         if not descriptors and not votes:
             return None
         files = _files(store, descriptors, generation, target)

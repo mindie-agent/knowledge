@@ -88,7 +88,7 @@ SESSIONS = {
     "codex": "task-core",
 }
 CONSENT_SCHEMA = "mindie-consent/1"
-CHOICES = ("contribute", "read-only", "later", "disabled")
+CHOICES = ("contribute", "local-only", "read-only", "later", "disabled")
 REPORTING = ("enabled", "disabled", "later")
 
 

@@ -22,15 +22,17 @@ treated as an explicit opt-out.
 
 The ``consent_config`` key (absolute path) names the
 profile-shared ``mindie-consent/1`` authority implemented by
-``mindie_knowledge.consent_store``. Every contribution gate additionally
-requires that document's saved ``contribute`` choice: a missing, unreadable,
-corrupt or non-contribute consent stops capture, model and write paths while
-read-only helpers keep working, and the fault is reported as itself — never as
-first-time onboarding. The field grants no permission by itself: an explicit
-``enabled=false`` here always wins. A missing field is an authority fault,
-not an implicit contribution choice or a request for new consent. The saved
-authority is independent of runtime installation and remains unchanged by
-runtime reload.
+``mindie_knowledge.consent_store``. Capture (``allows_capture``) requires an
+explicit saved ``local-only`` or ``contribute`` choice, while outbound
+publication (``allows_publication``) additionally requires ``contribute``, an
+explicit non-``local-only`` configuration and a usable publication target.
+A missing, unreadable, corrupt or undetermined consent stops the relevant
+paths while read-only helpers keep working, and the fault is reported as
+itself — never as first-time onboarding. The field grants no permission by
+itself: an explicit ``enabled=false`` here always wins. A missing field is an
+authority fault, not an implicit contribution choice or a request for new
+consent. The saved authority is independent of runtime installation and
+remains unchanged by runtime reload.
 """
 
 from __future__ import annotations
@@ -51,7 +53,11 @@ CONSENT_FIELD = "consent_config"
 DEFAULT_IDLE_SECONDS = 300
 MAX_IDLE_SECONDS = 86400
 _REPOSITORY_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+_ACCOUNT_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
 _BRANCH_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,120}")
+# Consent choices that authorize local capture. ``contribute`` additionally
+# authorizes outbound publication; ``local-only`` never does.
+CAPTURE_CHOICES = ("local-only", "contribute")
 
 
 def check_repository(value, name="repository"):
@@ -183,6 +189,21 @@ class CommunitySettings:
             self.branch = check_branch(str(self.raw.get("branch") or "main"))
         except ValueError:
             self.branch = "main"
+        # Publication extensions are read here so the two authorities share one
+        # read boundary. An absent/empty value means "same repository/ambient
+        # credentials"; a malformed value is a fault, never an implicit grant.
+        fork = self.raw.get("fork")
+        self.fork_error = bool(fork) and (
+            not isinstance(fork, str) or not _REPOSITORY_RE.fullmatch(fork)
+        )
+        self.fork = fork if isinstance(fork, str) and fork and not self.fork_error else None
+        account = self.raw.get("account")
+        self.account_error = bool(account) and (
+            not isinstance(account, str) or not _ACCOUNT_RE.fullmatch(account)
+        )
+        self.account = (account
+                        if isinstance(account, str) and account and not self.account_error
+                        else None)
         try:
             self.project_roots = [
                 Path(item) for item in normalized_roots(self.raw.get("project_roots", []))
@@ -225,27 +246,71 @@ class CommunitySettings:
             and bool(self.project_roots)
         )
 
-    def consent_allows_contribution(self):
-        """The consent half of the capture/contribution gate.
+    def consent_allows_capture(self):
+        """The saved authority permits local capture without publication.
 
-        The named authority must hold an explicit ``contribute`` choice.
-        A missing reference, unreadable/corrupt document or another saved
-        choice stops capture, model and outbound-write paths. Read-only
-        helpers keep working. The reference itself grants no permission,
-        and explicit enabled=false always wins.
+        A well-formed ``mindie-consent/1`` document must hold an explicit
+        ``local-only`` or ``contribute`` choice bound to a monotonic revision.
+        A missing reference, unreadable/corrupt document, an undetermined
+        choice, or a legacy choice without a revision stops capture. Local
+        retrieval keeps working.
+        """
+        return bool(
+            self.consent
+            and self.consent.get("state") == "ok"
+            and self.consent.get("choice") in CAPTURE_CHOICES
+            and bool(self.consent.get("choice_revision"))
+        )
+
+    def consent_allows_contribution(self):
+        """The consent half of the publication gate.
+
+        The named authority must hold an explicit ``contribute`` choice bound
+        to a monotonic revision. ``local-only``, ``read-only``, ``later`` and
+        ``disabled`` all close outbound writes. A missing reference,
+        unreadable/corrupt document, an undetermined choice, or a legacy
+        revisionless document is a fault, never a fresh onboarding prompt.
         """
         return bool(self.consent and
             self.consent.get("state") == "ok"
             and self.consent.get("choice") == "contribute"
+            and bool(self.consent.get("choice_revision"))
         )
 
     def allows_capture(self):
-        """The whole capture/extraction/sanitization chain needs an explicit,
-        well-formed on: schema, enabled, opaque generation, a finite positive
-        authorization boundary and at least one absolute canonical root plus
-        a named consent authority holding a saved ``contribute``
-        choice. Any malformed enabled config authorizes nothing."""
-        return self._base_allows_capture() and self.consent_allows_contribution()
+        """Local capture/distillation: enabled settings + a capture choice."""
+        return self._base_allows_capture() and self.consent_allows_capture()
+
+    def allows_publication(self):
+        """Outbound Git/GitHub writes, never implied by local capture.
+
+        Publication needs the same enabled/canonical settings boundary, an
+        explicit ``contribute`` consent, an explicit non-``local-only``
+        configuration, a valid repository, and fork/account values that are
+        either absent (same-repository publication with ambient credentials)
+        or well formed.
+        """
+        return (
+            self._base_allows_capture()
+            and not bool(self.raw.get("local_only"))
+            and self.consent_allows_contribution()
+            and self.repository is not None
+            and not self.fork_error
+            and not self.account_error
+        )
+
+    def effective_tier(self):
+        """The effective capability: ``contribute``, ``local-only`` or ``read-only``.
+
+        Publication-capable settings report ``contribute``; capture-capable but
+        publication-closed settings (``local-only`` consent/flag or a faulty
+        publication target) report ``local-only``; everything else is read-only.
+        """
+        if self.allows_publication():
+            return "contribute"
+        if self.allows_capture():
+            return "local-only"
+        return "read-only"
 
     def contribution_block_reason(self):
         """Short static reason the capture/model/write paths are closed."""
@@ -261,10 +326,43 @@ class CommunitySettings:
             return f"the saved consent authority is {state}; contribution is stopped"
         if consent.get("choice") is None:
             return "the consent authority holds no saved choice; contribution is stopped"
+        if not consent.get("choice_revision"):
+            return "the saved consent choice has no revision; contribution is stopped"
         return "the saved consent choice does not allow contribution"
 
+    def publication_block_reason(self):
+        """Short static reason outbound publication is closed."""
+        if self.allows_publication():
+            return ""
+        if not self._base_allows_capture():
+            if self.state == "disabled":
+                return "community publication is disabled or unconfigured"
+            return f"the community settings authority is {self.state}; publication is stopped"
+        if self.raw.get("local_only"):
+            return "community settings declare local-only capture; publication is off"
+        consent = self.consent or {}
+        state = consent.get("state")
+        if state != "ok":
+            return f"the saved consent authority is {state}; publication is stopped"
+        choice = consent.get("choice")
+        if choice == "local-only":
+            return "the saved consent choice is local-only; publication is off"
+        if choice is None:
+            return "the consent authority holds no saved choice; publication is stopped"
+        if choice != "contribute":
+            return "the saved consent choice does not allow publication"
+        # A saved contribute choice with an unusable target is a configuration
+        # fault, never an explicit revocation.
+        if self.repository is None:
+            return "publication has no valid target repository; publication is stopped"
+        if self.fork_error:
+            return "the configured publication fork is malformed; publication is stopped"
+        if self.account_error:
+            return "the configured publication account is malformed; publication is stopped"
+        return "publication is not authorized"
+
     def capture_block_kind(self):
-        """None when the gate is open, else ``"revoked"`` or ``"fault"``.
+        """None when capture is open, else ``"revoked"`` or ``"fault"``.
 
         ``revoked`` is an explicit saved off, and only that: a VALID config
         holding the boolean ``enabled=false``, or a valid consent document
@@ -293,6 +391,33 @@ class CommunitySettings:
         # state "disabled" is only ever assigned to a valid document holding
         # the explicit boolean false (see __init__); anything else is a fault.
         return "revoked" if self.state == "disabled" else "fault"
+
+    def publication_block_kind(self):
+        """None when publication is open, else ``"revoked"`` or ``"fault"``.
+
+        ``revoked`` is an explicit saved off for outbound writes:
+        ``local-only`` consent, an explicit ``local_only`` settings flag, or a
+        valid config holding the boolean ``enabled=false``. It is not a fault,
+        so dashboards keep the user's tier visible and queued work is
+        cancelled without reporting an incident.
+
+        ``fault`` is every authority or publication-target problem that
+        prevents proving permission: missing/corrupt settings or consent, an
+        undetermined choice, or a saved ``contribute`` choice whose target
+        repository/fork/account is missing or malformed.
+        """
+        if self.allows_publication():
+            return None
+        if not self._base_allows_capture():
+            return "revoked" if self.state == "disabled" else "fault"
+        if bool(self.raw.get("local_only")):
+            return "revoked"
+        consent = self.consent or {}
+        if consent.get("state") == "ok" and consent.get("choice") in (
+            "local-only", "read-only", "later", "disabled"
+        ):
+            return "revoked"
+        return "fault"
 
     def in_scope(self, candidate):
         """Canonical containment check against the configured project roots.
@@ -331,11 +456,14 @@ class CommunitySettings:
         return data
 
     def public_status(self):
-        """Secret-free operational status."""
+        """Secret-free operational status, including both authority gates."""
         return dict(
             configured=self.schema_ok,
             state=self.state,
             enabled=self.enabled,
+            effective_tier=self.effective_tier(),
+            allows_capture=self.allows_capture(),
+            allows_publication=self.allows_publication(),
             generation_set=self.generation is not None,
             repository=self.repository,
             branch=self.branch,

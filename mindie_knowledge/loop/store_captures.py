@@ -41,6 +41,82 @@ from .store_schema import (
 
 class MaterialMixin:
 
+    #: Origin tier values that are meaningful for publication provenance.
+    #: ``local-only`` material is permanently ineligible for outbound export,
+    #: even after a later switch to ``contribute``.
+    ORIGIN_TIERS = ("local-only", "contribute")
+
+    @staticmethod
+    def _origin_key(scope, identity):
+        if scope not in ("capture", "entry"):
+            raise ValueError("origin scope must be capture or entry")
+        if not isinstance(identity, str) or not identity or len(identity) > 256:
+            raise ValueError("origin identity must be nonempty bounded text")
+        return f"origin-tier:{scope}:{identity}"
+
+    def stamp_origin_tier(self, identity, *, scope="entry", origin_tier, generation=None,
+                          consent_revision=None):
+        """Record additive capture/material provenance in the generic state table.
+
+        No schema column or material-document field is added: this preserves
+        ``state-v4.sqlite3``/``FORMAT = 1`` and every existing reader. The
+        marker is what keeps ``local-only`` bytes from being backfilled into a
+        later ``contribute`` export.
+        """
+        if origin_tier not in self.ORIGIN_TIERS:
+            raise ValueError("origin_tier must be local-only or contribute")
+        if consent_revision is not None and not isinstance(consent_revision, str):
+            raise ValueError("consent_revision must be text or null")
+        key = self._origin_key(scope, identity)
+        record = dict(origin_tier=origin_tier, generation=generation,
+                      consent_revision=consent_revision, stamped=time.time())
+        with self._write_txn():
+            prior = self.db.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
+            if origin_tier == "contribute" and prior is not None:
+                # Provenance never downgrades: once local-only, the bytes stay
+                # ineligible for every later contribute export.
+                try:
+                    saved = json.loads(prior[0]).get("origin_tier")
+                except (TypeError, ValueError, AttributeError):
+                    saved = None
+                if saved == "local-only":
+                    return
+            self.db.execute("INSERT OR REPLACE INTO state VALUES(?,?)",
+                            (key, canonical(record)))
+
+    def origin_tier_of(self, identity, *, scope="entry"):
+        """The saved origin tier (``None`` for unmarked/legacy material)."""
+        key = self._origin_key(scope, identity)
+        with self.lock:
+            row = self.db.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
+        if row is None:
+            return None
+        try:
+            record = json.loads(row[0])
+        except (TypeError, ValueError):
+            return None
+        return record.get("origin_tier") if isinstance(record, dict) else None
+
+    def publication_origin_eligible(self, identity, *, scope="entry"):
+        """True unless the item is stamped ``local-only``.
+
+        Unmarked legacy material keeps its existing behaviour; the explicit
+        local-only marker is an absolute export boundary.
+        """
+        return self.origin_tier_of(identity, scope=scope) != "local-only"
+
+    def _stamp_authorization_origin(self, identity, authorization, *, scope="entry"):
+        if not isinstance(authorization, dict):
+            return
+        tier = authorization.get("origin_tier")
+        if tier not in self.ORIGIN_TIERS:
+            return
+        self.stamp_origin_tier(
+            identity, scope=scope, origin_tier=tier,
+            generation=authorization.get("generation"),
+            consent_revision=authorization.get("consent_revision"),
+        )
+
     def transcript_task(self, task_key):
         with self.lock:
             row = self.db.execute(f"SELECT t.*, {SUMMARY_STATUS_SQL} AS visible_status "
@@ -105,6 +181,7 @@ class MaterialMixin:
                                                  revision=revision, promote=False)
             doc = result['entry']
             self._bind_material_draft(doc, generation=authorization['generation'], owner=owner)
+            self._stamp_authorization_origin(entry_id, authorization)
             now = time.time()
             self.db.execute('INSERT OR REPLACE INTO material_streams VALUES(?,?,?,?,?,?,?,?)',
                             (stream_key, entry_id, end, source_identity,

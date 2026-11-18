@@ -149,34 +149,32 @@ def test_rsi_modules_delegate_to_mindie_harness_when_installed_and_fallback_when
     assert broken_proc.returncode != 0
     assert "non_existent_broken_dep_xyz" in broken_proc.stderr
 
-    # Fallback mode when mindie_harness is absent.
-    env_fallback = _isolated_env(tmp_path / "fallback")
-    env_fallback["PYTHONPATH"] = repo_root
-    fallback_proc = subprocess.run(
+    # Shadow RSI fallback bodies are retired; missing mindie_harness fails fast via ModuleNotFoundError.
+    env_missing = _isolated_env(tmp_path / "missing")
+    env_missing["PYTHONPATH"] = repo_root
+    missing_proc = subprocess.run(
         [
             sys.executable,
             "-c",
             (
-                "import json\n"
-                "from mindie_knowledge.graded import rsi_loop, experiment_ledger, rsi_crossover\n"
-                "print(json.dumps([\n"
-                "  rsi_loop.USING_HARNESS_RSI,\n"
-                "  callable(rsi_loop.main),\n"
-                "  experiment_ledger.USING_HARNESS_RSI,\n"
-                "  callable(experiment_ledger.append),\n"
-                "  rsi_crossover.USING_HARNESS_RSI,\n"
-                "  callable(rsi_crossover.suggest_orthogonal_crossovers),\n"
-                "]))\n"
+                "import importlib.abc, sys\n"
+                "class _BlockHarness(importlib.abc.MetaPathFinder):\n"
+                "    def find_spec(self, fullname, path, target=None):\n"
+                "        if fullname == 'mindie_harness' or fullname.startswith('mindie_harness.'):\n"
+                "            raise ModuleNotFoundError(\"No module named 'mindie_harness'\", name='mindie_harness')\n"
+                "        return None\n"
+                "sys.meta_path.insert(0, _BlockHarness())\n"
+                "import mindie_knowledge.graded.rsi_loop\n"
             ),
         ],
         cwd=tmp_path,
-        env=env_fallback,
+        env=env_missing,
         capture_output=True,
         text=True,
         timeout=10,
-        check=True,
     )
-    assert json.loads(fallback_proc.stdout.strip()) == [False, True, False, True, False, True]
+    assert missing_proc.returncode != 0
+    assert "mindie_harness" in missing_proc.stderr
 
 
 def test_runtime_inventory_v1_preserved_and_v2_substrate_wheel_supported(tmp_path: Path) -> None:

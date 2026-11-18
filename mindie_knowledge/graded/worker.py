@@ -3,6 +3,8 @@
 [Invariants] One admitted paid call per evidence request. Returned decisions
 resume local application; failed or uncertain calls are never replayed here.
 Related bodies are complete or explicitly omitted, never silently truncated.
+A local-only related unit or a completion-time downgrade keeps the result
+local-only; provenance never upgrades during apply.
 [Timeouts & Locks] Existing summary_budget bounds identity/model subprocesses;
 Gitleaks uses its 30s budget outside SQLite transactions. Writes use Store locks.
 [Side-Effect Policy] Runs the configured worker; applies local graded units and
@@ -32,13 +34,45 @@ from .units import UNIT_ID, canonical, locator_parts
 RELATED_BODY_BUDGET_BYTES = 16384
 
 
-def _compact_related(unit, *, body_complete):
-    return {"id": unit.id, "revision": unit.revision, "tier": unit.metadata["tier"],
-            "category": unit.metadata["category"], "title": unit.metadata["title"],
-            "conditions": unit.metadata["conditions"], "triggers": unit.metadata["triggers"],
-            "body_excerpt": unit.body if body_complete else "", "body_complete": body_complete,
-            "topic": unit.metadata.get("topic", unit.metadata["domain_path"]),
-            "target_signature": unit.metadata.get("target_signature", unit.id)}
+def _compact_related(unit, *, body_complete, origin_tier=None):
+    compact = {"id": unit.id, "revision": unit.revision, "tier": unit.metadata["tier"],
+               "category": unit.metadata["category"], "title": unit.metadata["title"],
+               "conditions": unit.metadata["conditions"], "triggers": unit.metadata["triggers"],
+               "body_excerpt": unit.body if body_complete else "", "body_complete": body_complete,
+               "topic": unit.metadata.get("topic", unit.metadata["domain_path"]),
+               "target_signature": unit.metadata.get("target_signature", unit.id)}
+    if origin_tier == "local-only":
+        # Only the sticky boundary participates in the request identity; a
+        # contribute marker must not change an already-admitted request digest.
+        compact["origin_tier"] = "local-only"
+    return compact
+
+
+def _provenance_tier(store, request, inputs, authorization, settings):
+    """The strictest origin bound to this distillation.
+
+    ``local-only`` is sticky: a job admitted under ``contribute`` that sees a
+    local-only related unit or input material, or completes after a downgrade,
+    must still stamp local-only. The live authority is checked at completion,
+    not only at admission.
+    """
+    tier = (authorization or {}).get("origin_tier")
+    live = settings.effective_tier() if settings is not None else None
+    if tier == "local-only" or live == "local-only":
+        return "local-only"
+    for item in request.get("related_units") or ():
+        if not isinstance(item, dict):
+            continue
+        if item.get("origin_tier") == "local-only":
+            return "local-only"
+        ident = item.get("id")
+        if isinstance(ident, str) and store.graded.local_origin_tier(ident) == "local-only":
+            return "local-only"
+    for collection in (inputs, request.get("sanitized_inputs")):
+        for item in collection or ():
+            if isinstance(item, dict) and item.get("origin_tier") == "local-only":
+                return "local-only"
+    return tier
 
 
 def _matching_related_units(store, inputs, related_refs):
@@ -87,7 +121,10 @@ def _matching_related_units(store, inputs, related_refs):
     for unit in ordered[:3]:
         size = len(unit.body.encode("utf-8"))
         complete = size <= RELATED_BODY_BUDGET_BYTES
-        related.append(_compact_related(unit, body_complete=complete))
+        related.append(_compact_related(
+            unit, body_complete=complete,
+            origin_tier=store.graded.local_origin_tier(unit.id),
+        ))
     return related or None
 
 
@@ -178,7 +215,10 @@ def run(engine, inputs, *, session_digest, task_state, authorization=None, cance
     def revalidate():
         if authorization is not None:
             engine._gate_live()
-            engine._revalidate(authorization)
+            return engine._revalidate(authorization)
+        # No admitted row: still honor the live local-only authority when the
+        # result is applied, so a downgrade cannot publish an unmarked unit.
+        return engine._settings()
 
     revalidate()
     private_paths = ((authorization["scope"],) if authorization else ()) + (str(Path.home()),)
@@ -198,9 +238,13 @@ def run(engine, inputs, *, session_digest, task_state, authorization=None, cance
         receipt_key = "graded:applied:" + request["request_digest"]
         try:
             with store._write_txn():
-                revalidate()
-                result = apply_decision(store, request, decision,
-                                        generation=authorization.get("generation") if authorization else None)
+                live = revalidate()
+                result = apply_decision(
+                    store, request, decision,
+                    generation=authorization.get("generation") if authorization else None,
+                    origin_tier=_provenance_tier(store, request, inputs, authorization, live),
+                    consent_revision=authorization.get("consent_revision") if authorization else None,
+                )
                 receipt = {key: value for key, value in result.items() if key != "publication_plan"}
                 receipt.update(attempt_id=None, model_calls=0, usage=0,
                                billing_status="not_applicable", model_execution="foreground_proposal",
@@ -281,9 +325,13 @@ def run(engine, inputs, *, session_digest, task_state, authorization=None, cance
     try:
         decision = _validated_decision(response["result"], request, engine, store, private_paths, cancel)
         with store._write_txn():
-            revalidate()
-            result = apply_decision(store, request, decision,
-                                    generation=authorization.get("generation") if authorization else None)
+            live = revalidate()
+            result = apply_decision(
+                store, request, decision,
+                generation=authorization.get("generation") if authorization else None,
+                origin_tier=_provenance_tier(store, request, inputs, authorization, live),
+                consent_revision=authorization.get("consent_revision") if authorization else None,
+            )
             receipt = {key: value for key, value in result.items() if key != "publication_plan"}
             receipt.update(attempt_id=attempt["attempt_id"], model_calls=response["model_calls"],
                            usage=response["usage"], billing_status=response["billing_status"])

@@ -24,7 +24,7 @@
 
 ### 双重校验与纯模板 PR 生成
 - 每个外发批次遵循 `mindie-contribution/1` Schema，包含完整的 `tasks/<task-id>/index.md`（`mindie-material-task/1` + `mindie-entry/3`）及其引用的 `tasks/<task-id>/blocks/*.md`（`mindie-material-block/1`），以及可选的 `feedback/*.json`（`mindie-feedback/1`）。
-- 在真正执行 Git 写入前，`mindie_knowledge.community` 会在信任边界再次校验所有文件的 SHA-256 摘要、路径白名单，并对**文件内容、确定性生成的 PR 标题/正文以及 Commit Message** 全部重跑一次 `mindie_knowledge.redact`（`r3`）隐私扫描。
+- 在真正执行 Git 写入前，`mindie_knowledge.community` 会在信任边界再次校验所有文件的 SHA-256 摘要、路径白名单，并对**文件内容、确定性生成的 PR 标题/正文以及 Commit Message** 全部重跑一次 `mindie_knowledge.redact`（`r4`）隐私扫描。
 
 ### 幂等提交与 PR 状态机
 

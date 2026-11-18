@@ -360,7 +360,9 @@ class Service:
             if not settings.allows_capture() or not scope or not settings.in_scope(scope):
                 raise ValueError("selected evidence is outside current contribution authorization")
             authorization = dict(session=session, generation=settings.generation, scope=scope,
-                                 activation_epoch=activation_epoch(lease["token"]))
+                                 activation_epoch=activation_epoch(lease["token"]),
+                                 origin_tier=settings.effective_tier(),
+                                 consent_revision=(settings.consent or {}).get("choice_revision"))
             proposal = args.get("proposal")
             if isinstance(proposal, dict) and proposal.get("session_digest") in (None, ""):
                 proposal = {**proposal, "session_digest": session_key(session)}
@@ -414,13 +416,15 @@ class Service:
             raise ValueError("explore action must be stagnation, context or evaluate")
         if method == "feedback":
             settings = self.engine._settings()
-            if settings.capture_block_kind() == 'fault':
+            if settings.publication_block_kind() == 'fault':
                 self.engine._fault('knowledge.feedback', 'authorization', 'authority_unavailable')
-                raise RuntimeError(settings.contribution_block_reason())
+                raise RuntimeError(settings.publication_block_reason())
             root_session = (lease or {}).get("root_session") or session
             scope = self.admission.scope_root(session) if self.admission else None
+            # A vote is publishable only under publication authority. Local-only
+            # feedback stays local (publishable=0) and is never backfilled.
             publishable = bool(
-                settings.allows_capture() and scope and settings.in_scope(scope)
+                settings.allows_publication() and scope and settings.in_scope(scope)
             )
             vote = self.store.record_vote(
                 root_hash=session_key(root_session), ref=args["ref"],

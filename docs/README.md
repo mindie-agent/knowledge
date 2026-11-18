@@ -25,7 +25,7 @@ flowchart LR
 | 中文文档 | English | 核心内容导读 |
 | --- | --- | --- |
 | **[领域知识闭环总览](mindie-loop.zh.md)** | **[MindIE Domain Loop](mindie-loop.md)** | **必读总纲**：串联授权门禁、双层存储、公开对话采集、分层路由与 BM25 检索、有用性反馈、发件箱对账与公共源同步的完整闭环。 |
-| **[公开对话采集与增量索引](public-transcript-capture.zh.md)** | **[Public Transcript Capture](public-transcript-capture.md)** | 如何从宿主 Transcript 中只提取公开可见消息、通过 Gitleaks + `r3` 脱敏切分为 16 KiB 无损分块，并按单调外层预算安全完成 `Stop` 准入与增量导航摘要。 |
+| **[公开对话采集与增量索引](public-transcript-capture.zh.md)** | **[Public Transcript Capture](public-transcript-capture.md)** | 如何从宿主 Transcript 中只提取公开可见消息、通过 Gitleaks + `r4` 脱敏切分为 16 KiB 无损分块，并按单调外层预算安全完成 `Stop` 准入与增量导航摘要。 |
 | **[社区共享与发件箱对账](community-sharing.zh.md)** | **[Community Sharing](community-sharing.md)** | 贡献者侧 `mindie_knowledge.community` 如何隔离 GitHub 凭据、幂等提交 `mindie-contribution/1` 批次，以及在网络超时后通过只读查询对账。 |
 | **[仓库审核 Bot 规范](repository-bot-contract.zh.md)** | **[Repository Bot Contract](repository-bot-contract.md)** | `mindie-content-review/2` 规范：维护者侧审核应用如何结合零信任 CI 检查、做有限脱敏修正、自动合入纯内容 PR 以及处理撤下请求。 |
 

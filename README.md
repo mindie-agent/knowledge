@@ -10,11 +10,11 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mindie-agent/knowledge/releases"><img src="https://img.shields.io/badge/Release-v0.13.23-blue" alt="Release v0.13.23"></a>
+  <a href="https://github.com/mindie-agent/knowledge/releases"><img src="https://img.shields.io/badge/Release-v0.13.24-blue" alt="Release v0.13.24"></a>
   <a href="https://github.com/mindie-agent/mindie-agent"><img src="https://img.shields.io/badge/MindIE%20Agent-Core%20Runtime-7045f5.svg" alt="MindIE Agent Core Runtime"></a>
   <a href="pyproject.toml"><img src="https://img.shields.io/badge/python-3.11%2B-0284c7.svg" alt="Python 3.11+"></a>
   <a href="https://github.com/mindie-agent/knowledge-vllm-ascend"><img src="https://img.shields.io/badge/feed-vllm--ascend%20%2B%208%20domains-0f766e.svg" alt="9 Domain Knowledge Feeds"></a>
-  <a href="mindie_knowledge/redact.py"><img src="https://img.shields.io/badge/redaction-gitleaks%20%2B%20r3-d97757.svg" alt="Redaction Gitleaks + r3"></a>
+  <a href="mindie_knowledge/redact.py"><img src="https://img.shields.io/badge/redaction-gitleaks%20%2B%20r4-d97757.svg" alt="Redaction Gitleaks + r4"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-0d9488.svg" alt="License MIT"></a>
   <a href="LICENSE-CORPUS"><img src="https://img.shields.io/badge/corpus-CC--BY--4.0-0d9488.svg" alt="Corpus License CC-BY-4.0"></a>
 </p>
@@ -52,7 +52,7 @@ Agent 会自动安装对应的宿主插件（`mindie-agent-cc`、`mindie-agent-c
 >    ```
 > 3. **安装后常用自检与操作命令**：
 >    ```bash
->    # 查看当前脱敏规则集版本（当前为 r3）
+>    # 查看当前脱敏规则集版本（当前为 r4）
 >    python3 -m mindie_knowledge.redact --profile
 >
 >    # 同步公开知识源（零大模型调用，社区共享关闭时同样可用）
@@ -83,7 +83,7 @@ Agent 会自动安装对应的宿主插件（`mindie-agent-cc`、`mindie-agent-c
 | **🧭 分层分片路由与条件匹配检索** | 通过 `routing-manifest.json` 与 `shard-topology.json` 实现多领域、多子拓扑的分层分片路由（Hierarchical Shard Routing），结合 `conditions` 适用条件过滤与本地 **BM25 + 标识符精确匹配**，毫秒级定位匹配当前 SoC、框架版本与场景的知识单元，**零大模型开销、零网络请求**。 |
 | **📖 先看目录，再按需读原文** | 同时支持 `mindie-graded-unit/1` 分级知识单元与本地任务知识包（轻量级 `index.md` 导航清单 + 16 KiB 无损原文分块 `blocks/<block_id>.md`）。Agent 先浏览摘要与适用条件，只对真正匹配的单元或分块点开精读，省 Token 且不漏细节。 |
 | **⚗️ 证据驱动经验提炼（`knowledge_distill`）与同步（`knowledge_sync`）** | 支持从经过实机验证的排障/调优证据中结构化提炼（`knowledge_distill`）新的分级知识单元，并通过 `knowledge_sync` 按需增量同步最新上游知识源，由 `publication_check` 在 CI 侧流式校验 Schema、分片拓扑与隐私合规。 |
-| **🛡️ 双层闭锁式隐私脱敏** | 社区共享**默认关闭（Opt-in）**。即使开启后，也只提取用户输入与助手可见回复（剔除工具调用噪音与隐藏推理链），并在入库与外发前先后经过 **Gitleaks + `mindie_knowledge.redact`（`r3`）** 双重确定性扫描，绝不用大模型篡改技术正文。 |
+| **🛡️ 双层闭锁式隐私脱敏** | 社区共享**默认关闭（Opt-in）**。即使开启后，也只提取用户输入与助手可见回复（剔除工具调用噪音与隐藏推理链），并在入库与外发前先后经过 **Gitleaks + `mindie_knowledge.redact`（`r4`）** 双重确定性扫描，绝不用大模型篡改技术正文。 |
 | **📮 确定性发件箱与只读对账** | 自动将完成索引的本地草稿、分级知识单元与有用性投票打包为 `mindie-contribution/1` 批次提交 GitHub PR。遇到网络超时或结果未知（`unknown`）时，仅做只读远程 PR 对账，**绝不盲目重放写操作或重复调用付费模型**。 |
 | **👍 独立版本化有用性反馈** | Agent 在实机验证某条知识后，可针对当时读到的精确修订号（`@<observed-revision>`）投 `up` 或 `down`，帮助社区识别真正管用的排障方案，同时绝不把投票数当成盲目信任的权威认证。 |
 
@@ -121,7 +121,7 @@ flowchart TB
   subgraph Engine["⚙️ mindie-knowledge 本地运行时 (<root>/<domain>/state-v4/)"]
     direction TB
     Gate["🔐 实时授权门禁<br/>(每次读取、调模型、外发前重验 mindie-consent/1 与项目范围)"]
-    Proj["✂️ 公开对话提取与双层脱敏<br/>(剔除工具/推理噪音 · Gitleaks 8.30.1 + redact r3 扫描)"]
+    Proj["✂️ 公开对话提取与双层脱敏<br/>(剔除工具/推理噪音 · Gitleaks 8.30.1 + redact r4 扫描)"]
     Mat["📂 私有本地层 (materials/ + state-v4.sqlite3)<br/>(L1–L4 分级知识单元 · 16 KiB 无损分块 · BM25 + 条件匹配索引)"]
     Out["📮 确定性发件箱 (outbox/)<br/>(冻结哈希视图 · 二次脱敏复检 · unknown 状态只读远程对账)"]
     FeedCache["📥 公开订阅与路由层 (feed/)<br/>(routing-manifest.json + shard-topology.json · git cat-file --batch 原子校验)"]
@@ -164,7 +164,7 @@ tasks/c3f998fdce9eecfbf1171624d6f791d4fc8e4e1b2bf7636f59dfa05e37327815/
 ```
 
 - **`index.md`（检索导航清单）**：内嵌 `mindie-entry/3` 头部，记录适用条件（如 `torch_npu_version: 2.10.0.post2`）、任务总体导航摘要，以及每个分块的 `block_id`、`sha256` 校验和与分块摘要。
-- **`blocks/<block_id>.md`（不可变正文分块）**：保留经 Gitleaks 与 `redact`（`r3`）清洗后的原始公开对话或实机验证步骤（例如完整的 `torch_npu.npu_rms_norm` 精度对比代码与误差输出；敏感路径会被替换为 `<redacted:user-path:6873afcd2105>` 形式的闭环占位符）。
+- **`blocks/<block_id>.md`（不可变正文分块）**：保留经 Gitleaks 与 `redact`（`r4`）清洗后的原始公开对话或实机验证步骤（例如完整的 `torch_npu.npu_rms_norm` 精度对比代码与误差输出；敏感路径会被替换为 `<redacted:user-path:6873afcd2105>` 形式的闭环占位符）。
 
 ---
 

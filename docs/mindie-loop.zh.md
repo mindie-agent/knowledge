@@ -28,7 +28,7 @@ sequenceDiagram
   Note over Dev,Remote: 阶段 B：经验沉淀与社区外发（仅在已手动 /mindie-agent 启用且用户显式开启 Opt-in、项目在授权范围内触发）
   Host->>Core: 回合结束触发 Stop Hook (携带会话身份与 Transcript 路径)
   Core->>Core: 1. 重验手动会话租约 (entry_enabled=1)、mindie-consent/1 与项目范围门禁
-  Core->>Core: 2. 提取公开可见消息 + Gitleaks & redact(r3) 双重脱敏 + 切分 16 KiB 分块
+  Core->>Core: 2. 提取公开可见消息 + Gitleaks & redact(r4) 双重脱敏 + 切分 16 KiB 分块
   Core->>Core: 3. 调用轻量原生小模型生成分块标题与 index.md 导航大纲
   Core->>Remote: 4. 发件箱二次脱敏复检，打包 mindie-contribution/1 提交 PR（网络超时则只读对账）
 ```
@@ -41,6 +41,7 @@ sequenceDiagram
 - **单次会话手动 `/mindie-agent` 准入（`entry_enabled = 1`）**：整个知识飞轮（`knowledge_query`、`knowledge_explain`、`knowledge_feedback`、`knowledge_distill`、宿主内 `knowledge_sync` 以及后台 `Stop` 对话采集）均要求当前会话显式调用过一次 `/mindie-agent`（`Admission.activate(..., automatic=False)`，在 `admission.sqlite3` 中记录 `entry_enabled = 1`）。同一会话的后续轮次自动保留该准入，直至显式停用（`Admission.deactivate`）。自动会话关联（`Admission.associate`，`entry_enabled = 0`）、新聊天、Fork、子代理、话题匹配与已保存的贡献开关本身都不会自动激活知识工具或后台采集。
 - **单次引导，跨会话持久保存**：插件安装后首次进入原生入口（Claude Code / Kimi / DSH 中的 `/mindie-agent` 或 Codex 中的 `/mindie-agent` / `$mindie-agent`）时，仅询问一次贡献意愿，并将选择保存在 `mindie-consent/1` 配置文件中；后续新会话输入 `/mindie-agent` 时直接复用已保存偏好，不再重复询问。
 - **默认零采集（Opt-in）**：默认状态下社区共享处于关闭状态（`enabled=false`）。在共享关闭期间——或任何未手动调用 `/mindie-agent` 的常规会话中——Stop Hook 直接短路返回，**不读取任何对话记录、不运行脱敏扫描、不调用摘要模型、也不产生任何外发草稿**；而在已手动启用 `/mindie-agent` 的会话中，即使关闭了社区共享，只读检索（`knowledge_query` / `knowledge_explain`）与公共知识库同步（`sync`）依然完全可用。
+- **`local-only`：仅本地采集、绝不外发**：保存 `local-only` 后，在有效会话租约内可进行转录采集、本地蒸馏与缓存检索，但**绝不**发起 GitHub 外发或诊断上传——即使磁盘上仍残留旧 `fork`/`account` 字段，也不会调用 `gh`、检查 fork、生成 outbox 批次或创建 PR。`local-only` 期间产生的材料会附加 `origin_tier=local-only` 标记；之后切换到 `contribute` 时从新的采集边界开始，**绝不导出或补发**这些材料。
 - **随时可改，绝不回溯**：用户可随时通过同一入口开启或关闭共享。中途关闭会立即取消正在排队或运行的采集与未发送批次，但保留已落盘草稿；重新开启后只采集已启用会话中新产生的对话，**绝不会偷偷回填关闭期间的历史记录**。
 
 ---
@@ -49,7 +50,9 @@ sequenceDiagram
 
 为了防止未手动启用的普通会话、历史自动关联记录或被意外损坏的配置文件触发误外发，`mindie-knowledge` 在**每次读取 Transcript 前、每次启动摘要小模型前、以及每次向外部写入前**，都会核验手动会话租约（`entry_enabled = 1`）并实时重读共享设置文件与绝对路径指向的 `mindie-consent/1`：
 
-$$\text{capture\_allowed} = \text{手动启用会话租约 }(\text{entry\_enabled}=1) \land \text{共享已开启} \land \text{项目根目录在授权范围内} \land \text{consent 明确允许贡献}$$
+$$\text{capture\_allowed} = \text{手动启用会话租约 }(\text{entry\_enabled}=1) \land \text{共享已开启} \land \text{项目根目录在授权范围内} \land \text{consent} \in \{\text{local-only},\text{contribute}\}$$
+
+$$\text{publication\_allowed} = \text{capture\_allowed} \land \text{consent} = \text{contribute} \land \text{无 local\_only 标志} \land \text{有效 repository/fork/account}$$
 
 - **区分“未开启”与“配置损坏”**：如果配置文件缺失、无法读取或 JSON 格式损坏，系统会将其作为明确的**授权故障（Authority Fault）**上报，并暂停已接收的后台工作（保留已生成的模型结果，等待修复后恢复），**绝不会把配置损坏当成“首次安装”去重新弹窗或重置用户数据**。
 

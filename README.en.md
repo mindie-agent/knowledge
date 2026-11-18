@@ -10,11 +10,11 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mindie-agent/knowledge/releases"><img src="https://img.shields.io/badge/Release-v0.13.23-blue" alt="Release v0.13.23"></a>
+  <a href="https://github.com/mindie-agent/knowledge/releases"><img src="https://img.shields.io/badge/Release-v0.13.24-blue" alt="Release v0.13.24"></a>
   <a href="https://github.com/mindie-agent/mindie-agent"><img src="https://img.shields.io/badge/MindIE%20Agent-Core%20Runtime-7045f5.svg" alt="MindIE Agent Core Runtime"></a>
   <a href="pyproject.toml"><img src="https://img.shields.io/badge/python-3.11%2B-0284c7.svg" alt="Python 3.11+"></a>
   <a href="https://github.com/mindie-agent/knowledge-vllm-ascend"><img src="https://img.shields.io/badge/feed-vllm--ascend%20%2B%208%20domains-0f766e.svg" alt="9 Domain Knowledge Feeds"></a>
-  <a href="mindie_knowledge/redact.py"><img src="https://img.shields.io/badge/redaction-gitleaks%20%2B%20r3-d97757.svg" alt="Redaction Gitleaks + r3"></a>
+  <a href="mindie_knowledge/redact.py"><img src="https://img.shields.io/badge/redaction-gitleaks%20%2B%20r4-d97757.svg" alt="Redaction Gitleaks + r4"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-0d9488.svg" alt="License MIT"></a>
   <a href="LICENSE-CORPUS"><img src="https://img.shields.io/badge/corpus-CC--BY--4.0-0d9488.svg" alt="Corpus License CC-BY-4.0"></a>
 </p>
@@ -52,7 +52,7 @@ Your Agent will automatically install the matching native plugin (`mindie-agent-
 >    ```
 > 3. **Common Verification & Standalone Commands**:
 >    ```bash
->    # Check the active deterministic redaction ruleset profile (currently r3)
+>    # Check the active deterministic redaction ruleset profile (currently r4)
 >    python3 -m mindie_knowledge.redact --profile
 >
 >    # Sync the latest public knowledge feed (zero model calls; works with community sharing off)
@@ -83,7 +83,7 @@ When working on Ascend NPU inference engineering (such as `vLLM-Ascend` operator
 | **🧭 Hierarchical Shard Routing & Condition-Matched Retrieval** | Combines `routing-manifest.json` and `shard-topology.json` hierarchical shard routing with `conditions` predicate matching and a local **BM25 + exact-identifier lexical index** to retrieve matching units in milliseconds—**zero model calls, zero network requests, and no resident search daemon**. |
 | **📖 Browse the Outline First, Read Exact Units or Blocks on Demand** | Supports both `mindie-graded-unit/1` graded units and local task packages (`index.md` navigation manifest plus lossless 16 KiB material blocks `blocks/<block_id>.md`). Agents inspect summaries and applicability first and open only the units or blocks they actually need. |
 | **⚗️ Evidence-Driven Distillation (`knowledge_distill`) & Sync (`knowledge_sync`)** | Distills verified debugging and optimization evidence into structured graded units via `knowledge_distill`, incrementally syncs upstream corpora via `knowledge_sync`, and enforces schema, shard-topology, and privacy gates in CI via `publication_check`. |
-| **🛡️ Double Fail-Closed Privacy Redaction** | Community sharing is **off by default (Opt-in)**. When enabled, only user prompts and visible assistant replies are extracted (stripping tool noise and hidden reasoning), then scanned by **Gitleaks + `mindie_knowledge.redact` (`r3`)** before storage and before export—never letting an LLM rewrite body text. |
+| **🛡️ Double Fail-Closed Privacy Redaction** | Community sharing is **off by default (Opt-in)**. When enabled, only user prompts and visible assistant replies are extracted (stripping tool noise and hidden reasoning), then scanned by **Gitleaks + `mindie_knowledge.redact` (`r4`)** before storage and before export—never letting an LLM rewrite body text. |
 | **📮 Deterministic Outbox & Read-Only Reconciliation** | Packs indexed local drafts, graded units, and publishable feedback votes into `mindie-contribution/1` batches for GitHub PR delivery. If a network call times out or leaves an `unknown` result, it reconciles via read-only remote checks—**never blindly replaying writes or repeating paid model calls**. |
 | **👍 Revision-Bound Usefulness Feedback** | After using an entry in real work, Agents can record an `up` or `down` vote bound to the exact observed revision (`@<observed-revision>`), helping surface proven fixes without treating votes as blind authority. |
 
@@ -121,7 +121,7 @@ flowchart TB
   subgraph Engine["⚙️ mindie-knowledge Local Runtime (<root>/<domain>/state-v4/)"]
     direction TB
     Gate["🔐 Live Authority Gate<br/>(Re-verifies mindie-consent/1 & project scope before every read, model call, or write)"]
-    Proj["✂️ Public Message Projection & Double Redaction<br/>(Strips tool/reasoning noise · Gitleaks 8.30.1 + redact r3 scan)"]
+    Proj["✂️ Public Message Projection & Double Redaction<br/>(Strips tool/reasoning noise · Gitleaks 8.30.1 + redact r4 scan)"]
     Mat["📂 Private Local Layer (materials/ + state-v4.sqlite3)<br/>(L1–L4 Graded Knowledge Units · Lossless 16 KiB blocks · BM25 + Condition Match Index)"]
     Out["📮 Deterministic Outbox (outbox/)<br/>(Frozen hash-bound views · second redaction check · read-only PR reconciliation)"]
     FeedCache["📥 Public Feed & Routing Layer (feed/)<br/>(routing-manifest.json + shard-topology.json · streaming git cat-file --batch switch)"]
@@ -252,7 +252,7 @@ All architecture and engineering guides under [`docs/`](docs/README.en.md) are a
 | --- | --- | --- | --- |
 | **Documentation Index** | [docs/README.en.md](docs/README.en.md) | [docs/README.md](docs/README.md) | Living specifications for architecture, data pipelines, and release contracts |
 | **MindIE Domain Loop Overview** | [mindie-loop.md](docs/mindie-loop.md) | [mindie-loop.zh.md](docs/mindie-loop.zh.md) | End-to-end walkthrough of consent gates, capture, hierarchical routing + BM25 search, citation grouping, feedback, and sync |
-| **Public Transcript Capture & Indexing** | [public-transcript-capture.md](docs/public-transcript-capture.md) | [public-transcript-capture.zh.md](docs/public-transcript-capture.zh.md) | How public turns are projected, redacted with Gitleaks + `r3`, admitted under one monotonic `Stop` deadline, and indexed incrementally |
+| **Public Transcript Capture & Indexing** | [public-transcript-capture.md](docs/public-transcript-capture.md) | [public-transcript-capture.zh.md](docs/public-transcript-capture.zh.md) | How public turns are projected, redacted with Gitleaks + `r4`, admitted under one monotonic `Stop` deadline, and indexed incrementally |
 | **Community Sharing & Outbox** | [community-sharing.md](docs/community-sharing.md) | [community-sharing.zh.md](docs/community-sharing.zh.md) | Contributor credential isolation, idempotent PR submission, and read-only reconciliation |
 | **Repository Review Bot Contract** | [repository-bot-contract.md](docs/repository-bot-contract.md) | [repository-bot-contract.zh.md](docs/repository-bot-contract.zh.md) | How the `mindie-content-review/2` review application validates, redacts, merges, or withdraws content PRs |
 | **Release Compatibility, Component Updates & File Locks** | [release-compatibility.md](docs/release-compatibility.md) | [release-compatibility.zh.md](docs/release-compatibility.zh.md) | Selecting compatible plugin releases, discovering/building v1/v2 component runtimes (including `mindie-harness`), and coordinating OS file locks |

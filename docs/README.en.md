@@ -25,7 +25,7 @@ These guides walk through how a troubleshooting or optimization session becomes 
 | English Guide | 中文文档 | What You Will Learn |
 | --- | --- | --- |
 | **[MindIE Domain Loop Overview](mindie-loop.md)** | **[领域知识闭环总览](mindie-loop.zh.md)** | **Start Here**: The end-to-end architecture connecting consent gates, two-layer storage, transcript capture, hierarchical routing + BM25 retrieval, feedback votes, outbox reconciliation, and public feed sync. |
-| **[Public Transcript Capture & Indexing](public-transcript-capture.md)** | **[公开对话采集与增量索引](public-transcript-capture.zh.md)** | How visible user/assistant turns are projected, redacted with Gitleaks + `r3` into lossless 16 KiB blocks, admitted within a single monotonic `Stop` deadline, and indexed incrementally. |
+| **[Public Transcript Capture & Indexing](public-transcript-capture.md)** | **[公开对话采集与增量索引](public-transcript-capture.zh.md)** | How visible user/assistant turns are projected, redacted with Gitleaks + `r4` into lossless 16 KiB blocks, admitted within a single monotonic `Stop` deadline, and indexed incrementally. |
 | **[Community Sharing & Outbox](community-sharing.md)** | **[社区贡献与外发规范](community-sharing.zh.md)** | How `mindie_knowledge.community` isolates GitHub credentials, submits idempotent `mindie-contribution/1` batches, and reconciles uncertain network writes via read-only checks. |
 | **[Repository Review Bot Contract](repository-bot-contract.md)** | **[仓库审核 Bot 规范](repository-bot-contract.zh.md)** | The `mindie-content-review/2` specification: how the maintainer's review bot combines zero-trust CI validation, bounded redaction edits, auto-merge for pure content PRs, and package withdrawals. |
 
