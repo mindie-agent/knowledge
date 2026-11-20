@@ -465,7 +465,7 @@ def test_distill_empty_inputs_with_topic_redacts_before_persisting_related_snaps
     sharing = tmp_path / "sharing-rc1.json"
     write_settings(sharing, consent_choice="local-only", enabled=True, roots=[tmp_path])
     adm_path = make_admission(tmp_path, project_root=tmp_path)
-    secret_topic = f"{tmp_path}/secret-project/aclgraph"
+    secret_topic = f"aclgraph capture: {tmp_path}"
 
     with closing(Store(tmp_path / "store-rc1", DOMAIN)) as store:
         # 1a. redactor_executable=None with inputs=[] + topic -> fails BEFORE any graded:related:* write.
@@ -541,8 +541,7 @@ def test_distill_empty_inputs_with_topic_redacts_before_persisting_related_snaps
             assert tmp_path.as_posix() not in raw_persisted
             parsed_snapshot = json.loads(raw_persisted)
             assert set(parsed_snapshot) <= {"related_units", "rejected_history", "_history_scope"}
-            assert "<redacted:local-path:" in parsed_snapshot["_history_scope"]["topic"]
-            assert parsed_snapshot["_history_scope"]["topic"].endswith("/secret-project/aclgraph")
+            assert parsed_snapshot["_history_scope"]["topic"].startswith("aclgraph capture: <redacted:local-path:")
 
             meta_rows = store.db.execute(
                 "SELECT key, value FROM state WHERE key LIKE 'graded:related-meta:%'"
