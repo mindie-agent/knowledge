@@ -258,17 +258,19 @@ class Service:
         session = args.pop("_session_id", None)
         if not isinstance(session, str) or not session:
             raise ValueError("call identity is missing")
-        if self.admission is None:
-            raise ValueError("no adapter admission is configured")
         token = args.pop("_activation", None)
         if token is not None:
+            if self.admission is None:
+                raise ValueError("no adapter admission is configured")
             if capture:
                 lease = self.admission.capture_lease(session, token)
             else:
                 lease = self.admission.check(session, token)
         elif not capture and args.pop("_session_verified", False):
-            lease = None if read_only else self.admission.active_lease(session)
+            lease = None if (read_only or self.admission is None) else self.admission.active_lease(session)
         else:
+            if self.admission is None:
+                raise ValueError("no adapter admission is configured")
             raise ValueError("call identity cannot be verified")
         return args, session, lease
 
@@ -356,7 +358,7 @@ class Service:
             if not set(args) <= allowed or not {"inputs", "task_state"} <= set(args):
                 raise ValueError("distill accepts explicit inputs and task_state plus optional related_refs/proposal")
             settings = self.engine._settings()
-            scope = self.admission.scope_root(session)
+            scope = self.admission.scope_root(session) if self.admission else None
             if not settings.allows_capture() or not scope or not settings.in_scope(scope):
                 raise ValueError("selected evidence is outside current contribution authorization")
             authorization = dict(session=session, generation=settings.generation, scope=scope,

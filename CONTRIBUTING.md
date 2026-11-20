@@ -8,8 +8,8 @@
 
 ## 1. 核心工程准则（`state-service` 四大铁律）
 
-1. **`SVC-CONSENT` — 严格同意书门禁与零补发承诺（`P2.1`）**：
-   社区共享默认关闭（Opt-in）。`knowledge_*` 工具、`Stop` 会话采集与 GitHub PR 外发均受显式会话租约（`entry_enabled = 1`）与 `mindie-consent/1`（`choice_revision`）双重约束；撤回授权时立即停止未发送外发项，重新开启时绝不回溯补发未授权期间的历史数据。
+1. **`SVC-CONSENT` — 公开检索零预绑定与严格采集/外发授权边界（`P2.7` / `P2.8` & `P2.1`）**：
+   公开知识读取与同步（`knowledge_query`、`knowledge_explain`、本地 `knowledge_feedback` 与 `knowledge_sync`）基于标准 MCP `tools/call` 开箱即用，零前置会话绑定门禁（`P2.7` / `P2.8`）；社区共享默认关闭（Opt-in），`Stop` 会话采集、`knowledge_distill` 经验提炼与 GitHub PR 外发严格受 `mindie-consent/1`（单调 `choice_revision`，支持 `contribute` / `local-only` / `read-only`）、授权 `project_roots` 与活跃采集租约约束（`origin_tier="local-only"` 永不外发）。撤回授权时立即停止未发送外发项，重新开启时绝不回溯补发未授权期间的历史数据。
 2. **`SVC-STATE-COMPAT` — 状态 Schema 前后向兼容与纯知识边界**：
    保持 `state_layout.py`（`FORMAT = 1`、`state-v4.sqlite3`）、`MaterialStore` 双阶段原子指针（`current.json`）与 `mindie-graded-unit/1` 回滚安全。RSI 演化循环（`rsi_loop`、`experiment_ledger`、`rsi_crossover`）以 `mindie_harness.rsi` 为唯一演进源，本仓对应模块仅作为平滑升级桥接层。严禁向任意 `Path.cwd()` 写出查询审计日志。
 3. **`SVC-LIFETIME` — 单调预算、软链/Worktree 友好与模块内聚（`< 800` 行）**：

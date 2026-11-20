@@ -8,8 +8,8 @@ Thank you for contributing to **MindIE Knowledge** (`mindie-agent/knowledge`, re
 
 ## 1. Core Engineering Rules (`state-service` Checklist Contract)
 
-1. **`SVC-CONSENT` — Explicit Consent Gate & Zero Retroactive Backfill (`P2.1`)**:
-   Community sharing is opt-in by default. `knowledge_*` calls, `Stop` transcript capture, and GitHub PR publication require both an explicit session lease (`entry_enabled = 1`) and `mindie-consent/1` (`choice_revision`). Withdrawing consent cancels unsent exports immediately, and re-enabling never backfills unconsented sessions.
+1. **`SVC-CONSENT` — Zero-Binding Public Reads & Strict Capture/Export Consent Scope (`P2.7` / `P2.8` & `P2.1`)**:
+   Public knowledge reads and sync (`knowledge_query`, `knowledge_explain`, local `knowledge_feedback`, and `knowledge_sync`) work out of the box over standard MCP `tools/call` with zero pre-call session-binding gates (`P2.7` / `P2.8`). Community sharing remains opt-in by default: `Stop` transcript capture, `knowledge_distill`, and outbound GitHub PR exports are strictly governed by `mindie-consent/1` (monotonic `choice_revision` across `contribute` / `local-only` / `read-only`), authorized `project_roots`, and active capture leases (`origin_tier="local-only"` is never exported). Withdrawing consent cancels unsent exports immediately, and re-enabling never backfills unconsented sessions.
 2. **`SVC-STATE-COMPAT` — Rollback-Safe On-Disk Schemas & Pure Knowledge Scope**:
    Keep `state_layout.py` (`FORMAT = 1`, `state-v4.sqlite3`), `MaterialStore` two-phase `current.json` promotion, and `mindie-graded-unit/1` rollback-safe across rolling upgrades. Canonical RSI evolution (`rsi_loop`, `experiment_ledger`, `rsi_crossover`) lives in `mindie_harness.rsi`; the matching modules in `mindie_knowledge.graded` serve strictly as Wave A->B compatibility shims. Never write query audit logs relative to unowned `Path.cwd()`.
 3. **`SVC-LIFETIME` — Single Monotonic Deadlines, Symlink/Worktree Support & Cohesive Modules (`< 800` LOC)**:

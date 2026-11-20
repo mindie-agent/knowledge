@@ -128,35 +128,61 @@ def _matching_related_units(store, inputs, related_refs):
     return related or None
 
 
-def _related_snapshot(store, inputs, *, session_digest, task_state, related_refs,
-                      topic=None, target_signature=None):
-    """Bind history and related-unit lookups to the initial paid-call identity."""
-    rel_key = "graded:related:" + hashlib.sha256(canonical({
+def _normalize_saved_snapshot(raw: str) -> dict:
+    saved = json.loads(raw)
+    # Preserve pre-history request identities when resuming a paid call.
+    return saved if isinstance(saved, dict) else {
+        "related_units": saved, "rejected_history": [], "_history_scope": {},
+    }
+
+
+def _merge_saved_snapshot(raw_related: str, raw_meta: str | None) -> dict:
+    saved = _normalize_saved_snapshot(raw_related)
+    if raw_meta is not None:
+        meta = json.loads(raw_meta)
+        if isinstance(meta, dict):
+            if isinstance(meta.get("history_scope_digest"), dict):
+                saved = {**saved, "_history_scope_digest": meta["history_scope_digest"]}
+            if isinstance(meta.get("redaction_rules"), list) and meta["redaction_rules"]:
+                saved = {**saved, "_redaction_rules": list(meta["redaction_rules"])}
+    return saved
+
+
+def _load_related_snapshot(store, inputs, *, session_digest, task_state, related_refs,
+                           topic=None, target_signature=None):
+    """Load a persisted related-unit snapshot or resolve an unsaved candidate in memory."""
+    rel_hash = hashlib.sha256(canonical({
         "session_digest": session_digest, "task_state": task_state,
         "inputs": inputs, "related_refs": list(related_refs or ()),
         **({"topic": topic} if topic is not None else {}),
         **({"target_signature": target_signature} if target_signature is not None else {}),
     }).encode()).hexdigest()
+    rel_key = "graded:related:" + rel_hash
+    meta_key = "graded:related-meta:" + rel_hash
     with store.lock:
         row = store.db.execute("SELECT value FROM state WHERE key=?", (rel_key,)).fetchone()
         if row is not None:
-            saved = json.loads(row[0])
-            # Preserve pre-history request identities when resuming a paid call.
-            return saved if isinstance(saved, dict) else {
-                "related_units": saved, "rejected_history": [], "_history_scope": {}}
+            meta_row = store.db.execute("SELECT value FROM state WHERE key=?", (meta_key,)).fetchone()
+            return (
+                rel_key,
+                meta_key,
+                _merge_saved_snapshot(row[0], meta_row[0] if meta_row is not None else None),
+                True,
+            )
         related_units = _matching_related_units(store, inputs, related_refs)
         scope = history_scope(inputs, related_units, topic=topic, target_signature=target_signature)
         context = {"related_units": related_units, "rejected_history": GradedStore(store).recent_rejected(**scope),
                    "_history_scope": scope}
-    with store._write_txn():
-        row = store.db.execute("SELECT value FROM state WHERE key=?", (rel_key,)).fetchone()
-        if row is not None:
-            saved = json.loads(row[0])
-            return saved if isinstance(saved, dict) else {
-                "related_units": saved, "rejected_history": [], "_history_scope": {}}
-        store.db.execute("INSERT OR REPLACE INTO state VALUES(?,?)",
-                         (rel_key, canonical(context)))
-    return context
+    return rel_key, meta_key, context, False
+
+
+def _related_snapshot(store, inputs, *, session_digest, task_state, related_refs,
+                      topic=None, target_signature=None):
+    """Bind history and related-unit lookups in memory without persisting unredacted state."""
+    return _load_related_snapshot(
+        store, inputs, session_digest=session_digest, task_state=task_state,
+        related_refs=related_refs, topic=topic, target_signature=target_signature,
+    )[2]
 
 
 def _validated_decision(pending, request, engine, store, private_paths, cancel):
@@ -222,12 +248,50 @@ def run(engine, inputs, *, session_digest, task_state, authorization=None, cance
 
     revalidate()
     private_paths = ((authorization["scope"],) if authorization else ()) + (str(Path.home()),)
-    context = _related_snapshot(store, inputs, session_digest=session_digest,
-                                task_state=task_state, related_refs=related_refs,
-                                topic=topic, target_signature=target_signature)
+    rel_key, meta_key, context, persisted = _load_related_snapshot(
+        store, inputs, session_digest=session_digest, task_state=task_state,
+        related_refs=related_refs, topic=topic, target_signature=target_signature,
+    )
     request = prepare_request(inputs, session_digest=session_digest, task_state=task_state,
                               redactor_executable=engine.redactor_executable, redaction_key=store.redaction_key(),
                               private_paths=private_paths, cancel=cancel, **context)
+    if not persisted:
+        sanitized_context = {
+            "related_units": context["related_units"],
+            "rejected_history": request.get("rejected_history", []),
+            "_history_scope": request.get("history_scope", {}),
+        }
+        sanitized_meta = {
+            **(
+                {"history_scope_digest": request["history_scope_digest"]}
+                if "history_scope_digest" in request else {}
+            ),
+            **(
+                {"redaction_rules": list(request["redaction_rules"])}
+                if request.get("redaction_rules") else {}
+            ),
+        }
+        concurrent_saved = None
+        with store._write_txn():
+            revalidate()
+            row = store.db.execute("SELECT value FROM state WHERE key=?", (rel_key,)).fetchone()
+            if row is not None:
+                meta_row = store.db.execute("SELECT value FROM state WHERE key=?", (meta_key,)).fetchone()
+                concurrent_saved = _merge_saved_snapshot(
+                    row[0], meta_row[0] if meta_row is not None else None,
+                )
+            else:
+                store.db.execute("INSERT INTO state VALUES(?,?)",
+                                 (rel_key, canonical(sanitized_context)))
+                if sanitized_meta:
+                    store.db.execute("INSERT OR REPLACE INTO state VALUES(?,?)",
+                                     (meta_key, canonical(sanitized_meta)))
+        if concurrent_saved is not None:
+            request = prepare_request(
+                inputs, session_digest=session_digest, task_state=task_state,
+                redactor_executable=engine.redactor_executable, redaction_key=store.redaction_key(),
+                private_paths=private_paths, cancel=cancel, **concurrent_saved,
+            )
     gate = value_gate(request)
     if gate:
         return apply_decision(store, request, noop_decision(request, gate))

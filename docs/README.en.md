@@ -37,3 +37,14 @@ These guides walk through how a troubleshooting or optimization session becomes 
 | --- | --- | --- |
 | **[Release Compatibility, Component Updates & File Locks](release-compatibility.md)** | **[版本兼容、组件更新与跨平台文件锁](release-compatibility.zh.md)** | How `mindie-plugin-release.json` selects compatible plugin releases, how v1/v2 `runtime_inventory` and `component_runtime` discover and build side-by-side `uv` runtimes (including `mindie-harness` substrate support), and how `locks.py` provides shared/exclusive OS file locking. |
 | **[Archived Historical Specifications](archive/README.md)** | **[历史过渡方案归档索引](archive/README.md)** | Historical process-supervision, Windows service-host transition notes, and explicit transcript-import notes preserved for design provenance. |
+
+---
+
+## 3. Release Notes
+
+| English Notes | 中文说明 | Highlights |
+| --- | --- | --- |
+| **[`0.13.25` Release Notes](releases/knowledge-0.13.25.en.md)** | **[`0.13.25` 发布说明](releases/knowledge-0.13.25.md)** | Out-of-the-box read-only service startup with `capture_mode="disabled"`, rollback-safe pre-persist distillation redaction (`graded:related-meta:<hash>`), and dual-layer Windows `pyvenv.cfg` PE GUI validation. |
+| [`0.13.24` Release Notes](releases/knowledge-0.13.24.en.md) | [`0.13.24` 发布说明](releases/knowledge-0.13.24.md) | First-class `local-only` consent tier, separated capture vs. publication authority, pure anonymous HTTPS public feed sync, and `r4` password redaction hardening. |
+| [`0.13.23` Release Notes](releases/knowledge-0.13.23.en.md) | [`0.13.23` 发布说明](releases/knowledge-0.13.23.md) | Pure knowledge domain convergence, backward-compatible `mindie-harness` RSI shims, `< 1ms` PEP 562 lazy top-level imports, and handoff race hardening. |
+| [`0.13.22` Release Notes](releases/knowledge-0.13.22.en.md) | [`0.13.22` 发布说明](releases/knowledge-0.13.22.md) | Shared storage lifecycle (`.inuse` leases and two-phase `.trash-*` retirement), automatic same-volume `uv` cache selection, Windows short directory keys, and silent cross-harness reclamation. |

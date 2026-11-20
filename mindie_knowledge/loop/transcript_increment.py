@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+from pathlib import Path
 import queue
 import time
 
@@ -469,10 +470,15 @@ class TranscriptMixin:
         try:
             settings = self._revalidate(row)
             lease = self.admission.active_lease(row["session"]) if self.admission else None
+            if self.capture_mode != "public-transcript":
+                raise ValueError("transcript capture is disabled in engine configuration")
             if not row["transcript"]:
                 raise ValueError("public transcript reference is required; summary fallback is forbidden")
-            if not self.redactor_executable:
+            if not self.redactor_executable or not Path(self.redactor_executable).is_absolute():
                 raise ValueError("public transcript capture requires an installed redactor")
+            if self.transcript is None and getattr(self, "_transcript_adapter_path", None):
+                from .cli import load_transcript_adapter
+                self.transcript = load_transcript_adapter({"transcript_adapter": self._transcript_adapter_path})
             text = self._transcript_increment(row, settings, lease, region)
             if text is None:
                 return

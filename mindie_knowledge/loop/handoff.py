@@ -275,7 +275,7 @@ def _is_admission_budget_exhausted(exc: AdmissionUnavailable, deadline: float | 
 def request_wake(config_path, *, session_id, event=None, timeout=None):
     """Spawn at most one detached service starter. Does not create a capture."""
     from . import settings as settings_mod
-    from .cli import config_at
+    from .cli import config_at, validate_capture_config
     from .locks import StartInProgress, StartLock
     from .lifecycle import require_active, ServiceRetired
 
@@ -308,6 +308,11 @@ def request_wake(config_path, *, session_id, event=None, timeout=None):
             out.update(wake='failed', runtime='unavailable', reason='authority-unavailable')
             return out
         out.update(wake="not-applicable", reason="sharing-disabled")
+        return out
+    try:
+        validate_capture_config(config)
+    except ValueError:
+        out.update(wake="failed", runtime="unavailable", reason="configuration")
         return out
     path = config.get("admission_path")
     if not isinstance(path, str):
@@ -462,6 +467,8 @@ def _record_hook_failure(config_path, cause, event=None):
     try:
         config = config_at(config_path)
         record_delivery_failure(config, stage="accept", cause=cause, event=event)
+    except TimeoutError:
+        raise
     except _HOOK_ERRORS:
         failure(
             "knowledge.capture", stage="accept",
@@ -522,7 +529,7 @@ def run_stop_hook(config_path, *, timeout=None):
 def accept_stop(config_path, event, *, timeout=None, deadline=None):
     """Durable Stop handoff governed by a single monotonic outer deadline."""
     from . import settings as settings_mod
-    from .cli import config_at
+    from .cli import config_at, validate_capture_config
     from .diagnostics import clear_delivery_event
 
     dropped = False
@@ -573,6 +580,12 @@ def accept_stop(config_path, event, *, timeout=None, deadline=None):
             return _result(stage='unavailable', reason='authority-unavailable',
                            cause='authority-unavailable', summary_dropped=dropped)
         return _result(stage="inert", reason="sharing-disabled", summary_dropped=dropped)
+    try:
+        validate_capture_config(config)
+    except ValueError:
+        from .dfx import failure
+        failure('knowledge.capture', stage='handoff', category='configuration_unavailable')
+        return _result(stage="unavailable", reason="configuration", cause="internal", summary_dropped=dropped)
     session = event.get("session_id")
     kind, key = _identity(event)
     if kind is None and key == "invalid":

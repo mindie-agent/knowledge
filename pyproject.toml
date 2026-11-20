@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mindie-knowledge"
-version = "0.13.24"
+version = "0.13.25"
 description = "Local knowledge and experience loop: bounded capture, optional community sharing, Git-published retrieval"
 readme = "README.md"
 license = "MIT"
@@ -20,7 +20,7 @@ dependencies = [
   "langmem==0.0.30",
   "pywin32==312; sys_platform == 'win32'",
   "mindie-diagnostics @ git+https://github.com/mindie-agent/diagnostics@7464cbb4381e9dc996871d192eb3f05f61dfdb28",
-  "mindie-harness @ git+https://github.com/mindie-agent/harness@5f507816d52602c3a77e91df2e39c78dbe402bf9",
+  "mindie-harness @ git+https://github.com/mindie-agent/harness@440b8bd3dfa47f3c2e2131259c391c8cee14f13d",
 ]
 
 [project.optional-dependencies]
