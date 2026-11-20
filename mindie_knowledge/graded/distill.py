@@ -220,7 +220,7 @@ def _sha(value):
 def prepare_request(inputs, *, session_digest, task_state, redactor_executable,
                     redaction_key, private_paths=(), cancel=None, related_units=None,
                     graded_store=None, topic=None, target_signature=None, rejected_history=None,
-                    _history_scope=None):
+                    _history_scope=None, _history_scope_digest=None, _redaction_rules=None):
     """Prepare selected evidence; explicit invocation is the local read scope."""
     if not isinstance(session_digest, str) or not SHA256.fullmatch(session_digest):
         raise ValueError("session_digest must be an exact SHA256")
@@ -251,7 +251,8 @@ def prepare_request(inputs, *, session_digest, task_state, redactor_executable,
         raise ValueError("selected distillation input exceeds 256 KiB; select a smaller evidence scope")
     scope = (_history_scope if _history_scope is not None else
              history_scope(inputs, related_units, topic=topic, target_signature=target_signature))
-    scope_identity = scope_digest(scope)
+    scope_identity = (dict(_history_scope_digest) if isinstance(_history_scope_digest, dict)
+                      else scope_digest(scope))
     history = rejected_history
     if history is None:
         history = graded_store.recent_rejected(**scope) if graded_store is not None else []
@@ -260,12 +261,14 @@ def prepare_request(inputs, *, session_digest, task_state, redactor_executable,
     if any(len(canonical(row).encode()) > MAX_HISTORY_BYTES for row in history):
         raise ValueError("rejected history summary exceeds 4 KiB")
     rules = []
-    if selected or history:
+    if selected or history or scope:
         from ..loop.transcript_redaction import redact_tree
         cleaned, rules = redact_tree(
             {"inputs": selected, "history": history, "scope": scope},
             executable=redactor_executable, key=redaction_key,
             private_paths=private_paths, cancel=cancel)
+        if _redaction_rules:
+            rules = sorted(set(rules) | set(_redaction_rules))
         selected, history, scope = cleaned["inputs"], cleaned["history"], cleaned["scope"]
         for item in selected:
             locator = item["source_locator"]

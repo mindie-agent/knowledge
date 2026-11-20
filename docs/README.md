@@ -37,3 +37,14 @@ flowchart LR
 | --- | --- | --- |
 | **[版本兼容、组件更新与跨平台文件锁](release-compatibility.zh.md)** | **[Release Compatibility & Locks](release-compatibility.md)** | `mindie-plugin-release.json` 宿主版本区间选择、v1/v2 组件清单（含 `mindie-harness` 共享宿主底座桥接）的独立 GitHub Release 发现与并排 `uv` 运行时构建，以及 POSIX/Windows 文件锁契约。 |
 | **[历史过渡方案归档索引](archive/README.md)** | **[Archived Historical Specs](archive/README.md)** | 早期宿主进程监管、Windows 计划任务过渡方案与显式历史导入的溯源归档（仅供历史参考，不作为当前门禁）。 |
+
+---
+
+## 3. 版本发布说明（Release Notes）
+
+| 中文说明 | English | 核心变更导读 |
+| --- | --- | --- |
+| **[`0.13.25` 发布说明](releases/knowledge-0.13.25.md)** | **[`0.13.25` Release Notes](releases/knowledge-0.13.25.en.md)** | 只读服务开箱即用与 `capture_mode="disabled"` 配置解耦、蒸馏关联快照落盘前闭锁脱敏（`graded:related-meta:<hash>` 回滚兼容）及 Windows 双层 `pyvenv.cfg` 无窗口 PE GUI 校验加固。 |
+| [`0.13.24` 发布说明](releases/knowledge-0.13.24.md) | [`0.13.24` Release Notes](releases/knowledge-0.13.24.en.md) | `local-only` 一等同意层、采集与外发授权链分离、纯匿名 HTTPS 公共语料同步及落盘前密码脱敏补强（`r4`）。 |
+| [`0.13.23` 发布说明](releases/knowledge-0.13.23.md) | [`0.13.23` Release Notes](releases/knowledge-0.13.23.en.md) | 纯知识域职责收敛、`mindie-harness` RSI 薄转发桥、`< 1ms` 顶层惰性按需导入与并发交接竞态修复。 |
+| [`0.13.22` 发布说明](releases/knowledge-0.13.22.md) | [`0.13.22` Release Notes](releases/knowledge-0.13.22.en.md) | 共享存储生命周期（`.inuse` 租约与两阶段 `.trash-*` 退役）、同卷 `uv` 缓存选择、Windows 短目录键与跨宿主历史回收。 |

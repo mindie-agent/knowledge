@@ -89,4 +89,4 @@ def package_version() -> str:
     except TimeoutError:
         raise
     except PackageNotFoundError:
-        return "0.13.24"
+        return "0.13.25"

@@ -56,10 +56,7 @@ def validate_config(config):
     if "client_contract" in config:
         raise ValueError("cross-runtime client compatibility is unsupported; reload the installed runtime")
     if "session_activation" in config:
-        raise ValueError(
-            "session_activation was removed; configure the neutral "
-            "admission_path SQLite file instead"
-        )
+        raise ValueError("session_activation was removed; configure the neutral admission_path SQLite file instead")
     if "agent_command" in config:
         raise ValueError("agent_command was removed; configure summary_command for public transcript indexing")
     command = config.get("summary_command")
@@ -68,23 +65,29 @@ def validate_config(config):
         raise ValueError("summary_command must be a nonempty argv list")
     if "admission_path" in config and not isinstance(config["admission_path"], str):
         raise ValueError("admission_path must be an explicit SQLite file path")
+    mode = config.get("capture_mode", "public-transcript")
+    if mode not in {"public-transcript", "disabled"}:
+        raise ValueError("only public-transcript or disabled capture_mode is supported")
+    scanner = config.get("redactor_executable")
+    if scanner is not None and (not isinstance(scanner, str) or not Path(scanner).is_absolute()):
+        raise ValueError("public transcript mode requires an absolute redactor_executable")
     adapter = config.get("transcript_adapter")
+    if adapter is not None and (not isinstance(adapter, str) or not Path(adapter).is_absolute() or Path(adapter).suffix != ".py"):
+        raise ValueError("transcript_adapter must be an absolute local parser module path")
+    return config
+
+
+def validate_capture_config(config):
     if config.get("capture_mode", "public-transcript") != "public-transcript":
         raise ValueError("only public-transcript capture is supported")
     scanner = config.get("redactor_executable")
     if not isinstance(scanner, str) or not Path(scanner).is_absolute():
         raise ValueError("public transcript mode requires an absolute redactor_executable")
+    adapter = config.get("transcript_adapter")
     if not adapter:
         raise ValueError("public transcript mode requires a transcript adapter")
-    if adapter is not None:
-        if (
-            not isinstance(adapter, str)
-            or not Path(adapter).is_absolute()
-            or Path(adapter).suffix != ".py"
-        ):
-            raise ValueError(
-                "transcript_adapter must be an absolute local parser module path"
-            )
+    if not isinstance(adapter, str) or not Path(adapter).is_absolute() or Path(adapter).suffix != ".py":
+        raise ValueError("transcript_adapter must be an absolute local parser module path")
     return config
 
 
@@ -564,13 +567,18 @@ def _serve(config_path, config):
         stage = "admission"
         admission = Admission(config["admission_path"]) if config.get("admission_path") else None
         stage = "transcript_adapter"
-        transcript = load_transcript_adapter(config)
+        mode, adapter_path = config.get("capture_mode", "public-transcript"), config.get("transcript_adapter")
+        transcript = None
+        if mode != "disabled" and adapter_path:
+            try:
+                transcript = load_transcript_adapter(config)
+            except ValueError:
+                if Path(adapter_path).is_file() or settings_mod.from_engine_config(config).allows_capture():
+                    raise
         stage = "engine"
-        engine = Engine(store,
-                        settings_path=config.get("community_config"), admission=admission,
-                        transcript_adapter=transcript, capture_mode=config.get("capture_mode", "public-transcript"),
-                        redactor_executable=config.get("redactor_executable"),
-                        summary_command=config.get("summary_command"))
+        engine = Engine(store, settings_path=config.get("community_config"), admission=admission,
+                        transcript_adapter=transcript, transcript_adapter_path=adapter_path, capture_mode=mode,
+                        redactor_executable=config.get("redactor_executable"), summary_command=config.get("summary_command"))
         stage = "service"
         service = Service(engine, connection_path=connection_path(config),
                           admission=admission, feeds=_feeds(config, store),
@@ -625,19 +633,9 @@ def main(argv=None):
     parser.add_argument(
         "operation",
         choices=[
-            "serve",
-            "hook",
-            "wake",
-            "status",
-            "diagnostic-status",
-            "stop",
-            "sync",
-            "distill",
-            "sharing-status",
-            "contribution-inspect",
-            "contribution-reconcile",
-            "contribution-retry",
-            "contribution-compact",
+            "serve", "hook", "wake", "status", "diagnostic-status", "stop", "sync", "distill",
+            "sharing-status", "contribution-inspect", "contribution-reconcile",
+            "contribution-retry", "contribution-compact",
         ],
     )
     parser.add_argument("--config", required=True)

@@ -55,14 +55,15 @@ SUMMARY_FAULT_BACKOFF_SECONDS = 30
 class Engine(TranscriptMixin):
     def __init__(self, store, *, settings_path=None,
                  admission=None, state_dir=None, transcript_adapter=None,
+                 transcript_adapter_path=None,
                  capture_mode="public-transcript", redactor_executable=None, summary_command=None):
         """``transcript_adapter`` is the already-loaded trusted parser module
         (absolute local module from engine config ``transcript_adapter``)
         exporting ``FileIdentity``/``identify``/``read_material``. Without it
         transcript capture fails explicitly; core never substitutes a summary."""
         self.store = store
-        if capture_mode != "public-transcript":
-            raise ValueError("only public-transcript capture is supported")
+        if capture_mode not in {"public-transcript", "disabled"}:
+            raise ValueError("only public-transcript or disabled capture_mode is supported")
         if summary_command is not None and (not isinstance(summary_command, list) or not summary_command or not all(isinstance(x, str) for x in summary_command)):
             raise ValueError("summary_command must be a nonempty argv list")
         self.capture_mode = capture_mode
@@ -71,6 +72,7 @@ class Engine(TranscriptMixin):
         self.settings_path = settings_path
         self.admission = admission
         self.transcript = transcript_adapter
+        self._transcript_adapter_path = transcript_adapter_path
         self.state_dir = Path(state_dir) if state_dir else store.root / "outbox"
         self.queue = queue.Queue(maxsize=8)
         self.stop = threading.Event()
