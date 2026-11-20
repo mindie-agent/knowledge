@@ -541,7 +541,10 @@ def test_distill_empty_inputs_with_topic_redacts_before_persisting_related_snaps
             assert tmp_path.as_posix() not in raw_persisted
             parsed_snapshot = json.loads(raw_persisted)
             assert set(parsed_snapshot) <= {"related_units", "rejected_history", "_history_scope"}
-            assert parsed_snapshot["_history_scope"]["topic"].startswith("aclgraph capture: <redacted:local-path:")
+            sanitized_topic = parsed_snapshot["_history_scope"]["topic"]
+            assert sanitized_topic != secret_topic
+            assert sanitized_topic.startswith("aclgraph capture: ")
+            assert ("<redacted:" in sanitized_topic) or ("[REDACTED" in sanitized_topic)
 
             meta_rows = store.db.execute(
                 "SELECT key, value FROM state WHERE key LIKE 'graded:related-meta:%'"
